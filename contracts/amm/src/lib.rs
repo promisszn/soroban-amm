@@ -284,6 +284,23 @@ impl AmmPool {
 
     // ── Quotes (read-only) ────────────────────────────────────────────────────
 
+    /// Return the current spot price of each token in terms of the other,
+    /// scaled by 1_000_000.
+    ///
+    /// Returns `(price_a, price_b)` where:
+    /// - `price_a` = price of token_a in terms of token_b (reserve_b * 1_000_000 / reserve_a)
+    /// - `price_b` = price of token_b in terms of token_a (reserve_a * 1_000_000 / reserve_b)
+    ///
+    /// Panics if either reserve is zero (pool is empty).
+    pub fn price_ratio(env: Env) -> (i128, i128) {
+        let reserve_a = Self::get_reserve_a(env.clone());
+        let reserve_b = Self::get_reserve_b(env);
+        assert!(reserve_a > 0 && reserve_b > 0, "pool is empty");
+        let price_a = reserve_b * 1_000_000 / reserve_a;
+        let price_b = reserve_a * 1_000_000 / reserve_b;
+        (price_a, price_b)
+    }
+
     /// Quote how much `token_out` you receive for `amount_in` of `token_in`.
     pub fn get_amount_out(env: Env, token_in: Address, amount_in: i128) -> i128 {
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
@@ -428,6 +445,45 @@ mod tests {
         let out = amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128);
         assert!(out > 0);
         assert!(out < 200_000); // slightly less than 2x due to fee + price impact
+    }
+
+    #[test]
+    fn test_price_ratio() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+
+        let (ta_client, ta_sac) = create_sac(&env, &admin);
+        let (tb_client, tb_sac) = create_sac(&env, &admin);
+
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
+
+        let provider = Address::generate(&env);
+        ta_sac.mint(&provider, &2_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+
+        amm.add_liquidity(&provider, &2_000_000_i128, &1_000_000_i128, &0_i128);
+
+        // reserve_a = 2_000_000, reserve_b = 1_000_000
+        // price_a = 1_000_000 * 1_000_000 / 2_000_000 = 500_000
+        // price_b = 2_000_000 * 1_000_000 / 1_000_000 = 2_000_000
+        let (price_a, price_b) = amm.price_ratio();
+        assert_eq!(price_a, 500_000);
+        assert_eq!(price_b, 2_000_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "pool is empty")]
+    fn test_price_ratio_panics_on_empty_pool() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+
+        let (ta_client, _) = create_sac(&env, &admin);
+        let (tb_client, _) = create_sac(&env, &admin);
+
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
+
+        // No liquidity added — reserves are zero, should panic
+        amm.price_ratio();
     }
 
     #[test]
