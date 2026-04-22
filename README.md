@@ -11,13 +11,15 @@ A constant-product Automated Market Maker (AMM) built as a Soroban smart contrac
 - [Contracts](#contracts)
   - [AMM Pool Contract](#amm-pool-contract)
   - [LP Token Contract](#lp-token-contract)
+  - [Factory Contract](#factory-contract)
 - [Math & Formulas](#math--formulas)
 - [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
   - [Build](#build)
   - [Test](#test)
 - [Usage](#usage)
-  - [Deploy](#deploy)
+  - [Deploy via Factory](#deploy-via-factory)
+  - [Deploy Manually](#deploy-manually)
   - [Add Liquidity](#add-liquidity)
   - [Swap Tokens](#swap-tokens)
   - [Remove Liquidity](#remove-liquidity)
@@ -49,11 +51,13 @@ soroban-amm/
 └── contracts/
     ├── amm/                    # Core AMM pool contract
     │   └── src/lib.rs
-    └── token/                  # SEP-41 LP token contract
+    ├── token/                  # SEP-41 LP token contract
+    │   └── src/lib.rs
+    └── factory/                # Pool factory contract
         └── src/lib.rs
 ```
 
-The AMM contract depends on the token contract. When liquidity is added or removed, the AMM calls the LP token contract to mint or burn shares on behalf of the provider.
+The AMM contract depends on the token contract. When liquidity is added or removed, the AMM calls the LP token contract to mint or burn shares on behalf of the provider. The factory contract depends on both AMM and token: it deploys and initialises them as a pair when a new pool is created.
 
 ---
 
@@ -87,6 +91,40 @@ Located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs).
 | `get_amount_out(token_in, amount_in) → amount_out` | Quote a swap without executing it |
 | `get_info() → PoolInfo` | Read pool state (reserves, fee, shares) |
 | `shares_of(provider) → shares` | Read an LP's share balance |
+
+### Factory Contract
+
+Located in [contracts/factory/src/lib.rs](contracts/factory/src/lib.rs).
+
+A single-entry-point contract for creating and discovering AMM pools. The factory deploys a new AMM pool and its paired LP token in one transaction, enforces uniqueness per token pair, and maintains a registry of all pools it has deployed.
+
+#### Storage
+
+| Key | Type | Description |
+|---|---|---|
+| `Admin` | `Address` | Factory administrator; set as AMM fee recipient |
+| `AmmWasmHash` | `BytesN<32>` | WASM hash of the AMM pool contract |
+| `TokenWasmHash` | `BytesN<32>` | WASM hash of the LP token contract |
+| `Pool(Address, Address)` | `Address` | Normalised token pair → pool address |
+| `AllPools` | `Vec<Address>` | Ordered list of all deployed pool addresses |
+| `PoolCount` | `u64` | Monotonic counter used to derive deploy salts |
+
+#### Public Interface
+
+| Function | Description |
+|---|---|
+| `initialize(admin, amm_wasm_hash, token_wasm_hash)` | One-time factory setup |
+| `create_pool(token_a, token_b, fee_bps) → Address` | Deploy a new AMM + LP token pair; panics on duplicate |
+| `get_pool(token_a, token_b) → Option<Address>` | Look up an existing pool (order-independent) |
+| `all_pools() → Vec<Address>` | List every pool deployed by this factory |
+
+#### Notes
+
+- Token pair order is **normalised** at creation time (smaller address stored first). `get_pool` accepts either order.
+- `create_pool` panics with `"pool already exists"` if a pool for the pair is already registered.
+- The factory admin is set as the AMM's `fee_recipient`; protocol fees start at 0 bps and can be enabled later.
+
+---
 
 ### LP Token Contract
 
@@ -245,19 +283,96 @@ target/wasm32-unknown-unknown/release/token.wasm
 
 ### Test
 
-Run the full test suite:
+The AMM and token contract tests run without pre-built WASM:
 
 ```sh
-cargo test
+cargo test -p amm -p token
 ```
 
-Tests are located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs) and cover adding liquidity, swapping, and removing liquidity.
+The factory tests embed compiled WASM at compile time, so build WASM first:
+
+```sh
+cargo build --release --target wasm32-unknown-unknown
+cargo test -p factory
+```
+
+Or run the full suite in one go:
+
+```sh
+cargo build --release --target wasm32-unknown-unknown && cargo test
+```
 
 ---
 
 ## Usage
 
-### Deploy
+### Deploy via Factory
+
+The factory is the recommended way to create pools. It deploys and initialises the AMM pool and its LP token in a single transaction, and registers the pool in its on-chain registry.
+
+**1. Upload the contract WASM blobs:**
+
+```sh
+stellar contract upload \
+  --wasm target/wasm32-unknown-unknown/release/amm.wasm \
+  --network testnet --source <YOUR_KEY>
+# → prints AMM_WASM_HASH
+
+stellar contract upload \
+  --wasm target/wasm32-unknown-unknown/release/token.wasm \
+  --network testnet --source <YOUR_KEY>
+# → prints TOKEN_WASM_HASH
+```
+
+**2. Deploy the factory:**
+
+```sh
+stellar contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/factory.wasm \
+  --network testnet --source <YOUR_KEY>
+# → prints FACTORY_CONTRACT_ID
+```
+
+**3. Initialise the factory:**
+
+```sh
+stellar contract invoke \
+  --id <FACTORY_CONTRACT_ID> \
+  --network testnet --source <YOUR_KEY> \
+  -- initialize \
+  --admin <YOUR_ADDRESS> \
+  --amm_wasm_hash <AMM_WASM_HASH> \
+  --token_wasm_hash <TOKEN_WASM_HASH>
+```
+
+**4. Create a pool (deploys AMM + LP token, registers the pair):**
+
+```sh
+stellar contract invoke \
+  --id <FACTORY_CONTRACT_ID> \
+  --network testnet --source <YOUR_KEY> \
+  -- create_pool \
+  --token_a <TOKEN_A_CONTRACT_ID> \
+  --token_b <TOKEN_B_CONTRACT_ID> \
+  --fee_bps 30
+# → prints the new POOL_CONTRACT_ID
+```
+
+**5. Look up an existing pool:**
+
+```sh
+stellar contract invoke \
+  --id <FACTORY_CONTRACT_ID> \
+  -- get_pool \
+  --token_a <TOKEN_A_CONTRACT_ID> \
+  --token_b <TOKEN_B_CONTRACT_ID>
+
+stellar contract invoke --id <FACTORY_CONTRACT_ID> -- all_pools
+```
+
+---
+
+### Deploy Manually
 
 Deploy the LP token contract first, then the AMM pool. The AMM contract address becomes the LP token's admin.
 
@@ -300,7 +415,9 @@ stellar contract invoke \
   --token_a <TOKEN_A_CONTRACT_ID> \
   --token_b <TOKEN_B_CONTRACT_ID> \
   --lp_token <LP_TOKEN_CONTRACT_ID> \
-  --fee_bps 30
+  --fee_bps 30 \
+  --fee_recipient <FEE_RECIPIENT_ADDRESS> \
+  --protocol_fee_bps 0
 ```
 
 ### Add Liquidity
