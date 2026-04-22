@@ -31,7 +31,7 @@ impl LpToken {
         decimals: u32,
     ) {
         if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialized");
+            panic!("already initialized: contract {:?}", env.current_contract_address());
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Name, &name);
@@ -82,7 +82,7 @@ impl LpToken {
     pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
         spender.require_auth();
         let allowance = Self::allowance(env.clone(), from.clone(), spender.clone());
-        assert!(allowance >= amount, "insufficient allowance");
+        assert!(allowance >= amount, "insufficient allowance: available={allowance}, requested={amount}");
         env.storage()
             .persistent()
             .set(&DataKey::Allowance(from.clone(), spender), &(allowance - amount));
@@ -115,7 +115,7 @@ impl LpToken {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         let bal = Self::balance(env.clone(), from.clone());
-        assert!(bal >= amount, "insufficient balance");
+        assert!(bal >= amount, "insufficient balance: available={bal}, requested={amount}");
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from), &(bal - amount));
@@ -127,9 +127,13 @@ impl LpToken {
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
+    pub fn admin(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Admin).unwrap()
+    }
+
     fn _transfer(env: &Env, from: &Address, to: &Address, amount: i128) {
         let from_bal = Self::balance(env.clone(), from.clone());
-        assert!(from_bal >= amount, "insufficient balance");
+        assert!(from_bal >= amount, "insufficient balance: available={from_bal}, requested={amount}");
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from.clone()), &(from_bal - amount));
@@ -141,5 +145,138 @@ impl LpToken {
             (Symbol::new(env, "transfer"), from.clone()),
             (to.clone(), amount),
         );
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{testutils::Address as _, Env};
+
+    struct TestSetup {
+        env: Env,
+        admin: Address,
+        contract_addr: Address,
+    }
+
+    fn setup() -> TestSetup {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_addr = env.register_contract(None, LpToken);
+        LpTokenClient::new(&env, &contract_addr).initialize(
+            &admin,
+            &String::from_str(&env, "Test Token"),
+            &String::from_str(&env, "TST"),
+            &7u32,
+        );
+        TestSetup { env, admin, contract_addr }
+    }
+
+    #[test]
+    fn test_initialize_twice_panics() {
+        let ts = setup();
+        let client = LpTokenClient::new(&ts.env, &ts.contract_addr);
+        let result = client.try_initialize(
+            &ts.admin,
+            &String::from_str(&ts.env, "X"),
+            &String::from_str(&ts.env, "X"),
+            &7u32,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_mint_and_burn() {
+        let ts = setup();
+        let client = LpTokenClient::new(&ts.env, &ts.contract_addr);
+        let user = Address::generate(&ts.env);
+
+        client.mint(&user, &1_000_i128);
+        assert_eq!(client.balance(&user), 1_000);
+        assert_eq!(client.total_supply(), 1_000);
+
+        client.burn(&user, &400_i128);
+        assert_eq!(client.balance(&user), 600);
+        assert_eq!(client.total_supply(), 600);
+    }
+
+    #[test]
+    fn test_burn_insufficient_balance_panics() {
+        let ts = setup();
+        let client = LpTokenClient::new(&ts.env, &ts.contract_addr);
+        let user = Address::generate(&ts.env);
+        client.mint(&user, &100_i128);
+        let result = client.try_burn(&user, &200_i128);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_transfer() {
+        let ts = setup();
+        let client = LpTokenClient::new(&ts.env, &ts.contract_addr);
+        let alice = Address::generate(&ts.env);
+        let bob = Address::generate(&ts.env);
+
+        client.mint(&alice, &500_i128);
+        client.transfer(&alice, &bob, &200_i128);
+
+        assert_eq!(client.balance(&alice), 300);
+        assert_eq!(client.balance(&bob), 200);
+        assert_eq!(client.total_supply(), 500);
+    }
+
+    #[test]
+    fn test_transfer_insufficient_balance_panics() {
+        let ts = setup();
+        let client = LpTokenClient::new(&ts.env, &ts.contract_addr);
+        let alice = Address::generate(&ts.env);
+        let bob = Address::generate(&ts.env);
+        client.mint(&alice, &100_i128);
+        let result = client.try_transfer(&alice, &bob, &200_i128);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_approve_and_transfer_from() {
+        let ts = setup();
+        let client = LpTokenClient::new(&ts.env, &ts.contract_addr);
+        let alice = Address::generate(&ts.env);
+        let bob = Address::generate(&ts.env);
+        let carol = Address::generate(&ts.env);
+
+        client.mint(&alice, &1_000_i128);
+        client.approve(&alice, &bob, &300_i128);
+        assert_eq!(client.allowance(&alice, &bob), 300);
+
+        client.transfer_from(&bob, &alice, &carol, &200_i128);
+        assert_eq!(client.balance(&alice), 800);
+        assert_eq!(client.balance(&carol), 200);
+        assert_eq!(client.allowance(&alice, &bob), 100);
+    }
+
+    #[test]
+    fn test_transfer_from_insufficient_allowance_panics() {
+        let ts = setup();
+        let client = LpTokenClient::new(&ts.env, &ts.contract_addr);
+        let alice = Address::generate(&ts.env);
+        let bob = Address::generate(&ts.env);
+        let carol = Address::generate(&ts.env);
+
+        client.mint(&alice, &1_000_i128);
+        client.approve(&alice, &bob, &50_i128);
+        let result = client.try_transfer_from(&bob, &alice, &carol, &100_i128);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_metadata() {
+        let ts = setup();
+        let client = LpTokenClient::new(&ts.env, &ts.contract_addr);
+        assert_eq!(client.name(), String::from_str(&ts.env, "Test Token"));
+        assert_eq!(client.symbol(), String::from_str(&ts.env, "TST"));
+        assert_eq!(client.decimals(), 7u32);
     }
 }
