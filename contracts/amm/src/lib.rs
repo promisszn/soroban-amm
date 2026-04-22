@@ -52,9 +52,22 @@ pub struct AmmPool;
 impl AmmPool {
     // ── Admin / Setup ─────────────────────────────────────────────────────────
 
-    /// Initialize the pool.
+    /// Initialize the AMM pool with two tokens, an LP token, and a swap fee.
     ///
-    /// `lp_token` must already be deployed and its admin set to this contract.
+    /// Must be called exactly once after deployment. The LP token contract must
+    /// already be deployed with this contract set as its admin so it can mint
+    /// and burn shares on behalf of liquidity providers.
+    ///
+    /// # Parameters
+    /// - `token_a` – Address of the first pool token (SEP-41 compliant).
+    /// - `token_b` – Address of the second pool token (SEP-41 compliant).
+    /// - `lp_token` – Address of the LP token contract used to represent pool shares.
+    /// - `fee_bps` – Swap fee in basis points (e.g. `30` = 0.30 %). Must be in `[0, 10_000]`.
+    ///
+    /// # Panics
+    /// - If the pool has already been initialized.
+    /// - If `token_a == token_b`.
+    /// - If `fee_bps` is outside the range `[0, 10_000]`.
     pub fn initialize(
         env: Env,
         token_a: Address,
@@ -79,11 +92,29 @@ impl AmmPool {
 
     // ── Liquidity ─────────────────────────────────────────────────────────────
 
-    /// Deposit `amount_a` of token_a and `amount_b` of token_b.
+    /// Deposit tokens into the pool and receive LP shares in return.
     ///
-    /// On the first deposit any ratio is accepted. Subsequent deposits must
-    /// match the current pool ratio (within rounding); excess is *not* refunded
-    /// automatically — callers should compute amounts off-chain first.
+    /// On the first deposit any ratio is accepted and the initial share supply is
+    /// set to the geometric mean of the two amounts. Subsequent deposits must
+    /// match the current pool ratio (within integer rounding); excess tokens are
+    /// **not** refunded automatically — callers should compute amounts off-chain
+    /// before calling.
+    ///
+    /// Requires `provider` to have authorized this call.
+    ///
+    /// # Parameters
+    /// - `provider` – Address of the liquidity provider funding the deposit.
+    /// - `amount_a` – Amount of `token_a` to deposit. Must be positive.
+    /// - `amount_b` – Amount of `token_b` to deposit. Must be positive.
+    /// - `min_shares` – Minimum number of LP shares the caller is willing to
+    ///   receive; the transaction panics if fewer would be minted (slippage guard).
+    ///
+    /// # Returns
+    /// The number of LP shares minted to `provider`.
+    ///
+    /// # Panics
+    /// - If either `amount_a` or `amount_b` is not positive.
+    /// - If the shares that would be minted are less than `min_shares`.
     pub fn add_liquidity(
         env: Env,
         provider: Address,
@@ -150,7 +181,32 @@ impl AmmPool {
         shares
     }
 
-    /// Burn `shares` LP tokens and receive back a proportional amount of each token.
+    /// Withdraw liquidity from the pool by burning LP shares.
+    ///
+    /// Burns exactly `shares` LP tokens held by `provider` and transfers a
+    /// proportional amount of both pool tokens back to the provider. The
+    /// proportion is `shares / total_shares` at the time of the call.
+    ///
+    /// Requires `provider` to have authorized this call.
+    ///
+    /// # Parameters
+    /// - `provider` – Address of the liquidity provider redeeming shares.
+    /// - `shares` – Number of LP shares to burn. Must be positive and ≤ the
+    ///   provider's current balance.
+    /// - `min_a` – Minimum amount of `token_a` the caller is willing to receive
+    ///   (slippage guard).
+    /// - `min_b` – Minimum amount of `token_b` the caller is willing to receive
+    ///   (slippage guard).
+    ///
+    /// # Returns
+    /// A tuple `(amount_a, amount_b)` — the token amounts transferred back to
+    /// the provider.
+    ///
+    /// # Panics
+    /// - If `shares` is not positive.
+    /// - If `provider` owns fewer shares than `shares`.
+    /// - If the computed `token_a` output would be less than `min_a`.
+    /// - If the computed `token_b` output would be less than `min_b`.
     pub fn remove_liquidity(
         env: Env,
         provider: Address,
@@ -212,9 +268,32 @@ impl AmmPool {
 
     // ── Swap ──────────────────────────────────────────────────────────────────
 
-    /// Swap an exact `amount_in` of `token_in` for at least `min_out` of the other token.
+    /// Swap an exact amount of one pool token for the other.
     ///
-    /// Uses the constant-product formula with fee deducted from `amount_in`.
+    /// Transfers `amount_in` of `token_in` from `trader` into the pool and
+    /// sends back the calculated output amount of the opposite token, computed
+    /// via the constant-product formula `x * y = k` with the pool fee deducted
+    /// from `amount_in` before the calculation.
+    ///
+    /// Requires `trader` to have authorized this call.
+    ///
+    /// # Parameters
+    /// - `trader` – Address of the account initiating the swap.
+    /// - `token_in` – Address of the token being sold; must be either `token_a`
+    ///   or `token_b` of this pool.
+    /// - `amount_in` – Exact amount of `token_in` to sell. Must be positive.
+    /// - `min_out` – Minimum amount of the output token the caller is willing to
+    ///   accept (slippage guard).
+    ///
+    /// # Returns
+    /// The amount of the output token transferred to `trader`.
+    ///
+    /// # Panics
+    /// - If `amount_in` is not positive.
+    /// - If `token_in` is not one of the two pool tokens.
+    /// - If either pool reserve is zero (pool is empty).
+    /// - If the computed output would be less than `min_out`.
+    /// - If the computed output equals or exceeds the output reserve (insufficient liquidity).
     pub fn swap(
         env: Env,
         trader: Address,
@@ -284,7 +363,23 @@ impl AmmPool {
 
     // ── Quotes (read-only) ────────────────────────────────────────────────────
 
-    /// Quote how much `token_out` you receive for `amount_in` of `token_in`.
+    /// Calculate the output amount for a hypothetical swap without executing it.
+    ///
+    /// Applies the same constant-product formula and fee as [`Self::swap`] but
+    /// makes no state changes. Useful for quoting prices off-chain or in other
+    /// contracts before committing to a swap.
+    ///
+    /// # Parameters
+    /// - `token_in` – Address of the token being sold; must be either `token_a`
+    ///   or `token_b` of this pool.
+    /// - `amount_in` – Hypothetical amount of `token_in` to sell.
+    ///
+    /// # Returns
+    /// The amount of the output token that would be received for `amount_in`,
+    /// after the pool fee is applied.
+    ///
+    /// # Panics
+    /// - If `token_in` is not one of the two pool tokens.
     pub fn get_amount_out(env: Env, token_in: Address, amount_in: i128) -> i128 {
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
@@ -302,7 +397,16 @@ impl AmmPool {
         amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee)
     }
 
-    /// Return full pool state.
+    /// Return a snapshot of the full pool state.
+    ///
+    /// This is a read-only view function; it makes no state changes.
+    ///
+    /// # Returns
+    /// A [`PoolInfo`] struct containing:
+    /// - `token_a` / `token_b` — addresses of the two pool tokens.
+    /// - `reserve_a` / `reserve_b` — current token reserves held by the pool.
+    /// - `total_shares` — total outstanding LP shares.
+    /// - `fee_bps` — the swap fee in basis points.
     pub fn get_info(env: Env) -> PoolInfo {
         PoolInfo {
             token_a: env.storage().instance().get(&DataKey::TokenA).unwrap(),
@@ -314,6 +418,16 @@ impl AmmPool {
         }
     }
 
+    /// Return the number of LP shares currently held by a given provider.
+    ///
+    /// This is a read-only view function; it makes no state changes.
+    ///
+    /// # Parameters
+    /// - `provider` – Address of the liquidity provider to query.
+    ///
+    /// # Returns
+    /// The LP share balance of `provider`, or `0` if the address has never
+    /// provided liquidity to this pool.
     pub fn shares_of(env: Env, provider: Address) -> i128 {
         env.storage()
             .persistent()
