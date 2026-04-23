@@ -73,6 +73,17 @@ pub trait FlashLoanReceiver {
     fn on_flash_loan(env: Env, token: Address, amount: i128, fee: i128, data: Bytes) -> bool;
 }
 
+// ── Swap simulation returned by `simulate_swap` ───────────────────────────────
+
+#[contracttype]
+pub struct SwapSimulation {
+    pub amount_out: i128,
+    pub fee_amount: i128,
+    pub price_impact_bps: i128, // price impact in basis points
+    pub effective_price: i128,  // amount_out / amount_in scaled by 1_000_000
+    pub spot_price: i128,       // reserve_out / reserve_in scaled by 1_000_000
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -701,12 +712,47 @@ env.storage().instance().set(&DataKey::FeeRecipient, &fee_recipient);
         amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee)
     }
 
+/// Simulate a swap and return a detailed breakdown without executing it.
+    ///
+    /// Returns the expected output, total fee taken, effective execution price,
+    /// spot price, and price impact — all computed from current reserve state.
+    /// `amount_out` is guaranteed to match `get_amount_out` for the same inputs.
+    pub fn simulate_swap(env: Env, token_in: Address, amount_in: i128) -> SwapSimulation {
+        assert!(amount_in > 0, "amount_in must be positive");
+        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
+        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
+        let (reserve_in, reserve_out) = if token_in == token_a {
+            (Self::get_reserve_a(env.clone()), Self::get_reserve_b(env.clone()))
+        } else if token_in == token_b {
+            (Self::get_reserve_b(env.clone()), Self::get_reserve_a(env.clone()))
+        } else {
+            panic!("unknown token");
+        };
+        assert!(reserve_in > 0 && reserve_out > 0, "pool is empty");
+        let amount_in_with_fee = amount_in * (10_000 - fee_bps);
+        let amount_out =
+            amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee);
+        let fee_amount = amount_in * fee_bps / 10_000;
+        // Prices scaled by 1_000_000 to preserve precision in integer arithmetic.
+        let spot_price = reserve_out * 1_000_000 / reserve_in;
+        let effective_price = amount_out * 1_000_000 / amount_in;
+        // Price impact: how far the execution price deviates from the spot price.
+        let price_impact_bps = (spot_price - effective_price) * 10_000 / spot_price;
+        SwapSimulation {
+            amount_out,
+            fee_amount,
+            price_impact_bps,
+            effective_price,
+            spot_price,
+        }
+    }
+
     /// Quote how much `token_in` is required to receive exactly `amount_out` of `token_out`.
     pub fn get_amount_in(env: Env, token_out: Address, amount_out: i128) -> i128 {
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
-
         let (reserve_in, reserve_out) = if token_out == token_a {
             (
                 Self::get_reserve_b(env.clone()),
@@ -720,11 +766,10 @@ env.storage().instance().set(&DataKey::FeeRecipient, &fee_recipient);
         } else {
             panic!("unknown token");
         };
-
         assert!(reserve_in > 0 && reserve_out > 0, "zero reserve");
         assert!(amount_out < reserve_out, "amount_out >= reserve_out");
-
         (reserve_in * amount_out * 10_000) / ((reserve_out - amount_out) * (10_000 - fee_bps)) + 1
+    }
     }
 
     /// Return full pool state.
