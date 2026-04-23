@@ -620,6 +620,7 @@ mod tests {
         let admin = Address::generate(&env);
         let amm_addr = env.register_contract(None, AmmPool);
         let lp_addr = env.register_contract(None, LpToken);
+
         token::LpTokenClient::new(&env, &lp_addr).initialize(
             &amm_addr,
             &soroban_sdk::String::from_str(&env, "AMM LP Token"),
@@ -1022,26 +1023,24 @@ mod tests {
 
     #[test]
     fn test_get_amount_in_round_trip() {
-        let (env, admin, amm_addr, lp_addr, _) = setup();
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
 
-        let (ta_client, ta_sac) = create_sac(&env, &admin);
-        let (tb_client, tb_sac) = create_sac(&env, &admin);
-
-        let amm = AmmPoolClient::new(&env, &amm_addr);
-        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
-
-        let provider = Address::generate(&env);
+        let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &2_000_000_i128);
         amm.add_liquidity(&provider, &1_000_000_i128, &2_000_000_i128, &0_i128);
 
         // Forward: how much B do we get for 100_000 A?
         let amount_in = 100_000_i128;
-        let amount_out = amm.get_amount_out(&ta_client.address, &amount_in);
+        let amount_out = amm.get_amount_out(&ts.ta_addr, &amount_in);
         assert!(amount_out > 0);
 
         // Reverse: how much A is needed to get exactly amount_out of B?
-        let amount_in_reverse = amm.get_amount_in(&tb_client.address, &amount_out);
+        let amount_in_reverse = amm.get_amount_in(&ts.tb_addr, &amount_out);
 
         // Due to integer rounding (+1 in get_amount_in), the reverse quote
         // should be >= the original input and at most 1 unit more.
@@ -1060,28 +1059,31 @@ mod tests {
         use soroban_sdk::testutils::Events as _;
         use soroban_sdk::{symbol_short, vec, IntoVal};
 
-        let (env, admin, amm_addr, lp_addr, _) = setup();
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
 
-        let (ta_client, ta_sac) = create_sac(&env, &admin);
-        let (tb_client, tb_sac) = create_sac(&env, &admin);
-
-        let amm = AmmPoolClient::new(&env, &amm_addr);
-        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
-
-        let provider = Address::generate(&env);
+        let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
 
         let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
-        amm.remove_liquidity(&provider, &shares, &0_i128, &0_i128);
+        let (out_a, out_b) = amm.remove_liquidity(&provider, &shares, &0_i128, &0_i128);
 
         // Find the rm_liq event among all published events
         let events = env.events().all();
         let rm_liq_event = events
             .iter()
-            .find(|(_, topics, _)| topics == &vec![&env, symbol_short!("rm_liq").into_val(&env)]);
+            .find(|(_, topics, _)| topics == &vec![env, symbol_short!("rm_liq").into_val(env)]);
 
         assert!(rm_liq_event.is_some(), "rm_liq event not emitted");
+
+        let (_, _, data) = rm_liq_event.unwrap();
+        let actual: (Address, i128, i128, i128) = data.into_val(env);
+        let expected = (provider.clone(), shares, out_a, out_b);
+        assert_eq!(actual, expected);
     }
 
     // ── Edge cases: zero-reserve guard ───────────────────────────────────────────
