@@ -43,6 +43,9 @@ pub enum DataKey {
     ReserveA,
     ReserveB,
     TotalShares,
+    PriceCumulativeA,
+    PriceCumulativeB,
+    LastTimestamp,
     Shares(Address),
     FeeBps,          // swap fee in basis points, e.g. 30 = 0.30 %
     Admin,           // Address — contract administrator; authorises set_protocol_fee
@@ -175,6 +178,15 @@ env.storage().instance().set(&DataKey::FeeRecipient, &fee_recipient);
         env.storage().instance().set(&DataKey::ReserveA, &0_i128);
         env.storage().instance().set(&DataKey::ReserveB, &0_i128);
         env.storage().instance().set(&DataKey::TotalShares, &0_i128);
+env.storage()
+            .instance()
+            .set(&DataKey::PriceCumulativeA, &0_i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::PriceCumulativeB, &0_i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::LastTimestamp, &env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Paused, &false);
     }
 
@@ -208,13 +220,11 @@ env.storage().instance().set(&DataKey::FeeRecipient, &fee_recipient);
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         assert!(admin == stored_admin, "not admin");
         admin.require_auth();
-
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
         assert!(
             protocol_fee_bps >= 0 && protocol_fee_bps <= fee_bps,
             "invalid protocol fee"
         );
-
         env.storage().instance().set(&DataKey::FeeRecipient, &recipient);
         env.storage().instance().set(&DataKey::ProtocolFeeBps, &protocol_fee_bps);
     }
@@ -226,6 +236,7 @@ env.storage().instance().set(&DataKey::FeeRecipient, &fee_recipient);
         let recipient: Option<Address> = env.storage().instance().get(&DataKey::FeeRecipient);
         let bps: i128 = env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
         (recipient, bps)
+    }
     }
 
     // ── Liquidity ─────────────────────────────────────────────────────────────
@@ -506,6 +517,43 @@ env.storage().instance().set(&DataKey::FeeRecipient, &fee_recipient);
         let client_out = SepTokenClient::new(&env, &token_out);
         client_out.transfer(&env.current_contract_address(), &trader, &amount_out);
 
+// Update accumulators before updating reserves.
+        let now = env.ledger().timestamp();
+        let last_timestamp: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastTimestamp)
+            .unwrap();
+        if now > last_timestamp {
+            let elapsed = (now - last_timestamp) as i128;
+            let reserve_a = Self::get_reserve_a(env.clone());
+            let reserve_b = Self::get_reserve_b(env.clone());
+            if reserve_a > 0 && reserve_b > 0 {
+                let mut price_cum_a: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::PriceCumulativeA)
+                    .unwrap_or(0);
+                let mut price_cum_b: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::PriceCumulativeB)
+                    .unwrap_or(0);
+                // price_a = reserve_b / reserve_a
+                // price_b = reserve_a / reserve_b
+                // We use a factor of 1,000,000 to maintain precision as suggested in the prompt.
+                price_cum_a += (reserve_b * 1_000_000 / reserve_a) * elapsed;
+                price_cum_b += (reserve_a * 1_000_000 / reserve_b) * elapsed;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PriceCumulativeA, &price_cum_a);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PriceCumulativeB, &price_cum_b);
+            }
+            env.storage().instance().set(&DataKey::LastTimestamp, &now);
+        }
+
         // Separate protocol fee from LP reserves.
         let protocol_fee_bps: i128 =
             env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
@@ -514,7 +562,6 @@ env.storage().instance().set(&DataKey::FeeRecipient, &fee_recipient);
         } else {
             0
         };
-
         // Update reserves (protocol fee held outside LP reserves).
         if token_in == token_a {
             env.storage()
@@ -812,6 +859,26 @@ env.storage().instance().set(&DataKey::FeeRecipient, &fee_recipient);
 
     // ── Internals ─────────────────────────────────────────────────────────────
 
+    /// Returns the cumulative price accumulators and the timestamp of the last update.
+    pub fn get_price_cumulative(env: Env) -> (i128, i128, u64) {
+        let price_cum_a = env
+            .storage()
+            .instance()
+            .get(&DataKey::PriceCumulativeA)
+            .unwrap_or(0);
+        let price_cum_b = env
+            .storage()
+            .instance()
+            .get(&DataKey::PriceCumulativeB)
+            .unwrap_or(0);
+        let last_timestamp = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastTimestamp)
+            .unwrap_or(0);
+        (price_cum_a, price_cum_b, last_timestamp)
+    }
+
     fn get_reserve_a(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -864,7 +931,7 @@ env.storage().instance().set(&DataKey::FeeRecipient, &fee_recipient);
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::Address as _,
+        testutils::{Address as _, Ledger},
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
         Env,
     };
@@ -933,6 +1000,7 @@ mod tests {
     fn setup() -> (Env, Address, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
+        env.ledger().set_timestamp(12345);
         let admin = Address::generate(&env);
         let amm_addr = env.register_contract(None, AmmPool);
         let lp_addr = env.register_contract(None, LpToken);
@@ -949,7 +1017,7 @@ mod tests {
     fn setup_pool(fee_bps: i128) -> TestSetup {
         let env = Env::default();
         env.mock_all_auths();
-
+        env.ledger().set_timestamp(12345);
         let admin = Address::generate(&env);
         let amm_addr = env.register_contract(None, AmmPool);
         let lp_addr = env.register_contract(None, LpToken);
@@ -1401,14 +1469,65 @@ mod tests {
         let events = env.events().all();
         let rm_liq_event = events
             .iter()
-            .find(|(_, topics, _)| topics == &vec![env, symbol_short!("rm_liq").into_val(env)]);
-
-        assert!(rm_liq_event.is_some(), "rm_liq event not emitted");
-
-        let (_, _, data) = rm_liq_event.unwrap();
-        let actual: (Address, i128, i128, i128) = data.into_val(env);
+            .find(|e| e.0 == amm.address && e.1 == vec![env, symbol_short!("rm_liq")].into_val(env))
+            .expect("remove_liquidity event not found");
+        let data: (Address, i128, i128, i128) = rm_liq_event.2.into_val(env);
         let expected = (provider.clone(), shares, out_a, out_b);
-        assert_eq!(actual, expected);
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_twap_oracle() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let provider = Address::generate(env);
+        // Add liquidity to set initial price (1:1)
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+
+        // Initial state: accumulators should be 0
+        let (cum_a, cum_b, last_ts) = amm.get_price_cumulative();
+        assert_eq!(cum_a, 0);
+        assert_eq!(cum_b, 0);
+        assert!(last_ts > 0);
+
+        // Jump 10 seconds ahead
+        env.ledger().set_timestamp(last_ts + 10);
+
+        // Swap A for B
+        let trader = Address::generate(env);
+        ta_sac.mint(&trader, &100_000_i128);
+        amm.swap(&trader, &ts.ta_addr, &100_000_i128, &0_i128);
+
+        // Accumulators should have updated: price (1_000_000) * 10 seconds = 10_000_000
+        let (new_cum_a, new_cum_b, new_ts) = amm.get_price_cumulative();
+        assert_eq!(new_ts, last_ts + 10);
+        assert_eq!(new_cum_a, 10_000_000);
+        assert_eq!(new_cum_b, 10_000_000);
+
+        // Jump another 5 seconds
+        env.ledger().set_timestamp(new_ts + 5);
+
+        // New spot price after swap:
+        // reserve_a = 1_100_000, reserve_b = 1_000_000 - out
+        // Price A = (1_000_000 - out) * 1_000_000 / 1_100_000
+        let info = amm.get_info();
+        let expected_price_a = info.reserve_b * 1_000_000 / info.reserve_a;
+        let expected_price_b = info.reserve_a * 1_000_000 / info.reserve_b;
+
+        // Perform another swap
+        tb_sac.mint(&trader, &50_000_i128);
+        amm.swap(&trader, &ts.tb_addr, &50_000_i128, &0_i128);
+
+        let (final_cum_a, final_cum_b, final_ts) = amm.get_price_cumulative();
+        assert_eq!(final_ts, new_ts + 5);
+        assert_eq!(final_cum_a, new_cum_a + expected_price_a * 5);
+        assert_eq!(final_cum_b, new_cum_b + expected_price_b * 5);
     }
 
     // ── Edge cases: zero-reserve guard ───────────────────────────────────────────
