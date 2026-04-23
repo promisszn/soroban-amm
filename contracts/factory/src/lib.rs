@@ -110,6 +110,7 @@ impl Factory {
 
         // Initialize AMM pool.
         AmmPoolClient::new(&env, &pool_addr).initialize(
+            &admin,
             &ta,
             &tb,
             &lp_addr,
