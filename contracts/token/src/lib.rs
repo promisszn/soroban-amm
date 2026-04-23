@@ -2,9 +2,7 @@
 
 #![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, String, Symbol,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol};
 
 #[contracttype]
 pub enum DataKey {
@@ -23,15 +21,12 @@ pub struct LpToken;
 #[contractimpl]
 impl LpToken {
     /// Initialize the token with metadata and an admin that can mint/burn.
-    pub fn initialize(
-        env: Env,
-        admin: Address,
-        name: String,
-        symbol: String,
-        decimals: u32,
-    ) {
+    pub fn initialize(env: Env, admin: Address, name: String, symbol: String, decimals: u32) {
         if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialized: contract {:?}", env.current_contract_address());
+            panic!(
+                "already initialized: contract {:?}",
+                env.current_contract_address()
+            );
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Name, &name);
@@ -55,7 +50,10 @@ impl LpToken {
     }
 
     pub fn total_supply(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalSupply)
+            .unwrap_or(0)
     }
 
     pub fn balance(env: Env, id: Address) -> i128 {
@@ -82,10 +80,14 @@ impl LpToken {
     pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
         spender.require_auth();
         let allowance = Self::allowance(env.clone(), from.clone(), spender.clone());
-        assert!(allowance >= amount, "insufficient allowance: available={allowance}, requested={amount}");
-        env.storage()
-            .persistent()
-            .set(&DataKey::Allowance(from.clone(), spender), &(allowance - amount));
+        assert!(
+            allowance >= amount,
+            "insufficient allowance: available={allowance}, requested={amount}"
+        );
+        env.storage().persistent().set(
+            &DataKey::Allowance(from.clone(), spender),
+            &(allowance - amount),
+        );
         Self::_transfer(&env, &from, &to, amount);
     }
 
@@ -115,7 +117,10 @@ impl LpToken {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         let bal = Self::balance(env.clone(), from.clone());
-        assert!(bal >= amount, "insufficient balance: available={bal}, requested={amount}");
+        assert!(
+            bal >= amount,
+            "insufficient balance: available={bal}, requested={amount}"
+        );
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from), &(bal - amount));
@@ -133,7 +138,10 @@ impl LpToken {
 
     fn _transfer(env: &Env, from: &Address, to: &Address, amount: i128) {
         let from_bal = Self::balance(env.clone(), from.clone());
-        assert!(from_bal >= amount, "insufficient balance: available={from_bal}, requested={amount}");
+        assert!(
+            from_bal >= amount,
+            "insufficient balance: available={from_bal}, requested={amount}"
+        );
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from.clone()), &(from_bal - amount));
@@ -172,7 +180,11 @@ mod tests {
             &String::from_str(&env, "TST"),
             &7u32,
         );
-        TestSetup { env, admin, contract_addr }
+        TestSetup {
+            env,
+            admin,
+            contract_addr,
+        }
     }
 
     #[test]
