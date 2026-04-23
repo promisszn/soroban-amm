@@ -233,6 +233,12 @@ You are now ready to build, test, and deploy.
 Build all contracts as optimised WASM binaries:
 
 ```sh
+cargo wasm
+```
+
+`wasm` is a Cargo alias defined in [.cargo/config.toml](.cargo/config.toml) that expands to:
+
+```sh
 cargo build --release --target wasm32-unknown-unknown
 ```
 
