@@ -9,9 +9,7 @@
 
 #![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, Symbol,
-};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 // Standard SEP-41 interface for pool tokens (token_a, token_b)
 use soroban_sdk::token::Client as SepTokenClient;
 // Our custom LP token client (has mint + burn)
@@ -76,10 +74,19 @@ impl AmmPool {
         fee_bps: i128, // recommended: 30 (0.30 %)
     ) {
         if env.storage().instance().has(&DataKey::TokenA) {
-            panic!("already initialized: contract {:?}", env.current_contract_address());
+            panic!(
+                "already initialized: contract {:?}",
+                env.current_contract_address()
+            );
         }
-        assert!(token_a != token_b, "tokens must differ: token_a={token_a:?}, token_b={token_b:?}");
-        assert!((0..=10_000).contains(&fee_bps), "invalid fee: {fee_bps} is outside 0..=10_000");
+        assert!(
+            token_a != token_b,
+            "tokens must differ: token_a={token_a:?}, token_b={token_b:?}"
+        );
+        assert!(
+            (0..=10_000).contains(&fee_bps),
+            "invalid fee: {fee_bps} is outside 0..=10_000"
+        );
 
         env.storage().instance().set(&DataKey::TokenA, &token_a);
         env.storage().instance().set(&DataKey::TokenB, &token_b);
@@ -123,7 +130,10 @@ impl AmmPool {
         min_shares: i128,
     ) -> i128 {
         provider.require_auth();
-        assert!(amount_a > 0 && amount_b > 0, "amounts must be positive: amount_a={amount_a}, amount_b={amount_b}");
+        assert!(
+            amount_a > 0 && amount_b > 0,
+            "amounts must be positive: amount_a={amount_a}, amount_b={amount_b}"
+        );
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
@@ -150,8 +160,14 @@ impl AmmPool {
             shares_a.min(shares_b)
         };
 
-        assert!(shares > 0, "amounts too small: computed shares would be zero");
-        assert!(shares >= min_shares, "slippage: insufficient shares minted: computed={shares}, minimum={min_shares}");
+        assert!(
+            shares > 0,
+            "amounts too small: computed shares would be zero"
+        );
+        assert!(
+            shares >= min_shares,
+            "slippage: insufficient shares minted: computed={shares}, minimum={min_shares}"
+        );
 
         // Update reserves.
         env.storage()
@@ -213,7 +229,10 @@ impl AmmPool {
         assert!(shares > 0, "shares must be positive: got {shares}");
 
         let owned = Self::shares_of(env.clone(), provider.clone());
-        assert!(owned >= shares, "insufficient LP shares: owned={owned}, requested={shares}");
+        assert!(
+            owned >= shares,
+            "insufficient LP shares: owned={owned}, requested={shares}"
+        );
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
@@ -226,8 +245,14 @@ impl AmmPool {
         let out_a = shares * reserve_a / total_shares;
         let out_b = shares * reserve_b / total_shares;
 
-        assert!(out_a >= min_a, "slippage: insufficient token_a out: got={out_a}, min={min_a}");
-        assert!(out_b >= min_b, "slippage: insufficient token_b out: got={out_b}, min={min_b}");
+        assert!(
+            out_a >= min_a,
+            "slippage: insufficient token_a out: got={out_a}, min={min_a}"
+        );
+        assert!(
+            out_b >= min_b,
+            "slippage: insufficient token_b out: got={out_b}, min={min_b}"
+        );
 
         // Burn LP tokens.
         let lp_client = LpTokenClient::new(&env, &lp_token);
@@ -300,14 +325,25 @@ impl AmmPool {
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
 
         let (reserve_in, reserve_out, token_out) = if token_in == token_a {
-            (Self::get_reserve_a(env.clone()), Self::get_reserve_b(env.clone()), token_b.clone())
+            (
+                Self::get_reserve_a(env.clone()),
+                Self::get_reserve_b(env.clone()),
+                token_b.clone(),
+            )
         } else if token_in == token_b {
-            (Self::get_reserve_b(env.clone()), Self::get_reserve_a(env.clone()), token_a.clone())
+            (
+                Self::get_reserve_b(env.clone()),
+                Self::get_reserve_a(env.clone()),
+                token_a.clone(),
+            )
         } else {
             panic!("token_in is not part of this pool: {token_in:?}");
         };
 
-        assert!(reserve_in > 0 && reserve_out > 0, "pool is empty: reserve_in={reserve_in}, reserve_out={reserve_out}");
+        assert!(
+            reserve_in > 0 && reserve_out > 0,
+            "pool is empty: reserve_in={reserve_in}, reserve_out={reserve_out}"
+        );
 
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
 
@@ -317,8 +353,14 @@ impl AmmPool {
         let amount_out =
             amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee);
 
-        assert!(amount_out >= min_out, "slippage: insufficient output amount: got={amount_out}, min={min_out}");
-        assert!(amount_out < reserve_out, "insufficient liquidity: amount_out={amount_out} >= reserve_out={reserve_out}");
+        assert!(
+            amount_out >= min_out,
+            "slippage: insufficient output amount: got={amount_out}, min={min_out}"
+        );
+        assert!(
+            amount_out < reserve_out,
+            "insufficient liquidity: amount_out={amount_out} >= reserve_out={reserve_out}"
+        );
 
         // Transfer in.
         let client_in = SepTokenClient::new(&env, &token_in);
@@ -378,14 +420,23 @@ impl AmmPool {
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
 
         let (reserve_in, reserve_out) = if token_in == token_a {
-            (Self::get_reserve_a(env.clone()), Self::get_reserve_b(env.clone()))
+            (
+                Self::get_reserve_a(env.clone()),
+                Self::get_reserve_b(env.clone()),
+            )
         } else if token_in == token_b {
-            (Self::get_reserve_b(env.clone()), Self::get_reserve_a(env.clone()))
+            (
+                Self::get_reserve_b(env.clone()),
+                Self::get_reserve_a(env.clone()),
+            )
         } else {
             panic!("unknown token_in: {token_in:?}");
         };
 
-        assert!(reserve_in > 0 && reserve_out > 0, "pool is empty: reserve_in={reserve_in}, reserve_out={reserve_out}");
+        assert!(
+            reserve_in > 0 && reserve_out > 0,
+            "pool is empty: reserve_in={reserve_in}, reserve_out={reserve_out}"
+        );
         let amount_in_with_fee = amount_in * (10_000 - fee_bps);
         amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee)
     }
@@ -429,15 +480,24 @@ impl AmmPool {
     // ── Internals ─────────────────────────────────────────────────────────────
 
     fn get_reserve_a(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::ReserveA).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::ReserveA)
+            .unwrap_or(0)
     }
 
     fn get_reserve_b(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::ReserveB).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::ReserveB)
+            .unwrap_or(0)
     }
 
     fn get_total_shares(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0)
+        env.storage()
+            .instance()
+            .get(&DataKey::TotalShares)
+            .unwrap_or(0)
     }
 
     /// Integer square root via Newton's method.
@@ -509,14 +569,25 @@ mod tests {
         let (ta, ta_sac) = create_sac(&env, &admin);
         let (tb, tb_sac) = create_sac(&env, &admin);
 
-        AmmPoolClient::new(&env, &amm_addr)
-            .initialize(&ta.address, &tb.address, &lp_addr, &fee_bps);
+        AmmPoolClient::new(&env, &amm_addr).initialize(
+            &ta.address,
+            &tb.address,
+            &lp_addr,
+            &fee_bps,
+        );
 
         let ta_addr = ta.address.clone();
         let tb_addr = tb.address.clone();
         drop((ta, ta_sac, tb, tb_sac));
 
-        TestSetup { env, amm_addr, lp_addr, ta_addr, tb_addr, admin }
+        TestSetup {
+            env,
+            amm_addr,
+            lp_addr,
+            ta_addr,
+            tb_addr,
+            admin,
+        }
     }
 
     // ── Initialization ────────────────────────────────────────────────────────
@@ -588,8 +659,12 @@ mod tests {
         );
         let (ta, _) = create_sac(&env, &admin);
         let (tb, _) = create_sac(&env, &admin);
-        let result = AmmPoolClient::new(&env, &amm_addr)
-            .try_initialize(&ta.address, &tb.address, &lp_addr, &10_001_i128);
+        let result = AmmPoolClient::new(&env, &amm_addr).try_initialize(
+            &ta.address,
+            &tb.address,
+            &lp_addr,
+            &10_001_i128,
+        );
         assert!(result.is_err());
     }
 
