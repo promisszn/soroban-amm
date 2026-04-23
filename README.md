@@ -260,6 +260,14 @@ cargo test
 
 Tests are located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs) and cover adding liquidity, swapping, and removing liquidity.
 
+For a real-network smoke test on Stellar testnet, run the end-to-end script:
+
+```sh
+scripts/e2e.sh
+```
+
+The script deploys fresh contracts, funds a test account, adds liquidity, swaps, removes liquidity, and exits non-zero on any failed assertion.
+
 ---
 
 ## Usage
