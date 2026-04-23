@@ -615,7 +615,13 @@ Contributions are welcome. Please follow the guidelines below to keep the codeba
 ### Code Style
 
 - An [`.editorconfig`](.editorconfig) at the workspace root defines shared formatting rules (UTF-8, LF line endings, 4-space indentation, trailing-whitespace trimming). Most editors apply it automatically; install the [EditorConfig plugin](https://editorconfig.org/#download) if yours does not.
-- Run `cargo fmt` before committing — the project uses default `rustfmt` settings.
+- A [`rustfmt.toml`](rustfmt.toml) at the workspace root defines Rust formatting rules. It enforces:
+  - **Edition**: 2021
+  - **Max width**: 100 columns
+  - **Indentation**: 4 spaces
+  - **Line endings**: Unix (LF)
+  - **Import grouping**: Standard library, external crates, then crate-local modules
+- Run `cargo fmt` before committing to automatically apply these rules.
 - Run `cargo clippy -- -D warnings` and resolve any warnings before opening a PR.
 - Prefer explicit arithmetic with overflow checks over silent wrapping. The release profile already enables `overflow-checks = true`.
 - Avoid unsafe code. There is no reason to use `unsafe` in a Soroban contract.
