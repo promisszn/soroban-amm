@@ -14,8 +14,24 @@ use soroban_sdk::{
 };
 // Standard SEP-41 interface for pool tokens (token_a, token_b)
 use soroban_sdk::token::Client as SepTokenClient;
-// Our custom LP token client (has mint + burn)
-use token::LpTokenClient;
+
+/// Interface for the LP token contract.
+///
+/// We define this locally rather than importing the `token` crate to avoid
+/// duplicate symbol errors during the WASM build.
+#[soroban_sdk::contractclient(name = "LpTokenClient")]
+pub trait LpTokenInterface {
+    fn initialize(
+        env: Env,
+        admin: Address,
+        name: soroban_sdk::String,
+        symbol: soroban_sdk::String,
+        decimals: u32,
+    );
+    fn mint(env: Env, to: Address, amount: i128);
+    fn burn(env: Env, from: Address, amount: i128);
+    fn balance(env: Env, id: Address) -> i128;
+}
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 
@@ -873,6 +889,59 @@ mod tests {
     }
 
     #[test]
+    fn test_sequential_swaps_invariant() {
+        let ts = setup_pool(30); // 0.30% fee
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        // 1. Initial liquidity
+        let provider = Address::generate(env);
+        let initial_amt = 1_000_000_i128;
+        ta_sac.mint(&provider, &initial_amt);
+        tb_sac.mint(&provider, &initial_amt);
+        amm.add_liquidity(&provider, &initial_amt, &initial_amt, &0_i128);
+
+        let info = amm.get_info();
+        let initial_k = info.reserve_a * info.reserve_b;
+        let mut current_k = initial_k;
+
+        // 2. Perform 10 alternating swaps
+        let trader = Address::generate(env);
+        let swap_amt = 10_000_i128;
+
+        for i in 0..10 {
+            if i % 2 == 0 {
+                // A -> B
+                ta_sac.mint(&trader, &swap_amt);
+                amm.swap(&trader, &ts.ta_addr, &swap_amt, &0_i128);
+            } else {
+                // B -> A
+                tb_sac.mint(&trader, &swap_amt);
+                amm.swap(&trader, &ts.tb_addr, &swap_amt, &0_i128);
+            }
+
+            let new_info = amm.get_info();
+            let new_k = new_info.reserve_a * new_info.reserve_b;
+
+            // Invariant must hold: new_k >= initial_k
+            assert!(
+                new_k >= initial_k,
+                "Invariant violated: new_k ({new_k}) < initial_k ({initial_k}) at swap {i}"
+            );
+
+            // k must grow (or stay same if fee is 0, but here it's 30bps)
+            assert!(
+                new_k >= current_k,
+                "k decreased: new_k ({new_k}) < current_k ({current_k}) at swap {i}"
+            );
+            
+            current_k = new_k;
+        }
+
+        // Final k should be strictly greater than initial k because of fees
+        assert!(current_k > initial_k);
     fn test_get_amount_in_round_trip() {
         let (env, admin, amm_addr, lp_addr, _) = setup();
 
