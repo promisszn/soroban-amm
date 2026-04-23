@@ -60,24 +60,49 @@ The AMM contract depends on the token contract. When liquidity is added or remov
 
 ## Contracts
 
+---
+
+## Storage Layout
+
+### AMM Pool Contract
+
+| Key | Storage Tier | Type | Description |
+|---|---|---|---|
+| `TokenA` | Instance | `Address` | First pool asset |
+| `TokenB` | Instance | `Address` | Second pool asset |
+| `LpToken` | Instance | `Address` | LP token contract |
+| `ReserveA` | Instance | `i128` | Current TokenA reserves |
+| `ReserveB` | Instance | `i128` | Current TokenB reserves |
+| `TotalShares` | Instance | `i128` | Total LP shares issued |
+| `FeeBps` | Instance | `i128` | Swap fee in basis points |
+
+### LP Token Contract
+
+| Key | Storage Tier | Type | Description |
+|---|---|---|---|
+| `Admin` | Instance | `Address` | Contract administrator (the AMM pool) |
+| `Name` | Instance | `String` | Token name |
+| `Symbol` | Instance | `String` | Token symbol |
+| `Decimals` | Instance | `u32` | Token decimal places |
+| `TotalSupply` | Instance | `i128` | Total shares in circulation |
+| `Balance(Address)` | Persistent | `i128` | Individual user share balance |
+| `Allowance(Address, Address)` | Persistent | `i128` | Third-party spending allowance |
+
+---
+
+## Upgrade Considerations
+
+- **Storage Immutability**: Critical setup parameters (e.g., `TokenA`, `TokenB`, `LpToken`) are immutable after `initialize`.
+- **Breaking Changes**: Modifying `DataKey` variants or data types constitutes a breaking change. Since Soroban storage is keyed by the enum's binary representation, any restructuring requires a new deployment or a careful migration strategy.
+- **State Migration**: Upgrading logic while preserving state is possible via contract code upgrades, but changing storage tiers (e.g., Instance to Persistent) requires manual data relocation.
+
+---
+
+## Public Interface
+
 ### AMM Pool Contract
 
 Located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs).
-
-#### Storage
-
-| Key | Type | Description |
-|---|---|---|
-| `TokenA` | `Address` | First pool asset |
-| `TokenB` | `Address` | Second pool asset |
-| `LpToken` | `Address` | LP token contract |
-| `ReserveA` | `i128` | Pool's current balance of TokenA |
-| `ReserveB` | `i128` | Pool's current balance of TokenB |
-| `TotalShares` | `i128` | Total LP shares outstanding |
-| `Shares(Address)` | `i128` | LP shares held by a specific provider |
-| `FeeBps` | `i128` | Swap fee in basis points (e.g. `30` = 0.30%) |
-
-#### Public Interface
 
 | Function | Description |
 |---|---|
@@ -92,10 +117,6 @@ Located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs).
 ### LP Token Contract
 
 Located in [contracts/token/src/lib.rs](contracts/token/src/lib.rs).
-
-A minimal SEP-41 compliant fungible token used exclusively as the LP share token. The AMM contract is set as admin at deployment and is the only caller permitted to `mint` and `burn`.
-
-#### Public Interface
 
 | Function | Description |
 |---|---|
