@@ -11,8 +11,8 @@ testutils = ["soroban-sdk/testutils", "token/testutils"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
-token = { path = "../token" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 token = { path = "../token", features = ["testutils"] }
+proptest = "1"
