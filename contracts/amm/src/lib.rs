@@ -1187,8 +1187,8 @@ mod tests {
 #[cfg(test)]
 mod prop_tests {
     extern crate std;
-    use proptest::prelude::*;
     use super::AmmPool;
+    use proptest::prelude::*;
 
     proptest! {
         /// Property 1: For any valid first deposit, initial shares (sqrt(a*b)) are always positive.
