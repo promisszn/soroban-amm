@@ -42,6 +42,9 @@ pub enum DataKey {
     ReserveB,
     TotalShares,
     FeeBps, // fee in basis points, e.g. 30 = 0.30 %
+    PriceCumulativeA,
+    PriceCumulativeB,
+    LastTimestamp,
 }
 
 // ── Pool info returned by `get_info` ─────────────────────────────────────────
@@ -111,6 +114,15 @@ impl AmmPool {
         env.storage().instance().set(&DataKey::ReserveA, &0_i128);
         env.storage().instance().set(&DataKey::ReserveB, &0_i128);
         env.storage().instance().set(&DataKey::TotalShares, &0_i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::PriceCumulativeA, &0_i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::PriceCumulativeB, &0_i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::LastTimestamp, &env.ledger().timestamp());
     }
 
     // ── Liquidity ─────────────────────────────────────────────────────────────
@@ -386,6 +398,46 @@ impl AmmPool {
         let client_out = SepTokenClient::new(&env, &token_out);
         client_out.transfer(&env.current_contract_address(), &trader, &amount_out);
 
+        // Update accumulators before updating reserves.
+        let now = env.ledger().timestamp();
+        let last_timestamp: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastTimestamp)
+            .unwrap();
+        if now > last_timestamp {
+            let elapsed = (now - last_timestamp) as i128;
+            let reserve_a = Self::get_reserve_a(env.clone());
+            let reserve_b = Self::get_reserve_b(env.clone());
+
+            if reserve_a > 0 && reserve_b > 0 {
+                let mut price_cum_a: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::PriceCumulativeA)
+                    .unwrap_or(0);
+                let mut price_cum_b: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::PriceCumulativeB)
+                    .unwrap_or(0);
+
+                // price_a = reserve_b / reserve_a
+                // price_b = reserve_a / reserve_b
+                // We use a factor of 1,000,000 to maintain precision as suggested in the prompt.
+                price_cum_a += (reserve_b * 1_000_000 / reserve_a) * elapsed;
+                price_cum_b += (reserve_a * 1_000_000 / reserve_b) * elapsed;
+
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PriceCumulativeA, &price_cum_a);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PriceCumulativeB, &price_cum_b);
+            }
+            env.storage().instance().set(&DataKey::LastTimestamp, &now);
+        }
+
         // Update reserves.
         if token_in == token_a {
             env.storage()
@@ -495,6 +547,26 @@ impl AmmPool {
 
     // ── Internals ─────────────────────────────────────────────────────────────
 
+    /// Returns the cumulative price accumulators and the timestamp of the last update.
+    pub fn get_price_cumulative(env: Env) -> (i128, i128, u64) {
+        let price_cum_a = env
+            .storage()
+            .instance()
+            .get(&DataKey::PriceCumulativeA)
+            .unwrap_or(0);
+        let price_cum_b = env
+            .storage()
+            .instance()
+            .get(&DataKey::PriceCumulativeB)
+            .unwrap_or(0);
+        let last_timestamp = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastTimestamp)
+            .unwrap_or(0);
+        (price_cum_a, price_cum_b, last_timestamp)
+    }
+
     fn get_reserve_a(env: Env) -> i128 {
         env.storage()
             .instance()
@@ -540,7 +612,7 @@ impl AmmPool {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::Address as _,
+        testutils::{Address as _, Ledger},
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
         Env,
     };
@@ -861,5 +933,51 @@ mod tests {
         let actual = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128);
 
         assert_eq!(quoted, actual);
+    }
+
+    #[test]
+    fn test_twap_oracle() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let provider = Address::generate(env);
+        // Add liquidity to set initial price (1:1)
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+
+        // Initial state: price 1.0 (represented as 1,000,000)
+        let (cum_a, cum_b, last_ts) = amm.get_price_cumulative();
+        assert_eq!(cum_a, 0);
+        assert_eq!(cum_b, 0);
+        // last_ts should match the ledger timestamp at initialization
+        // Ledgers start at 0 in tests unless set
+        assert_eq!(last_ts, 0);
+
+        // Advance time by 10 seconds and perform a swap
+        env.ledger().set_timestamp(10);
+        let trader = Address::generate(env);
+        ta_sac.mint(&trader, &100_000_i128);
+        amm.swap(&trader, &ts.ta_addr, &100_000_i128, &0_i128);
+
+        // Accumulator should have updated: elapsed=10, price=1.0 * 1,000,000 = 1,000,000
+        // cum_a = 0 + 1,000,000 * 10 = 10,000,000
+        let (cum_a2, cum_b2, last_ts2) = amm.get_price_cumulative();
+        assert_eq!(cum_a2, 10_000_000);
+        assert_eq!(cum_b2, 10_000_000);
+        assert_eq!(last_ts2, 10);
+
+        // Advance time by another 20 seconds and perform another swap
+        env.ledger().set_timestamp(30);
+        tb_sac.mint(&trader, &50_000_i128);
+        amm.swap(&trader, &ts.tb_addr, &50_000_i128, &0_i128);
+
+        let (cum_a3, cum_b3, last_ts3) = amm.get_price_cumulative();
+        assert!(cum_a3 > cum_a2);
+        assert!(cum_b3 > cum_b2);
+        assert_eq!(last_ts3, 30);
     }
 }
