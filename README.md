@@ -11,17 +11,20 @@ A constant-product Automated Market Maker (AMM) built as a Soroban smart contrac
 - [Contracts](#contracts)
   - [AMM Pool Contract](#amm-pool-contract)
   - [LP Token Contract](#lp-token-contract)
+  - [Factory Contract](#factory-contract)
 - [Math & Formulas](#math--formulas)
 - [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
   - [Build](#build)
   - [Test](#test)
 - [Usage](#usage)
-  - [Deploy](#deploy)
+  - [Deploy via Factory](#deploy-via-factory)
+  - [Deploy Manually](#deploy-manually)
   - [Add Liquidity](#add-liquidity)
   - [Swap Tokens](#swap-tokens)
   - [Remove Liquidity](#remove-liquidity)
   - [Query the Pool](#query-the-pool)
+  - [TypeScript Client Example](#typescript-client-example)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -49,21 +52,57 @@ soroban-amm/
 └── contracts/
     ├── amm/                    # Core AMM pool contract
     │   └── src/lib.rs
-    └── token/                  # SEP-41 LP token contract
+    ├── token/                  # SEP-41 LP token contract
+    │   └── src/lib.rs
+    └── factory/                # Pool factory contract
         └── src/lib.rs
 ```
 
-The AMM contract depends on the token contract. When liquidity is added or removed, the AMM calls the LP token contract to mint or burn shares on behalf of the provider.
+The AMM contract depends on the token contract. When liquidity is added or removed, the AMM calls the LP token contract to mint or burn shares on behalf of the provider. The factory contract depends on both AMM and token: it deploys and initialises them as a pair when a new pool is created.
 
 ---
 
 ## Contracts
 
+---
+
+## Storage Layout
+
 ### AMM Pool Contract
 
-Located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs).
+| Key | Storage Tier | Type | Description |
+|---|---|---|---|
+| `TokenA` | Instance | `Address` | First pool asset |
+| `TokenB` | Instance | `Address` | Second pool asset |
+| `LpToken` | Instance | `Address` | LP token contract |
+| `ReserveA` | Instance | `i128` | Current TokenA reserves |
+| `ReserveB` | Instance | `i128` | Current TokenB reserves |
+| `TotalShares` | Instance | `i128` | Total LP shares issued |
+| `FeeBps` | Instance | `i128` | Swap fee in basis points |
 
-#### Storage
+### LP Token Contract
+
+| Key | Storage Tier | Type | Description |
+|---|---|---|---|
+| `Admin` | Instance | `Address` | Contract administrator (the AMM pool) |
+| `Name` | Instance | `String` | Token name |
+| `Symbol` | Instance | `String` | Token symbol |
+| `Decimals` | Instance | `u32` | Token decimal places |
+| `TotalSupply` | Instance | `i128` | Total shares in circulation |
+| `Balance(Address)` | Persistent | `i128` | Individual user share balance |
+| `Allowance(Address, Address)` | Persistent | `i128` | Third-party spending allowance |
+
+---
+
+## Upgrade Considerations
+
+- **Storage Immutability**: Critical setup parameters (e.g., `TokenA`, `TokenB`, `LpToken`) are immutable after `initialize`.
+- **Breaking Changes**: Modifying `DataKey` variants or data types constitutes a breaking change. Since Soroban storage is keyed by the enum's binary representation, any restructuring requires a new deployment or a careful migration strategy.
+- **State Migration**: Upgrading logic while preserving state is possible via contract code upgrades, but changing storage tiers (e.g., Instance to Persistent) requires manual data relocation.
+
+---
+
+## Public Interface
 
 | Key | Type | Description |
 |---|---|---|
@@ -75,12 +114,20 @@ Located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs).
 | `TotalShares` | `i128` | Total LP shares outstanding |
 | `Shares(Address)` | `i128` | LP shares held by a specific provider |
 | `FeeBps` | `i128` | Swap fee in basis points (e.g. `30` = 0.30%) |
+| `Paused` | `bool` | Emergency circuit breaker state |
+| `FlashLoanFeeBps` | `i128` | Flash-loan fee in basis points; defaults to `FeeBps` |
+### AMM Pool Contract
 
-#### Public Interface
+Located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs).
 
 | Function | Description |
 |---|---|
 | `initialize(token_a, token_b, lp_token, fee_bps)` | One-time pool setup |
+| `pause(admin)` | Pause state-changing pool operations; requires `admin` auth |
+| `unpause(admin)` | Resume state-changing pool operations; requires `admin` auth |
+| `is_paused() → bool` | Read the current pause state |
+| `initialize_with_flash_loan_fee(token_a, token_b, lp_token, fee_bps, flash_loan_fee_bps)` | One-time pool setup with a distinct flash-loan fee |
+| `flash_loan(receiver, token, amount, data) -> fee` | Borrow pool reserves and repay within the receiver callback |
 | `add_liquidity(provider, amount_a, amount_b, min_shares) → shares` | Deposit tokens, receive LP shares |
 | `remove_liquidity(provider, shares, min_a, min_b) → (a, b)` | Burn LP shares, withdraw tokens |
 | `swap(trader, token_in, amount_in, min_out) → amount_out` | Exchange tokens |
@@ -88,13 +135,56 @@ Located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs).
 | `get_info() → PoolInfo` | Read pool state (reserves, fee, shares) |
 | `shares_of(provider) → shares` | Read an LP's share balance |
 
+### Factory Contract
+
+Located in [contracts/factory/src/lib.rs](contracts/factory/src/lib.rs).
+
+A single-entry-point contract for creating and discovering AMM pools. The factory deploys a new AMM pool and its paired LP token in one transaction, enforces uniqueness per token pair, and maintains a registry of all pools it has deployed.
+
+#### Storage
+
+| Key | Type | Description |
+|---|---|---|
+| `Admin` | `Address` | Factory administrator; set as AMM fee recipient |
+| `AmmWasmHash` | `BytesN<32>` | WASM hash of the AMM pool contract |
+| `TokenWasmHash` | `BytesN<32>` | WASM hash of the LP token contract |
+| `Pool(Address, Address)` | `Address` | Normalised token pair → pool address |
+| `AllPools` | `Vec<Address>` | Ordered list of all deployed pool addresses |
+| `PoolCount` | `u64` | Monotonic counter used to derive deploy salts |
+
+#### Public Interface
+
+| Function | Description |
+|---|---|
+| `initialize(admin, amm_wasm_hash, token_wasm_hash)` | One-time factory setup |
+| `create_pool(token_a, token_b, fee_bps) → Address` | Deploy a new AMM + LP token pair; panics on duplicate |
+| `get_pool(token_a, token_b) → Option<Address>` | Look up an existing pool (order-independent) |
+| `all_pools() → Vec<Address>` | List every pool deployed by this factory |
+
+#### Notes
+
+- Token pair order is **normalised** at creation time (smaller address stored first). `get_pool` accepts either order.
+- `create_pool` panics with `"pool already exists"` if a pool for the pair is already registered.
+- The factory admin is set as the AMM's `fee_recipient`; protocol fees start at 0 bps and can be enabled later.
+
+---
+
+### LP Token Contract
+#### Flash Loan Receiver Interface
+
+Borrowers must implement a callback contract with this interface:
+
+```rust
+pub trait FlashLoanReceiver {
+    fn on_flash_loan(env: Env, token: Address, amount: i128, fee: i128, data: Bytes) -> bool;
+}
+```
+
+During `flash_loan`, the AMM transfers `amount` of `token` to `receiver`, invokes `on_flash_loan`, and then checks that the pool's token balance increased by at least `fee`. If the receiver does not return `amount + fee` before the callback finishes, the transaction reverts.
+
 ### LP Token Contract
 
 Located in [contracts/token/src/lib.rs](contracts/token/src/lib.rs).
-
-A minimal SEP-41 compliant fungible token used exclusively as the LP share token. The AMM contract is set as admin at deployment and is the only caller permitted to `mint` and `burn`.
-
-#### Public Interface
 
 | Function | Description |
 |---|---|
@@ -251,19 +341,104 @@ target/wasm32-unknown-unknown/release/token.wasm
 
 ### Test
 
-Run the full test suite:
+The AMM and token contract tests run without pre-built WASM:
 
 ```sh
-cargo test
+cargo test -p amm -p token
 ```
 
-Tests are located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs) and cover adding liquidity, swapping, and removing liquidity.
+The factory tests embed compiled WASM at compile time, so build WASM first:
+
+```sh
+cargo build --release --target wasm32-unknown-unknown
+cargo test -p factory
+```
+
+Or run the full suite in one go:
+
+```sh
+cargo build --release --target wasm32-unknown-unknown && cargo test
+```
+
+For a real-network smoke test on Stellar testnet, run the end-to-end script:
+
+```sh
+scripts/e2e.sh
+```
+
+The script deploys fresh contracts, funds a test account, adds liquidity, swaps, removes liquidity, and exits non-zero on any failed assertion.
 
 ---
 
 ## Usage
 
-### Deploy
+### Deploy via Factory
+
+The factory is the recommended way to create pools. It deploys and initialises the AMM pool and its LP token in a single transaction, and registers the pool in its on-chain registry.
+
+**1. Upload the contract WASM blobs:**
+
+```sh
+stellar contract upload \
+  --wasm target/wasm32-unknown-unknown/release/amm.wasm \
+  --network testnet --source <YOUR_KEY>
+# → prints AMM_WASM_HASH
+
+stellar contract upload \
+  --wasm target/wasm32-unknown-unknown/release/token.wasm \
+  --network testnet --source <YOUR_KEY>
+# → prints TOKEN_WASM_HASH
+```
+
+**2. Deploy the factory:**
+
+```sh
+stellar contract deploy \
+  --wasm target/wasm32-unknown-unknown/release/factory.wasm \
+  --network testnet --source <YOUR_KEY>
+# → prints FACTORY_CONTRACT_ID
+```
+
+**3. Initialise the factory:**
+
+```sh
+stellar contract invoke \
+  --id <FACTORY_CONTRACT_ID> \
+  --network testnet --source <YOUR_KEY> \
+  -- initialize \
+  --admin <YOUR_ADDRESS> \
+  --amm_wasm_hash <AMM_WASM_HASH> \
+  --token_wasm_hash <TOKEN_WASM_HASH>
+```
+
+**4. Create a pool (deploys AMM + LP token, registers the pair):**
+
+```sh
+stellar contract invoke \
+  --id <FACTORY_CONTRACT_ID> \
+  --network testnet --source <YOUR_KEY> \
+  -- create_pool \
+  --token_a <TOKEN_A_CONTRACT_ID> \
+  --token_b <TOKEN_B_CONTRACT_ID> \
+  --fee_bps 30
+# → prints the new POOL_CONTRACT_ID
+```
+
+**5. Look up an existing pool:**
+
+```sh
+stellar contract invoke \
+  --id <FACTORY_CONTRACT_ID> \
+  -- get_pool \
+  --token_a <TOKEN_A_CONTRACT_ID> \
+  --token_b <TOKEN_B_CONTRACT_ID>
+
+stellar contract invoke --id <FACTORY_CONTRACT_ID> -- all_pools
+```
+
+---
+
+### Deploy Manually
 
 Deploy the LP token contract first, then the AMM pool. The AMM contract address becomes the LP token's admin.
 
@@ -306,7 +481,9 @@ stellar contract invoke \
   --token_a <TOKEN_A_CONTRACT_ID> \
   --token_b <TOKEN_B_CONTRACT_ID> \
   --lp_token <LP_TOKEN_CONTRACT_ID> \
-  --fee_bps 30
+  --fee_bps 30 \
+  --fee_recipient <FEE_RECIPIENT_ADDRESS> \
+  --protocol_fee_bps 0
 ```
 
 ### Add Liquidity
@@ -370,6 +547,17 @@ stellar contract invoke --id <AMM_CONTRACT_ID> \
 # LP share balance
 stellar contract invoke --id <AMM_CONTRACT_ID> \
   -- shares_of --provider <PROVIDER_ADDRESS>
+```
+
+### TypeScript Client Example
+
+A standalone TypeScript client is available in [examples/client](examples/client). It demonstrates connecting to Stellar testnet RPC, reading `get_info()`, quoting with `get_amount_out()`, executing `swap()`, and reading LP shares with `shares_of()`.
+
+```sh
+cd examples/client
+npm install
+npm run build
+npm start
 ```
 
 ---

@@ -9,7 +9,9 @@
 
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, Symbol};
+use soroban_sdk::{
+    contract, contractclient, contractimpl, contracttype, symbol_short, Address, Bytes, Env, Symbol,
+};
 // Standard SEP-41 interface for pool tokens (token_a, token_b)
 use soroban_sdk::token::Client as SepTokenClient;
 
@@ -41,10 +43,18 @@ pub enum DataKey {
     ReserveA,
     ReserveB,
     TotalShares,
-    FeeBps, // fee in basis points, e.g. 30 = 0.30 %
     PriceCumulativeA,
     PriceCumulativeB,
     LastTimestamp,
+    Shares(Address),
+    FeeBps,          // swap fee in basis points, e.g. 30 = 0.30 %
+    Admin,           // Address — contract administrator; authorises set_protocol_fee
+    FeeRecipient,    // Address — receives accrued protocol fees
+    ProtocolFeeBps,  // i128 — protocol fee bps (subset of FeeBps going to protocol)
+    AccruedFeeA,     // i128 — protocol fees accrued in TokenA
+    AccruedFeeB,     // i128 — protocol fees accrued in TokenB
+    Paused,
+    FlashLoanFeeBps,
 }
 
 // ── Pool info returned by `get_info` ─────────────────────────────────────────
@@ -58,6 +68,23 @@ pub struct PoolInfo {
     pub reserve_b: i128,
     pub total_shares: i128,
     pub fee_bps: i128,
+    pub flash_loan_fee_bps: i128,
+}
+
+#[contractclient(name = "FlashLoanReceiverClient")]
+pub trait FlashLoanReceiver {
+    fn on_flash_loan(env: Env, token: Address, amount: i128, fee: i128, data: Bytes) -> bool;
+}
+
+// ── Swap simulation returned by `simulate_swap` ───────────────────────────────
+
+#[contracttype]
+pub struct SwapSimulation {
+    pub amount_out: i128,
+    pub fee_amount: i128,
+    pub price_impact_bps: i128, // price impact in basis points
+    pub effective_price: i128,  // amount_out / amount_in scaled by 1_000_000
+    pub spot_price: i128,       // reserve_out / reserve_in scaled by 1_000_000
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -81,16 +108,36 @@ impl AmmPool {
     /// - `lp_token` – Address of the LP token contract used to represent pool shares.
     /// - `fee_bps` – Swap fee in basis points (e.g. `30` = 0.30 %). Must be in `[0, 10_000]`.
     ///
+    /// `lp_token` must already be deployed and its admin set to this contract.
+    /// `admin` is stored as the contract administrator and is the only address
+    /// permitted to call `set_protocol_fee` after deployment.
+    /// `fee_recipient` receives accrued protocol fees via `withdraw_protocol_fees`.
+    /// `protocol_fee_bps` must be ≤ `fee_bps`; set to 0 to disable protocol fees.
     /// # Panics
     /// - If the pool has already been initialized.
     /// - If `token_a == token_b`.
     /// - If `fee_bps` is outside the range `[0, 10_000]`.
     pub fn initialize(
         env: Env,
+        admin: Address,
         token_a: Address,
         token_b: Address,
         lp_token: Address,
         fee_bps: i128, // recommended: 30 (0.30 %)
+        fee_recipient: Address,
+        protocol_fee_bps: i128,
+    ) {
+        Self::initialize_with_flash_loan_fee(env, token_a, token_b, lp_token, fee_bps, fee_bps);
+    }
+
+    /// Initialize the pool with a distinct flash-loan fee.
+    pub fn initialize_with_flash_loan_fee(
+        env: Env,
+        token_a: Address,
+        token_b: Address,
+        lp_token: Address,
+        fee_bps: i128,
+        flash_loan_fee_bps: i128,
     ) {
         if env.storage().instance().has(&DataKey::TokenA) {
             panic!(
@@ -98,7 +145,7 @@ impl AmmPool {
                 env.current_contract_address()
             );
         }
-        assert!(
+assert!(
             token_a != token_b,
             "tokens must differ: token_a={token_a:?}, token_b={token_b:?}"
         );
@@ -106,15 +153,32 @@ impl AmmPool {
             (0..=10_000).contains(&fee_bps),
             "invalid fee: {fee_bps} is outside 0..=10_000"
         );
+        assert!(
+            (0..=10_000).contains(&flash_loan_fee_bps),
+            "invalid flash loan fee: {flash_loan_fee_bps} is outside 0..=10_000"
+        );
+        assert!(
+            (0..=fee_bps).contains(&protocol_fee_bps),
+            "invalid protocol fee: {protocol_fee_bps} must be in 0..={fee_bps}"
+        );
+        );
 
+        env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::TokenA, &token_a);
         env.storage().instance().set(&DataKey::TokenB, &token_b);
         env.storage().instance().set(&DataKey::LpToken, &lp_token);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
+env.storage().instance().set(&DataKey::FeeRecipient, &fee_recipient);
+        env.storage().instance().set(&DataKey::ProtocolFeeBps, &protocol_fee_bps);
+        env.storage().instance().set(&DataKey::AccruedFeeA, &0_i128);
+        env.storage().instance().set(&DataKey::AccruedFeeB, &0_i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::FlashLoanFeeBps, &flash_loan_fee_bps);
         env.storage().instance().set(&DataKey::ReserveA, &0_i128);
         env.storage().instance().set(&DataKey::ReserveB, &0_i128);
         env.storage().instance().set(&DataKey::TotalShares, &0_i128);
-        env.storage()
+env.storage()
             .instance()
             .set(&DataKey::PriceCumulativeA, &0_i128);
         env.storage()
@@ -123,6 +187,56 @@ impl AmmPool {
         env.storage()
             .instance()
             .set(&DataKey::LastTimestamp, &env.ledger().timestamp());
+        env.storage().instance().set(&DataKey::Paused, &false);
+    }
+
+    pub fn pause(env: Env, admin: Address) {
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+    }
+
+    pub fn unpause(env: Env, admin: Address) {
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
+    /// Update the protocol fee configuration. Admin-only.
+    ///
+    /// Set `protocol_fee_bps` to 0 to disable protocol fee collection.
+    /// `protocol_fee_bps` must be ≤ the pool's `fee_bps`.
+    pub fn set_protocol_fee(
+        env: Env,
+        admin: Address,
+        recipient: Address,
+        protocol_fee_bps: i128,
+    ) {
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        assert!(admin == stored_admin, "not admin");
+        admin.require_auth();
+        let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
+        assert!(
+            protocol_fee_bps >= 0 && protocol_fee_bps <= fee_bps,
+            "invalid protocol fee"
+        );
+        env.storage().instance().set(&DataKey::FeeRecipient, &recipient);
+        env.storage().instance().set(&DataKey::ProtocolFeeBps, &protocol_fee_bps);
+    }
+
+    /// Return the current protocol fee recipient and rate.
+    ///
+    /// Returns `(None, 0)` when protocol fees are disabled.
+    pub fn get_protocol_fee(env: Env) -> (Option<Address>, i128) {
+        let recipient: Option<Address> = env.storage().instance().get(&DataKey::FeeRecipient);
+        let bps: i128 = env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
+        (recipient, bps)
+    }
     }
 
     // ── Liquidity ─────────────────────────────────────────────────────────────
@@ -157,6 +271,7 @@ impl AmmPool {
         amount_b: i128,
         min_shares: i128,
     ) -> i128 {
+        assert!(!Self::is_paused(env.clone()), "pool is paused");
         provider.require_auth();
         assert!(
             amount_a > 0 && amount_b > 0,
@@ -253,6 +368,7 @@ impl AmmPool {
         min_a: i128,
         min_b: i128,
     ) -> (i128, i128) {
+        assert!(!Self::is_paused(env.clone()), "pool is paused");
         provider.require_auth();
         assert!(shares > 0, "shares must be positive: got {shares}");
 
@@ -330,6 +446,8 @@ impl AmmPool {
     /// - `min_out` – Minimum amount of the output token the caller is willing to
     ///   accept (slippage guard).
     ///
+    /// Uses the constant-product formula with fee deducted from `amount_in`.
+    /// The `protocol_fee_bps` portion of `amount_in` is held for `withdraw_protocol_fees`.
     /// # Returns
     /// The amount of the output token transferred to `trader`.
     ///
@@ -346,6 +464,7 @@ impl AmmPool {
         amount_in: i128,
         min_out: i128,
     ) -> i128 {
+        assert!(!Self::is_paused(env.clone()), "pool is paused");
         trader.require_auth();
         assert!(amount_in > 0, "amount_in must be positive: got {amount_in}");
 
@@ -398,7 +517,7 @@ impl AmmPool {
         let client_out = SepTokenClient::new(&env, &token_out);
         client_out.transfer(&env.current_contract_address(), &trader, &amount_out);
 
-        // Update accumulators before updating reserves.
+// Update accumulators before updating reserves.
         let now = env.ledger().timestamp();
         let last_timestamp: u64 = env
             .storage()
@@ -409,7 +528,6 @@ impl AmmPool {
             let elapsed = (now - last_timestamp) as i128;
             let reserve_a = Self::get_reserve_a(env.clone());
             let reserve_b = Self::get_reserve_b(env.clone());
-
             if reserve_a > 0 && reserve_b > 0 {
                 let mut price_cum_a: i128 = env
                     .storage()
@@ -421,13 +539,11 @@ impl AmmPool {
                     .instance()
                     .get(&DataKey::PriceCumulativeB)
                     .unwrap_or(0);
-
                 // price_a = reserve_b / reserve_a
                 // price_b = reserve_a / reserve_b
                 // We use a factor of 1,000,000 to maintain precision as suggested in the prompt.
                 price_cum_a += (reserve_b * 1_000_000 / reserve_a) * elapsed;
                 price_cum_b += (reserve_a * 1_000_000 / reserve_b) * elapsed;
-
                 env.storage()
                     .instance()
                     .set(&DataKey::PriceCumulativeA, &price_cum_a);
@@ -438,21 +554,43 @@ impl AmmPool {
             env.storage().instance().set(&DataKey::LastTimestamp, &now);
         }
 
-        // Update reserves.
+        // Separate protocol fee from LP reserves.
+        let protocol_fee_bps: i128 =
+            env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
+        let protocol_fee = if protocol_fee_bps > 0 {
+            amount_in * protocol_fee_bps / 10_000
+        } else {
+            0
+        };
+        // Update reserves (protocol fee held outside LP reserves).
         if token_in == token_a {
             env.storage()
                 .instance()
-                .set(&DataKey::ReserveA, &(reserve_in + amount_in));
+                .set(&DataKey::ReserveA, &(reserve_in + amount_in - protocol_fee));
             env.storage()
                 .instance()
                 .set(&DataKey::ReserveB, &(reserve_out - amount_out));
+            if protocol_fee > 0 {
+                let accrued: i128 =
+                    env.storage().instance().get(&DataKey::AccruedFeeA).unwrap_or(0);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::AccruedFeeA, &(accrued + protocol_fee));
+            }
         } else {
             env.storage()
                 .instance()
-                .set(&DataKey::ReserveB, &(reserve_in + amount_in));
+                .set(&DataKey::ReserveB, &(reserve_in + amount_in - protocol_fee));
             env.storage()
                 .instance()
                 .set(&DataKey::ReserveA, &(reserve_out - amount_out));
+            if protocol_fee > 0 {
+                let accrued: i128 =
+                    env.storage().instance().get(&DataKey::AccruedFeeB).unwrap_or(0);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::AccruedFeeB, &(accrued + protocol_fee));
+            }
         }
 
         env.events().publish(
@@ -461,6 +599,100 @@ impl AmmPool {
         );
 
         amount_out
+    }
+
+    // ── Protocol Fees ─────────────────────────────────────────────────────────
+
+    /// Withdraw all accrued protocol fees to the configured fee recipient.
+    ///
+    /// Only callable by the fee recipient. Resets accrued balances to zero.
+    /// Returns `(fee_a_withdrawn, fee_b_withdrawn)`.
+    pub fn withdraw_protocol_fees(env: Env) -> (i128, i128) {
+        let fee_recipient: Address =
+            env.storage().instance().get(&DataKey::FeeRecipient).unwrap();
+        fee_recipient.require_auth();
+
+        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
+        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+
+        let fee_a: i128 = env.storage().instance().get(&DataKey::AccruedFeeA).unwrap_or(0);
+        let fee_b: i128 = env.storage().instance().get(&DataKey::AccruedFeeB).unwrap_or(0);
+
+        if fee_a > 0 {
+            SepTokenClient::new(&env, &token_a).transfer(
+                &env.current_contract_address(),
+                &fee_recipient,
+                &fee_a,
+            );
+            env.storage().instance().set(&DataKey::AccruedFeeA, &0_i128);
+        }
+
+        if fee_b > 0 {
+            SepTokenClient::new(&env, &token_b).transfer(
+                &env.current_contract_address(),
+                &fee_recipient,
+                &fee_b,
+            );
+            env.storage().instance().set(&DataKey::AccruedFeeB, &0_i128);
+        }
+
+        (fee_a, fee_b)
+    /// Borrow pool liquidity and repay it plus a fee during the receiver callback.
+    pub fn flash_loan(
+        env: Env,
+        receiver: Address,
+        token: Address,
+        amount: i128,
+        data: Bytes,
+    ) -> i128 {
+        assert!(amount > 0, "amount must be positive");
+
+        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
+        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let reserve = if token == token_a {
+            Self::get_reserve_a(env.clone())
+        } else if token == token_b {
+            Self::get_reserve_b(env.clone())
+        } else {
+            panic!("token is not part of this pool");
+        };
+        assert!(reserve >= amount, "insufficient liquidity");
+
+        let fee_bps = Self::get_flash_loan_fee_bps(env.clone());
+        let fee = amount * fee_bps / 10_000;
+        let pool = env.current_contract_address();
+        let token_client = SepTokenClient::new(&env, &token);
+        let balance_before = token_client.balance(&pool);
+
+        token_client.transfer(&pool, &receiver, &amount);
+
+        let accepted = FlashLoanReceiverClient::new(&env, &receiver)
+            .on_flash_loan(&token, &amount, &fee, &data);
+        assert!(accepted, "flash loan callback rejected");
+
+        let balance_after = token_client.balance(&pool);
+        assert!(
+            balance_after >= balance_before + fee,
+            "flash loan was not repaid"
+        );
+
+        let reserve_after = reserve + (balance_after - balance_before);
+        if token == token_a {
+            env.storage()
+                .instance()
+                .set(&DataKey::ReserveA, &reserve_after);
+        } else {
+            env.storage()
+                .instance()
+                .set(&DataKey::ReserveB, &reserve_after);
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "flash_loan"), receiver),
+            (token, amount, fee),
+        );
+
+        fee
     }
 
     // ── Quotes (read-only) ────────────────────────────────────────────────────
@@ -527,12 +759,47 @@ impl AmmPool {
         amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee)
     }
 
+/// Simulate a swap and return a detailed breakdown without executing it.
+    ///
+    /// Returns the expected output, total fee taken, effective execution price,
+    /// spot price, and price impact — all computed from current reserve state.
+    /// `amount_out` is guaranteed to match `get_amount_out` for the same inputs.
+    pub fn simulate_swap(env: Env, token_in: Address, amount_in: i128) -> SwapSimulation {
+        assert!(amount_in > 0, "amount_in must be positive");
+        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
+        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
+        let (reserve_in, reserve_out) = if token_in == token_a {
+            (Self::get_reserve_a(env.clone()), Self::get_reserve_b(env.clone()))
+        } else if token_in == token_b {
+            (Self::get_reserve_b(env.clone()), Self::get_reserve_a(env.clone()))
+        } else {
+            panic!("unknown token");
+        };
+        assert!(reserve_in > 0 && reserve_out > 0, "pool is empty");
+        let amount_in_with_fee = amount_in * (10_000 - fee_bps);
+        let amount_out =
+            amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee);
+        let fee_amount = amount_in * fee_bps / 10_000;
+        // Prices scaled by 1_000_000 to preserve precision in integer arithmetic.
+        let spot_price = reserve_out * 1_000_000 / reserve_in;
+        let effective_price = amount_out * 1_000_000 / amount_in;
+        // Price impact: how far the execution price deviates from the spot price.
+        let price_impact_bps = (spot_price - effective_price) * 10_000 / spot_price;
+        SwapSimulation {
+            amount_out,
+            fee_amount,
+            price_impact_bps,
+            effective_price,
+            spot_price,
+        }
+    }
+
     /// Quote how much `token_in` is required to receive exactly `amount_out` of `token_out`.
     pub fn get_amount_in(env: Env, token_out: Address, amount_out: i128) -> i128 {
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
-
         let (reserve_in, reserve_out) = if token_out == token_a {
             (
                 Self::get_reserve_b(env.clone()),
@@ -546,11 +813,10 @@ impl AmmPool {
         } else {
             panic!("unknown token");
         };
-
         assert!(reserve_in > 0 && reserve_out > 0, "zero reserve");
         assert!(amount_out < reserve_out, "amount_out >= reserve_out");
-
         (reserve_in * amount_out * 10_000) / ((reserve_out - amount_out) * (10_000 - fee_bps)) + 1
+    }
     }
 
     /// Return full pool state.
@@ -572,6 +838,7 @@ impl AmmPool {
             reserve_b: Self::get_reserve_b(env.clone()),
             total_shares: Self::get_total_shares(env.clone()),
             fee_bps: env.storage().instance().get(&DataKey::FeeBps).unwrap(),
+            flash_loan_fee_bps: Self::get_flash_loan_fee_bps(env.clone()),
         }
     }
 
@@ -633,6 +900,13 @@ impl AmmPool {
             .unwrap_or(0)
     }
 
+    fn get_flash_loan_fee_bps(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::FlashLoanFeeBps)
+            .unwrap_or_else(|| env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0))
+    }
+
     /// Integer square root via Newton's method.
     fn sqrt(n: i128) -> i128 {
         if n < 0 {
@@ -663,6 +937,43 @@ mod tests {
     };
     use token::LpToken;
 
+#[contracttype]
+    enum ReceiverDataKey {
+        Amm,
+        ShouldRepay,
+    }
+    #[contract]
+    pub struct MockFlashLoanReceiver;
+    #[contractimpl]
+    impl MockFlashLoanReceiver {
+        pub fn initialize(env: Env, amm: Address, should_repay: bool) {
+            env.storage().instance().set(&ReceiverDataKey::Amm, &amm);
+            env.storage()
+                .instance()
+                .set(&ReceiverDataKey::ShouldRepay, &should_repay);
+        }
+        pub fn on_flash_loan(
+            env: Env,
+            token: Address,
+            amount: i128,
+            fee: i128,
+            _data: Bytes,
+        ) -> bool {
+            let should_repay = env
+                .storage()
+                .instance()
+                .get(&ReceiverDataKey::ShouldRepay)
+                .unwrap_or(false);
+            if should_repay {
+                let amm: Address = env.storage().instance().get(&ReceiverDataKey::Amm).unwrap();
+                let token_client = SepTokenClient::new(&env, &token);
+                token_client.transfer(&env.current_contract_address(), &amm, &(amount + fee));
+            }
+            true
+        }
+    }
+
+    /// Register a Stellar Asset Contract and return (TokenClient, StellarAssetClient).
     fn create_sac<'a>(
         env: &'a Env,
         admin: &Address,
@@ -762,6 +1073,7 @@ mod tests {
         let info = amm.get_info();
         assert_eq!(info.reserve_a, 1_000_000);
         assert_eq!(info.reserve_b, 2_000_000);
+        assert_eq!(info.flash_loan_fee_bps, 30);
 
         let trader = Address::generate(env);
         ta_sac.mint(&trader, &100_000_i128);
@@ -778,7 +1090,15 @@ mod tests {
         let (tb_client, tb_sac) = create_sac(&env, &admin);
 
         let amm = AmmPoolClient::new(&env, &amm_addr);
-        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
+        amm.initialize(
+            &admin,
+            &ta_client.address,
+            &tb_client.address,
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &0_i128,
+        );
 
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &2_000_000_i128);
@@ -1305,5 +1625,389 @@ mod tests {
         let result =
             amm.try_add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &1_000_001_i128);
         assert!(result.is_err());
+    }
+}
+
+// ── Property-based tests ───────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod prop_tests {
+    extern crate std;
+    use super::AmmPool;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Property 1: For any valid first deposit, initial shares (sqrt(a*b)) are always positive.
+        #[test]
+        fn first_deposit_shares_always_positive(
+            a in 1_i128..=100_000_i128,
+            b in 1_i128..=100_000_i128,
+        ) {
+            let shares = AmmPool::sqrt(a * b);
+            prop_assert!(shares > 0, "shares={shares} for a={a}, b={b}");
+        }
+
+        /// Property 2: Subsequent deposit shares minted are ≤ the proportional amount for each token.
+        #[test]
+        fn subsequent_deposit_shares_leq_proportional(
+            amount_a in 1_i128..=1_000_000_i128,
+            amount_b in 1_i128..=1_000_000_i128,
+            reserve_a in 1_i128..=1_000_000_i128,
+            reserve_b in 1_i128..=1_000_000_i128,
+            total_shares in 1_i128..=1_000_000_i128,
+        ) {
+            let shares_a = amount_a * total_shares / reserve_a;
+            let shares_b = amount_b * total_shares / reserve_b;
+            let minted = shares_a.min(shares_b);
+            prop_assert!(minted <= shares_a, "minted={minted} > shares_a={shares_a}");
+            prop_assert!(minted <= shares_b, "minted={minted} > shares_b={shares_b}");
+        }
+
+        /// Property 3: For any valid shares ≤ total_shares, remove_liquidity outputs are non-negative.
+        #[test]
+        fn remove_liquidity_outputs_nonneg(
+            shares in 1_i128..=10_000_i128,
+            extra in 0_i128..=10_000_i128,
+            reserve_a in 0_i128..=1_000_000_i128,
+            reserve_b in 0_i128..=1_000_000_i128,
+        ) {
+            // total_shares >= shares by construction
+            let total_shares = shares + extra;
+            let out_a = shares * reserve_a / total_shares;
+            let out_b = shares * reserve_b / total_shares;
+            prop_assert!(out_a >= 0, "out_a={out_a} is negative");
+            prop_assert!(out_b >= 0, "out_b={out_b} is negative");
+        }
+
+        /// Property 4: get_amount_out output is always strictly less than the output reserve.
+        #[test]
+        fn amount_out_strictly_lt_reserve(
+            amount_in in 1_i128..=100_000_i128,
+            reserve_in in 1_i128..=1_000_000_i128,
+            reserve_out in 1_i128..=1_000_000_i128,
+            fee_bps in 0_i128..=10_000_i128,
+        ) {
+            let amount_in_with_fee = amount_in * (10_000 - fee_bps);
+            let denom = reserve_in * 10_000 + amount_in_with_fee;
+            // When fee_bps == 10_000, amount_in_with_fee == 0 → amount_out == 0 < reserve_out.
+            let amount_out = if denom == 0 {
+                0
+            } else {
+                amount_in_with_fee * reserve_out / denom
+            };
+            prop_assert!(
+                amount_out < reserve_out,
+                "amount_out={amount_out} >= reserve_out={reserve_out}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_flash_loan_success_with_repayment() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+
+        let (ta_client, ta_sac) = create_sac(&env, &admin);
+        let (tb_client, tb_sac) = create_sac(&env, &admin);
+
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize_with_flash_loan_fee(
+            &ta_client.address,
+            &tb_client.address,
+            &lp_addr,
+            &30_i128,
+            &50_i128,
+        );
+
+        let provider = Address::generate(&env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+
+        let receiver_addr = env.register_contract(None, MockFlashLoanReceiver);
+        let receiver = MockFlashLoanReceiverClient::new(&env, &receiver_addr);
+        receiver.initialize(&amm_addr, &true);
+
+        ta_sac.mint(&receiver_addr, &1_000_i128);
+
+        let fee = amm.flash_loan(
+            &receiver_addr,
+            &ta_client.address,
+            &100_000_i128,
+            &Bytes::new(&env),
+        );
+        assert_eq!(fee, 500);
+
+        let info = amm.get_info();
+        assert_eq!(info.reserve_a, 1_000_500);
+        assert_eq!(info.reserve_b, 1_000_000);
+        assert_eq!(info.flash_loan_fee_bps, 50);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_flash_loan_failed_repayment_panics() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+
+        let (ta_client, ta_sac) = create_sac(&env, &admin);
+        let (tb_client, tb_sac) = create_sac(&env, &admin);
+
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(
+            &admin,
+            &ta_client.address,
+            &tb_client.address,
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &0_i128,
+        );
+
+        let provider = Address::generate(&env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+
+        let receiver_addr = env.register_contract(None, MockFlashLoanReceiver);
+        let receiver = MockFlashLoanReceiverClient::new(&env, &receiver_addr);
+        receiver.initialize(&amm_addr, &false);
+
+        amm.flash_loan(
+            &receiver_addr,
+            &ta_client.address,
+            &100_000_i128,
+            &Bytes::new(&env),
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_pause_requires_admin_auth() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let amm_addr = env.register_contract(None, AmmPool);
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+
+        amm.pause(&admin);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_unpause_requires_admin_auth() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let amm_addr = env.register_contract(None, AmmPool);
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+
+        amm.unpause(&admin);
+    }
+
+    #[test]
+    fn test_pause_blocks_read_only_functions_remain_available_then_unpause_succeeds() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+        let (ta_client, ta_sac) = create_sac(&env, &admin);
+        let (tb_client, tb_sac) = create_sac(&env, &admin);
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
+
+        let provider = Address::generate(&env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+
+        amm.pause(&admin);
+        assert!(amm.is_paused());
+
+        let info = amm.get_info();
+        assert_eq!(info.reserve_a, 1_000_000);
+        assert_eq!(info.reserve_b, 1_000_000);
+
+        let quote = amm.get_amount_out(&ta_client.address, &100_000_i128);
+        assert!(quote > 0);
+        assert_eq!(amm.shares_of(&provider), shares);
+
+        amm.unpause(&admin);
+        assert!(!amm.is_paused());
+
+        let trader = Address::generate(&env);
+        ta_sac.mint(&trader, &100_000_i128);
+        let out = amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128);
+        assert!(out > 0);
+
+        let extra_provider = Address::generate(&env);
+        ta_sac.mint(&extra_provider, &100_000_i128);
+        tb_sac.mint(&extra_provider, &100_000_i128);
+        let extra_shares =
+            amm.add_liquidity(&extra_provider, &100_000_i128, &100_000_i128, &0_i128);
+        assert!(extra_shares > 0);
+
+        let (out_a, out_b) = amm.remove_liquidity(&provider, &shares, &0_i128, &0_i128);
+        assert!(out_a > 0 && out_b > 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_add_liquidity_panics_when_paused() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+        let (ta_client, ta_sac) = create_sac(&env, &admin);
+        let (tb_client, tb_sac) = create_sac(&env, &admin);
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
+
+        let provider = Address::generate(&env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+
+        amm.pause(&admin);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_swap_panics_when_paused() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+        let (ta_client, ta_sac) = create_sac(&env, &admin);
+        let (tb_client, tb_sac) = create_sac(&env, &admin);
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
+
+        let provider = Address::generate(&env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+
+        let trader = Address::generate(&env);
+        ta_sac.mint(&trader, &100_000_i128);
+
+        amm.pause(&admin);
+        amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_remove_liquidity_panics_when_paused() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+        let (ta_client, ta_sac) = create_sac(&env, &admin);
+        let (tb_client, tb_sac) = create_sac(&env, &admin);
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
+
+        let provider = Address::generate(&env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+
+        amm.pause(&admin);
+        amm.remove_liquidity(&provider, &shares, &0_i128, &0_i128);
+    }
+
+    #[test]
+    fn test_protocol_fee_accrual() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+
+        let (ta_client, ta_sac) = create_sac(&env, &admin);
+        let (tb_client, tb_sac) = create_sac(&env, &admin);
+
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        // fee_bps=30, protocol_fee_bps=5
+        amm.initialize(
+            &admin,
+            &ta_client.address,
+            &tb_client.address,
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &5_i128,
+        );
+
+        let provider = Address::generate(&env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+
+        let trader = Address::generate(&env);
+        ta_sac.mint(&trader, &200_000_i128);
+
+        // Two swaps of 100_000 A each — protocol fee per swap = 100_000 * 5 / 10_000 = 50
+        amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128);
+        amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128);
+
+        let admin_bal_before = ta_client.balance(&admin);
+        let (withdrawn_a, withdrawn_b) = amm.withdraw_protocol_fees();
+        let admin_bal_after = ta_client.balance(&admin);
+
+        assert_eq!(withdrawn_a, 100_i128); // 50 + 50
+        assert_eq!(withdrawn_b, 0_i128);
+        assert_eq!(admin_bal_after - admin_bal_before, 100_i128);
+    }
+
+    #[test]
+    fn test_withdraw_resets_accrued() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+
+        let (ta_client, ta_sac) = create_sac(&env, &admin);
+        let (tb_client, tb_sac) = create_sac(&env, &admin);
+
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(
+            &ta_client.address,
+            &tb_client.address,
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &5_i128,
+        );
+
+        let provider = Address::generate(&env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+
+        let trader = Address::generate(&env);
+        ta_sac.mint(&trader, &100_000_i128);
+        amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128);
+
+        // First withdrawal collects accrued fees.
+        let (w1_a, _) = amm.withdraw_protocol_fees();
+        assert!(w1_a > 0);
+
+        // Second withdrawal: accrued balances were reset to zero.
+        let (w2_a, w2_b) = amm.withdraw_protocol_fees();
+        assert_eq!(w2_a, 0_i128);
+        assert_eq!(w2_b, 0_i128);
+    }
+
+    #[test]
+    fn test_reaccrual_after_withdrawal() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+
+        let (ta_client, ta_sac) = create_sac(&env, &admin);
+        let (tb_client, tb_sac) = create_sac(&env, &admin);
+
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(
+            &ta_client.address,
+            &tb_client.address,
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &5_i128,
+        );
+
+        let provider = Address::generate(&env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+
+        let trader = Address::generate(&env);
+        ta_sac.mint(&trader, &200_000_i128);
+
+        // Swap → withdraw → swap again → withdraw: fees re-accrue after reset.
+        amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128);
+        let (w1, _) = amm.withdraw_protocol_fees();
+        assert!(w1 > 0);
+
+        amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128);
+        let (w2, _) = amm.withdraw_protocol_fees();
+        assert!(w2 > 0);
     }
 }
