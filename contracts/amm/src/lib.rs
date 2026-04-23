@@ -911,7 +911,7 @@ mod tests {
                 new_k >= current_k,
                 "k decreased: new_k ({new_k}) < current_k ({current_k}) at swap {i}"
             );
-            
+
             current_k = new_k;
         }
 
