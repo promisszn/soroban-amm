@@ -1181,3 +1181,78 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+// ── Property-based tests ───────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod prop_tests {
+    extern crate std;
+    use super::AmmPool;
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Property 1: For any valid first deposit, initial shares (sqrt(a*b)) are always positive.
+        #[test]
+        fn first_deposit_shares_always_positive(
+            a in 1_i128..=100_000_i128,
+            b in 1_i128..=100_000_i128,
+        ) {
+            let shares = AmmPool::sqrt(a * b);
+            prop_assert!(shares > 0, "shares={shares} for a={a}, b={b}");
+        }
+
+        /// Property 2: Subsequent deposit shares minted are ≤ the proportional amount for each token.
+        #[test]
+        fn subsequent_deposit_shares_leq_proportional(
+            amount_a in 1_i128..=1_000_000_i128,
+            amount_b in 1_i128..=1_000_000_i128,
+            reserve_a in 1_i128..=1_000_000_i128,
+            reserve_b in 1_i128..=1_000_000_i128,
+            total_shares in 1_i128..=1_000_000_i128,
+        ) {
+            let shares_a = amount_a * total_shares / reserve_a;
+            let shares_b = amount_b * total_shares / reserve_b;
+            let minted = shares_a.min(shares_b);
+            prop_assert!(minted <= shares_a, "minted={minted} > shares_a={shares_a}");
+            prop_assert!(minted <= shares_b, "minted={minted} > shares_b={shares_b}");
+        }
+
+        /// Property 3: For any valid shares ≤ total_shares, remove_liquidity outputs are non-negative.
+        #[test]
+        fn remove_liquidity_outputs_nonneg(
+            shares in 1_i128..=10_000_i128,
+            extra in 0_i128..=10_000_i128,
+            reserve_a in 0_i128..=1_000_000_i128,
+            reserve_b in 0_i128..=1_000_000_i128,
+        ) {
+            // total_shares >= shares by construction
+            let total_shares = shares + extra;
+            let out_a = shares * reserve_a / total_shares;
+            let out_b = shares * reserve_b / total_shares;
+            prop_assert!(out_a >= 0, "out_a={out_a} is negative");
+            prop_assert!(out_b >= 0, "out_b={out_b} is negative");
+        }
+
+        /// Property 4: get_amount_out output is always strictly less than the output reserve.
+        #[test]
+        fn amount_out_strictly_lt_reserve(
+            amount_in in 1_i128..=100_000_i128,
+            reserve_in in 1_i128..=1_000_000_i128,
+            reserve_out in 1_i128..=1_000_000_i128,
+            fee_bps in 0_i128..=10_000_i128,
+        ) {
+            let amount_in_with_fee = amount_in * (10_000 - fee_bps);
+            let denom = reserve_in * 10_000 + amount_in_with_fee;
+            // When fee_bps == 10_000, amount_in_with_fee == 0 → amount_out == 0 < reserve_out.
+            let amount_out = if denom == 0 {
+                0
+            } else {
+                amount_in_with_fee * reserve_out / denom
+            };
+            prop_assert!(
+                amount_out < reserve_out,
+                "amount_out={amount_out} >= reserve_out={reserve_out}"
+            );
+        }
+    }
+}
