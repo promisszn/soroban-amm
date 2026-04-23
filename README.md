@@ -22,6 +22,7 @@ A constant-product Automated Market Maker (AMM) built as a Soroban smart contrac
   - [Swap Tokens](#swap-tokens)
   - [Remove Liquidity](#remove-liquidity)
   - [Query the Pool](#query-the-pool)
+  - [TypeScript Client Example](#typescript-client-example)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -59,11 +60,45 @@ The AMM contract depends on the token contract. When liquidity is added or remov
 
 ## Contracts
 
+---
+
+## Storage Layout
+
 ### AMM Pool Contract
 
-Located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs).
+| Key | Storage Tier | Type | Description |
+|---|---|---|---|
+| `TokenA` | Instance | `Address` | First pool asset |
+| `TokenB` | Instance | `Address` | Second pool asset |
+| `LpToken` | Instance | `Address` | LP token contract |
+| `ReserveA` | Instance | `i128` | Current TokenA reserves |
+| `ReserveB` | Instance | `i128` | Current TokenB reserves |
+| `TotalShares` | Instance | `i128` | Total LP shares issued |
+| `FeeBps` | Instance | `i128` | Swap fee in basis points |
 
-#### Storage
+### LP Token Contract
+
+| Key | Storage Tier | Type | Description |
+|---|---|---|---|
+| `Admin` | Instance | `Address` | Contract administrator (the AMM pool) |
+| `Name` | Instance | `String` | Token name |
+| `Symbol` | Instance | `String` | Token symbol |
+| `Decimals` | Instance | `u32` | Token decimal places |
+| `TotalSupply` | Instance | `i128` | Total shares in circulation |
+| `Balance(Address)` | Persistent | `i128` | Individual user share balance |
+| `Allowance(Address, Address)` | Persistent | `i128` | Third-party spending allowance |
+
+---
+
+## Upgrade Considerations
+
+- **Storage Immutability**: Critical setup parameters (e.g., `TokenA`, `TokenB`, `LpToken`) are immutable after `initialize`.
+- **Breaking Changes**: Modifying `DataKey` variants or data types constitutes a breaking change. Since Soroban storage is keyed by the enum's binary representation, any restructuring requires a new deployment or a careful migration strategy.
+- **State Migration**: Upgrading logic while preserving state is possible via contract code upgrades, but changing storage tiers (e.g., Instance to Persistent) requires manual data relocation.
+
+---
+
+## Public Interface
 
 | Key | Type | Description |
 |---|---|---|
@@ -75,12 +110,20 @@ Located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs).
 | `TotalShares` | `i128` | Total LP shares outstanding |
 | `Shares(Address)` | `i128` | LP shares held by a specific provider |
 | `FeeBps` | `i128` | Swap fee in basis points (e.g. `30` = 0.30%) |
+| `Paused` | `bool` | Emergency circuit breaker state |
+| `FlashLoanFeeBps` | `i128` | Flash-loan fee in basis points; defaults to `FeeBps` |
+### AMM Pool Contract
 
-#### Public Interface
+Located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs).
 
 | Function | Description |
 |---|---|
 | `initialize(token_a, token_b, lp_token, fee_bps)` | One-time pool setup |
+| `pause(admin)` | Pause state-changing pool operations; requires `admin` auth |
+| `unpause(admin)` | Resume state-changing pool operations; requires `admin` auth |
+| `is_paused() → bool` | Read the current pause state |
+| `initialize_with_flash_loan_fee(token_a, token_b, lp_token, fee_bps, flash_loan_fee_bps)` | One-time pool setup with a distinct flash-loan fee |
+| `flash_loan(receiver, token, amount, data) -> fee` | Borrow pool reserves and repay within the receiver callback |
 | `add_liquidity(provider, amount_a, amount_b, min_shares) → shares` | Deposit tokens, receive LP shares |
 | `remove_liquidity(provider, shares, min_a, min_b) → (a, b)` | Burn LP shares, withdraw tokens |
 | `swap(trader, token_in, amount_in, min_out) → amount_out` | Exchange tokens |
@@ -88,13 +131,21 @@ Located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs).
 | `get_info() → PoolInfo` | Read pool state (reserves, fee, shares) |
 | `shares_of(provider) → shares` | Read an LP's share balance |
 
+#### Flash Loan Receiver Interface
+
+Borrowers must implement a callback contract with this interface:
+
+```rust
+pub trait FlashLoanReceiver {
+    fn on_flash_loan(env: Env, token: Address, amount: i128, fee: i128, data: Bytes) -> bool;
+}
+```
+
+During `flash_loan`, the AMM transfers `amount` of `token` to `receiver`, invokes `on_flash_loan`, and then checks that the pool's token balance increased by at least `fee`. If the receiver does not return `amount + fee` before the callback finishes, the transaction reverts.
+
 ### LP Token Contract
 
 Located in [contracts/token/src/lib.rs](contracts/token/src/lib.rs).
-
-A minimal SEP-41 compliant fungible token used exclusively as the LP share token. The AMM contract is set as admin at deployment and is the only caller permitted to `mint` and `burn`.
-
-#### Public Interface
 
 | Function | Description |
 |---|---|
@@ -233,6 +284,12 @@ You are now ready to build, test, and deploy.
 Build all contracts as optimised WASM binaries:
 
 ```sh
+cargo wasm
+```
+
+`wasm` is a Cargo alias defined in [.cargo/config.toml](.cargo/config.toml) that expands to:
+
+```sh
 cargo build --release --target wasm32-unknown-unknown
 ```
 
@@ -252,6 +309,14 @@ cargo test
 ```
 
 Tests are located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs) and cover adding liquidity, swapping, and removing liquidity.
+
+For a real-network smoke test on Stellar testnet, run the end-to-end script:
+
+```sh
+scripts/e2e.sh
+```
+
+The script deploys fresh contracts, funds a test account, adds liquidity, swaps, removes liquidity, and exits non-zero on any failed assertion.
 
 ---
 
@@ -366,6 +431,17 @@ stellar contract invoke --id <AMM_CONTRACT_ID> \
   -- shares_of --provider <PROVIDER_ADDRESS>
 ```
 
+### TypeScript Client Example
+
+A standalone TypeScript client is available in [examples/client](examples/client). It demonstrates connecting to Stellar testnet RPC, reading `get_info()`, quoting with `get_amount_out()`, executing `swap()`, and reading LP shares with `shares_of()`.
+
+```sh
+cd examples/client
+npm install
+npm run build
+npm start
+```
+
 ---
 
 ## Contributing
@@ -420,6 +496,7 @@ Contributions are welcome. Please follow the guidelines below to keep the codeba
 
 ### Code Style
 
+- An [`.editorconfig`](.editorconfig) at the workspace root defines shared formatting rules (UTF-8, LF line endings, 4-space indentation, trailing-whitespace trimming). Most editors apply it automatically; install the [EditorConfig plugin](https://editorconfig.org/#download) if yours does not.
 - Run `cargo fmt` before committing — the project uses default `rustfmt` settings.
 - Run `cargo clippy -- -D warnings` and resolve any warnings before opening a PR.
 - Prefer explicit arithmetic with overflow checks over silent wrapping. The release profile already enables `overflow-checks = true`.
