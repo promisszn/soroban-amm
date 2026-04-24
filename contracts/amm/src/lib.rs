@@ -1626,6 +1626,173 @@ mod tests {
             amm.try_add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &1_000_001_i128);
         assert!(result.is_err());
     }
+
+    // ── Issue #34: imbalanced deposit uses the minimum ratio ──────────────────
+
+    #[test]
+    fn test_imbalanced_deposit_uses_minimum_ratio() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        // Seed pool: 1,000,000 A and 2,000,000 B (ratio 1:2)
+        let seeder = Address::generate(env);
+        ta_sac.mint(&seeder, &1_000_000_i128);
+        tb_sac.mint(&seeder, &2_000_000_i128);
+        let initial_shares = amm.add_liquidity(&seeder, &1_000_000_i128, &2_000_000_i128, &0_i128);
+
+        // Deposit 500,000 A and 1,500,000 B — B is 500,000 in excess of the 1:2 ratio
+        let lp2 = Address::generate(env);
+        ta_sac.mint(&lp2, &500_000_i128);
+        tb_sac.mint(&lp2, &1_500_000_i128);
+        let shares_minted = amm.add_liquidity(&lp2, &500_000_i128, &1_500_000_i128, &0_i128);
+
+        let shares_from_a = 500_000_i128 * initial_shares / 1_000_000;
+        let shares_from_b = 1_500_000_i128 * initial_shares / 2_000_000;
+
+        assert!(shares_from_a < shares_from_b, "TokenA should be the limiting ratio");
+        assert_eq!(shares_minted, shares_from_a, "shares minted must use the limiting (TokenA) ratio");
+
+        let info = amm.get_info();
+        assert_eq!(info.reserve_a, 1_500_000);
+        assert_eq!(info.reserve_b, 3_500_000);
+    }
+
+    // ── Issue #35: partial remove_liquidity leaves correct residual reserves ──
+
+    #[test]
+    fn test_partial_remove_liquidity_leaves_correct_reserves() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        let total_shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        assert_eq!(total_shares, 1_000_000);
+
+        let shares_to_remove = total_shares / 4; // 25% = 250,000
+        let (out_a, out_b) = amm.remove_liquidity(&provider, &shares_to_remove, &0_i128, &0_i128);
+
+        assert_eq!(out_a, 250_000);
+        assert_eq!(out_b, 250_000);
+
+        let info = amm.get_info();
+        assert_eq!(info.reserve_a, 750_000);
+        assert_eq!(info.reserve_b, 750_000);
+        assert_eq!(info.total_shares, total_shares - shares_to_remove);
+    }
+
+    // ── Issue #36: swap output rate decreases as input size grows ─────────────
+
+    #[test]
+    fn test_swap_output_rate_decreases_with_input_size() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+
+        let input_sizes = [1_000_i128, 10_000_i128, 100_000_i128, 500_000_i128];
+        let mut prev_rate = i128::MAX;
+
+        for &amount_in in input_sizes.iter() {
+            let amount_out = amm.get_amount_out(&ts.ta_addr, &amount_in);
+            // Scale by 1_000_000 to preserve precision when comparing rates
+            let rate = amount_out * 1_000_000 / amount_in;
+            assert!(
+                rate < prev_rate,
+                "effective rate {rate} at input {amount_in} should be strictly less than previous rate {prev_rate}"
+            );
+            prev_rate = rate;
+        }
+    }
+
+    // ── Issue #37: overflow guard tests for near-maximum reserve values ────────
+
+    #[test]
+    fn test_sqrt_handles_large_input() {
+        // sqrt(10^18) = 10^9
+        assert_eq!(AmmPool::sqrt(1_000_000_000_000_000_000_i128), 1_000_000_000_i128);
+        // sqrt(10^36) = 10^18; 10^36 < i128::MAX (~1.7e38)
+        assert_eq!(
+            AmmPool::sqrt(1_000_000_000_000_000_000_000_000_000_000_000_000_i128),
+            1_000_000_000_000_000_000_i128,
+        );
+    }
+
+    #[test]
+    fn test_large_reserves_add_liquidity_no_overflow() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        // 4e18 * 4e18 = 1.6e37 < i128::MAX (~1.7e38); sqrt = 4e18
+        let large_amount = 4_000_000_000_000_000_000_i128;
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &large_amount);
+        tb_sac.mint(&provider, &large_amount);
+        let shares = amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128);
+
+        assert_eq!(shares, large_amount);
+        let info = amm.get_info();
+        assert_eq!(info.reserve_a, large_amount);
+        assert_eq!(info.reserve_b, large_amount);
+    }
+
+    #[test]
+    fn test_large_reserves_swap_no_overflow() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let large_amount = 4_000_000_000_000_000_000_i128;
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &large_amount);
+        tb_sac.mint(&provider, &large_amount);
+        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128);
+
+        // amount_in=10^9; numerator = 10^9*9970*4e18 ~ 4e31 < i128::MAX
+        let trader = Address::generate(env);
+        let amount_in = 1_000_000_000_i128;
+        ta_sac.mint(&trader, &amount_in);
+        let out = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128);
+        assert!(out > 0 && out < large_amount);
+    }
+
+    #[test]
+    fn test_large_reserves_price_ratio_no_overflow() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let large_amount = 4_000_000_000_000_000_000_i128;
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &large_amount);
+        tb_sac.mint(&provider, &large_amount);
+        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128);
+
+        // price_ratio: reserve_b * 1_000_000 / reserve_a; 4e18 * 1e6 = 4e24 < i128::MAX
+        let (price_a, price_b) = amm.price_ratio();
+        assert_eq!(price_a, 1_000_000);
+        assert_eq!(price_b, 1_000_000);
+    }
 }
 
 // ── Property-based tests ───────────────────────────────────────────────────────
