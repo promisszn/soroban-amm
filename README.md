@@ -26,6 +26,7 @@ A constant-product Automated Market Maker (AMM) built as a Soroban smart contrac
   - [Query the Pool](#query-the-pool)
   - [TypeScript Client Example](#typescript-client-example)
 - [Contributing](#contributing)
+- [Security](#security)
 - [License](#license)
 
 ---
@@ -570,7 +571,7 @@ Contributions are welcome. Please follow the guidelines below to keep the codeba
 
 - Search existing issues before opening a new one.
 - Include the Rust / `soroban-sdk` version, the steps to reproduce, and the expected vs. actual behavior.
-- For security vulnerabilities, **do not open a public issue** — contact the maintainers directly.
+- For security vulnerabilities, **do not open a public issue** — see [SECURITY.md](SECURITY.md) for the responsible disclosure process.
 
 ### Development Workflow
 
@@ -641,6 +642,12 @@ Before requesting review, confirm:
 ### Versioning
 
 This project follows [Semantic Versioning](https://semver.org/). Breaking changes to the on-chain interface (function signatures, storage layout, error codes) constitute a major version bump.
+
+---
+
+## Security
+
+Please do not open public issues for security vulnerabilities. See [SECURITY.md](SECURITY.md) for the full vulnerability disclosure policy, supported versions, and how to reach the maintainers privately.
 
 ---
 
