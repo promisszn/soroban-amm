@@ -922,7 +922,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'fee_bps must be between 0 and 10000, got 10001' from contract function 'Symbol(obj#211)'"
+                  "string": "caught panic 'invalid fee: 10001 is outside 0..=10_000' from contract function 'Symbol(obj#211)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"

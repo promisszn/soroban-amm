@@ -170,7 +170,7 @@ impl Factory {
 //
 // Tests deploy the AMM and token contracts as real WASM. Build the WASM first:
 //
-//   cargo build --release --target wasm32-unknown-unknown
+//   cargo build --release --target wasm32v1-none
 //
 // Then run:
 //
@@ -184,13 +184,13 @@ mod tests {
     // Embed compiled WASM at test-compile time.
     mod amm_wasm {
         soroban_sdk::contractimport!(
-            file = "../../target/wasm32-unknown-unknown/release/amm.wasm"
+            file = "../../target/wasm32v1-none/release/amm.wasm"
         );
     }
 
     mod token_wasm {
         soroban_sdk::contractimport!(
-            file = "../../target/wasm32-unknown-unknown/release/token.wasm"
+            file = "../../target/wasm32v1-none/release/token.wasm"
         );
     }
 
