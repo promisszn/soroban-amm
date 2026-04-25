@@ -1,0 +1,33 @@
+## Summary of Changes
+
+<!-- Explain *what* changed and *why*. Keep it concise but complete enough
+     for a reviewer who has no prior context. -->
+
+## Related Issue(s)
+
+<!-- Link every issue this PR addresses.
+     Use "Closes #<n>" to auto-close on merge, or "Related to #<n>" for partial work. -->
+
+- Closes #
+
+## Type of Change
+
+<!-- Check all that apply. -->
+
+- [ ] Bug fix
+- [ ] New feature
+- [ ] Refactor (no behaviour change)
+- [ ] Tests only
+- [ ] Documentation only
+- [ ] Chore (build, tooling, dependencies)
+
+## Checklist
+
+<!-- Complete every item before requesting review. -->
+
+- [ ] `cargo fmt` has been run
+- [ ] `cargo clippy -- -D warnings` passes with no new warnings
+- [ ] `cargo test` passes (build WASM first for factory tests: `cargo build --release --target wasm32-unknown-unknown`)
+- [ ] New behaviour is covered by tests
+- [ ] Public interface changes are reflected in the README
+- [ ] Commit messages follow the [Conventional Commits](https://www.conventionalcommits.org/) format
