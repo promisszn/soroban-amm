@@ -9,11 +9,8 @@
 
 #![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, contracttype,
-    Address, BytesN, Env, Vec,
-};
 use amm::AmmPoolClient;
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Vec};
 use token::LpTokenClient;
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -51,9 +48,15 @@ impl Factory {
             panic!("already initialized");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
-        env.storage().instance().set(&DataKey::AmmWasmHash, &amm_wasm_hash);
-        env.storage().instance().set(&DataKey::TokenWasmHash, &token_wasm_hash);
-        env.storage().instance().set(&DataKey::AllPools, &Vec::<Address>::new(&env));
+        env.storage()
+            .instance()
+            .set(&DataKey::AmmWasmHash, &amm_wasm_hash);
+        env.storage()
+            .instance()
+            .set(&DataKey::TokenWasmHash, &token_wasm_hash);
+        env.storage()
+            .instance()
+            .set(&DataKey::AllPools, &Vec::<Address>::new(&env));
         env.storage().instance().set(&DataKey::PoolCount, &0u64);
     }
 
@@ -66,12 +69,7 @@ impl Factory {
     /// to match the original order when looking up a pool.
     ///
     /// Panics if a pool for this pair already exists.
-    pub fn create_pool(
-        env: Env,
-        token_a: Address,
-        token_b: Address,
-        fee_bps: i128,
-    ) -> Address {
+    pub fn create_pool(env: Env, token_a: Address, token_b: Address, fee_bps: i128) -> Address {
         // Normalise: smaller address is always token_a.
         let (ta, tb) = if token_a < token_b {
             (token_a, token_b)
@@ -79,26 +77,42 @@ impl Factory {
             (token_b, token_a)
         };
 
-        if env.storage().instance().has(&DataKey::Pool(ta.clone(), tb.clone())) {
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::Pool(ta.clone(), tb.clone()))
+        {
             panic!("pool already exists");
         }
 
-        let amm_wasm: BytesN<32> =
-            env.storage().instance().get(&DataKey::AmmWasmHash).unwrap();
-        let token_wasm: BytesN<32> =
-            env.storage().instance().get(&DataKey::TokenWasmHash).unwrap();
+        let amm_wasm: BytesN<32> = env.storage().instance().get(&DataKey::AmmWasmHash).unwrap();
+        let token_wasm: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::TokenWasmHash)
+            .unwrap();
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
 
         // Derive two unique salts per pool from a monotonic counter.
-        let n: u64 = env.storage().instance().get(&DataKey::PoolCount).unwrap_or(0);
+        let n: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::PoolCount)
+            .unwrap_or(0);
         env.storage().instance().set(&DataKey::PoolCount, &(n + 1));
 
         let lp_salt = Self::make_salt(&env, n * 2);
         let pool_salt = Self::make_salt(&env, n * 2 + 1);
 
         // Deploy LP token then AMM pool.
-        let lp_addr = env.deployer().with_current_contract(lp_salt).deploy(token_wasm);
-        let pool_addr = env.deployer().with_current_contract(pool_salt).deploy(amm_wasm);
+        let lp_addr = env
+            .deployer()
+            .with_current_contract(lp_salt)
+            .deploy(token_wasm);
+        let pool_addr = env
+            .deployer()
+            .with_current_contract(pool_salt)
+            .deploy(amm_wasm);
 
         // Initialize LP token — admin must be the pool so it can mint/burn.
         LpTokenClient::new(&env, &lp_addr).initialize(
@@ -110,13 +124,8 @@ impl Factory {
 
         // Initialize AMM pool.
         AmmPoolClient::new(&env, &pool_addr).initialize(
-            &admin,
-            &ta,
-            &tb,
-            &lp_addr,
-            &fee_bps,
-            &admin,   // fee_recipient
-            &0_i128,  // protocol_fee_bps (disabled by default)
+            &admin, &ta, &tb, &lp_addr, &fee_bps, &admin,  // fee_recipient
+            &0_i128, // protocol_fee_bps (disabled by default)
         );
 
         // Register pool in both lookup indexes.
@@ -183,15 +192,11 @@ mod tests {
 
     // Embed compiled WASM at test-compile time.
     mod amm_wasm {
-        soroban_sdk::contractimport!(
-            file = "../../target/wasm32v1-none/release/amm.wasm"
-        );
+        soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/amm.wasm");
     }
 
     mod token_wasm {
-        soroban_sdk::contractimport!(
-            file = "../../target/wasm32v1-none/release/token.wasm"
-        );
+        soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/token.wasm");
     }
 
     /// Deploy the factory and return (env, factory_client).

@@ -1,0 +1,110 @@
+{
+  "contracts": {
+    "amm": {
+      "functions": [
+        {
+          "name": "initialize",
+          "inputs": [
+            { "name": "admin", "type": "Address" },
+            { "name": "token_a", "type": "Address" },
+            { "name": "token_b", "type": "Address" },
+            { "name": "lp_token", "type": "Address" },
+            { "name": "fee_bps", "type": "i128" },
+            { "name": "fee_recipient", "type": "Address" },
+            { "name": "protocol_fee_bps", "type": "i128" }
+          ],
+          "outputs": [],
+          "events": []
+        },
+        {
+          "name": "swap",
+          "inputs": [
+            { "name": "trader", "type": "Address" },
+            { "name": "token_in", "type": "Address" },
+            { "name": "amount_in", "type": "i128" },
+            { "name": "min_out", "type": "i128" }
+          ],
+          "outputs": [{ "type": "i128" }],
+          "events": ["swap"]
+        },
+        {
+          "name": "add_liquidity",
+          "inputs": [
+            { "name": "provider", "type": "Address" },
+            { "name": "amount_a", "type": "i128" },
+            { "name": "amount_b", "type": "i128" },
+            { "name": "min_shares", "type": "i128" }
+          ],
+          "outputs": [{ "type": "i128" }],
+          "events": ["add_liquidity"]
+        },
+        {
+          "name": "remove_liquidity",
+          "inputs": [
+            { "name": "provider", "type": "Address" },
+            { "name": "shares", "type": "i128" },
+            { "name": "min_a", "type": "i128" },
+            { "name": "min_b", "type": "i128" }
+          ],
+          "outputs": [{ "type": "(i128, i128)" }],
+          "events": ["remove_liquidity"]
+        },
+        {
+          "name": "get_info",
+          "inputs": [],
+          "outputs": [{ "type": "PoolInfo" }],
+          "events": []
+        },
+        {
+          "name": "withdraw_protocol_fees",
+          "inputs": [],
+          "outputs": [{ "type": "(i128, i128)" }],
+          "events": ["withdraw_fees"]
+        }
+      ]
+    },
+    "token": {
+      "functions": [
+        {
+          "name": "initialize",
+          "inputs": [
+            { "name": "admin", "type": "Address" },
+            { "name": "name", "type": "String" },
+            { "name": "symbol", "type": "String" },
+            { "name": "decimals", "type": "u32" }
+          ],
+          "outputs": [],
+          "events": []
+        },
+        {
+          "name": "transfer",
+          "inputs": [
+            { "name": "from", "type": "Address" },
+            { "name": "to", "type": "Address" },
+            { "name": "amount", "type": "i128" }
+          ],
+          "outputs": [],
+          "events": ["transfer"]
+        },
+        {
+          "name": "mint",
+          "inputs": [
+            { "name": "to", "type": "Address" },
+            { "name": "amount", "type": "i128" }
+          ],
+          "outputs": [],
+          "events": ["mint"]
+        },
+        {
+          "name": "burn",
+          "inputs": [
+            { "name": "from", "type": "Address" },
+            { "name": "amount", "type": "i128" }
+          ],
+          "outputs": [],
+          "events": ["burn"]
+        }
+      ]
+    }
+  }
+}
