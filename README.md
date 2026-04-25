@@ -12,6 +12,7 @@ A constant-product Automated Market Maker (AMM) built as a Soroban smart contrac
   - [AMM Pool Contract](#amm-pool-contract)
   - [LP Token Contract](#lp-token-contract)
   - [Factory Contract](#factory-contract)
+  - [TWAP Consumer Contract](#twap-consumer-contract)
 - [Math & Formulas](#math--formulas)
 - [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
@@ -24,6 +25,7 @@ A constant-product Automated Market Maker (AMM) built as a Soroban smart contrac
   - [Swap Tokens](#swap-tokens)
   - [Remove Liquidity](#remove-liquidity)
   - [Query the Pool](#query-the-pool)
+  - [Use the TWAP Oracle](#use-the-twap-oracle)
   - [TypeScript Client Example](#typescript-client-example)
 - [Contributing](#contributing)
 - [Security](#security)
@@ -45,7 +47,7 @@ All operations include slippage protection parameters. Fees are configurable in 
 
 ## Architecture
 
-The project is a Cargo workspace with two contracts:
+The project is a Cargo workspace with four contracts:
 
 ```
 soroban-amm/
@@ -55,7 +57,9 @@ soroban-amm/
     │   └── src/lib.rs
     ├── token/                  # SEP-41 LP token contract
     │   └── src/lib.rs
-    └── factory/                # Pool factory contract
+    ├── factory/                # Pool factory contract
+    │   └── src/lib.rs
+    └── twap_consumer/          # Example TWAP consumer integration contract
         └── src/lib.rs
 ```
 
@@ -167,6 +171,21 @@ A single-entry-point contract for creating and discovering AMM pools. The factor
 - Token pair order is **normalised** at creation time (smaller address stored first). `get_pool` accepts either order.
 - `create_pool` panics with `"pool already exists"` if a pool for the pair is already registered.
 - The factory admin is set as the AMM's `fee_recipient`; protocol fees start at 0 bps and can be enabled later.
+
+---
+
+### TWAP Consumer Contract
+
+Located in [contracts/twap_consumer/src/lib.rs](contracts/twap_consumer/src/lib.rs).
+
+An example integration contract that reads the AMM cumulative oracle and computes a windowed TWAP for token A.
+
+| Function | Description |
+|---|---|
+| `save_snapshot(pool)` | Stores `(cum_a, cum_b, pool_ts)` under `Snapshot(pool, pool_ts)` |
+| `get_twap_price(pool, window_seconds) -> i128` | Returns `(cum_a_now - cum_a_then) / window_seconds`, where `cum_a_then` comes from the snapshot at `now_ts - window_seconds` |
+
+This contract is intentionally simple and intended as integration documentation for downstream builders.
 
 ---
 
@@ -549,6 +568,38 @@ stellar contract invoke --id <AMM_CONTRACT_ID> \
 stellar contract invoke --id <AMM_CONTRACT_ID> \
   -- shares_of --provider <PROVIDER_ADDRESS>
 ```
+
+### Use the TWAP Oracle
+
+The AMM exposes cumulative price state with `get_price_cumulative()`. The example consumer contract shows one way to turn that into a fixed-window TWAP.
+
+1. Deploy `twap_consumer.wasm`.
+2. Save a snapshot (for example every minute):
+
+```sh
+stellar contract invoke \
+  --id <TWAP_CONSUMER_CONTRACT_ID> \
+  --network testnet --source <YOUR_KEY> \
+  -- save_snapshot \
+  --pool <AMM_CONTRACT_ID>
+```
+
+3. After `window_seconds` has elapsed, read TWAP:
+
+```sh
+stellar contract invoke \
+  --id <TWAP_CONSUMER_CONTRACT_ID> \
+  --network testnet --source <YOUR_KEY> \
+  -- get_twap_price \
+  --pool <AMM_CONTRACT_ID> \
+  --window_seconds 60
+```
+
+Notes:
+
+- `window_seconds` must be greater than 0.
+- `save_snapshot` must have been called exactly at `now_ts - window_seconds` (matching the pool timestamp used by `get_price_cumulative`).
+- Returned TWAP is scaled the same way as AMM spot price (`1_000_000` scale factor).
 
 ### TypeScript Client Example
 
