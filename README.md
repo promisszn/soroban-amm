@@ -25,6 +25,7 @@ A constant-product Automated Market Maker (AMM) built as a Soroban smart contrac
   - [Remove Liquidity](#remove-liquidity)
   - [Query the Pool](#query-the-pool)
   - [TypeScript Client Example](#typescript-client-example)
+  - [Python Client Example](#python-client-example)
 - [Contributing](#contributing)
 - [Security](#security)
 - [License](#license)
@@ -559,6 +560,18 @@ cd examples/client
 npm install
 npm run build
 npm start
+```
+
+### Python Client Example
+
+A standalone Python client is available in [examples/python](examples/python). It demonstrates the same flow using `py-stellar-base` (`stellar-sdk`): connect to Stellar testnet RPC, read `get_info()`, quote with `get_amount_out()`, execute `swap()`, and read LP shares with `shares_of()`.
+
+```sh
+cd examples/python
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+python client.py
 ```
 
 ---
