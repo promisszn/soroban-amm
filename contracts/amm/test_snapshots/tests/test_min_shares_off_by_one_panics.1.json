@@ -321,7 +321,76 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "AccruedFeeA"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "i128": {
+                            "hi": 0,
+                            "lo": 0
+                          }
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "AccruedFeeB"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "i128": {
+                            "hi": 0,
+                            "lo": 0
+                          }
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "Admin"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "FeeBps"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "i128": {
+                            "hi": 0,
+                            "lo": 30
+                          }
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "FeeRecipient"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "FlashLoanFeeBps"
                             }
                           ]
                         },
@@ -360,6 +429,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "Paused"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "bool": false
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "PriceCumulativeA"
                             }
                           ]
@@ -376,6 +457,21 @@
                           "vec": [
                             {
                               "symbol": "PriceCumulativeB"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "i128": {
+                            "hi": 0,
+                            "lo": 0
+                          }
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "ProtocolFeeBps"
                             }
                           ]
                         },
@@ -1276,6 +1372,9 @@
             "data": {
               "vec": [
                 {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                },
+                {
                   "address": "CCABDO7UZXYE4W6GVSEGSNNZTKSLFQGKXXQTH6OX7M7GKZ4Z6CUJNGZN"
                 },
                 {
@@ -1288,6 +1387,15 @@
                   "i128": {
                     "hi": 0,
                     "lo": 30
+                  }
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 0
                   }
                 }
               ]
@@ -1534,7 +1642,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000001
+                    "lo": 999001
                   }
                 }
               ]
@@ -1743,7 +1851,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'slippage: insufficient shares minted: computed=1000000, minimum=1000001' from contract function 'Symbol(obj#357)'"
+                  "string": "caught panic 'slippage: insufficient shares minted: computed=999000, minimum=999001' from contract function 'Symbol(obj#381)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
@@ -1763,7 +1871,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1000001
+                    "lo": 999001
                   }
                 }
               ]
@@ -1843,7 +1951,7 @@
                     {
                       "i128": {
                         "hi": 0,
-                        "lo": 1000001
+                        "lo": 999001
                       }
                     }
                   ]
