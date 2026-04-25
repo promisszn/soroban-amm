@@ -392,6 +392,18 @@ The script deploys fresh contracts, funds a test account, adds liquidity, swaps,
 
 ## Usage
 
+### Automated Deployment
+
+The fastest way to deploy a full AMM environment (Token A, Token B, LP Token, and AMM Pool) to testnet is using the provided deployment script:
+
+```sh
+./scripts/deploy.sh [network]
+```
+
+- **network**: Optional target network (defaults to `testnet`).
+- The script builds contracts, generates/funds a deployer account, deploys all contracts, and initialises them.
+- Deployed contract IDs are printed to the console and saved to `.soroban-amm.deploy.env`.
+
 ### Deploy via Factory
 
 The factory is the recommended way to create pools. It deploys and initialises the AMM pool and its LP token in a single transaction, and registers the pool in its on-chain registry.
