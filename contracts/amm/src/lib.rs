@@ -127,16 +127,29 @@ impl AmmPool {
         fee_recipient: Address,
         protocol_fee_bps: i128,
     ) {
-        Self::initialize_with_flash_loan_fee(env, token_a, token_b, lp_token, fee_bps, fee_bps);
+        Self::initialize_with_flash_loan_fee(
+            env,
+            admin,
+            token_a,
+            token_b,
+            lp_token,
+            fee_bps,
+            fee_recipient,
+            protocol_fee_bps,
+            fee_bps,
+        );
     }
 
     /// Initialize the pool with a distinct flash-loan fee.
     pub fn initialize_with_flash_loan_fee(
         env: Env,
+        admin: Address,
         token_a: Address,
         token_b: Address,
         lp_token: Address,
         fee_bps: i128,
+        fee_recipient: Address,
+        protocol_fee_bps: i128,
         flash_loan_fee_bps: i128,
     ) {
         if env.storage().instance().has(&DataKey::TokenA) {
@@ -160,7 +173,6 @@ assert!(
         assert!(
             (0..=fee_bps).contains(&protocol_fee_bps),
             "invalid protocol fee: {protocol_fee_bps} must be in 0..={fee_bps}"
-        );
         );
 
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -236,7 +248,6 @@ env.storage()
         let recipient: Option<Address> = env.storage().instance().get(&DataKey::FeeRecipient);
         let bps: i128 = env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
         (recipient, bps)
-    }
     }
 
     // ── Liquidity ─────────────────────────────────────────────────────────────
@@ -637,6 +648,8 @@ env.storage()
         }
 
         (fee_a, fee_b)
+    }
+
     /// Borrow pool liquidity and repay it plus a fee during the receiver callback.
     pub fn flash_loan(
         env: Env,
@@ -817,7 +830,6 @@ env.storage()
         assert!(amount_out < reserve_out, "amount_out >= reserve_out");
         (reserve_in * amount_out * 10_000) / ((reserve_out - amount_out) * (10_000 - fee_bps)) + 1
     }
-    }
 
     /// Return full pool state.
     /// Return a snapshot of the full pool state.
@@ -928,7 +940,7 @@ env.storage()
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
@@ -943,7 +955,7 @@ mod tests {
         ShouldRepay,
     }
     #[contract]
-    pub struct MockFlashLoanReceiver;
+    pub(crate) struct MockFlashLoanReceiver;
     #[contractimpl]
     impl MockFlashLoanReceiver {
         pub fn initialize(env: Env, amm: Address, should_repay: bool) {
@@ -974,7 +986,7 @@ mod tests {
     }
 
     /// Register a Stellar Asset Contract and return (TokenClient, StellarAssetClient).
-    fn create_sac<'a>(
+    pub(crate) fn create_sac<'a>(
         env: &'a Env,
         admin: &Address,
     ) -> (StellarTokenClient<'a>, StellarAssetClient<'a>) {
@@ -985,19 +997,19 @@ mod tests {
         )
     }
 
-    struct TestSetup {
-        env: Env,
-        amm_addr: Address,
-        lp_addr: Address,
-        ta_addr: Address,
-        tb_addr: Address,
+    pub(crate) struct TestSetup {
+        pub(crate) env: Env,
+        pub(crate) amm_addr: Address,
+        pub(crate) lp_addr: Address,
+        pub(crate) ta_addr: Address,
+        pub(crate) tb_addr: Address,
         #[allow(dead_code)]
-        admin: Address,
+        pub(crate) admin: Address,
     }
 
     /// Minimal setup: env + uninitialized AMM + LP token. Tokens are created by
     /// individual tests so each test can control the pool ratio independently.
-    fn setup() -> (Env, Address, Address, Address, Address) {
+    pub(crate) fn setup() -> (Env, Address, Address, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().set_timestamp(12345);
@@ -1014,7 +1026,7 @@ mod tests {
         (env, admin.clone(), amm_addr, lp_addr, admin)
     }
 
-    fn setup_pool(fee_bps: i128) -> TestSetup {
+    pub(crate) fn setup_pool(fee_bps: i128) -> TestSetup {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().set_timestamp(12345);
@@ -1033,10 +1045,13 @@ mod tests {
         let (tb, tb_sac) = create_sac(&env, &admin);
 
         AmmPoolClient::new(&env, &amm_addr).initialize(
+            &admin,
             &ta.address,
             &tb.address,
             &lp_addr,
             &fee_bps,
+            &admin,
+            &0_i128,
         );
 
         let ta_addr = ta.address.clone();
@@ -1123,7 +1138,7 @@ mod tests {
         let (tb_client, _) = create_sac(&env, &admin);
 
         let amm = AmmPoolClient::new(&env, &amm_addr);
-        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
+        amm.initialize(&admin, &ta_client.address, &tb_client.address, &lp_addr, &30_i128, &admin, &0_i128);
 
         // No liquidity added — reserves are zero, should panic
         amm.price_ratio();
@@ -1151,7 +1166,7 @@ mod tests {
     fn test_initialize_twice_panics() {
         let ts = setup_pool(30);
         let amm = AmmPoolClient::new(&ts.env, &ts.amm_addr);
-        let result = amm.try_initialize(&ts.ta_addr, &ts.tb_addr, &ts.lp_addr, &30_i128);
+        let result = amm.try_initialize(&ts.admin, &ts.ta_addr, &ts.tb_addr, &ts.lp_addr, &30_i128, &ts.admin, &0_i128);
         assert!(result.is_err());
     }
 
@@ -1171,10 +1186,13 @@ mod tests {
         let (ta, _) = create_sac(&env, &admin);
         let (tb, _) = create_sac(&env, &admin);
         let result = AmmPoolClient::new(&env, &amm_addr).try_initialize(
+            &admin,
             &ta.address,
             &tb.address,
             &lp_addr,
             &10_001_i128,
+            &admin,
+            &0_i128,
         );
         assert!(result.is_err());
     }
@@ -1800,7 +1818,10 @@ mod tests {
 #[cfg(test)]
 mod prop_tests {
     extern crate std;
-    use super::AmmPool;
+    use super::*;
+    use super::tests::*;
+    use soroban_sdk::{testutils::{Address as _, Ledger as _}, Address, Bytes, Env, Vec, String};
+    use soroban_sdk::token::{StellarAssetClient, TokenClient as StellarTokenClient};
     use proptest::prelude::*;
 
     proptest! {
@@ -1878,10 +1899,13 @@ mod prop_tests {
 
         let amm = AmmPoolClient::new(&env, &amm_addr);
         amm.initialize_with_flash_loan_fee(
+            &admin,
             &ta_client.address,
             &tb_client.address,
             &lp_addr,
             &30_i128,
+            &admin,
+            &0_i128,
             &50_i128,
         );
 
@@ -1974,7 +1998,7 @@ mod prop_tests {
         let (ta_client, ta_sac) = create_sac(&env, &admin);
         let (tb_client, tb_sac) = create_sac(&env, &admin);
         let amm = AmmPoolClient::new(&env, &amm_addr);
-        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
+        amm.initialize(&admin, &ta_client.address, &tb_client.address, &lp_addr, &30_i128, &admin, &0_i128);
 
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &1_000_000_i128);
@@ -2018,7 +2042,7 @@ mod prop_tests {
         let (ta_client, ta_sac) = create_sac(&env, &admin);
         let (tb_client, tb_sac) = create_sac(&env, &admin);
         let amm = AmmPoolClient::new(&env, &amm_addr);
-        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
+        amm.initialize(&admin, &ta_client.address, &tb_client.address, &lp_addr, &30_i128, &admin, &0_i128);
 
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &1_000_000_i128);
@@ -2035,7 +2059,7 @@ mod prop_tests {
         let (ta_client, ta_sac) = create_sac(&env, &admin);
         let (tb_client, tb_sac) = create_sac(&env, &admin);
         let amm = AmmPoolClient::new(&env, &amm_addr);
-        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
+        amm.initialize(&admin, &ta_client.address, &tb_client.address, &lp_addr, &30_i128, &admin, &0_i128);
 
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &1_000_000_i128);
@@ -2056,7 +2080,7 @@ mod prop_tests {
         let (ta_client, ta_sac) = create_sac(&env, &admin);
         let (tb_client, tb_sac) = create_sac(&env, &admin);
         let amm = AmmPoolClient::new(&env, &amm_addr);
-        amm.initialize(&ta_client.address, &tb_client.address, &lp_addr, &30_i128);
+        amm.initialize(&admin, &ta_client.address, &tb_client.address, &lp_addr, &30_i128, &admin, &0_i128);
 
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &1_000_000_i128);
@@ -2116,6 +2140,7 @@ mod prop_tests {
 
         let amm = AmmPoolClient::new(&env, &amm_addr);
         amm.initialize(
+            &admin,
             &ta_client.address,
             &tb_client.address,
             &lp_addr,
@@ -2152,6 +2177,7 @@ mod prop_tests {
 
         let amm = AmmPoolClient::new(&env, &amm_addr);
         amm.initialize(
+            &admin,
             &ta_client.address,
             &tb_client.address,
             &lp_addr,
