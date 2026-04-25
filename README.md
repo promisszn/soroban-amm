@@ -422,6 +422,22 @@ The project includes a `Makefile` to simplify common development tasks:
 - `make e2e`: Run full end-to-end integration tests
 - `make clean`: Remove build artifacts
 
+### Reproducible Builds with Docker
+
+To ensure identical WASM binaries across different environments, you can use the provided Docker configuration:
+
+```sh
+# Build using Docker Compose
+docker compose run --rm build
+
+# Alternatively, using raw Docker
+docker build -t soroban-amm-build .
+docker run --rm -v $(pwd):/app soroban-amm-build
+```
+
+- **Base Image**: `rust:1.93.0-slim`
+- **Stellar CLI**: `25.1.0`
+
 ### Deploy via Factory
 
 The factory is the recommended way to create pools. It deploys and initialises the AMM pool and its LP token in a single transaction, and registers the pool in its on-chain registry.
