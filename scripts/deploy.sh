@@ -5,6 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 NETWORK="${1:-${STELLAR_NETWORK:-${NETWORK:-testnet}}}"
 SOURCE_ACCOUNT="${SOURCE_ACCOUNT:-soroban-amm-deployer}"
 DEPLOY_ENV="${DEPLOY_ENV:-"$ROOT_DIR/.soroban-amm.deploy.env"}"
+ADMIN_ADDRESS="${ADMIN_ADDRESS:-}"
+FEE_RECIPIENT="${FEE_RECIPIENT:-}"
+PROTOCOL_FEE_BPS="${PROTOCOL_FEE_BPS:-0}"
 
 TOKEN_WASM="${TOKEN_WASM:-"$ROOT_DIR/target/wasm32-unknown-unknown/release/token.wasm"}"
 AMM_WASM="${AMM_WASM:-"$ROOT_DIR/target/wasm32-unknown-unknown/release/amm.wasm"}"
@@ -73,6 +76,14 @@ require_cmd stellar
 generate_and_fund_source
 SOURCE_PUBLIC_KEY="$(stellar keys address "$SOURCE_ACCOUNT")"
 
+if [[ -z "$ADMIN_ADDRESS" ]]; then
+  ADMIN_ADDRESS="$SOURCE_PUBLIC_KEY"
+fi
+
+if [[ -z "$FEE_RECIPIENT" ]]; then
+  FEE_RECIPIENT="$SOURCE_PUBLIC_KEY"
+fi
+
 if [[ ! -f "$TOKEN_WASM" || ! -f "$AMM_WASM" ]]; then
   require_cmd cargo
   log "building release WASM artifacts"
@@ -114,13 +125,13 @@ invoke "$LP_TOKEN_CONTRACT_ID" initialize \
 
 log "initializing AMM"
 invoke "$AMM_CONTRACT_ID" initialize \
-  --admin "$SOURCE_PUBLIC_KEY" \
+--admin "$ADMIN_ADDRESS" \
   --token_a "$TOKEN_A_CONTRACT_ID" \
   --token_b "$TOKEN_B_CONTRACT_ID" \
   --lp_token "$LP_TOKEN_CONTRACT_ID" \
   --fee_bps 30 \
-  --fee_recipient "$SOURCE_PUBLIC_KEY" \
-  --protocol_fee_bps 0 >/dev/null
+  --fee_recipient "$FEE_RECIPIENT" \
+  --protocol_fee_bps "$PROTOCOL_FEE_BPS" >/dev/null
 
 cat >"$DEPLOY_ENV" <<EOF
 export NETWORK="$NETWORK"

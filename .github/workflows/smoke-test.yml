@@ -1,0 +1,47 @@
+name: Testnet Smoke Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      network:
+        description: Network to test against
+        default: testnet
+        required: true
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable with wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Stellar CLI
+        uses: stellar/stellar-cli@v23.0.1
+
+      - name: Import smoke test identity
+        shell: bash
+        env:
+          STELLAR_SECRET_KEY: ${{ secrets.TESTNET_SECRET_KEY }}
+        run: |
+          if [ -z "$STELLAR_SECRET_KEY" ]; then
+            echo "TESTNET_SECRET_KEY is not configured"
+            exit 1
+          fi
+          printf '%s\n' "$STELLAR_SECRET_KEY" | stellar keys add ci-smoke --secret-key
+
+      - name: Run e2e script
+        shell: bash
+        run: bash scripts/e2e.sh
+        env:
+          STELLAR_NETWORK: ${{ inputs.network }}
+          STELLAR_SECRET_KEY: ${{ secrets.TESTNET_SECRET_KEY }}
+          SOURCE_ACCOUNT: ci-smoke
