@@ -49,6 +49,7 @@ pub enum DataKey {
     Shares(Address),
     FeeBps,         // swap fee in basis points, e.g. 30 = 0.30 %
     Admin,          // Address — contract administrator; authorises set_protocol_fee
+    PendingAdmin,   // Option<Address> � nominee waiting to accept admin role
     FeeRecipient,   // Address — receives accrued protocol fees
     ProtocolFeeBps, // i128 — protocol fee bps (subset of FeeBps going to protocol)
     AccruedFeeA,    // i128 — protocol fees accrued in TokenA
@@ -257,6 +258,45 @@ impl AmmPool {
             .get(&DataKey::ProtocolFeeBps)
             .unwrap_or(0);
         (recipient, bps)
+    }
+
+    /// Nominate a new admin. The nominee must call `accept_admin` to complete the transfer.
+    ///
+    /// # Panics
+    /// - If `current_admin` is not the stored admin.
+    /// - If `current_admin` auth fails.
+    pub fn propose_admin(env: Env, current_admin: Address, new_admin: Address) {
+        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        assert!(current_admin == stored, "not admin");
+        current_admin.require_auth();
+        env.storage().instance().set(&DataKey::PendingAdmin, &Some(new_admin));
+    }
+
+    /// Accept the pending admin nomination. Caller becomes the new admin.
+    ///
+    /// # Panics
+    /// - If there is no pending admin proposal.
+    /// - If `new_admin` does not match the pending nominee.
+    /// - If `new_admin` auth fails.
+    pub fn accept_admin(env: Env, new_admin: Address) {
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None);
+        let nominee = pending.expect("no pending admin proposal");
+        assert!(new_admin == nominee, "caller is not the pending admin");
+        new_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().set(&DataKey::PendingAdmin, &Option::<Address>::None);
+    }
+
+    /// Return the pending admin nominee, or `None` if no transfer is in progress.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None)
     }
 
     // ── Liquidity ─────────────────────────────────────────────────────────────
