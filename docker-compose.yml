@@ -1,0 +1,8 @@
+services:
+  build:
+    build: .
+    volumes:
+      - .:/app
+    environment:
+      - CARGO_HOME=/app/.cargo_docker
+    command: make build

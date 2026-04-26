@@ -406,6 +406,39 @@ The fastest way to deploy a full AMM environment (Token A, Token B, LP Token, an
 - The script builds contracts, generates/funds a deployer account, deploys all contracts, and initialises them.
 - Deployed contract IDs are printed to the console and saved to `.soroban-amm.deploy.env`.
 
+### ABI Schema
+
+A machine-readable JSON schema of all public contract functions, parameters, and events is available at [docs/abi.json](docs/abi.json).
+
+### Development
+
+The project includes a `Makefile` to simplify common development tasks:
+
+- `make build`: Build contracts for production (`wasm32-unknown-unknown`)
+- `make test`: Run all contract unit tests
+- `make fmt`: Format code using `cargo fmt`
+- `make lint`: Run `clippy` with warnings treated as errors
+- `make check`: Run formatting, linting, and tests in sequence
+- `make deploy`: Deploy contracts to testnet via `scripts/deploy.sh`
+- `make e2e`: Run full end-to-end integration tests
+- `make clean`: Remove build artifacts
+
+### Reproducible Builds with Docker
+
+To ensure identical WASM binaries across different environments, you can use the provided Docker configuration:
+
+```sh
+# Build using Docker Compose
+docker compose run --rm build
+
+# Alternatively, using raw Docker
+docker build -t soroban-amm-build .
+docker run --rm -v $(pwd):/app soroban-amm-build
+```
+
+- **Base Image**: `rust:1.93.0-slim`
+- **Stellar CLI**: `25.1.0`
+
 ### Deploy via Factory
 
 The factory is the recommended way to create pools. It deploys and initialises the AMM pool and its LP token in a single transaction, and registers the pool in its on-chain registry.

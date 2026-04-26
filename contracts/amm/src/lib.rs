@@ -47,12 +47,12 @@ pub enum DataKey {
     PriceCumulativeB,
     LastTimestamp,
     Shares(Address),
-    FeeBps,          // swap fee in basis points, e.g. 30 = 0.30 %
-    Admin,           // Address — contract administrator; authorises set_protocol_fee
-    FeeRecipient,    // Address — receives accrued protocol fees
-    ProtocolFeeBps,  // i128 — protocol fee bps (subset of FeeBps going to protocol)
-    AccruedFeeA,     // i128 — protocol fees accrued in TokenA
-    AccruedFeeB,     // i128 — protocol fees accrued in TokenB
+    FeeBps,         // swap fee in basis points, e.g. 30 = 0.30 %
+    Admin,          // Address — contract administrator; authorises set_protocol_fee
+    FeeRecipient,   // Address — receives accrued protocol fees
+    ProtocolFeeBps, // i128 — protocol fee bps (subset of FeeBps going to protocol)
+    AccruedFeeA,    // i128 — protocol fees accrued in TokenA
+    AccruedFeeB,    // i128 — protocol fees accrued in TokenB
     Paused,
     FlashLoanFeeBps,
 }
@@ -117,6 +117,7 @@ impl AmmPool {
     /// - If the pool has already been initialized.
     /// - If `token_a == token_b`.
     /// - If `fee_bps` is outside the range `[0, 10_000]`.
+    #[allow(clippy::too_many_arguments)]
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -141,6 +142,7 @@ impl AmmPool {
     }
 
     /// Initialize the pool with a distinct flash-loan fee.
+    #[allow(clippy::too_many_arguments)]
     pub fn initialize_with_flash_loan_fee(
         env: Env,
         admin: Address,
@@ -158,7 +160,7 @@ impl AmmPool {
                 env.current_contract_address()
             );
         }
-assert!(
+        assert!(
             token_a != token_b,
             "tokens must differ: token_a={token_a:?}, token_b={token_b:?}"
         );
@@ -180,8 +182,12 @@ assert!(
         env.storage().instance().set(&DataKey::TokenB, &token_b);
         env.storage().instance().set(&DataKey::LpToken, &lp_token);
         env.storage().instance().set(&DataKey::FeeBps, &fee_bps);
-env.storage().instance().set(&DataKey::FeeRecipient, &fee_recipient);
-        env.storage().instance().set(&DataKey::ProtocolFeeBps, &protocol_fee_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeRecipient, &fee_recipient);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProtocolFeeBps, &protocol_fee_bps);
         env.storage().instance().set(&DataKey::AccruedFeeA, &0_i128);
         env.storage().instance().set(&DataKey::AccruedFeeB, &0_i128);
         env.storage()
@@ -190,7 +196,7 @@ env.storage().instance().set(&DataKey::FeeRecipient, &fee_recipient);
         env.storage().instance().set(&DataKey::ReserveA, &0_i128);
         env.storage().instance().set(&DataKey::ReserveB, &0_i128);
         env.storage().instance().set(&DataKey::TotalShares, &0_i128);
-env.storage()
+        env.storage()
             .instance()
             .set(&DataKey::PriceCumulativeA, &0_i128);
         env.storage()
@@ -223,12 +229,7 @@ env.storage()
     ///
     /// Set `protocol_fee_bps` to 0 to disable protocol fee collection.
     /// `protocol_fee_bps` must be ≤ the pool's `fee_bps`.
-    pub fn set_protocol_fee(
-        env: Env,
-        admin: Address,
-        recipient: Address,
-        protocol_fee_bps: i128,
-    ) {
+    pub fn set_protocol_fee(env: Env, admin: Address, recipient: Address, protocol_fee_bps: i128) {
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         assert!(admin == stored_admin, "not admin");
         admin.require_auth();
@@ -237,8 +238,12 @@ env.storage()
             protocol_fee_bps >= 0 && protocol_fee_bps <= fee_bps,
             "invalid protocol fee"
         );
-        env.storage().instance().set(&DataKey::FeeRecipient, &recipient);
-        env.storage().instance().set(&DataKey::ProtocolFeeBps, &protocol_fee_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey::FeeRecipient, &recipient);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProtocolFeeBps, &protocol_fee_bps);
     }
 
     /// Return the current protocol fee recipient and rate.
@@ -246,7 +251,11 @@ env.storage()
     /// Returns `(None, 0)` when protocol fees are disabled.
     pub fn get_protocol_fee(env: Env) -> (Option<Address>, i128) {
         let recipient: Option<Address> = env.storage().instance().get(&DataKey::FeeRecipient);
-        let bps: i128 = env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
+        let bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeBps)
+            .unwrap_or(0);
         (recipient, bps)
     }
 
@@ -528,7 +537,7 @@ env.storage()
         let client_out = SepTokenClient::new(&env, &token_out);
         client_out.transfer(&env.current_contract_address(), &trader, &amount_out);
 
-// Update accumulators before updating reserves.
+        // Update accumulators before updating reserves.
         let now = env.ledger().timestamp();
         let last_timestamp: u64 = env
             .storage()
@@ -566,8 +575,11 @@ env.storage()
         }
 
         // Separate protocol fee from LP reserves.
-        let protocol_fee_bps: i128 =
-            env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
+        let protocol_fee_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeBps)
+            .unwrap_or(0);
         let protocol_fee = if protocol_fee_bps > 0 {
             amount_in * protocol_fee_bps / 10_000
         } else {
@@ -582,8 +594,11 @@ env.storage()
                 .instance()
                 .set(&DataKey::ReserveB, &(reserve_out - amount_out));
             if protocol_fee > 0 {
-                let accrued: i128 =
-                    env.storage().instance().get(&DataKey::AccruedFeeA).unwrap_or(0);
+                let accrued: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::AccruedFeeA)
+                    .unwrap_or(0);
                 env.storage()
                     .instance()
                     .set(&DataKey::AccruedFeeA, &(accrued + protocol_fee));
@@ -596,8 +611,11 @@ env.storage()
                 .instance()
                 .set(&DataKey::ReserveA, &(reserve_out - amount_out));
             if protocol_fee > 0 {
-                let accrued: i128 =
-                    env.storage().instance().get(&DataKey::AccruedFeeB).unwrap_or(0);
+                let accrued: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::AccruedFeeB)
+                    .unwrap_or(0);
                 env.storage()
                     .instance()
                     .set(&DataKey::AccruedFeeB, &(accrued + protocol_fee));
@@ -619,15 +637,26 @@ env.storage()
     /// Only callable by the fee recipient. Resets accrued balances to zero.
     /// Returns `(fee_a_withdrawn, fee_b_withdrawn)`.
     pub fn withdraw_protocol_fees(env: Env) -> (i128, i128) {
-        let fee_recipient: Address =
-            env.storage().instance().get(&DataKey::FeeRecipient).unwrap();
+        let fee_recipient: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeRecipient)
+            .unwrap();
         fee_recipient.require_auth();
 
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
 
-        let fee_a: i128 = env.storage().instance().get(&DataKey::AccruedFeeA).unwrap_or(0);
-        let fee_b: i128 = env.storage().instance().get(&DataKey::AccruedFeeB).unwrap_or(0);
+        let fee_a: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccruedFeeA)
+            .unwrap_or(0);
+        let fee_b: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccruedFeeB)
+            .unwrap_or(0);
 
         if fee_a > 0 {
             SepTokenClient::new(&env, &token_a).transfer(
@@ -772,7 +801,7 @@ env.storage()
         amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee)
     }
 
-/// Simulate a swap and return a detailed breakdown without executing it.
+    /// Simulate a swap and return a detailed breakdown without executing it.
     ///
     /// Returns the expected output, total fee taken, effective execution price,
     /// spot price, and price impact — all computed from current reserve state.
@@ -783,9 +812,15 @@ env.storage()
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
         let (reserve_in, reserve_out) = if token_in == token_a {
-            (Self::get_reserve_a(env.clone()), Self::get_reserve_b(env.clone()))
+            (
+                Self::get_reserve_a(env.clone()),
+                Self::get_reserve_b(env.clone()),
+            )
         } else if token_in == token_b {
-            (Self::get_reserve_b(env.clone()), Self::get_reserve_a(env.clone()))
+            (
+                Self::get_reserve_b(env.clone()),
+                Self::get_reserve_a(env.clone()),
+            )
         } else {
             panic!("unknown token");
         };
@@ -949,7 +984,7 @@ pub(crate) mod tests {
     };
     use token::LpToken;
 
-#[contracttype]
+    #[contracttype]
     enum ReceiverDataKey {
         Amm,
         ShouldRepay,
@@ -1138,7 +1173,15 @@ pub(crate) mod tests {
         let (tb_client, _) = create_sac(&env, &admin);
 
         let amm = AmmPoolClient::new(&env, &amm_addr);
-        amm.initialize(&admin, &ta_client.address, &tb_client.address, &lp_addr, &30_i128, &admin, &0_i128);
+        amm.initialize(
+            &admin,
+            &ta_client.address,
+            &tb_client.address,
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &0_i128,
+        );
 
         // No liquidity added — reserves are zero, should panic
         amm.price_ratio();
@@ -1166,7 +1209,15 @@ pub(crate) mod tests {
     fn test_initialize_twice_panics() {
         let ts = setup_pool(30);
         let amm = AmmPoolClient::new(&ts.env, &ts.amm_addr);
-        let result = amm.try_initialize(&ts.admin, &ts.ta_addr, &ts.tb_addr, &ts.lp_addr, &30_i128, &ts.admin, &0_i128);
+        let result = amm.try_initialize(
+            &ts.admin,
+            &ts.ta_addr,
+            &ts.tb_addr,
+            &ts.lp_addr,
+            &30_i128,
+            &ts.admin,
+            &0_i128,
+        );
         assert!(result.is_err());
     }
 
@@ -1670,8 +1721,14 @@ pub(crate) mod tests {
         let shares_from_a = 500_000_i128 * initial_shares / 1_000_000;
         let shares_from_b = 1_500_000_i128 * initial_shares / 2_000_000;
 
-        assert!(shares_from_a < shares_from_b, "TokenA should be the limiting ratio");
-        assert_eq!(shares_minted, shares_from_a, "shares minted must use the limiting (TokenA) ratio");
+        assert!(
+            shares_from_a < shares_from_b,
+            "TokenA should be the limiting ratio"
+        );
+        assert_eq!(
+            shares_minted, shares_from_a,
+            "shares minted must use the limiting (TokenA) ratio"
+        );
 
         let info = amm.get_info();
         assert_eq!(info.reserve_a, 1_500_000);
@@ -1741,7 +1798,10 @@ pub(crate) mod tests {
     #[test]
     fn test_sqrt_handles_large_input() {
         // sqrt(10^18) = 10^9
-        assert_eq!(AmmPool::sqrt(1_000_000_000_000_000_000_i128), 1_000_000_000_i128);
+        assert_eq!(
+            AmmPool::sqrt(1_000_000_000_000_000_000_i128),
+            1_000_000_000_i128
+        );
         // sqrt(10^36) = 10^18; 10^36 < i128::MAX (~1.7e38)
         assert_eq!(
             AmmPool::sqrt(1_000_000_000_000_000_000_000_000_000_000_000_000_i128),
@@ -1818,11 +1878,14 @@ pub(crate) mod tests {
 #[cfg(test)]
 mod prop_tests {
     extern crate std;
-    use super::*;
     use super::tests::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger as _}, Address, Bytes, Env, Vec, String};
-    use soroban_sdk::token::{StellarAssetClient, TokenClient as StellarTokenClient};
+    use super::*;
     use proptest::prelude::*;
+    use soroban_sdk::token::{StellarAssetClient, TokenClient as StellarTokenClient};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger as _},
+        Address, Bytes, Env, String, Vec,
+    };
 
     proptest! {
         /// Property 1: For any valid first deposit, initial shares (sqrt(a*b)) are always positive.
@@ -1998,7 +2061,15 @@ mod prop_tests {
         let (ta_client, ta_sac) = create_sac(&env, &admin);
         let (tb_client, tb_sac) = create_sac(&env, &admin);
         let amm = AmmPoolClient::new(&env, &amm_addr);
-        amm.initialize(&admin, &ta_client.address, &tb_client.address, &lp_addr, &30_i128, &admin, &0_i128);
+        amm.initialize(
+            &admin,
+            &ta_client.address,
+            &tb_client.address,
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &0_i128,
+        );
 
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &1_000_000_i128);
@@ -2042,7 +2113,15 @@ mod prop_tests {
         let (ta_client, ta_sac) = create_sac(&env, &admin);
         let (tb_client, tb_sac) = create_sac(&env, &admin);
         let amm = AmmPoolClient::new(&env, &amm_addr);
-        amm.initialize(&admin, &ta_client.address, &tb_client.address, &lp_addr, &30_i128, &admin, &0_i128);
+        amm.initialize(
+            &admin,
+            &ta_client.address,
+            &tb_client.address,
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &0_i128,
+        );
 
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &1_000_000_i128);
@@ -2059,7 +2138,15 @@ mod prop_tests {
         let (ta_client, ta_sac) = create_sac(&env, &admin);
         let (tb_client, tb_sac) = create_sac(&env, &admin);
         let amm = AmmPoolClient::new(&env, &amm_addr);
-        amm.initialize(&admin, &ta_client.address, &tb_client.address, &lp_addr, &30_i128, &admin, &0_i128);
+        amm.initialize(
+            &admin,
+            &ta_client.address,
+            &tb_client.address,
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &0_i128,
+        );
 
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &1_000_000_i128);
@@ -2080,7 +2167,15 @@ mod prop_tests {
         let (ta_client, ta_sac) = create_sac(&env, &admin);
         let (tb_client, tb_sac) = create_sac(&env, &admin);
         let amm = AmmPoolClient::new(&env, &amm_addr);
-        amm.initialize(&admin, &ta_client.address, &tb_client.address, &lp_addr, &30_i128, &admin, &0_i128);
+        amm.initialize(
+            &admin,
+            &ta_client.address,
+            &tb_client.address,
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &0_i128,
+        );
 
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &1_000_000_i128);
