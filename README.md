@@ -29,6 +29,7 @@ A constant-product Automated Market Maker (AMM) built as a Soroban smart contrac
   - [TypeScript Client Example](#typescript-client-example)
   - [Python Client Example](#python-client-example)
 - [Contributing](#contributing)
+- [Changelog](#changelog)
 - [Security](#security)
 - [License](#license)
 
@@ -713,11 +714,18 @@ Before requesting review, confirm:
 - [ ] `cargo test` passes
 - [ ] New behavior is covered by tests
 - [ ] Public interface changes are reflected in this README
+- [ ] `CHANGELOG.md` has been updated with any notable changes
 - [ ] Commit messages follow the Conventional Commits format
 
 ### Versioning
 
 This project follows [Semantic Versioning](https://semver.org/). Breaking changes to the on-chain interface (function signatures, storage layout, error codes) constitute a major version bump.
+
+---
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for a history of notable changes to this project.
 
 ---
 
