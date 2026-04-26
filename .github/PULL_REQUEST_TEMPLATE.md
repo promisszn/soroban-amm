@@ -30,4 +30,5 @@
 - [ ] `cargo test` passes (build WASM first for factory tests: `cargo build --release --target wasm32-unknown-unknown`)
 - [ ] New behaviour is covered by tests
 - [ ] Public interface changes are reflected in the README
+- [ ] `CHANGELOG.md` has been updated with any notable changes
 - [ ] Commit messages follow the [Conventional Commits](https://www.conventionalcommits.org/) format
