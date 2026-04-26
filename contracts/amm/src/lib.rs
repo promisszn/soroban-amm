@@ -208,12 +208,14 @@ impl AmmPool {
         env.storage().instance().set(&DataKey::Paused, &false);
     }
 
-    pub fn pause(env: Env, admin: Address) {
+    pub fn pause(env: Env) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
     }
 
-    pub fn unpause(env: Env, admin: Address) {
+    pub fn unpause(env: Env) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
     }
@@ -290,8 +292,10 @@ impl AmmPool {
         amount_a: i128,
         amount_b: i128,
         min_shares: i128,
+        deadline: u64,
     ) -> i128 {
         assert!(!Self::is_paused(env.clone()), "pool is paused");
+        assert!(deadline >= env.ledger().timestamp(), "deadline exceeded");
         provider.require_auth();
         assert!(
             amount_a > 0 && amount_b > 0,
@@ -305,12 +309,6 @@ impl AmmPool {
         let reserve_a: i128 = Self::get_reserve_a(env.clone());
         let reserve_b: i128 = Self::get_reserve_b(env.clone());
         let total_shares: i128 = Self::get_total_shares(env.clone());
-
-        // Pull tokens from provider into the pool contract.
-        let client_a = SepTokenClient::new(&env, &token_a);
-        let client_b = SepTokenClient::new(&env, &token_b);
-        client_a.transfer(&provider, &env.current_contract_address(), &amount_a);
-        client_b.transfer(&provider, &env.current_contract_address(), &amount_b);
 
         // Compute shares to mint.
         let shares = if total_shares == 0 {
@@ -346,6 +344,12 @@ impl AmmPool {
         // Mint LP tokens.
         let lp_client = LpTokenClient::new(&env, &lp_token);
         lp_client.mint(&provider, &shares);
+
+        // Pull tokens from provider into the pool contract.
+        let client_a = SepTokenClient::new(&env, &token_a);
+        let client_b = SepTokenClient::new(&env, &token_b);
+        client_a.transfer(&provider, &env.current_contract_address(), &amount_a);
+        client_b.transfer(&provider, &env.current_contract_address(), &amount_b);
 
         env.events().publish(
             (Symbol::new(&env, "add_liquidity"), provider),
@@ -387,8 +391,10 @@ impl AmmPool {
         shares: i128,
         min_a: i128,
         min_b: i128,
+        deadline: u64,
     ) -> (i128, i128) {
         assert!(!Self::is_paused(env.clone()), "pool is paused");
+        assert!(deadline >= env.ledger().timestamp(), "deadline exceeded");
         provider.require_auth();
         assert!(shares > 0, "shares must be positive: got {shares}");
 
@@ -483,8 +489,10 @@ impl AmmPool {
         token_in: Address,
         amount_in: i128,
         min_out: i128,
+        deadline: u64,
     ) -> i128 {
         assert!(!Self::is_paused(env.clone()), "pool is paused");
+        assert!(deadline >= env.ledger().timestamp(), "deadline exceeded");
         trader.require_auth();
         assert!(amount_in > 0, "amount_in must be positive: got {amount_in}");
 
@@ -1117,7 +1125,7 @@ pub(crate) mod tests {
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &2_000_000_i128);
 
-        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &2_000_000_i128, &0_i128);
+        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &2_000_000_i128, &0_i128, &u64::MAX);
         assert!(shares > 0);
 
         let info = amm.get_info();
@@ -1127,7 +1135,7 @@ pub(crate) mod tests {
 
         let trader = Address::generate(env);
         ta_sac.mint(&trader, &100_000_i128);
-        let out = amm.swap(&trader, &ts.ta_addr, &100_000_i128, &0_i128);
+        let out = amm.swap(&trader, &ts.ta_addr, &100_000_i128, &0_i128, &u64::MAX);
         assert!(out > 0);
         assert!(out < 200_000);
     }
@@ -1154,7 +1162,7 @@ pub(crate) mod tests {
         ta_sac.mint(&provider, &2_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
 
-        amm.add_liquidity(&provider, &2_000_000_i128, &1_000_000_i128, &0_i128);
+        amm.add_liquidity(&provider, &2_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
         // reserve_a = 2_000_000, reserve_b = 1_000_000
         // price_a = 1_000_000 * 1_000_000 / 2_000_000 = 500_000
@@ -1199,8 +1207,8 @@ pub(crate) mod tests {
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
 
-        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
-        let (out_a, out_b) = amm.remove_liquidity(&provider, &shares, &0_i128, &0_i128);
+        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
+        let (out_a, out_b) = amm.remove_liquidity(&provider, &shares, &0_i128, &0_i128, &u64::MAX);
         assert!(out_a > 0 && out_b > 0);
         assert_eq!(amm.get_info().total_shares, 0);
     }
@@ -1261,11 +1269,11 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
         let trader = Address::generate(env);
         tb_sac.mint(&trader, &100_000_i128);
-        let out = amm.swap(&trader, &ts.tb_addr, &100_000_i128, &0_i128);
+        let out = amm.swap(&trader, &ts.tb_addr, &100_000_i128, &0_i128, &u64::MAX);
         assert!(out > 0 && out < 100_000);
 
         let info = amm.get_info();
@@ -1284,7 +1292,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
         let trader = Address::generate(env);
         ta_sac.mint(&trader, &100_000_i128);
@@ -1303,12 +1311,12 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
         let trader = Address::generate(env);
         let amount_in = 100_000_i128;
         ta_sac.mint(&trader, &amount_in);
-        let out = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128);
+        let out = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128, &u64::MAX);
 
         let info = amm.get_info();
         assert_eq!(info.reserve_a, 1_000_000 + amount_in);
@@ -1345,7 +1353,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
         let result = amm.try_remove_liquidity(&provider, &shares, &i128::MAX, &0_i128);
         assert!(result.is_err());
     }
@@ -1364,7 +1372,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
         let recipient = Address::generate(env);
         lp.transfer(&provider, &recipient, &shares);
@@ -1372,7 +1380,7 @@ pub(crate) mod tests {
         assert_eq!(amm.shares_of(&provider), 0);
         assert_eq!(amm.shares_of(&recipient), shares);
 
-        let (out_a, out_b) = amm.remove_liquidity(&recipient, &shares, &0_i128, &0_i128);
+        let (out_a, out_b) = amm.remove_liquidity(&recipient, &shares, &0_i128, &0_i128, &u64::MAX);
         assert!(out_a > 0 && out_b > 0);
         assert_eq!(amm.get_info().total_shares, 0);
     }
@@ -1388,17 +1396,17 @@ pub(crate) mod tests {
         let lp1 = Address::generate(env);
         ta_sac.mint(&lp1, &1_000_000_i128);
         tb_sac.mint(&lp1, &1_000_000_i128);
-        let shares1 = amm.add_liquidity(&lp1, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        let shares1 = amm.add_liquidity(&lp1, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
         let lp2 = Address::generate(env);
         ta_sac.mint(&lp2, &500_000_i128);
         tb_sac.mint(&lp2, &500_000_i128);
-        let shares2 = amm.add_liquidity(&lp2, &500_000_i128, &500_000_i128, &0_i128);
+        let shares2 = amm.add_liquidity(&lp2, &500_000_i128, &500_000_i128, &0_i128, &u64::MAX);
 
         assert_eq!(amm.get_info().total_shares, shares1 + shares2);
 
-        amm.remove_liquidity(&lp1, &shares1, &0_i128, &0_i128);
-        amm.remove_liquidity(&lp2, &shares2, &0_i128, &0_i128);
+        amm.remove_liquidity(&lp1, &shares1, &0_i128, &0_i128, &u64::MAX);
+        amm.remove_liquidity(&lp2, &shares2, &0_i128, &0_i128, &u64::MAX);
         assert_eq!(amm.get_info().total_shares, 0);
     }
 
@@ -1415,14 +1423,14 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
         let amount_in = 50_000_i128;
         let quoted = amm.get_amount_out(&ts.ta_addr, &amount_in);
 
         let trader = Address::generate(env);
         ta_sac.mint(&trader, &amount_in);
-        let actual = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128);
+        let actual = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128, &u64::MAX);
 
         assert_eq!(quoted, actual);
     }
@@ -1440,7 +1448,7 @@ pub(crate) mod tests {
         let initial_amt = 1_000_000_i128;
         ta_sac.mint(&provider, &initial_amt);
         tb_sac.mint(&provider, &initial_amt);
-        amm.add_liquidity(&provider, &initial_amt, &initial_amt, &0_i128);
+        amm.add_liquidity(&provider, &initial_amt, &initial_amt, &0_i128, &u64::MAX);
 
         let info = amm.get_info();
         let initial_k = info.reserve_a * info.reserve_b;
@@ -1454,11 +1462,11 @@ pub(crate) mod tests {
             if i % 2 == 0 {
                 // A -> B
                 ta_sac.mint(&trader, &swap_amt);
-                amm.swap(&trader, &ts.ta_addr, &swap_amt, &0_i128);
+                amm.swap(&trader, &ts.ta_addr, &swap_amt, &0_i128, &u64::MAX);
             } else {
                 // B -> A
                 tb_sac.mint(&trader, &swap_amt);
-                amm.swap(&trader, &ts.tb_addr, &swap_amt, &0_i128);
+                amm.swap(&trader, &ts.tb_addr, &swap_amt, &0_i128, &u64::MAX);
             }
 
             let new_info = amm.get_info();
@@ -1494,7 +1502,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &2_000_000_i128);
-        amm.add_liquidity(&provider, &1_000_000_i128, &2_000_000_i128, &0_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &2_000_000_i128, &0_i128, &u64::MAX);
 
         // Forward: how much B do we get for 100_000 A?
         let amount_in = 100_000_i128;
@@ -1531,8 +1539,8 @@ pub(crate) mod tests {
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
 
-        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
-        let (out_a, out_b) = amm.remove_liquidity(&provider, &shares, &0_i128, &0_i128);
+        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
+        let (out_a, out_b) = amm.remove_liquidity(&provider, &shares, &0_i128, &0_i128, &u64::MAX);
 
         // Find the rm_liq event among all published events
         let events = env.events().all();
@@ -1557,7 +1565,7 @@ pub(crate) mod tests {
         // Add liquidity to set initial price (1:1)
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
         // Initial state: accumulators should be 0
         let (cum_a, cum_b, last_ts) = amm.get_price_cumulative();
@@ -1571,7 +1579,7 @@ pub(crate) mod tests {
         // Swap A for B
         let trader = Address::generate(env);
         ta_sac.mint(&trader, &100_000_i128);
-        amm.swap(&trader, &ts.ta_addr, &100_000_i128, &0_i128);
+        amm.swap(&trader, &ts.ta_addr, &100_000_i128, &0_i128, &u64::MAX);
 
         // Accumulators should have updated: price (1_000_000) * 10 seconds = 10_000_000
         let (new_cum_a, new_cum_b, new_ts) = amm.get_price_cumulative();
@@ -1591,7 +1599,7 @@ pub(crate) mod tests {
 
         // Perform another swap
         tb_sac.mint(&trader, &50_000_i128);
-        amm.swap(&trader, &ts.tb_addr, &50_000_i128, &0_i128);
+        amm.swap(&trader, &ts.tb_addr, &50_000_i128, &0_i128, &u64::MAX);
 
         let (final_cum_a, final_cum_b, final_ts) = amm.get_price_cumulative();
         assert_eq!(final_ts, new_ts + 5);
@@ -1627,12 +1635,12 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
         let trader = Address::generate(env);
         let amount_in = 100_000_i128;
         ta_sac.mint(&trader, &amount_in);
-        let out = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128);
+        let out = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128, &u64::MAX);
         // fee_bps=0 → no discount; pure constant-product formula
         let expected = amount_in * 1_000_000 / (1_000_000 + amount_in);
         assert_eq!(out, expected);
@@ -1651,7 +1659,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
         let trader = Address::generate(env);
         ta_sac.mint(&trader, &100_000_i128);
@@ -1675,7 +1683,7 @@ pub(crate) mod tests {
         tb_sac.mint(&provider, &1_000_000_i128);
         // Initial deposit: shares = sqrt(1_000_000 * 1_000_000) = 1_000_000
         let shares =
-            amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &1_000_000_i128);
+            amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &1_000_000_i128, &u64::MAX);
         assert_eq!(shares, 1_000_000);
     }
 
@@ -1710,13 +1718,13 @@ pub(crate) mod tests {
         let seeder = Address::generate(env);
         ta_sac.mint(&seeder, &1_000_000_i128);
         tb_sac.mint(&seeder, &2_000_000_i128);
-        let initial_shares = amm.add_liquidity(&seeder, &1_000_000_i128, &2_000_000_i128, &0_i128);
+        let initial_shares = amm.add_liquidity(&seeder, &1_000_000_i128, &2_000_000_i128, &0_i128, &u64::MAX);
 
         // Deposit 500,000 A and 1,500,000 B — B is 500,000 in excess of the 1:2 ratio
         let lp2 = Address::generate(env);
         ta_sac.mint(&lp2, &500_000_i128);
         tb_sac.mint(&lp2, &1_500_000_i128);
-        let shares_minted = amm.add_liquidity(&lp2, &500_000_i128, &1_500_000_i128, &0_i128);
+        let shares_minted = amm.add_liquidity(&lp2, &500_000_i128, &1_500_000_i128, &0_i128, &u64::MAX);
 
         let shares_from_a = 500_000_i128 * initial_shares / 1_000_000;
         let shares_from_b = 1_500_000_i128 * initial_shares / 2_000_000;
@@ -1748,11 +1756,11 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        let total_shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        let total_shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
         assert_eq!(total_shares, 1_000_000);
 
         let shares_to_remove = total_shares / 4; // 25% = 250,000
-        let (out_a, out_b) = amm.remove_liquidity(&provider, &shares_to_remove, &0_i128, &0_i128);
+        let (out_a, out_b) = amm.remove_liquidity(&provider, &shares_to_remove, &0_i128, &0_i128, &u64::MAX);
 
         assert_eq!(out_a, 250_000);
         assert_eq!(out_b, 250_000);
@@ -1776,7 +1784,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
         let input_sizes = [1_000_i128, 10_000_i128, 100_000_i128, 500_000_i128];
         let mut prev_rate = i128::MAX;
@@ -1822,7 +1830,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &large_amount);
         tb_sac.mint(&provider, &large_amount);
-        let shares = amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128);
+        let shares = amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &u64::MAX);
 
         assert_eq!(shares, large_amount);
         let info = amm.get_info();
@@ -1842,13 +1850,13 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &large_amount);
         tb_sac.mint(&provider, &large_amount);
-        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128);
+        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &u64::MAX);
 
         // amount_in=10^9; numerator = 10^9*9970*4e18 ~ 4e31 < i128::MAX
         let trader = Address::generate(env);
         let amount_in = 1_000_000_000_i128;
         ta_sac.mint(&trader, &amount_in);
-        let out = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128);
+        let out = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128, &u64::MAX);
         assert!(out > 0 && out < large_amount);
     }
 
@@ -1864,7 +1872,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &large_amount);
         tb_sac.mint(&provider, &large_amount);
-        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128);
+        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &u64::MAX);
 
         // price_ratio: reserve_b * 1_000_000 / reserve_a; 4e18 * 1e6 = 4e24 < i128::MAX
         let (price_a, price_b) = amm.price_ratio();
@@ -1975,7 +1983,7 @@ mod prop_tests {
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
         let receiver_addr = env.register_contract(None, MockFlashLoanReceiver);
         let receiver = MockFlashLoanReceiverClient::new(&env, &receiver_addr);
@@ -2019,7 +2027,7 @@ mod prop_tests {
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
         let receiver_addr = env.register_contract(None, MockFlashLoanReceiver);
         let receiver = MockFlashLoanReceiverClient::new(&env, &receiver_addr);
@@ -2041,7 +2049,7 @@ mod prop_tests {
         let amm_addr = env.register_contract(None, AmmPool);
         let amm = AmmPoolClient::new(&env, &amm_addr);
 
-        amm.pause(&admin);
+        amm.pause();
     }
 
     #[test]
@@ -2074,9 +2082,9 @@ mod prop_tests {
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
-        amm.pause(&admin);
+        amm.pause();
         assert!(amm.is_paused());
 
         let info = amm.get_info();
@@ -2087,22 +2095,22 @@ mod prop_tests {
         assert!(quote > 0);
         assert_eq!(amm.shares_of(&provider), shares);
 
-        amm.unpause(&admin);
+        amm.unpause();
         assert!(!amm.is_paused());
 
         let trader = Address::generate(&env);
         ta_sac.mint(&trader, &100_000_i128);
-        let out = amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128);
+        let out = amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128, &u64::MAX);
         assert!(out > 0);
 
         let extra_provider = Address::generate(&env);
         ta_sac.mint(&extra_provider, &100_000_i128);
         tb_sac.mint(&extra_provider, &100_000_i128);
         let extra_shares =
-            amm.add_liquidity(&extra_provider, &100_000_i128, &100_000_i128, &0_i128);
+            amm.add_liquidity(&extra_provider, &100_000_i128, &100_000_i128, &0_i128, &u64::MAX);
         assert!(extra_shares > 0);
 
-        let (out_a, out_b) = amm.remove_liquidity(&provider, &shares, &0_i128, &0_i128);
+        let (out_a, out_b) = amm.remove_liquidity(&provider, &shares, &0_i128, &0_i128, &u64::MAX);
         assert!(out_a > 0 && out_b > 0);
     }
 
@@ -2127,8 +2135,8 @@ mod prop_tests {
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
 
-        amm.pause(&admin);
-        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        amm.pause();
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
     }
 
     #[test]
@@ -2151,13 +2159,13 @@ mod prop_tests {
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
         let trader = Address::generate(&env);
         ta_sac.mint(&trader, &100_000_i128);
 
-        amm.pause(&admin);
-        amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128);
+        amm.pause();
+        amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128, &u64::MAX);
     }
 
     #[test]
@@ -2180,10 +2188,10 @@ mod prop_tests {
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
-        amm.pause(&admin);
-        amm.remove_liquidity(&provider, &shares, &0_i128, &0_i128);
+        amm.pause();
+        amm.remove_liquidity(&provider, &shares, &0_i128, &0_i128, &u64::MAX);
     }
 
     #[test]
@@ -2208,14 +2216,14 @@ mod prop_tests {
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
         let trader = Address::generate(&env);
         ta_sac.mint(&trader, &200_000_i128);
 
         // Two swaps of 100_000 A each — protocol fee per swap = 100_000 * 5 / 10_000 = 50
-        amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128);
-        amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128);
+        amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128, &u64::MAX);
+        amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128, &u64::MAX);
 
         let admin_bal_before = ta_client.balance(&admin);
         let (withdrawn_a, withdrawn_b) = amm.withdraw_protocol_fees();
@@ -2247,11 +2255,11 @@ mod prop_tests {
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
         let trader = Address::generate(&env);
         ta_sac.mint(&trader, &100_000_i128);
-        amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128);
+        amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128, &u64::MAX);
 
         // First withdrawal collects accrued fees.
         let (w1_a, _) = amm.withdraw_protocol_fees();
@@ -2284,17 +2292,17 @@ mod prop_tests {
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
 
         let trader = Address::generate(&env);
         ta_sac.mint(&trader, &200_000_i128);
 
         // Swap → withdraw → swap again → withdraw: fees re-accrue after reset.
-        amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128);
+        amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128, &u64::MAX);
         let (w1, _) = amm.withdraw_protocol_fees();
         assert!(w1 > 0);
 
-        amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128);
+        amm.swap(&trader, &ta_client.address, &100_000_i128, &0_i128, &u64::MAX);
         let (w2, _) = amm.withdraw_protocol_fees();
         assert!(w2 > 0);
     }
