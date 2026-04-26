@@ -259,6 +259,41 @@ impl AmmPool {
         (recipient, bps)
     }
 
+    /// Validate that a fee value is within the allowed range [0, 10_000].<br>
+    /// Shared by initialize, update_fee, and set_protocol_fee.<br>
+    fn validate_fee_bps(fee_bps: i128) {
+        assert!(
+            (0..=10_000).contains(&fee_bps),
+            "invalid fee_bps: {fee_bps} is outside 0..=10_000"
+        );
+    }
+
+    /// Update the swap fee post-deployment. Admin-only.<br>
+    ///<br>
+    /// The new fee takes effect on the very next swap.<br>
+    /// Emits a ee_update event on every successful call.<br>
+    ///<br>
+    /// # Parameters<br>
+    /// - dmin - must match the stored admin address.<br>
+    /// - 
+ew_fee_bps - new swap fee in basis points; must be in [0, 10_000].<br>
+    ///<br>
+    /// # Panics<br>
+    /// - If dmin auth fails.<br>
+    /// - If 
+ew_fee_bps is outside [0, 10_000].<br>
+    pub fn update_fee(env: Env, admin: Address, new_fee_bps: i128) {
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        assert!(admin == stored_admin, "not admin");
+        admin.require_auth();
+        Self::validate_fee_bps(new_fee_bps);
+        env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
+        env.events().publish(
+            (symbol_short!("fee_upd"), admin.clone()),
+            (new_fee_bps,),
+        );
+    }
+
     // ── Liquidity ─────────────────────────────────────────────────────────────
 
     /// Deposit tokens into the pool and receive LP shares in return.
