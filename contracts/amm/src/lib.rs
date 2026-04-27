@@ -49,6 +49,7 @@ pub enum DataKey {
     Shares(Address),
     FeeBps,         // swap fee in basis points, e.g. 30 = 0.30 %
     Admin,          // Address — contract administrator; authorises set_protocol_fee
+    PendingAdmin,   // Option<Address> � nominee waiting to accept admin role
     FeeRecipient,   // Address — receives accrued protocol fees
     ProtocolFeeBps, // i128 — protocol fee bps (subset of FeeBps going to protocol)
     AccruedFeeA,    // i128 — protocol fees accrued in TokenA
@@ -275,8 +276,8 @@ impl AmmPool {
         (recipient, bps)
     }
 
-    /// Validate that a fee value is within the allowed range [0, 10_000].<br>
-    /// Shared by initialize, update_fee, and set_protocol_fee.<br>
+/// Validate that a fee value is within the allowed range [0, 10_000].
+    /// Shared by initialize, update_fee, and set_protocol_fee.
     fn validate_fee_bps(fee_bps: i128) {
         assert!(
             (0..=10_000).contains(&fee_bps),
@@ -284,20 +285,18 @@ impl AmmPool {
         );
     }
 
-    /// Update the swap fee post-deployment. Admin-only.<br>
-    ///<br>
-    /// The new fee takes effect on the very next swap.<br>
-    /// Emits a ee_update event on every successful call.<br>
-    ///<br>
-    /// # Parameters<br>
-    /// - dmin - must match the stored admin address.<br>
-    /// - 
-ew_fee_bps - new swap fee in basis points; must be in [0, 10_000].<br>
-    ///<br>
-    /// # Panics<br>
-    /// - If dmin auth fails.<br>
-    /// - If 
-ew_fee_bps is outside [0, 10_000].<br>
+    /// Update the swap fee post-deployment. Admin-only.
+    ///
+    /// The new fee takes effect on the very next swap.
+    /// Emits a `fee_upd` event on every successful call.
+    ///
+    /// # Parameters
+    /// - `admin` - must match the stored admin address.
+    /// - `new_fee_bps` - new swap fee in basis points; must be in [0, 10_000].
+    ///
+    /// # Panics
+    /// - If `admin` auth fails.
+    /// - If `new_fee_bps` is outside [0, 10_000].
     pub fn update_fee(env: Env, admin: Address, new_fee_bps: i128) {
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         assert!(admin == stored_admin, "not admin");
@@ -309,6 +308,45 @@ ew_fee_bps is outside [0, 10_000].<br>
             (new_fee_bps,),
         );
     }
+
+    /// Nominate a new admin. The nominee must call `accept_admin` to complete the transfer.
+    ///
+    /// # Panics
+    /// - If `current_admin` is not the stored admin.
+    /// - If `current_admin` auth fails.
+    pub fn propose_admin(env: Env, current_admin: Address, new_admin: Address) {
+        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        assert!(current_admin == stored, "not admin");
+        current_admin.require_auth();
+        env.storage().instance().set(&DataKey::PendingAdmin, &Some(new_admin));
+    }
+
+    /// Accept the pending admin nomination. Caller becomes the new admin.
+    ///
+    /// # Panics
+    /// - If there is no pending admin proposal.
+    /// - If `new_admin` does not match the pending nominee.
+    /// - If `new_admin` auth fails.
+    pub fn accept_admin(env: Env, new_admin: Address) {
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None);
+        let nominee = pending.expect("no pending admin proposal");
+        assert!(new_admin == nominee, "caller is not the pending admin");
+        new_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().set(&DataKey::PendingAdmin, &Option::<Address>::None);
+    }
+
+    /// Return the pending admin nominee, or `None` if no transfer is in progress.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None)
+    }    }
 
     // ── Liquidity ─────────────────────────────────────────────────────────────
 
