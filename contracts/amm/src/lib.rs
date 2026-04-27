@@ -383,8 +383,8 @@ impl AmmPool {
         min_shares: i128,
         deadline: u64,
     ) -> i128 {
-        assert!(!Self::is_paused(env.clone()), "pool is paused");
         assert!(deadline >= env.ledger().timestamp(), "deadline exceeded");
+        assert!(!Self::is_paused(env.clone()), "pool is paused");
         provider.require_auth();
         assert!(
             amount_a > 0 && amount_b > 0,
@@ -419,6 +419,12 @@ impl AmmPool {
             "slippage: insufficient shares minted: computed={shares}, minimum={min_shares}"
         );
 
+        // Pull tokens from provider into the pool contract.
+        let client_a = SepTokenClient::new(&env, &token_a);
+        let client_b = SepTokenClient::new(&env, &token_b);
+        client_a.transfer(&provider, &env.current_contract_address(), &amount_a);
+        client_b.transfer(&provider, &env.current_contract_address(), &amount_b);
+
         // Update reserves.
         env.storage()
             .instance()
@@ -433,12 +439,6 @@ impl AmmPool {
         // Mint LP tokens.
         let lp_client = LpTokenClient::new(&env, &lp_token);
         lp_client.mint(&provider, &shares);
-
-        // Pull tokens from provider into the pool contract.
-        let client_a = SepTokenClient::new(&env, &token_a);
-        let client_b = SepTokenClient::new(&env, &token_b);
-        client_a.transfer(&provider, &env.current_contract_address(), &amount_a);
-        client_b.transfer(&provider, &env.current_contract_address(), &amount_b);
 
         env.events().publish(
             (Symbol::new(&env, "add_liquidity"), provider),
@@ -482,8 +482,8 @@ impl AmmPool {
         min_b: i128,
         deadline: u64,
     ) -> (i128, i128) {
-        assert!(!Self::is_paused(env.clone()), "pool is paused");
         assert!(deadline >= env.ledger().timestamp(), "deadline exceeded");
+        assert!(!Self::is_paused(env.clone()), "pool is paused");
         provider.require_auth();
         assert!(shares > 0, "shares must be positive: got {shares}");
 
@@ -580,8 +580,8 @@ impl AmmPool {
         min_out: i128,
         deadline: u64,
     ) -> i128 {
-        assert!(!Self::is_paused(env.clone()), "pool is paused");
         assert!(deadline >= env.ledger().timestamp(), "deadline exceeded");
+        assert!(!Self::is_paused(env.clone()), "pool is paused");
         trader.require_auth();
         assert!(amount_in > 0, "amount_in must be positive: got {amount_in}");
 
