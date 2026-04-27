@@ -7,6 +7,7 @@
     [],
     [],
     [],
+    [],
     []
   ],
   "ledger": {
@@ -205,7 +206,7 @@
                           ]
                         },
                         "val": {
-                          "string": "AMM LP Token #0"
+                          "string": "USDC/XLM LP"
                         }
                       },
                       {
@@ -217,7 +218,7 @@
                           ]
                         },
                         "val": {
-                          "string": "ALP0"
+                          "string": "USDC-XLM"
                         }
                       },
                       {
@@ -701,8 +702,12 @@
                     "lo": 30
                   }
                 },
-                "void",
-                "void"
+                {
+                  "string": "USDC/XLM LP"
+                },
+                {
+                  "string": "USDC-XLM"
+                }
               ]
             }
           }
@@ -734,10 +739,10 @@
                   "address": "CDDMUEDPF7Z22WY7BL24MYJZWHJK7OPKG5UN4MDPDIRROZZUBU6H3OPS"
                 },
                 {
-                  "string": "AMM LP Token #0"
+                  "string": "USDC/XLM LP"
                 },
                 {
-                  "string": "ALP0"
+                  "string": "USDC-XLM"
                 },
                 {
                   "u32": 7
@@ -883,18 +888,11 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000002"
               },
               {
-                "symbol": "get_pool"
+                "symbol": "get_lp_token"
               }
             ],
             "data": {
-              "vec": [
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAITA4"
-                }
-              ]
+              "address": "CDDMUEDPF7Z22WY7BL24MYJZWHJK7OPKG5UN4MDPDIRROZZUBU6H3OPS"
             }
           }
         }
@@ -913,11 +911,11 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "get_pool"
+                "symbol": "get_lp_token"
               }
             ],
             "data": {
-              "address": "CDDMUEDPF7Z22WY7BL24MYJZWHJK7OPKG5UN4MDPDIRROZZUBU6H3OPS"
+              "address": "CBRIAA73VOIKPZYM5G3LGPF3NGCFXLR3IW22MKEYJAB3QBOMTUTRCASK"
             }
           }
         }
@@ -936,10 +934,10 @@
                 "symbol": "fn_call"
               },
               {
-                "bytes": "0000000000000000000000000000000000000000000000000000000000000002"
+                "bytes": "628003fbab90a7e70ce9b6b33cbb69845bae3b45b5a628984803b805cc9d2711"
               },
               {
-                "symbol": "all_pools"
+                "symbol": "name"
               }
             ],
             "data": "void"
@@ -951,7 +949,7 @@
     {
       "event": {
         "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000002",
+        "contract_id": "628003fbab90a7e70ce9b6b33cbb69845bae3b45b5a628984803b805cc9d2711",
         "type_": "diagnostic",
         "body": {
           "v0": {
@@ -960,15 +958,58 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "all_pools"
+                "symbol": "name"
               }
             ],
             "data": {
-              "vec": [
-                {
-                  "address": "CDDMUEDPF7Z22WY7BL24MYJZWHJK7OPKG5UN4MDPDIRROZZUBU6H3OPS"
-                }
-              ]
+              "string": "USDC/XLM LP"
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "628003fbab90a7e70ce9b6b33cbb69845bae3b45b5a628984803b805cc9d2711"
+              },
+              {
+                "symbol": "symbol"
+              }
+            ],
+            "data": "void"
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "628003fbab90a7e70ce9b6b33cbb69845bae3b45b5a628984803b805cc9d2711",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "symbol"
+              }
+            ],
+            "data": {
+              "string": "USDC-XLM"
             }
           }
         }

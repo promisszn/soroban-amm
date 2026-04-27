@@ -90,9 +90,7 @@
                 "symbol": "unpause"
               }
             ],
-            "data": {
-              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-            }
+            "data": "void"
           }
         }
       },
@@ -107,23 +105,11 @@
           "v0": {
             "topics": [
               {
-                "symbol": "error"
-              },
-              {
-                "error": {
-                  "auth": "invalid_action"
-                }
+                "symbol": "log"
               }
             ],
             "data": {
-              "vec": [
-                {
-                  "string": "Unauthorized function call for address"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-                }
-              ]
+              "string": "caught panic 'called `Option::unwrap()` on a `None` value' from contract function 'Symbol(unpause)'"
             }
           }
         }
@@ -143,32 +129,7 @@
               },
               {
                 "error": {
-                  "auth": "invalid_action"
-                }
-              }
-            ],
-            "data": {
-              "string": "escalating error to panic"
-            }
-          }
-        }
-      },
-      "failed_call": true
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000002",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "error"
-              },
-              {
-                "error": {
-                  "auth": "invalid_action"
+                  "wasm_vm": "invalid_action"
                 }
               }
             ],
@@ -193,7 +154,7 @@
               },
               {
                 "error": {
-                  "auth": "invalid_action"
+                  "wasm_vm": "invalid_action"
                 }
               }
             ],
@@ -206,11 +167,7 @@
                   "symbol": "unpause"
                 },
                 {
-                  "vec": [
-                    {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-                    }
-                  ]
+                  "vec": []
                 }
               ]
             }
@@ -232,7 +189,7 @@
               },
               {
                 "error": {
-                  "auth": "invalid_action"
+                  "wasm_vm": "invalid_action"
                 }
               }
             ],
