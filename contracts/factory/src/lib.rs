@@ -126,17 +126,15 @@ impl Factory {
             .deploy(amm_wasm);
 
         // Resolve LP token name/symbol — use caller-supplied values or counter defaults.
-        let name = lp_name
-            .unwrap_or_else(|| Self::counter_string(&env, b"AMM LP Token #", n));
-        let symbol = lp_symbol
-            .unwrap_or_else(|| Self::counter_string(&env, b"ALP", n));
+        let name = lp_name.unwrap_or_else(|| Self::counter_string(&env, b"AMM LP Token #", n));
+        let symbol = lp_symbol.unwrap_or_else(|| Self::counter_string(&env, b"ALP", n));
 
         // Initialize LP token — admin must be the pool so it can mint/burn.
         LpTokenClient::new(&env, &lp_addr).initialize(&pool_addr, &name, &symbol, &7u32);
 
         // Initialize AMM pool.
         AmmPoolClient::new(&env, &pool_addr).initialize(
-            &admin, &ta, &tb, &lp_addr, &fee_bps, &admin, // fee_recipient
+            &admin, &ta, &tb, &lp_addr, &fee_bps, &admin,  // fee_recipient
             &0_i128, // protocol_fee_bps (disabled by default)
         );
 

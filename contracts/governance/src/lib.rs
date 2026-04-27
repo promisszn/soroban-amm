@@ -193,10 +193,7 @@ impl Governance {
         assert!(!proposal.executed, "proposal already executed");
 
         let voted_key = DataKey::HasVoted(proposal_id, voter.clone());
-        assert!(
-            !env.storage().instance().has(&voted_key),
-            "already voted"
-        );
+        assert!(!env.storage().instance().has(&voted_key), "already voted");
 
         let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
         let voting_power = LpTokenClient::new(&env, &lp_token).balance(&voter);
@@ -292,8 +289,7 @@ impl Governance {
         // Voting closed — check outcome.
         let total_votes = proposal.votes_for + proposal.votes_against;
         let quorum_threshold = proposal.snapshot_total_supply * QUORUM_BPS / 10_000;
-        let passed = total_votes >= quorum_threshold
-            && proposal.votes_for > proposal.votes_against;
+        let passed = total_votes >= quorum_threshold && proposal.votes_for > proposal.votes_against;
 
         if !passed {
             return ProposalStatus::Defeated;
@@ -378,7 +374,15 @@ mod tests {
         let gov_addr = env.register_contract(None, Governance);
         GovernanceClient::new(&env, &gov_addr).initialize(&amm_addr, &lp_addr);
 
-        Suite { env, gov_addr, amm_addr, lp_addr, ta_addr, tb_addr, admin }
+        Suite {
+            env,
+            gov_addr,
+            amm_addr,
+            lp_addr,
+            ta_addr,
+            tb_addr,
+            admin,
+        }
     }
 
     /// Mint LP tokens directly to an address (simulates adding liquidity).

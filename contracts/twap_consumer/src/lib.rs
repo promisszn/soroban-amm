@@ -121,7 +121,7 @@ mod tests {
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &2_000_000_i128);
         tb_sac.mint(&provider, &2_000_000_i128);
-        amm.add_liquidity(&provider, &2_000_000_i128, &2_000_000_i128, &0_i128);
+        amm.add_liquidity(&provider, &2_000_000_i128, &2_000_000_i128, &0_i128, &10_000_u64);
 
         let consumer = TwapConsumerClient::new(&env, &consumer_addr);
         consumer.save_snapshot(&amm_addr);
@@ -130,7 +130,7 @@ mod tests {
         env.ledger().set_timestamp(10_060);
         let whale = Address::generate(&env);
         ta_sac.mint(&whale, &1_000_000_i128);
-        amm.swap(&whale, &ta.address, &1_000_000_i128, &0_i128);
+        amm.swap(&whale, &ta.address, &1_000_000_i128, &0_i128, &10_060_u64);
 
         let twap = consumer.get_twap_price(&amm_addr, &60_u64);
         let (spot_a, _spot_b) = amm.price_ratio();
