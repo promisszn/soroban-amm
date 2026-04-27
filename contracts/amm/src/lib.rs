@@ -348,7 +348,7 @@ impl AmmPool {
             .instance()
             .get(&DataKey::PendingAdmin)
             .unwrap_or(None)
-    }    }
+    }
 
     // ── Liquidity ─────────────────────────────────────────────────────────────
 
