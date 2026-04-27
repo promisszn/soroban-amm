@@ -250,21 +250,6 @@ impl AmmPool {
     }
 
 
-    /// Update the pool swap fee. Callable by the stored admin (e.g. governance contract).
-    ///
-    /// `new_fee_bps` must be in `[0, 10_000]`.
-    pub fn update_fee(env: Env, new_fee_bps: i128) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        admin.require_auth();
-        assert!(
-            (0..=10_000).contains(&new_fee_bps),
-            "invalid fee: {new_fee_bps} must be in 0..=10_000"
-        );
-        env.storage()
-            .instance()
-            .set(&DataKey::FeeBps, &new_fee_bps);
-    }
-
     /// Return the current protocol fee recipient and rate.
     ///
     /// Returns `(None, 0)` when protocol fees are disabled.
@@ -348,7 +333,7 @@ impl AmmPool {
             .instance()
             .get(&DataKey::PendingAdmin)
             .unwrap_or(None)
-    }    }
+    }
 
     // ── Liquidity ─────────────────────────────────────────────────────────────
 

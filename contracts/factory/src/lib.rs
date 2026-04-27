@@ -69,7 +69,13 @@ impl Factory {
     /// to match the original order when looking up a pool.
     ///
     /// Panics if a pool for this pair already exists.
-    pub fn create_pool(env: Env, token_a: Address, token_b: Address, fee_bps: i128) -> Address {
+    pub fn create_pool(
+        env: Env,
+        token_a: Address,
+        token_b: Address,
+        fee_bps: i128,
+        name: Option<soroban_sdk::String>,
+    ) -> Address {
         // Normalise: smaller address is always token_a.
         let (ta, tb) = if token_a < token_b {
             (token_a, token_b)
@@ -127,6 +133,11 @@ impl Factory {
             &admin, &ta, &tb, &lp_addr, &fee_bps, &admin,  // fee_recipient
             &0_i128, // protocol_fee_bps (disabled by default)
         );
+
+        // Forward optional name to pool metadata (Issue #105).
+        if let Some(ref n) = name {
+            AmmPoolClient::new(&env, &pool_addr).set_name(n);
+        }
 
         // Register pool in both lookup indexes.
         env.storage()
@@ -235,7 +246,7 @@ mod tests {
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
 
-        let pool = factory.create_pool(&ta, &tb, &30_i128);
+        let pool = factory.create_pool(&ta, &tb, &30_i128, &None);
 
         assert_eq!(factory.get_pool(&ta, &tb), Some(pool.clone()));
         assert_eq!(factory.all_pools().len(), 1);
@@ -257,7 +268,7 @@ mod tests {
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
 
-        factory.create_pool(&ta, &tb, &30_i128);
+        factory.create_pool(&ta, &tb, &30_i128, &None);
 
         // Reverse-order lookup returns the same pool.
         assert_eq!(factory.get_pool(&ta, &tb), factory.get_pool(&tb, &ta));
@@ -279,8 +290,8 @@ mod tests {
         let ta = Address::generate(&env);
         let tb = Address::generate(&env);
 
-        factory.create_pool(&ta, &tb, &30_i128);
-        let result = factory.try_create_pool(&ta, &tb, &30_i128);
+        factory.create_pool(&ta, &tb, &30_i128, &None);
+        let result = factory.try_create_pool(&ta, &tb, &30_i128, &None);
         assert!(result.is_err());
     }
 
@@ -303,10 +314,10 @@ mod tests {
         let tb = Address::generate(&env);
         let tc = Address::generate(&env);
 
-        factory.create_pool(&ta, &tb, &30_i128);
+        factory.create_pool(&ta, &tb, &30_i128, &None);
         assert_eq!(factory.all_pools().len(), 1);
 
-        factory.create_pool(&ta, &tc, &30_i128);
+        factory.create_pool(&ta, &tc, &30_i128, &None);
         assert_eq!(factory.all_pools().len(), 2);
     }
 }
