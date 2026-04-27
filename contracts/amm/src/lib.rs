@@ -712,6 +712,162 @@ impl AmmPool {
         amount_out
     }
 
+    /// Swap a variable input amount to receive exactly `amount_out` of `token_out`.
+    ///
+    /// Computes the required input via `get_amount_in` and enforces `max_in` as a
+    /// slippage guard. Updates reserves and the TWAP accumulator identically to `swap`.
+    ///
+    /// # Parameters
+    /// - `trader`     – Address initiating the swap; must authorise this call.
+    /// - `token_out`  – Address of the token to receive; must be `token_a` or `token_b`.
+    /// - `amount_out` – Exact amount of `token_out` the caller wants to receive.
+    /// - `max_in`     – Maximum `token_in` the caller is willing to spend (slippage guard).
+    /// - `deadline`   – Latest ledger timestamp at which this call is valid.
+    ///
+    /// # Returns
+    /// The amount of the input token actually spent.
+    ///
+    /// # Panics
+    /// - If `amount_out` is not positive.
+    /// - If `token_out` is not one of the two pool tokens.
+    /// - If the required input exceeds `max_in`.
+    /// - If the pool is paused.
+    #[allow(clippy::too_many_arguments)]
+    pub fn swap_exact_out(
+        env: Env,
+        trader: Address,
+        token_out: Address,
+        amount_out: i128,
+        max_in: i128,
+        deadline: u64,
+    ) -> i128 {
+        assert!(deadline >= env.ledger().timestamp(), "deadline exceeded");
+        assert!(!Self::is_paused(env.clone()), "pool is paused");
+        trader.require_auth();
+        assert!(amount_out > 0, "amount_out must be positive");
+
+        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
+        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+
+        let token_in = if token_out == token_a {
+            token_b.clone()
+        } else if token_out == token_b {
+            token_a.clone()
+        } else {
+            panic!("token_out is not part of this pool: {token_out:?}");
+        };
+
+        let amount_in = Self::get_amount_in(env.clone(), token_out.clone(), amount_out);
+        assert!(
+            amount_in <= max_in,
+            "slippage: required_in={amount_in} exceeds max_in={max_in}"
+        );
+
+        // Transfer tokens.
+        SepTokenClient::new(&env, &token_in).transfer(
+            &trader,
+            &env.current_contract_address(),
+            &amount_in,
+        );
+        SepTokenClient::new(&env, &token_out).transfer(
+            &env.current_contract_address(),
+            &trader,
+            &amount_out,
+        );
+
+        // Update TWAP accumulators using pre-swap reserves.
+        let now = env.ledger().timestamp();
+        let last_timestamp: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastTimestamp)
+            .unwrap();
+        if now > last_timestamp {
+            let elapsed = (now - last_timestamp) as i128;
+            let reserve_a = Self::get_reserve_a(env.clone());
+            let reserve_b = Self::get_reserve_b(env.clone());
+            if reserve_a > 0 && reserve_b > 0 {
+                let mut price_cum_a: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::PriceCumulativeA)
+                    .unwrap_or(0);
+                let mut price_cum_b: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::PriceCumulativeB)
+                    .unwrap_or(0);
+                price_cum_a += (reserve_b * 1_000_000 / reserve_a) * elapsed;
+                price_cum_b += (reserve_a * 1_000_000 / reserve_b) * elapsed;
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PriceCumulativeA, &price_cum_a);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::PriceCumulativeB, &price_cum_b);
+            }
+            env.storage().instance().set(&DataKey::LastTimestamp, &now);
+        }
+
+        // Separate protocol fee from LP reserves.
+        let protocol_fee_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeBps)
+            .unwrap_or(0);
+        let protocol_fee = if protocol_fee_bps > 0 {
+            amount_in * protocol_fee_bps / 10_000
+        } else {
+            0
+        };
+
+        // Update reserves.
+        let reserve_a = Self::get_reserve_a(env.clone());
+        let reserve_b = Self::get_reserve_b(env.clone());
+        if token_in == token_a {
+            env.storage()
+                .instance()
+                .set(&DataKey::ReserveA, &(reserve_a + amount_in - protocol_fee));
+            env.storage()
+                .instance()
+                .set(&DataKey::ReserveB, &(reserve_b - amount_out));
+            if protocol_fee > 0 {
+                let accrued: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::AccruedFeeA)
+                    .unwrap_or(0);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::AccruedFeeA, &(accrued + protocol_fee));
+            }
+        } else {
+            env.storage()
+                .instance()
+                .set(&DataKey::ReserveB, &(reserve_b + amount_in - protocol_fee));
+            env.storage()
+                .instance()
+                .set(&DataKey::ReserveA, &(reserve_a - amount_out));
+            if protocol_fee > 0 {
+                let accrued: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::AccruedFeeB)
+                    .unwrap_or(0);
+                env.storage()
+                    .instance()
+                    .set(&DataKey::AccruedFeeB, &(accrued + protocol_fee));
+            }
+        }
+
+        env.events().publish(
+            (Symbol::new(&env, "swap"), trader),
+            (token_in, amount_in, amount_out),
+        );
+
+        amount_in
+    }
+
     // ── Protocol Fees ─────────────────────────────────────────────────────────
 
     /// Withdraw all accrued protocol fees to the configured fee recipient.
@@ -1187,6 +1343,51 @@ pub(crate) mod tests {
 
     // ── Initialization ────────────────────────────────────────────────────────
 
+    // Issue #86: initialize() must persist admin, fee_recipient, and protocol_fee_bps.
+    #[test]
+    fn test_initialize_stores_admin() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+        let (ta, _) = create_sac(&env, &admin);
+        let (tb, _) = create_sac(&env, &admin);
+        let fee_recipient = Address::generate(&env);
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(
+            &admin,
+            &ta.address,
+            &tb.address,
+            &lp_addr,
+            &30_i128,
+            &fee_recipient,
+            &5_i128,
+        );
+        let (stored_recipient, stored_bps) = amm.get_protocol_fee();
+        assert_eq!(stored_recipient, Some(fee_recipient));
+        assert_eq!(stored_bps, 5);
+    }
+
+    #[test]
+    fn test_set_protocol_fee_works_after_initialize() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+        let (ta, _) = create_sac(&env, &admin);
+        let (tb, _) = create_sac(&env, &admin);
+        let fee_recipient = Address::generate(&env);
+        let new_recipient = Address::generate(&env);
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(
+            &admin,
+            &ta.address,
+            &tb.address,
+            &lp_addr,
+            &30_i128,
+            &fee_recipient,
+            &0_i128,
+        );
+        amm.set_protocol_fee(&admin, &new_recipient, &10_i128);
+        let (stored_recipient, stored_bps) = amm.get_protocol_fee();
+        assert_eq!(stored_recipient, Some(new_recipient));
+        assert_eq!(stored_bps, 10);
+    }
+
     #[test]
     fn test_add_and_swap() {
         let ts = setup_pool(30);
@@ -1370,7 +1571,7 @@ pub(crate) mod tests {
 
         let trader = Address::generate(env);
         ta_sac.mint(&trader, &100_000_i128);
-        let result = amm.try_swap(&trader, &ts.ta_addr, &100_000_i128, &200_000_i128);
+        let result = amm.try_swap(&trader, &ts.ta_addr, &100_000_i128, &200_000_i128, &u64::MAX);
         assert!(result.is_err());
     }
 
@@ -1399,6 +1600,118 @@ pub(crate) mod tests {
         assert!(info.reserve_a * info.reserve_b > 1_000_000 * 1_000_000);
     }
 
+    // ── Issue #98: swap_exact_out ─────────────────────────────────────────────
+
+    #[test]
+    fn test_swap_exact_out_normal_path() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
+
+        let want_out = 50_000_i128;
+        let required_in = amm.get_amount_in(&ts.tb_addr, &want_out);
+
+        let trader = Address::generate(env);
+        ta_sac.mint(&trader, &(required_in + 1_000));
+
+        let spent = amm.swap_exact_out(&trader, &ts.tb_addr, &want_out, &(required_in + 1_000), &u64::MAX);
+
+        assert_eq!(spent, required_in);
+        let info = amm.get_info();
+        assert_eq!(info.reserve_b, 1_000_000 - want_out);
+        assert_eq!(info.reserve_a, 1_000_000 + spent);
+    }
+
+    #[test]
+    fn test_swap_exact_out_slippage_panics() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
+
+        let trader = Address::generate(env);
+        ta_sac.mint(&trader, &100_000_i128);
+        // max_in=1 is far too low for any real swap — must panic with slippage message
+        let result = amm.try_swap_exact_out(&trader, &ts.tb_addr, &50_000_i128, &1_i128, &u64::MAX);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_swap_exact_out_invalid_token_panics() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
+
+        let unknown = Address::generate(env);
+        let trader = Address::generate(env);
+        let result = amm.try_swap_exact_out(&trader, &unknown, &1_000_i128, &i128::MAX, &u64::MAX);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_swap_exact_out_paused_panics() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
+
+        amm.pause();
+
+        let trader = Address::generate(env);
+        ta_sac.mint(&trader, &100_000_i128);
+        let result = amm.try_swap_exact_out(&trader, &ts.tb_addr, &10_000_i128, &i128::MAX, &u64::MAX);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_swap_exact_out_round_trip_consistent_with_get_amount_in() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &10_000_000_i128);
+        tb_sac.mint(&provider, &10_000_000_i128);
+        amm.add_liquidity(&provider, &10_000_000_i128, &10_000_000_i128, &0_i128, &u64::MAX);
+
+        let want_out = 500_000_i128;
+        let quoted_in = amm.get_amount_in(&ts.tb_addr, &want_out);
+
+        let trader = Address::generate(env);
+        ta_sac.mint(&trader, &quoted_in);
+        let actual_in = amm.swap_exact_out(&trader, &ts.tb_addr, &want_out, &quoted_in, &u64::MAX);
+
+        assert_eq!(actual_in, quoted_in);
+    }
+
     // ── Liquidity ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -1412,7 +1725,7 @@ pub(crate) mod tests {
         let provider = Address::generate(env);
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
-        let result = amm.try_add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &i128::MAX);
+        let result = amm.try_add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &i128::MAX, &u64::MAX);
         assert!(result.is_err());
     }
 
@@ -1428,7 +1741,7 @@ pub(crate) mod tests {
         ta_sac.mint(&provider, &1_000_000_i128);
         tb_sac.mint(&provider, &1_000_000_i128);
         let shares = amm.add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
-        let result = amm.try_remove_liquidity(&provider, &shares, &i128::MAX, &0_i128);
+        let result = amm.try_remove_liquidity(&provider, &shares, &i128::MAX, &0_i128, &u64::MAX);
         assert!(result.is_err());
     }
 
@@ -1692,7 +2005,7 @@ pub(crate) mod tests {
 
         let trader = Address::generate(env);
         ta_sac.mint(&trader, &1_000_i128);
-        let result = amm.try_swap(&trader, &ts.ta_addr, &1_000_i128, &0_i128);
+        let result = amm.try_swap(&trader, &ts.ta_addr, &1_000_i128, &0_i128, &u64::MAX);
         assert!(result.is_err());
     }
 
@@ -1737,7 +2050,7 @@ pub(crate) mod tests {
 
         let trader = Address::generate(env);
         ta_sac.mint(&trader, &100_000_i128);
-        let result = amm.try_swap(&trader, &ts.ta_addr, &100_000_i128, &0_i128);
+        let result = amm.try_swap(&trader, &ts.ta_addr, &100_000_i128, &0_i128, &u64::MAX);
         assert!(result.is_ok());
         assert_eq!(result.unwrap().unwrap(), 0);
     }
@@ -1774,7 +2087,7 @@ pub(crate) mod tests {
         tb_sac.mint(&provider, &1_000_000_i128);
         // Expected = 1_000_000; requesting 1_000_001 triggers the slippage guard.
         let result =
-            amm.try_add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &1_000_001_i128);
+            amm.try_add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &1_000_001_i128, &u64::MAX);
         assert!(result.is_err());
     }
 
