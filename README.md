@@ -1,5 +1,7 @@
 # Soroban AMM
 
+[![CI](https://github.com/promisszn/soroban-amm/workflows/CI/badge.svg)](https://github.com/promisszn/soroban-amm/actions)
+
 A constant-product Automated Market Maker (AMM) built as a Soroban smart contract on the Stellar blockchain. It implements the classic `x * y = k` bonding curve model — the same design used by Uniswap v2 — providing decentralized token swaps and liquidity provisioning.
 
 ---
