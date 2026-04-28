@@ -364,8 +364,10 @@ impl AmmPool {
                     .instance()
                     .get(&DataKey::PriceCumulativeB)
                     .unwrap_or(0);
-                cum_a += (reserve_b * 1_000_000 / reserve_a) * elapsed;
-                cum_b += (reserve_a * 1_000_000 / reserve_b) * elapsed;
+                // Use wrapping_add so overflow is defined and consumers can handle it via
+                // unsigned subtraction: (now - then) as u128 gives the correct delta.
+                cum_a = cum_a.wrapping_add((reserve_b * 1_000_000 / reserve_a) * elapsed);
+                cum_b = cum_b.wrapping_add((reserve_a * 1_000_000 / reserve_b) * elapsed);
                 env.storage()
                     .instance()
                     .set(&DataKey::PriceCumulativeA, &cum_a);
