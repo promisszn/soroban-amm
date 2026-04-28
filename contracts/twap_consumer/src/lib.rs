@@ -28,6 +28,7 @@ impl TwapConsumer {
     /// Stores a pool cumulative-price snapshot keyed by the pool timestamp.
     pub fn save_snapshot(env: Env, pool: Address) {
         let (cum_a, cum_b, pool_ts) = AmmPoolOracleClient::new(&env, &pool).get_price_cumulative();
+        let ledger_ts = env.ledger().timestamp(); // key by keeper clock, not pool clock
         let snapshot = PriceSnapshot {
             cum_a,
             cum_b,
@@ -35,7 +36,7 @@ impl TwapConsumer {
         };
         env.storage()
             .persistent()
-            .set(&DataKey::Snapshot(pool, pool_ts), &snapshot);
+            .set(&DataKey::Snapshot(pool, ledger_ts), &snapshot);
     }
 
     /// Computes TWAP for token A in terms of token B over `window_seconds`.
@@ -44,21 +45,27 @@ impl TwapConsumer {
     pub fn get_twap_price(env: Env, pool: Address, window_seconds: u64) -> i128 {
         assert!(window_seconds > 0, "window_seconds must be > 0");
 
-        let (cum_a_now, _cum_b_now, now_ts) =
+        let (cum_a_now, _cum_b_now, pool_ts_now) =
             AmmPoolOracleClient::new(&env, &pool).get_price_cumulative();
+        let ledger_ts_now = env.ledger().timestamp();
         assert!(
-            now_ts >= window_seconds,
-            "pool timestamp is smaller than requested window"
+            ledger_ts_now >= window_seconds,
+            "ledger timestamp is smaller than requested window"
         );
 
-        let then_ts = now_ts - window_seconds;
+        let then_ts = ledger_ts_now - window_seconds;
         let snapshot: PriceSnapshot = env
             .storage()
             .persistent()
-            .get(&DataKey::Snapshot(pool, then_ts))
-            .unwrap_or_else(|| panic!("missing snapshot at target timestamp"));
+            .get(&DataKey::Snapshot(pool.clone(), then_ts))
+            .unwrap_or_else(|| panic!("missing snapshot at target ledger timestamp {then_ts}"));
 
-        (cum_a_now - snapshot.cum_a) / (window_seconds as i128)
+        // Use wrapping_sub on u128 to handle accumulator wrap-around correctly.
+        let delta_a = (cum_a_now as u128).wrapping_sub(snapshot.cum_a as u128) as i128;
+        let elapsed = (pool_ts_now - snapshot.pool_ts) as i128;
+        assert!(elapsed > 0, "window too small (pool time did not advance)");
+
+        delta_a / elapsed
     }
 }
 
@@ -121,7 +128,7 @@ mod tests {
         let provider = Address::generate(&env);
         ta_sac.mint(&provider, &2_000_000_i128);
         tb_sac.mint(&provider, &2_000_000_i128);
-        amm.add_liquidity(&provider, &2_000_000_i128, &2_000_000_i128, &0_i128);
+        amm.add_liquidity(&provider, &2_000_000_i128, &2_000_000_i128, &0_i128, &10_000_u64);
 
         let consumer = TwapConsumerClient::new(&env, &consumer_addr);
         consumer.save_snapshot(&amm_addr);
@@ -130,7 +137,7 @@ mod tests {
         env.ledger().set_timestamp(10_060);
         let whale = Address::generate(&env);
         ta_sac.mint(&whale, &1_000_000_i128);
-        amm.swap(&whale, &ta.address, &1_000_000_i128, &0_i128);
+        amm.swap(&whale, &ta.address, &1_000_000_i128, &0_i128, &10_060_u64);
 
         let twap = consumer.get_twap_price(&amm_addr, &60_u64);
         let (spot_a, _spot_b) = amm.price_ratio();

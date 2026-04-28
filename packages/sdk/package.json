@@ -1,0 +1,27 @@
+{
+  "name": "@soroban-amm/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript/JavaScript SDK for the Soroban AMM contract",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^13.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.7",
+    "typescript": "^5.7.2",
+    "vitest": "^3.0.0"
+  }
+}

@@ -9,8 +9,8 @@ ADMIN_ADDRESS="${ADMIN_ADDRESS:-}"
 FEE_RECIPIENT="${FEE_RECIPIENT:-}"
 PROTOCOL_FEE_BPS="${PROTOCOL_FEE_BPS:-0}"
 
-TOKEN_WASM="${TOKEN_WASM:-"$ROOT_DIR/target/wasm32-unknown-unknown/release/token.wasm"}"
-AMM_WASM="${AMM_WASM:-"$ROOT_DIR/target/wasm32-unknown-unknown/release/amm.wasm"}"
+TOKEN_WASM="${TOKEN_WASM:-"$ROOT_DIR/target/wasm32v1-none/release/token.wasm"}"
+AMM_WASM="${AMM_WASM:-"$ROOT_DIR/target/wasm32v1-none/release/amm.wasm"}"
 
 log() {
   printf '[deploy] %s\n' "$*" >&2
@@ -87,7 +87,7 @@ fi
 if [[ ! -f "$TOKEN_WASM" || ! -f "$AMM_WASM" ]]; then
   require_cmd cargo
   log "building release WASM artifacts"
-  (cd "$ROOT_DIR" && cargo build --release --target wasm32-unknown-unknown)
+  (cd "$ROOT_DIR" && cargo build --release --target wasm32v1-none)
 fi
 
 log "deploying Token A"
