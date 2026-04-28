@@ -165,14 +165,8 @@ impl AmmPool {
             token_a != token_b,
             "tokens must differ: token_a={token_a:?}, token_b={token_b:?}"
         );
-        assert!(
-            (0..=10_000).contains(&fee_bps),
-            "invalid fee: {fee_bps} is outside 0..=10_000"
-        );
-        assert!(
-            (0..=10_000).contains(&flash_loan_fee_bps),
-            "invalid flash loan fee: {flash_loan_fee_bps} is outside 0..=10_000"
-        );
+        Self::validate_fee_bps(fee_bps);
+        Self::validate_fee_bps(flash_loan_fee_bps);
         assert!(
             (0..=fee_bps).contains(&protocol_fee_bps),
             "invalid protocol fee: {protocol_fee_bps} must be in 0..={fee_bps}"
@@ -283,11 +277,21 @@ impl AmmPool {
     /// # Panics
     /// - If `admin` auth fails.
     /// - If `new_fee_bps` is outside [0, 10_000].
+    /// - If `new_fee_bps` is less than the current `protocol_fee_bps`.
     pub fn update_fee(env: Env, admin: Address, new_fee_bps: i128) {
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         assert!(admin == stored_admin, "not admin");
         admin.require_auth();
         Self::validate_fee_bps(new_fee_bps);
+        let protocol_fee_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeBps)
+            .unwrap_or(0);
+        assert!(
+            new_fee_bps >= protocol_fee_bps,
+            "fee_bps must be >= protocol_fee_bps: new={new_fee_bps}, protocol={protocol_fee_bps}"
+        );
         env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
         env.events()
             .publish((symbol_short!("fee_upd"), admin.clone()), (new_fee_bps,));
@@ -1130,7 +1134,11 @@ impl AmmPool {
         assert!(reserve >= amount, "insufficient liquidity");
 
         let fee_bps = Self::get_flash_loan_fee_bps(env.clone());
-        let fee = amount * fee_bps / 10_000;
+        let fee = if fee_bps > 0 {
+            (amount * fee_bps / 10_000).max(1)
+        } else {
+            0
+        };
         let pool = env.current_contract_address();
         let token_client = SepTokenClient::new(&env, &token);
         let balance_before = token_client.balance(&pool);
@@ -1262,7 +1270,8 @@ impl AmmPool {
         let spot_price = reserve_out * 1_000_000 / reserve_in;
         let effective_price = amount_out * 1_000_000 / amount_in;
         // Price impact: how far the execution price deviates from the spot price.
-        let price_impact_bps = (spot_price - effective_price) * 10_000 / spot_price;
+        // Clamp to [0, 10_000] to handle integer truncation edge cases on tiny amounts.
+        let price_impact_bps = ((spot_price - effective_price) * 10_000 / spot_price).max(0);
         SwapSimulation {
             amount_out,
             fee_amount,
