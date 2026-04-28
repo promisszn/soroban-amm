@@ -412,6 +412,15 @@ The fastest way to deploy a full AMM environment (Token A, Token B, LP Token, an
 
 A machine-readable JSON schema of all public contract functions, parameters, and events is available at [docs/abi.json](docs/abi.json).
 
+#### AMM Event Payloads
+
+| Event | Topics | Data Payload |
+|---|---|---|
+| `swap` | `("swap", trader)` | `(token_in, amount_in, token_out, amount_out)` |
+| `add_liquidity` | `("add_liq")` | `(provider, amount_a, amount_b, shares)` |
+| `remove_liquidity` | `("rm_liq")` | `(provider, shares, amount_a, amount_b)` |
+| `withdraw_fees` | `("wd_fees", fee_recipient)` | `(fee_a, fee_b)` |
+
 ### Development
 
 The project includes a `Makefile` to simplify common development tasks:
