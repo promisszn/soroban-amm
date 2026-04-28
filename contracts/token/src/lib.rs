@@ -7,8 +7,10 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Sy
 #[contracttype]
 pub enum DataKey {
     Balance(Address),
+    Locked(Address),
     Allowance(Address, Address),
     Admin,
+    Locker,
     Name,
     Symbol,
     Decimals,
@@ -32,6 +34,7 @@ impl LpToken {
             );
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Locker, &admin);
         env.storage().instance().set(&DataKey::Name, &name);
         env.storage().instance().set(&DataKey::Symbol, &symbol);
         env.storage().instance().set(&DataKey::Decimals, &decimals);
@@ -160,11 +163,61 @@ impl LpToken {
         env.storage().instance().get(&DataKey::Admin).unwrap()
     }
 
+    /// Address allowed to lock/unlock balances (governance).
+    pub fn locker(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Locker).unwrap()
+    }
+
+    /// Admin-only locker update.
+    pub fn set_locker(env: Env, locker: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Locker, &locker);
+    }
+
+    /// Returns currently locked balance for `id`.
+    pub fn locked_balance(env: Env, id: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Locked(id))
+            .unwrap_or(0)
+    }
+
+    /// Governance-locker only: lock a holder's transferable balance.
+    pub fn lock(env: Env, holder: Address, amount: i128) {
+        assert!(amount > 0, "amount must be positive");
+        let locker: Address = env.storage().instance().get(&DataKey::Locker).unwrap();
+        locker.require_auth();
+        let bal = Self::balance(env.clone(), holder.clone());
+        let locked = Self::locked_balance(env.clone(), holder.clone());
+        assert!(
+            bal - locked >= amount,
+            "insufficient unlocked balance to lock"
+        );
+        env.storage()
+            .persistent()
+            .set(&DataKey::Locked(holder), &(locked + amount));
+    }
+
+    /// Governance-locker only: unlock previously locked balance.
+    pub fn unlock(env: Env, holder: Address, amount: i128) {
+        assert!(amount > 0, "amount must be positive");
+        let locker: Address = env.storage().instance().get(&DataKey::Locker).unwrap();
+        locker.require_auth();
+        let locked = Self::locked_balance(env.clone(), holder.clone());
+        assert!(locked >= amount, "unlock exceeds locked balance");
+        env.storage()
+            .persistent()
+            .set(&DataKey::Locked(holder), &(locked - amount));
+    }
+
     fn _transfer(env: &Env, from: &Address, to: &Address, amount: i128) {
         let from_bal = Self::balance(env.clone(), from.clone());
+        let locked = Self::locked_balance(env.clone(), from.clone());
         assert!(
-            from_bal >= amount,
-            "insufficient balance: available={from_bal}, requested={amount}"
+            from_bal - locked >= amount,
+            "insufficient unlocked balance: available={}, requested={amount}",
+            from_bal - locked
         );
         env.storage()
             .persistent()
@@ -314,5 +367,28 @@ mod tests {
         assert_eq!(client.name(), String::from_str(&ts.env, "Test Token"));
         assert_eq!(client.symbol(), String::from_str(&ts.env, "TST"));
         assert_eq!(client.decimals(), 7u32);
+    }
+
+    #[test]
+    fn test_lock_blocks_transfer_until_unlock() {
+        let ts = setup();
+        let client = LpTokenClient::new(&ts.env, &ts.contract_addr);
+        let alice = Address::generate(&ts.env);
+        let bob = Address::generate(&ts.env);
+        let locker = Address::generate(&ts.env);
+
+        client.set_locker(&locker);
+        client.mint(&alice, &1_000_i128);
+        client.lock(&alice, &700_i128);
+        assert_eq!(client.locked_balance(&alice), 700);
+
+        assert!(client.try_transfer(&alice, &bob, &400_i128).is_err());
+        client.transfer(&alice, &bob, &300_i128);
+
+        client.unlock(&alice, &700_i128);
+        assert_eq!(client.locked_balance(&alice), 0);
+        client.transfer(&alice, &bob, &700_i128);
+        assert_eq!(client.balance(&alice), 0);
+        assert_eq!(client.balance(&bob), 1_000);
     }
 }

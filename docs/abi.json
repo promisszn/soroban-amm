@@ -61,6 +61,21 @@
           "outputs": [{ "type": "(i128, i128)" }],
           "events": ["withdraw_fees"]
         }
+      ],
+      "events": [
+        {
+          "name": "swap",
+          "topics": [
+            { "name": "event", "type": "Symbol" },
+            { "name": "trader", "type": "Address" }
+          ],
+          "data": [
+            { "name": "token_in", "type": "Address" },
+            { "name": "amount_in", "type": "i128" },
+            { "name": "token_out", "type": "Address" },
+            { "name": "amount_out", "type": "i128" }
+          ]
+        }
       ]
     },
     "token": {
