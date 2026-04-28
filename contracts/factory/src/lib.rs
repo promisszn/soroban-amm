@@ -87,6 +87,11 @@ impl Factory {
         } else {
             (token_b, token_a)
         };
+        
+        assert!(
+            (0..=10_000).contains(&fee_bps),
+            "invalid fee_bps: {fee_bps} must be in 0..=10_000"
+        );
 
         if env
             .storage()
@@ -153,6 +158,11 @@ impl Factory {
             .unwrap_or_else(|| Vec::new(&env));
         all.push_back(pool_addr.clone());
         env.storage().instance().set(&DataKey::AllPools, &all);
+
+        env.events().publish(
+            (Symbol::new(&env, "pool_created"),),
+            (ta.clone(), tb.clone(), pool_addr.clone(), fee_bps, lp_addr.clone()),
+        );
 
         pool_addr
     }
