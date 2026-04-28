@@ -278,9 +278,8 @@ impl AmmPool {
     /// - If `admin` auth fails.
     /// - If `new_fee_bps` is outside [0, 10_000].
     /// - If `new_fee_bps` is less than the current `protocol_fee_bps`.
-    pub fn update_fee(env: Env, admin: Address, new_fee_bps: i128) {
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        assert!(admin == stored_admin, "not admin");
+    pub fn update_fee(env: Env, new_fee_bps: i128) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         Self::validate_fee_bps(new_fee_bps);
         let protocol_fee_bps: i128 = env
