@@ -278,9 +278,8 @@ impl AmmPool {
     /// - If `admin` auth fails.
     /// - If `new_fee_bps` is outside [0, 10_000].
     /// - If `new_fee_bps` is less than the current `protocol_fee_bps`.
-    pub fn update_fee(env: Env, admin: Address, new_fee_bps: i128) {
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        assert!(admin == stored_admin, "not admin");
+    pub fn update_fee(env: Env, new_fee_bps: i128) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         Self::validate_fee_bps(new_fee_bps);
         let protocol_fee_bps: i128 = env
@@ -334,7 +333,7 @@ impl AmmPool {
 
     /// Return the pending admin nominee, or `None` if no transfer is in progress.
     pub fn get_pending_admin(env: Env) -> Option<Address> {
-        env.storage()
+        env.storage() 
             .instance()
             .get(&DataKey::PendingAdmin)
             .unwrap_or(None)
@@ -2628,6 +2627,56 @@ pub(crate) mod tests {
         let (price_a, price_b) = amm.price_ratio();
         assert_eq!(price_a, 1_000_000);
         assert_eq!(price_b, 1_000_000);
+    }
+
+    #[test]
+    fn test_large_reserves_get_amount_in_round_trip() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let large_amount = 4_000_000_000_000_000_000_i128; // 4e18
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &large_amount);
+        tb_sac.mint(&provider, &large_amount);
+        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &u64::MAX);
+
+        // Forward: B for A
+        let amount_in = 1_000_000_000_i128;
+        let amount_out = amm.get_amount_out(&ts.ta_addr, &amount_in);
+        assert!(amount_out > 0);
+
+        // Reverse: A needed for B
+        let amount_in_reverse = amm.get_amount_in(&ts.tb_addr, &amount_out);
+
+        assert!(
+            amount_in_reverse >= amount_in,
+            "reverse quote should be >= original input"
+        );
+        assert!(
+            amount_in_reverse <= amount_in + 1,
+            "reverse quote should be at most 1 unit above original input"
+        );
+    }
+    #[test]
+    #[should_panic]
+    fn test_get_amount_in_overflow() {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let large_amount = 4_000_000_000_000_000_000_i128; // 4e18
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &large_amount);
+        tb_sac.mint(&provider, &large_amount);
+        amm.add_liquidity(&provider, &large_amount, &large_amount, &0_i128, &u64::MAX);
+
+        // 4e18 * 1e17 * 10000 = 4e39 > i128::MAX
+        amm.get_amount_in(&ts.ta_addr, &100_000_000_000_000_000_i128);
     }
 }
 

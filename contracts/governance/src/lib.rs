@@ -334,7 +334,7 @@ mod tests {
 
     fn setup_suite(initial_fee_bps: i128) -> Suite {
         let env = Env::default();
-        env.mock_all_auths();
+        env.mock_all_auths_allowing_non_root_auth();
         env.ledger().set_timestamp(1_000_000);
 
         let admin = Address::generate(&env);
