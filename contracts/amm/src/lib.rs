@@ -333,7 +333,7 @@ impl AmmPool {
 
     /// Return the pending admin nominee, or `None` if no transfer is in progress.
     pub fn get_pending_admin(env: Env) -> Option<Address> {
-        env.storage() 
+        env.storage()
             .instance()
             .get(&DataKey::PendingAdmin)
             .unwrap_or(None)
@@ -927,7 +927,7 @@ impl AmmPool {
 
         env.events().publish(
             (Symbol::new(&env, "swap"), trader),
-            (token_in, amount_in, amount_out),
+            (token_in, amount_in, token_out, amount_out),
         );
 
         amount_out
@@ -1052,7 +1052,7 @@ impl AmmPool {
 
         env.events().publish(
             (Symbol::new(&env, "swap"), trader),
-            (token_in, amount_in, amount_out),
+            (token_in, amount_in, token_out, amount_out),
         );
 
         amount_in
@@ -2251,6 +2251,51 @@ pub(crate) mod tests {
             .expect("remove_liquidity event not found");
         let data: (Address, i128, i128, i128) = rm_liq_event.2.into_val(env);
         let expected = (provider.clone(), shares, out_a, out_b);
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_swap_emits_token_out_in_event_payload() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::{symbol_short, IntoVal};
+
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(
+            &provider,
+            &1_000_000_i128,
+            &1_000_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+
+        let trader = Address::generate(env);
+        let amount_in = 100_000_i128;
+        ta_sac.mint(&trader, &amount_in);
+        let amount_out = amm.swap(&trader, &ts.ta_addr, &amount_in, &0_i128, &u64::MAX);
+
+        let events = env.events().all();
+        let swap_event = events
+            .iter()
+            .find(|e| {
+                e.0 == amm.address && e.1 == (symbol_short!("swap"), trader.clone()).into_val(env)
+            })
+            .expect("swap event not found");
+
+        let data: (Address, i128, Address, i128) = swap_event.2.into_val(env);
+        let expected = (
+            ts.ta_addr.clone(),
+            amount_in,
+            ts.tb_addr.clone(),
+            amount_out,
+        );
         assert_eq!(data, expected);
     }
 
