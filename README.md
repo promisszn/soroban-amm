@@ -141,8 +141,11 @@ Located in [contracts/amm/src/lib.rs](contracts/amm/src/lib.rs).
 | `remove_liquidity(provider, shares, min_a, min_b) → (a, b)` | Burn LP shares, withdraw tokens |
 | `swap(trader, token_in, amount_in, min_out) → amount_out` | Exchange tokens |
 | `get_amount_out(token_in, amount_in) → amount_out` | Quote a swap without executing it |
-| `get_info() → PoolInfo` | Read pool state (reserves, fee, shares) |
+| `get_info() → PoolInfo` | Read pool state — reserves, fees, total shares, admin, fee recipient, protocol fee |
+| `get_accrued_fees() → (i128, i128)` | Read pending protocol fees in `(token_a, token_b)` without moving funds |
 | `shares_of(provider) → shares` | Read an LP's share balance |
+| `propose_admin(current_admin, new_admin)` | Nominate a new admin; emits `admin_nominated` |
+| `accept_admin(new_admin)` | Nominee accepts the role; emits `admin_changed` |
 
 ### Factory Contract
 
@@ -420,6 +423,16 @@ A machine-readable JSON schema of all public contract functions, parameters, and
 | `add_liquidity` | `("add_liq")` | `(provider, amount_a, amount_b, shares)` |
 | `remove_liquidity` | `("rm_liq")` | `(provider, shares, amount_a, amount_b)` |
 | `withdraw_fees` | `("wd_fees", fee_recipient)` | `(fee_a, fee_b)` |
+| `admin_nominated` | `("admin_nominated")` | `(current_admin, new_admin)` |
+| `admin_changed` | `("admin_changed")` | `(new_admin,)` |
+
+#### Governance Event Payloads
+
+| Event | Topics | Data Payload |
+|---|---|---|
+| `proposed` | `("proposed")` | `(proposal_id, proposer, new_fee_bps, vote_end)` |
+| `voted` | `("voted")` | `(proposal_id, voter, support, voting_power)` |
+| `executed` | `("executed")` | `(proposal_id, new_fee_bps)` |
 
 ### Development
 

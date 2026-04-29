@@ -95,8 +95,19 @@ export class AmmPool {
       protocolFeeBps: BigInt(String(native.protocol_fee_bps ?? 0)),
       feeRecipient: native.fee_recipient ? String(native.fee_recipient) : null,
       flashLoanFeeBps: BigInt(String(native.flash_loan_fee_bps ?? 0)),
+      admin: native.admin ? String(native.admin) : null,
       isPaused: Boolean(native.is_paused),
       name: native.name ? String(native.name) : null,
+    };
+  }
+
+  /** Return protocol fees accrued but not yet withdrawn — read-only. */
+  async getAccruedFees(): Promise<{ accruedA: bigint; accruedB: bigint }> {
+    const raw = await this.simulate("get_accrued_fees");
+    const native = scValToNative(raw) as [unknown, unknown];
+    return {
+      accruedA: BigInt(String(native[0] ?? 0)),
+      accruedB: BigInt(String(native[1] ?? 0)),
     };
   }
 

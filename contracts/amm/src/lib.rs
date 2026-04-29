@@ -70,6 +70,9 @@ pub struct PoolInfo {
     pub total_shares: i128,
     pub fee_bps: i128,
     pub flash_loan_fee_bps: i128,
+    pub admin: Address,
+    pub fee_recipient: Address,
+    pub protocol_fee_bps: i128,
 }
 
 #[contractclient(name = "FlashLoanReceiverClient")]
@@ -307,7 +310,11 @@ impl AmmPool {
         current_admin.require_auth();
         env.storage()
             .instance()
-            .set(&DataKey::PendingAdmin, &Some(new_admin));
+            .set(&DataKey::PendingAdmin, &Some(new_admin.clone()));
+        env.events().publish(
+            (Symbol::new(&env, "admin_nominated"),),
+            (current_admin, new_admin),
+        );
     }
 
     /// Accept the pending admin nomination. Caller becomes the new admin.
@@ -329,6 +336,8 @@ impl AmmPool {
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &Option::<Address>::None);
+        env.events()
+            .publish((Symbol::new(&env, "admin_changed"),), (new_admin,));
     }
 
     /// Return the pending admin nominee, or `None` if no transfer is in progress.
@@ -1314,6 +1323,10 @@ impl AmmPool {
     /// - `reserve_a` / `reserve_b` — current token reserves held by the pool.
     /// - `total_shares` — total outstanding LP shares.
     /// - `fee_bps` — the swap fee in basis points.
+    /// - `flash_loan_fee_bps` — the flash-loan fee in basis points.
+    /// - `admin` — the pool administrator.
+    /// - `fee_recipient` — recipient of accrued protocol fees.
+    /// - `protocol_fee_bps` — protocol fee in basis points (subset of `fee_bps`).
     pub fn get_info(env: Env) -> PoolInfo {
         PoolInfo {
             token_a: env.storage().instance().get(&DataKey::TokenA).unwrap(),
@@ -1323,7 +1336,39 @@ impl AmmPool {
             total_shares: Self::get_total_shares(env.clone()),
             fee_bps: env.storage().instance().get(&DataKey::FeeBps).unwrap(),
             flash_loan_fee_bps: Self::get_flash_loan_fee_bps(env.clone()),
+            admin: env.storage().instance().get(&DataKey::Admin).unwrap(),
+            fee_recipient: env
+                .storage()
+                .instance()
+                .get(&DataKey::FeeRecipient)
+                .unwrap(),
+            protocol_fee_bps: env
+                .storage()
+                .instance()
+                .get(&DataKey::ProtocolFeeBps)
+                .unwrap_or(0),
         }
+    }
+
+    /// Return the protocol fees accrued but not yet withdrawn, without moving funds.
+    ///
+    /// Read-only counterpart to [`withdraw_protocol_fees`]; useful for fee recipients
+    /// and dashboards that need a non-destructive view of pending fees.
+    ///
+    /// # Returns
+    /// `(accrued_fee_a, accrued_fee_b)` — pending protocol fees in each token.
+    pub fn get_accrued_fees(env: Env) -> (i128, i128) {
+        let fee_a: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccruedFeeA)
+            .unwrap_or(0);
+        let fee_b: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccruedFeeB)
+            .unwrap_or(0);
+        (fee_a, fee_b)
     }
 
     /// Return the number of LP shares currently held by a given provider.
@@ -3250,5 +3295,159 @@ mod prop_tests {
         );
         let (w2, _) = amm.withdraw_protocol_fees();
         assert!(w2 > 0);
+    }
+
+    // Issue #132: PoolInfo must expose admin, fee_recipient, and protocol_fee_bps.
+    #[test]
+    fn test_get_info_returns_admin_and_fee_recipient() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+        let (ta, _) = create_sac(&env, &admin);
+        let (tb, _) = create_sac(&env, &admin);
+        let fee_recipient = Address::generate(&env);
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(
+            &admin,
+            &ta.address,
+            &tb.address,
+            &lp_addr,
+            &30_i128,
+            &fee_recipient,
+            &5_i128,
+        );
+
+        let info = amm.get_info();
+        assert_eq!(info.admin, admin);
+        assert_eq!(info.fee_recipient, fee_recipient);
+        assert_eq!(info.protocol_fee_bps, 5_i128);
+        assert_eq!(info.fee_bps, 30_i128);
+    }
+
+    // Issue #131: get_accrued_fees must return (0, 0) before swaps.
+    #[test]
+    fn test_get_accrued_fees_zero_before_swaps() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+        let (ta, _) = create_sac(&env, &admin);
+        let (tb, _) = create_sac(&env, &admin);
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(
+            &admin,
+            &ta.address,
+            &tb.address,
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &5_i128,
+        );
+
+        let (a, b) = amm.get_accrued_fees();
+        assert_eq!(a, 0_i128);
+        assert_eq!(b, 0_i128);
+    }
+
+    // Issue #131: get_accrued_fees must match accumulation after swaps without
+    // mutating state.
+    #[test]
+    fn test_get_accrued_fees_matches_swap_accumulation() {
+        let (env, admin, amm_addr, lp_addr, _) = setup();
+        let (ta_client, ta_sac) = create_sac(&env, &admin);
+        let (tb_client, tb_sac) = create_sac(&env, &admin);
+        let amm = AmmPoolClient::new(&env, &amm_addr);
+        amm.initialize(
+            &admin,
+            &ta_client.address,
+            &tb_client.address,
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &5_i128,
+        );
+
+        let provider = Address::generate(&env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        amm.add_liquidity(
+            &provider,
+            &1_000_000_i128,
+            &1_000_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+
+        let trader = Address::generate(&env);
+        ta_sac.mint(&trader, &100_000_i128);
+        amm.swap(
+            &trader,
+            &ta_client.address,
+            &100_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+
+        // protocol fee per swap = 100_000 * 5 / 10_000 = 50, accrued in token A.
+        let (accrued_a, accrued_b) = amm.get_accrued_fees();
+        assert_eq!(accrued_a, 50_i128);
+        assert_eq!(accrued_b, 0_i128);
+
+        // Calling get_accrued_fees does not mutate state — withdrawing now
+        // returns the same amount.
+        let (withdrawn_a, withdrawn_b) = amm.withdraw_protocol_fees();
+        assert_eq!(withdrawn_a, 50_i128);
+        assert_eq!(withdrawn_b, 0_i128);
+
+        // After withdrawal, accrued is back to zero.
+        let (post_a, post_b) = amm.get_accrued_fees();
+        assert_eq!(post_a, 0_i128);
+        assert_eq!(post_b, 0_i128);
+    }
+
+    // Issue #130: propose_admin must emit `admin_nominated`.
+    #[test]
+    fn test_propose_admin_emits_event() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::IntoVal;
+
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let nominee = Address::generate(env);
+
+        amm.propose_admin(&ts.admin, &nominee);
+
+        let events = env.events().all();
+        let evt = events
+            .iter()
+            .find(|e| {
+                e.0 == amm.address && e.1 == (Symbol::new(env, "admin_nominated"),).into_val(env)
+            })
+            .expect("admin_nominated event not found");
+
+        let data: (Address, Address) = evt.2.into_val(env);
+        assert_eq!(data, (ts.admin.clone(), nominee.clone()));
+    }
+
+    // Issue #130: accept_admin must emit `admin_changed`.
+    #[test]
+    fn test_accept_admin_emits_event() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::IntoVal;
+
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let nominee = Address::generate(env);
+
+        amm.propose_admin(&ts.admin, &nominee);
+        amm.accept_admin(&nominee);
+
+        let events = env.events().all();
+        let evt = events
+            .iter()
+            .find(|e| {
+                e.0 == amm.address && e.1 == (Symbol::new(env, "admin_changed"),).into_val(env)
+            })
+            .expect("admin_changed event not found");
+
+        let data: (Address,) = evt.2.into_val(env);
+        assert_eq!(data, (nominee,));
     }
 }
