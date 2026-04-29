@@ -20,6 +20,7 @@ export interface PoolInfo {
   protocolFeeBps: bigint;
   feeRecipient: string | null;
   flashLoanFeeBps: bigint;
+  admin: string | null;
   isPaused: boolean;
   name: string | null;
 }

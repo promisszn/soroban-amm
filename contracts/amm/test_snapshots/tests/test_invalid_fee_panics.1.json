@@ -260,6 +260,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "Locker"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "Name"
                             }
                           ]
@@ -922,7 +934,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'invalid fee_bps: 10001 is outside 0..=10_000' from contract function 'Symbol(obj#211)'"
+                  "string": "caught panic 'invalid fee_bps: 10001 is outside 0..=10_000' from contract function 'Symbol(obj#213)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"

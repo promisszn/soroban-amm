@@ -12,7 +12,7 @@
 
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -214,6 +214,11 @@ impl Governance {
             .instance()
             .set(&DataKey::ProposalCount, &(id + 1));
 
+        env.events().publish(
+            (Symbol::new(&env, "proposed"),),
+            (id, proposer, new_fee_bps, vote_end),
+        );
+
         id
     }
 
@@ -257,9 +262,14 @@ impl Governance {
         Self::bump_key_ttl(&env, &proposal_key);
         env.storage().persistent().set(&voted_key, &true);
         Self::bump_key_ttl(&env, &voted_key);
-        let lock_key = DataKey::LockedVote(proposal_id, voter);
+        let lock_key = DataKey::LockedVote(proposal_id, voter.clone());
         env.storage().persistent().set(&lock_key, &voting_power);
         Self::bump_key_ttl(&env, &lock_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "voted"),),
+            (proposal_id, voter, support, voting_power),
+        );
     }
 
     /// Execute a passed proposal after the timelock has elapsed.
@@ -310,6 +320,11 @@ impl Governance {
         proposal.executed = true;
         env.storage().persistent().set(&proposal_key, &proposal);
         Self::bump_key_ttl(&env, &proposal_key);
+
+        env.events().publish(
+            (Symbol::new(&env, "executed"),),
+            (proposal_id, proposal.new_fee_bps),
+        );
     }
 
     /// Unlock voting power for a concluded proposal.
@@ -689,5 +704,65 @@ mod tests {
         gov.unlock_vote(&lp1, &pid);
         assert_eq!(lp_client.locked_balance(&lp1), 0);
         lp_client.transfer(&lp1, &receiver, &600_i128);
+    }
+
+    // Issue #129: governance must emit `proposed`, `voted`, and `executed`
+    // events with the documented payloads.
+    #[test]
+    fn test_governance_emits_proposed_voted_executed_events() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::IntoVal;
+
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        let lp1 = Address::generate(&s.env);
+        let lp2 = Address::generate(&s.env);
+        mint_lp(&s, &lp1, 600);
+        mint_lp(&s, &lp2, 400);
+
+        let pid = gov.propose(&lp1, &50_i128);
+        let proposal = gov.get_proposal(&pid);
+
+        // `proposed` event: (id, proposer, new_fee_bps, vote_end)
+        let events = s.env.events().all();
+        let proposed_evt = events
+            .iter()
+            .find(|e| {
+                e.0 == gov.address && e.1 == (Symbol::new(&s.env, "proposed"),).into_val(&s.env)
+            })
+            .expect("proposed event not found");
+        let proposed_data: (u32, Address, i128, u64) = proposed_evt.2.into_val(&s.env);
+        assert_eq!(
+            proposed_data,
+            (pid, lp1.clone(), 50_i128, proposal.vote_end)
+        );
+
+        gov.vote(&lp1, &pid, &true);
+
+        // `voted` event: (proposal_id, voter, support, voting_power)
+        let events = s.env.events().all();
+        let voted_evt = events
+            .iter()
+            .find(|e| e.0 == gov.address && e.1 == (Symbol::new(&s.env, "voted"),).into_val(&s.env))
+            .expect("voted event not found");
+        let voted_data: (u32, Address, bool, i128) = voted_evt.2.into_val(&s.env);
+        assert_eq!(voted_data, (pid, lp1.clone(), true, 600_i128));
+
+        gov.vote(&lp2, &pid, &true);
+
+        s.env.ledger().set_timestamp(proposal.execute_after + 1);
+        gov.execute(&pid);
+
+        // `executed` event: (proposal_id, new_fee_bps)
+        let events = s.env.events().all();
+        let executed_evt = events
+            .iter()
+            .find(|e| {
+                e.0 == gov.address && e.1 == (Symbol::new(&s.env, "executed"),).into_val(&s.env)
+            })
+            .expect("executed event not found");
+        let executed_data: (u32, i128) = executed_evt.2.into_val(&s.env);
+        assert_eq!(executed_data, (pid, 50_i128));
     }
 }
