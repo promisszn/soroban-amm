@@ -195,6 +195,18 @@ impl Factory {
         );
     }
 
+    /// Replace the factory contract WASM with a new version. Admin-only.
+    ///
+    /// The new WASM must already be uploaded to the network.
+    /// State is preserved; only bytecode is replaced.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        env.events()
+            .publish((Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
+    }
+
     // ── Queries ───────────────────────────────────────────────────────────────
 
     /// Return the LP token address for the given pool, or `None` if unknown.

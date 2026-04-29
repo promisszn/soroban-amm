@@ -10,7 +10,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, symbol_short, Address, Bytes, Env, Symbol,
+    contract, contractclient, contractimpl, contracttype, symbol_short, Address, Bytes, BytesN,
+    Env, Symbol,
 };
 // Standard SEP-41 interface for pool tokens (token_a, token_b)
 use soroban_sdk::token::Client as SepTokenClient;
@@ -338,6 +339,18 @@ impl AmmPool {
             .set(&DataKey::PendingAdmin, &Option::<Address>::None);
         env.events()
             .publish((Symbol::new(&env, "admin_changed"),), (new_admin,));
+    }
+
+    /// Replace the contract WASM with a new version. Admin-only.
+    ///
+    /// The new WASM must already be uploaded to the network.
+    /// State is preserved; only bytecode is replaced.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        env.events()
+            .publish((Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
     }
 
     /// Return the pending admin nominee, or `None` if no transfer is in progress.
