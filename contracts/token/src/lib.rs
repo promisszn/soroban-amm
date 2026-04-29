@@ -2,7 +2,7 @@
 
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Symbol};
 
 #[contracttype]
 pub enum DataKey {
@@ -166,6 +166,18 @@ impl LpToken {
     /// Address allowed to lock/unlock balances (governance).
     pub fn locker(env: Env) -> Address {
         env.storage().instance().get(&DataKey::Locker).unwrap()
+    }
+
+    /// Replace the contract WASM with a new version. Admin-only.
+    ///
+    /// The new WASM must already be uploaded to the network.
+    /// State is preserved; only bytecode is replaced.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+        env.events()
+            .publish((Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
     }
 
     /// Admin-only locker update.

@@ -4,7 +4,7 @@
 //! Voting power is locked during the proposal lifecycle to prevent
 //! flash-loan and vote-then-sell attacks. A proposal passes when:
 //!   - `votes_for > votes_against`
-//!   - total votes cast >= quorum (10 % of total LP supply at snapshot)
+//!   - total votes cast >= quorum (configurable % of total LP supply at snapshot)
 //!
 //! After the voting period ends a timelock delay must elapse before anyone
 //! can call `execute()`, which applies the change via `update_fee()` on the
@@ -16,14 +16,6 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// Voting period: 7 days expressed in seconds.
-const VOTING_PERIOD_SECS: u64 = 7 * 24 * 60 * 60;
-
-/// Timelock delay after voting closes before execution is allowed: 2 days.
-const TIMELOCK_SECS: u64 = 2 * 24 * 60 * 60;
-
-/// Quorum: 10 % of total LP supply at snapshot must participate.
-const QUORUM_BPS: i128 = 1_000; // 10 % in basis points
 const MAX_BPS: i128 = 10_000;
 const MIN_PERSISTENT_TTL: u32 = 172_800; // ~10 days at 5s/ledger
 const PERSISTENT_TTL_BUMP_TO: u32 = 259_200; // ~15 days at 5s/ledger
@@ -42,9 +34,15 @@ pub enum DataKey {
     Admin,
     /// Minimum proposer stake in basis points of total LP supply.
     MinProposerStakeBps,
+    /// Voting period in seconds (configurable at initialize).
+    VotingPeriod,
+    /// Timelock delay in seconds (configurable at initialize).
+    Timelock,
+    /// Quorum requirement in basis points of total LP supply at snapshot.
+    QuorumBps,
     /// Individual proposal storage.
     Proposal(u32),
-    /// Whether a voter has already voted on a proposal: (proposal_id, voter).
+    /// Vote record for a voter on a proposal: (proposal_id, voter).
     HasVoted(u32, Address),
     /// Locked voting amount for a voter on a proposal.
     LockedVote(u32, Address),
@@ -67,6 +65,27 @@ pub enum ProposalStatus {
     Defeated,
     /// Proposal expired without execution after timelock window.
     Expired,
+    /// Proposal was cancelled by the original proposer.
+    Cancelled,
+}
+
+/// Records how an address voted on a specific proposal.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub enum VoteRecord {
+    DidNotVote,
+    VotedFor,
+    VotedAgainst,
+}
+
+/// Current governance configuration returned by `get_params`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct GovernanceParams {
+    pub voting_period_secs: u64,
+    pub timelock_secs: u64,
+    pub quorum_bps: i128,
+    pub min_proposer_stake_bps: i128,
 }
 
 #[contracttype]
@@ -81,13 +100,14 @@ pub struct Proposal {
     pub vote_start: u64,
     /// Timestamp when voting closes.
     pub vote_end: u64,
-    /// Timestamp after which execution is allowed (vote_end + TIMELOCK_SECS).
+    /// Timestamp after which execution is allowed (vote_end + timelock_secs).
     pub execute_after: u64,
-    /// Timestamp after which the proposal expires if not executed (execute_after + TIMELOCK_SECS).
+    /// Timestamp after which the proposal expires if not executed (execute_after + timelock_secs).
     pub expires_at: u64,
     pub votes_for: i128,
     pub votes_against: i128,
     pub executed: bool,
+    pub cancelled: bool,
 }
 
 // ── LP token client ───────────────────────────────────────────────────────────
@@ -117,16 +137,30 @@ impl Governance {
     // ── Setup ─────────────────────────────────────────────────────────────────
 
     /// One-time initialisation. Must be called after deployment.
+    ///
+    /// - `voting_period_secs` must be > 0.
+    /// - `timelock_secs` must be > 0.
+    /// - `quorum_bps` must be in [1, 10_000].
+    /// - `min_proposer_stake_bps` must be in [0, 10_000].
     pub fn initialize(
         env: Env,
         admin: Address,
         amm_pool: Address,
         lp_token: Address,
+        voting_period_secs: u64,
+        timelock_secs: u64,
+        quorum_bps: i128,
         min_proposer_stake_bps: i128,
     ) {
         assert!(
             !env.storage().instance().has(&DataKey::AmmPool),
             "already initialized"
+        );
+        assert!(voting_period_secs > 0, "voting_period_secs must be > 0");
+        assert!(timelock_secs > 0, "timelock_secs must be > 0");
+        assert!(
+            (1..=MAX_BPS).contains(&quorum_bps),
+            "quorum_bps must be in [1, 10_000]"
         );
         assert!(
             (0..=MAX_BPS).contains(&min_proposer_stake_bps),
@@ -135,6 +169,15 @@ impl Governance {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::AmmPool, &amm_pool);
         env.storage().instance().set(&DataKey::LpToken, &lp_token);
+        env.storage()
+            .instance()
+            .set(&DataKey::VotingPeriod, &voting_period_secs);
+        env.storage()
+            .instance()
+            .set(&DataKey::Timelock, &timelock_secs);
+        env.storage()
+            .instance()
+            .set(&DataKey::QuorumBps, &quorum_bps);
         env.storage()
             .instance()
             .set(&DataKey::MinProposerStakeBps, &min_proposer_stake_bps);
@@ -182,10 +225,13 @@ impl Governance {
             "insufficient stake to propose"
         );
 
+        let voting_period: u64 = env.storage().instance().get(&DataKey::VotingPeriod).unwrap();
+        let timelock: u64 = env.storage().instance().get(&DataKey::Timelock).unwrap();
+
         let now = env.ledger().timestamp();
-        let vote_end = now + VOTING_PERIOD_SECS;
-        let execute_after = vote_end + TIMELOCK_SECS;
-        let expires_at = execute_after + TIMELOCK_SECS; // extra window to execute
+        let vote_end = now + voting_period;
+        let execute_after = vote_end + timelock;
+        let expires_at = execute_after + timelock; // extra window to execute
 
         let id: u32 = env
             .storage()
@@ -205,6 +251,7 @@ impl Governance {
             votes_for: 0,
             votes_against: 0,
             executed: false,
+            cancelled: false,
         };
 
         let proposal_key = DataKey::Proposal(id);
@@ -225,8 +272,7 @@ impl Governance {
     /// Cast a vote on an active proposal.
     ///
     /// Voting power = voter's current LP balance, which is then locked until
-    /// the proposal concludes.
-    /// Each address may only vote once per proposal.
+    /// the proposal concludes. Each address may only vote once per proposal.
     pub fn vote(env: Env, voter: Address, proposal_id: u32, support: bool) {
         voter.require_auth();
 
@@ -242,6 +288,7 @@ impl Governance {
         assert!(now >= proposal.vote_start, "voting not started");
         assert!(now <= proposal.vote_end, "voting period has ended");
         assert!(!proposal.executed, "proposal already executed");
+        assert!(!proposal.cancelled, "proposal is cancelled");
 
         let voted_key = DataKey::HasVoted(proposal_id, voter.clone());
         assert!(!env.storage().persistent().has(&voted_key), "already voted");
@@ -260,8 +307,15 @@ impl Governance {
 
         env.storage().persistent().set(&proposal_key, &proposal);
         Self::bump_key_ttl(&env, &proposal_key);
-        env.storage().persistent().set(&voted_key, &true);
+
+        let record = if support {
+            VoteRecord::VotedFor
+        } else {
+            VoteRecord::VotedAgainst
+        };
+        env.storage().persistent().set(&voted_key, &record);
         Self::bump_key_ttl(&env, &voted_key);
+
         let lock_key = DataKey::LockedVote(proposal_id, voter.clone());
         env.storage().persistent().set(&lock_key, &voting_power);
         Self::bump_key_ttl(&env, &lock_key);
@@ -285,27 +339,22 @@ impl Governance {
         Self::bump_key_ttl(&env, &proposal_key);
 
         assert!(!proposal.executed, "already executed");
+        assert!(!proposal.cancelled, "proposal is cancelled");
 
         let now = env.ledger().timestamp();
 
-        // Must be past voting period.
         assert!(now > proposal.vote_end, "voting period not ended");
-
-        // Must not have expired.
         assert!(now <= proposal.expires_at, "proposal expired");
-
-        // Timelock must have elapsed.
         assert!(now >= proposal.execute_after, "timelock not elapsed");
 
-        // Check quorum: total votes >= 10% of snapshot supply.
+        let quorum_bps: i128 = env.storage().instance().get(&DataKey::QuorumBps).unwrap();
         let total_votes = proposal.votes_for + proposal.votes_against;
-        let quorum_threshold = proposal.snapshot_total_supply * QUORUM_BPS / MAX_BPS;
+        let quorum_threshold = proposal.snapshot_total_supply * quorum_bps / MAX_BPS;
         assert!(
             total_votes >= quorum_threshold,
             "quorum not met: votes={total_votes}, required={quorum_threshold}"
         );
 
-        // Check majority.
         assert!(
             proposal.votes_for > proposal.votes_against,
             "proposal defeated: for={}, against={}",
@@ -313,7 +362,6 @@ impl Governance {
             proposal.votes_against
         );
 
-        // Apply the fee change on the AMM.
         let amm_pool: Address = env.storage().instance().get(&DataKey::AmmPool).unwrap();
         AmmPoolClient::new(&env, &amm_pool).update_fee(&proposal.new_fee_bps);
 
@@ -327,6 +375,59 @@ impl Governance {
         );
     }
 
+    /// Cancel an active proposal. Only the original proposer can cancel,
+    /// and only while voting is still open.
+    pub fn cancel_proposal(env: Env, proposal_id: u32, proposer: Address) {
+        proposer.require_auth();
+
+        let proposal_key = DataKey::Proposal(proposal_id);
+        let mut proposal: Proposal = env
+            .storage()
+            .persistent()
+            .get(&proposal_key)
+            .expect("proposal not found");
+        Self::bump_key_ttl(&env, &proposal_key);
+
+        assert!(!proposal.executed, "cannot cancel executed proposal");
+        assert!(!proposal.cancelled, "already cancelled");
+        assert!(
+            env.ledger().timestamp() <= proposal.vote_end,
+            "voting period ended"
+        );
+        assert!(proposal.proposer == proposer, "not the proposer");
+
+        proposal.cancelled = true;
+        env.storage().persistent().set(&proposal_key, &proposal);
+        Self::bump_key_ttl(&env, &proposal_key);
+
+        env.events()
+            .publish((Symbol::new(&env, "cancelled"),), (proposal_id,));
+    }
+
+    /// Query how an address voted on a proposal.
+    ///
+    /// Returns `VotedFor`, `VotedAgainst`, or `DidNotVote`.
+    pub fn get_vote_info(env: Env, proposal_id: u32, voter: Address) -> VoteRecord {
+        env.storage()
+            .persistent()
+            .get(&DataKey::HasVoted(proposal_id, voter))
+            .unwrap_or(VoteRecord::DidNotVote)
+    }
+
+    /// Return the current governance configuration parameters.
+    pub fn get_params(env: Env) -> GovernanceParams {
+        GovernanceParams {
+            voting_period_secs: env.storage().instance().get(&DataKey::VotingPeriod).unwrap(),
+            timelock_secs: env.storage().instance().get(&DataKey::Timelock).unwrap(),
+            quorum_bps: env.storage().instance().get(&DataKey::QuorumBps).unwrap(),
+            min_proposer_stake_bps: env
+                .storage()
+                .instance()
+                .get(&DataKey::MinProposerStakeBps)
+                .unwrap(),
+        }
+    }
+
     /// Unlock voting power for a concluded proposal.
     pub fn unlock_vote(env: Env, voter: Address, proposal_id: u32) {
         voter.require_auth();
@@ -334,7 +435,8 @@ impl Governance {
         assert!(
             status == ProposalStatus::Executed
                 || status == ProposalStatus::Defeated
-                || status == ProposalStatus::Expired,
+                || status == ProposalStatus::Expired
+                || status == ProposalStatus::Cancelled,
             "proposal not concluded"
         );
         let lock_key = DataKey::LockedVote(proposal_id, voter.clone());
@@ -367,6 +469,10 @@ impl Governance {
             .expect("proposal not found");
         Self::bump_key_ttl(&env, &DataKey::Proposal(proposal_id));
 
+        if proposal.cancelled {
+            return ProposalStatus::Cancelled;
+        }
+
         if proposal.executed {
             return ProposalStatus::Executed;
         }
@@ -377,9 +483,9 @@ impl Governance {
             return ProposalStatus::Active;
         }
 
-        // Voting closed — check outcome.
+        let quorum_bps: i128 = env.storage().instance().get(&DataKey::QuorumBps).unwrap();
         let total_votes = proposal.votes_for + proposal.votes_against;
-        let quorum_threshold = proposal.snapshot_total_supply * QUORUM_BPS / MAX_BPS;
+        let quorum_threshold = proposal.snapshot_total_supply * quorum_bps / MAX_BPS;
         let passed = total_votes >= quorum_threshold && proposal.votes_for > proposal.votes_against;
 
         if !passed {
@@ -458,13 +564,17 @@ mod tests {
             &0_i128,
         );
 
-        // Re-initialise LP token with AMM as admin so it can mint/burn.
-        // (In production the LP token is deployed with AMM as admin from the start.)
-        // For tests we use mock_all_auths so the admin check passes regardless.
-
-        // Deploy governance.
+        // Deploy governance with configurable parameters matching original defaults.
         let gov_addr = env.register_contract(None, Governance);
-        GovernanceClient::new(&env, &gov_addr).initialize(&admin, &amm_addr, &lp_addr, &100_i128);
+        GovernanceClient::new(&env, &gov_addr).initialize(
+            &admin,
+            &amm_addr,
+            &lp_addr,
+            &(7 * 24 * 60 * 60_u64), // voting_period_secs: 7 days
+            &(2 * 24 * 60 * 60_u64), // timelock_secs: 2 days
+            &1_000_i128,              // quorum_bps: 10%
+            &100_i128,                // min_proposer_stake_bps
+        );
         token::LpTokenClient::new(&env, &lp_addr).set_locker(&gov_addr);
 
         Suite {
