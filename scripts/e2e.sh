@@ -12,6 +12,7 @@ SWAP_AMOUNT_IN="${SWAP_AMOUNT_IN:-100000}"
 MIN_SWAP_OUT="${MIN_SWAP_OUT:-150000}"
 MAX_SWAP_OUT="${MAX_SWAP_OUT:-200000}"
 DUST_LIMIT="${DUST_LIMIT:-10}"
+DEADLINE_BUFFER_SECS="${DEADLINE_BUFFER_SECS:-3600}"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -163,11 +164,13 @@ invoke "$TOKEN_B_CONTRACT_ID" mint \
   --amount "$AMOUNT_B" >/dev/null
 pass "minted token B to test account"
 
+DEADLINE=$(( $(date +%s) + DEADLINE_BUFFER_SECS ))
 ADD_OUTPUT="$(invoke "$AMM_CONTRACT_ID" add_liquidity \
   --provider "$SOURCE_PUBLIC_KEY" \
   --amount_a "$AMOUNT_A" \
   --amount_b "$AMOUNT_B" \
-  --min_shares 0)"
+  --min_shares 0 \
+  --deadline "$DEADLINE")"
 LP_SHARES="$(printf '%s\n' "$ADD_OUTPUT" | parse_i128)"
 if [[ -z "$LP_SHARES" || "$LP_SHARES" -le 0 ]]; then
   die "add_liquidity did not return positive LP shares: $ADD_OUTPUT"
@@ -180,22 +183,26 @@ RESERVE_B="$(printf '%s\n' "$INFO_OUTPUT" | field_value reserve_b)"
 assert_eq "reserve A after add_liquidity" "$RESERVE_A" "$AMOUNT_A"
 assert_eq "reserve B after add_liquidity" "$RESERVE_B" "$AMOUNT_B"
 
+DEADLINE=$(( $(date +%s) + DEADLINE_BUFFER_SECS ))
 SWAP_OUTPUT="$(invoke "$AMM_CONTRACT_ID" swap \
   --trader "$SOURCE_PUBLIC_KEY" \
   --token_in "$TOKEN_A_CONTRACT_ID" \
   --amount_in "$SWAP_AMOUNT_IN" \
-  --min_out 0)"
+  --min_out 0 \
+  --deadline "$DEADLINE")"
 SWAP_OUT="$(printf '%s\n' "$SWAP_OUTPUT" | parse_i128)"
 if [[ -z "$SWAP_OUT" ]]; then
   die "swap did not return an amount: $SWAP_OUTPUT"
 fi
 assert_between "swap output" "$SWAP_OUT" "$MIN_SWAP_OUT" "$MAX_SWAP_OUT"
 
+DEADLINE=$(( $(date +%s) + DEADLINE_BUFFER_SECS ))
 invoke "$AMM_CONTRACT_ID" remove_liquidity \
   --provider "$SOURCE_PUBLIC_KEY" \
   --shares "$LP_SHARES" \
   --min_a 0 \
-  --min_b 0 >/dev/null
+  --min_b 0 \
+  --deadline "$DEADLINE" >/dev/null
 pass "removed all LP shares"
 
 FINAL_INFO_OUTPUT="$(invoke "$AMM_CONTRACT_ID" get_info)"
