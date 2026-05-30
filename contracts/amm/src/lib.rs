@@ -58,6 +58,8 @@ pub enum AmmError {
     InsufficientLiquidity = 11,
     NoPendingAdmin       = 12,
     WrongAdmin           = 13,
+    CircuitBreakerTripped = 14,
+    InvalidThreshold     = 15,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -83,6 +85,12 @@ pub enum DataKey {
     AccruedFeeB,    // i128 — protocol fees accrued in TokenB
     Paused,
     FlashLoanFeeBps,
+    // ── Circuit breaker ────────────────────────────────────────────────────
+    CircuitBreakerEnabled,   // bool
+    CircuitBreakerThreshold, // i128 — max price deviation in bps (e.g. 5000 = 50%)
+    CircuitBreakerCooldown,  // u64 — seconds before auto-recovery is allowed
+    CircuitBreakerPausedAt,  // u64 — timestamp when circuit breaker tripped
+    LastPrice,               // i128 — last recorded spot price (reserve_b * 1_000_000 / reserve_a)
 }
 
 // ── Pool info returned by `get_info` ─────────────────────────────────────────
@@ -260,6 +268,174 @@ impl AmmPool {
             .instance()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
+    // ── Circuit breaker ─────────────────────────────────────────────────────
+
+    /// Configure the circuit breaker. Admin-only.
+    ///
+    /// When enabled, any swap that would move the spot price by more than
+    /// `threshold_bps` (in basis points, e.g. 5000 = 50%) triggers an
+    /// automatic pool pause. The pool remains paused until `auto_unpause`
+    /// is called after `cooldown_secs` have elapsed.
+    ///
+    /// # Parameters
+    /// - `admin` – Must match the stored admin address.
+    /// - `enabled` – Toggle the circuit breaker on/off.
+    /// - `threshold_bps` – Maximum allowed price deviation in basis points (1..10_000).
+    /// - `cooldown_secs` – Seconds before auto-recovery is allowed (must be > 0).
+    pub fn set_circuit_breaker(
+        env: Env,
+        admin: Address,
+        enabled: bool,
+        threshold_bps: i128,
+        cooldown_secs: u64,
+    ) -> Result<(), AmmError> {
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            return Err(AmmError::Unauthorized);
+        }
+        admin.require_auth();
+        if enabled {
+            if threshold_bps <= 0 || threshold_bps > 10_000 {
+                return Err(AmmError::InvalidThreshold);
+            }
+            if cooldown_secs == 0 {
+                return Err(AmmError::InvalidThreshold);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerEnabled, &enabled);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerThreshold, &threshold_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerCooldown, &cooldown_secs);
+        Ok(())
+    }
+
+    /// Return the current circuit breaker configuration.
+    ///
+    /// Returns `(enabled, threshold_bps, cooldown_secs)`.
+    pub fn get_circuit_breaker(env: Env) -> (bool, i128, u64) {
+        let enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerEnabled)
+            .unwrap_or(false);
+        let threshold: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerThreshold)
+            .unwrap_or(5_000);
+        let cooldown: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerCooldown)
+            .unwrap_or(300);
+        (enabled, threshold, cooldown)
+    }
+
+    /// Auto-unpause the pool after the circuit breaker cooldown has elapsed.
+    ///
+    /// Anyone can call this — the cooldown prevents premature recovery.
+    /// Returns `Ok(true)` if the pool was unpaused, `Ok(false)` if the
+    /// cooldown hasn't elapsed yet, or an error if the pool wasn't paused
+    /// by the circuit breaker.
+    pub fn auto_unpause(env: Env) -> Result<bool, AmmError> {
+        let paused: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false);
+        if !paused {
+            return Ok(false);
+        }
+        let paused_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerPausedAt)
+            .unwrap_or(0);
+        if paused_at == 0 {
+            return Err(AmmError::Unauthorized); // Not paused by circuit breaker.
+        }
+        let cooldown: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerCooldown)
+            .unwrap_or(300);
+        let now = env.ledger().timestamp();
+        if now < paused_at + cooldown {
+            return Ok(false); // Cooldown not elapsed.
+        }
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage()
+            .instance()
+            .set(&DataKey::CircuitBreakerPausedAt, &0u64);
+        // Record current price as new baseline after recovery.
+        let reserve_a = Self::get_reserve_a(env.clone());
+        let reserve_b = Self::get_reserve_b(env.clone());
+        if reserve_a > 0 && reserve_b > 0 {
+            let price = reserve_b * 1_000_000 / reserve_a;
+            env.storage()
+                .instance()
+                .set(&DataKey::LastPrice, &price);
+        }
+        Ok(true)
+    }
+
+    /// Internal: check price deviation and trip circuit breaker if threshold exceeded.
+    ///
+    /// Called after reserves are updated. Compares the new spot price against
+    /// `LastPrice`. If the absolute deviation exceeds `CircuitBreakerThreshold`,
+    /// pauses the pool and records the pause timestamp.
+    fn check_circuit_breaker(env: &Env, reserve_a: i128, reserve_b: i128) {
+        let enabled: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::CircuitBreakerEnabled)
+            .unwrap_or(false);
+        if !enabled {
+            return;
+        }
+        if reserve_a <= 0 || reserve_b <= 0 {
+            return;
+        }
+        let last_price: Option<i128> = env.storage().instance().get(&DataKey::LastPrice);
+        if let Some(prev_price) = last_price {
+            if prev_price > 0 {
+                let new_price = reserve_b * 1_000_000 / reserve_a;
+                let threshold: i128 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::CircuitBreakerThreshold)
+                    .unwrap_or(5_000);
+                // Deviation in bps relative to prev_price (scaled by 1_000_000).
+                let deviation = if new_price > prev_price {
+                    (new_price - prev_price) * 10_000 / prev_price
+                } else {
+                    (prev_price - new_price) * 10_000 / prev_price
+                };
+                if deviation > threshold {
+                    env.storage().instance().set(&DataKey::Paused, &true);
+                    env.storage().instance().set(
+                        &DataKey::CircuitBreakerPausedAt,
+                        &env.ledger().timestamp(),
+                    );
+                    env.events().publish(
+                        (Symbol::new(&env, "cb_trip"),),
+                        (prev_price, new_price, deviation),
+                    );
+                }
+            }
+        }
+        // Always update last price.
+        let price = reserve_b * 1_000_000 / reserve_a;
+        env.storage()
+            .instance()
+            .set(&DataKey::LastPrice, &price);
     }
 
     /// Update the protocol fee configuration. Admin-only.
@@ -1011,6 +1187,11 @@ impl AmmPool {
             }
         }
 
+        // Check circuit breaker after reserve update.
+        let new_reserve_a = Self::get_reserve_a(env.clone());
+        let new_reserve_b = Self::get_reserve_b(env.clone());
+        Self::check_circuit_breaker(&env, new_reserve_a, new_reserve_b);
+
         env.events().publish(
             (Symbol::new(&env, "swap"), trader),
             (token_in, amount_in, token_out, amount_out, referrer),
@@ -1141,6 +1322,11 @@ impl AmmPool {
                     .set(&DataKey::AccruedFeeB, &(accrued + protocol_fee));
             }
         }
+
+        // Check circuit breaker after reserve update.
+        let new_reserve_a = Self::get_reserve_a(env.clone());
+        let new_reserve_b = Self::get_reserve_b(env.clone());
+        Self::check_circuit_breaker(&env, new_reserve_a, new_reserve_b);
 
         env.events().publish(
             (Symbol::new(&env, "swap"), trader),
