@@ -1854,7 +1854,12 @@ mod tests {
 #[cfg(test)]
 mod prop_tests {
     extern crate std;
+    use super::tests::{mint_lp, setup_suite};
+    use super::*;
     use proptest::prelude::*;
+    use soroban_sdk::{testutils::Address as _, Address};
+
+    // ── Pure-math properties (no contract interaction) ──────────────────────
 
     proptest! {
         /// Property 1: Quorum threshold never overflows or goes out of bounds.
@@ -1920,6 +1925,190 @@ mod prop_tests {
             let execute_after = vote_end + timelock;
             let expires_at = execute_after + timelock.max(voting_period);
             prop_assert!(expires_at >= execute_after);
+        }
+    }
+
+    // ── Contract-interaction property tests ────────────────────────────────
+
+    proptest! {
+        /// Property 7: Voting power conservation — total votes across For/Against/Abstain
+        /// always equal the sum of individual voter LP balances (no votes created or destroyed).
+        #[test]
+        fn voting_power_conservation(
+            bal1 in 1i128..10_000,
+            bal2 in 1i128..10_000,
+            bal3 in 1i128..10_000,
+        ) {
+            let s = setup_suite(30);
+            let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+            let lp1 = Address::generate(&s.env);
+            let lp2 = Address::generate(&s.env);
+            let lp3 = Address::generate(&s.env);
+            mint_lp(&s, &lp1, bal1);
+            mint_lp(&s, &lp2, bal2);
+            mint_lp(&s, &lp3, bal3);
+
+            // Need enough stake to propose (100 bps = 1% of total supply).
+            let total = bal1 + bal2 + bal3;
+            // lp1 must hold >= 1% to propose.
+            prop_assume!(bal1 * 10_000 >= total);
+
+            let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+            gov.vote(&lp1, &pid, &Vote::For);
+            gov.vote(&lp2, &pid, &Vote::Against);
+            gov.vote(&lp3, &pid, &Vote::Abstain);
+
+            let proposal = gov.get_proposal(&pid);
+            let total_votes =
+                proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
+
+            // Conservation: sum of votes == sum of LP balances that voted.
+            prop_assert_eq!(total_votes, bal1 + bal2 + bal3);
+            // Each bucket matches its voter's balance.
+            prop_assert_eq!(proposal.votes_for, bal1);
+            prop_assert_eq!(proposal.votes_against, bal2);
+            prop_assert_eq!(proposal.votes_abstain, bal3);
+        }
+
+        /// Property 8: Lock/unlock consistency — after voting, LP balance is locked;
+        /// after unlock_vote, LP balance is fully restored. No tokens lost or created.
+        #[test]
+        fn lock_unlock_consistency(
+            bal1 in 100i128..10_000,
+            bal2 in 100i128..10_000,
+        ) {
+            let s = setup_suite(30);
+            let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+            let lp_client = token::LpTokenClient::new(&s.env, &s.lp_addr);
+
+            let lp1 = Address::generate(&s.env);
+            let lp2 = Address::generate(&s.env);
+            mint_lp(&s, &lp1, bal1);
+            mint_lp(&s, &lp2, bal2);
+
+            let total = bal1 + bal2;
+            prop_assume!(bal1 * 10_000 >= total);
+
+            // Record pre-vote balances.
+            let pre_bal1 = lp_client.balance(&lp1);
+            let pre_bal2 = lp_client.balance(&lp2);
+
+            let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+            gov.vote(&lp1, &pid, &Vote::For);
+            gov.vote(&lp2, &pid, &Vote::Against);
+
+            // After voting, balances should be 0 (locked).
+            prop_assert_eq!(lp_client.balance(&lp1), 0);
+            prop_assert_eq!(lp_client.balance(&lp2), 0);
+
+            // Advance past proposal lifecycle to Expired.
+            let proposal = gov.get_proposal(&pid);
+            s.env.ledger().set_timestamp(proposal.expires_at + 1);
+            assert_eq!(gov.proposal_status(&pid), ProposalStatus::Expired);
+
+            // Unlock both voters.
+            gov.unlock_vote(&lp1, &pid);
+            gov.unlock_vote(&lp2, &pid);
+
+            // Balances fully restored — no tokens lost or created.
+            prop_assert_eq!(lp_client.balance(&lp1), pre_bal1);
+            prop_assert_eq!(lp_client.balance(&lp2), pre_bal2);
+        }
+
+        /// Property 9: Double-vote is always rejected regardless of voter balance or choice.
+        #[test]
+        fn double_vote_always_rejected(
+            bal1 in 100i128..10_000,
+            choice_idx in 0u8..3,
+        ) {
+            let s = setup_suite(30);
+            let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+            let lp1 = Address::generate(&s.env);
+            let lp2 = Address::generate(&s.env);
+            mint_lp(&s, &lp1, bal1);
+            mint_lp(&s, &lp2, 10_000);
+
+            let total = bal1 + 10_000;
+            prop_assume!(bal1 * 10_000 >= total);
+
+            let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+            let choice = match choice_idx {
+                0 => Vote::For,
+                1 => Vote::Against,
+                _ => Vote::Abstain,
+            };
+            gov.vote(&lp1, &pid, &choice);
+
+            // Second vote by same voter must fail with AlreadyVoted.
+            let result = gov.try_vote(&lp1, &pid, &Vote::For);
+            prop_assert!(result.is_err());
+            prop_assert_eq!(result.unwrap_err().unwrap(), GovernanceError::AlreadyVoted);
+        }
+
+        /// Property 10: Proposals can only be created by addresses with sufficient stake
+        /// (>= min_proposer_stake_bps % of total supply).
+        #[test]
+        fn insufficient_stake_cannot_propose(
+            bal1 in 1i128..100,
+            bal2 in 1_000i128..100_000,
+        ) {
+            let s = setup_suite(30);
+            let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+            let lp1 = Address::generate(&s.env);
+            let lp2 = Address::generate(&s.env);
+            mint_lp(&s, &lp1, bal1);
+            mint_lp(&s, &lp2, bal2);
+
+            // min_proposer_stake_bps is 100 (1%). lp1 must hold < 1% of total.
+            let total = bal1 + bal2;
+            prop_assume!(bal1 * 10_000 < total);
+
+            let result = gov.try_propose(&lp1, &ProposalKind::UpdateFee(50));
+            prop_assert!(result.is_err());
+            prop_assert_eq!(
+                result.unwrap_err().unwrap(),
+                GovernanceError::InsufficientStake
+            );
+        }
+
+        /// Property 11: Quorum enforcement — proposals below quorum are always defeated,
+        /// proposals at or above quorum with majority For are passable.
+        #[test]
+        fn quorum_enforcement(
+            voter_bal in 1i128..500,
+            total_supply in 1_000i128..10_000,
+        ) {
+            // quorum_bps is 100 (1% of total supply).
+            let quorum_threshold = total_supply * 100 / 10_000;
+
+            let s = setup_suite(30);
+            let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+            let proposer = Address::generate(&s.env);
+            let voter = Address::generate(&s.env);
+            // Give proposer enough to meet min stake (1% of their supply).
+            mint_lp(&s, &proposer, total_supply);
+            mint_lp(&s, &voter, voter_bal);
+
+            let pid = gov.propose(&proposer, &ProposalKind::UpdateFee(50));
+            gov.vote(&voter, &pid, &Vote::For);
+
+            let proposal = gov.get_proposal(&pid);
+            s.env.ledger().set_timestamp(proposal.execute_after + 1);
+
+            if voter_bal < quorum_threshold {
+                // Below quorum → defeated.
+                let status = gov.proposal_status(&pid);
+                prop_assert_eq!(status, ProposalStatus::Defeated);
+            } else {
+                // At or above quorum + majority For → can execute.
+                // (Note: proposer didn't vote, so only voter_bal votes exist.)
+                let status = gov.proposal_status(&pid);
+                prop_assert_eq!(status, ProposalStatus::Queued);
+            }
         }
     }
 }
