@@ -58,6 +58,9 @@ pub enum AmmError {
     InsufficientLiquidity = 11,
     NoPendingAdmin       = 12,
     WrongAdmin           = 13,
+    /// A reentrant call was detected. The flash-loan receiver attempted to
+    /// call back into the AMM while the reentrancy lock was held.
+    Reentrancy           = 14,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -74,7 +77,19 @@ pub enum DataKey {
     PriceCumulativeB,
     LastTimestamp,
     Shares(Address),
-
+    Admin,
+    FeeBps,
+    FeeRecipient,
+    ProtocolFeeBps,
+    AccruedFeeA,
+    AccruedFeeB,
+    FlashLoanFeeBps,
+    Paused,
+    PendingAdmin,
+    /// Boolean flag set to `true` while a flash loan callback is executing.
+    /// Prevents the receiver contract from reentering any state-mutating AMM
+    /// function during the callback.
+    Locked,
 }
 
 // ── Pool info returned by `get_info` ─────────────────────────────────────────
@@ -230,6 +245,7 @@ impl AmmPool {
             .instance()
             .set(&DataKey::LastTimestamp, &env.ledger().timestamp());
         env.storage().instance().set(&DataKey::Paused, &false);
+        env.storage().instance().set(&DataKey::Locked, &false);
         Ok(())
     }
 
@@ -295,6 +311,48 @@ impl AmmPool {
     fn validate_fee_bps(fee_bps: i128) -> Result<(), AmmError> {
         if !(0..=10_000).contains(&fee_bps) {
             return Err(AmmError::InvalidFeeBps);
+        }
+        Ok(())
+    }
+
+    // ── Reentrancy guard ──────────────────────────────────────────────────────
+
+    /// Acquire the reentrancy lock. Returns `Reentrancy` if already locked.
+    ///
+    /// Safety assumption: Soroban executes each contract invocation atomically
+    /// within a single ledger transaction. The `Locked` flag is stored in
+    /// instance storage which is scoped to this contract address. A flash-loan
+    /// receiver that calls back into the AMM during its callback will find the
+    /// flag set and receive `AmmError::Reentrancy` rather than proceeding.
+    fn enter_guard(env: &Env) -> Result<(), AmmError> {
+        let locked: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Locked)
+            .unwrap_or(false);
+        if locked {
+            return Err(AmmError::Reentrancy);
+        }
+        env.storage().instance().set(&DataKey::Locked, &true);
+        Ok(())
+    }
+
+    /// Release the reentrancy lock.
+    fn exit_guard(env: &Env) {
+        env.storage().instance().set(&DataKey::Locked, &false);
+    }
+
+    /// Lightweight read-only check used by state-mutating functions other than
+    /// `flash_loan` itself. These functions do not acquire the lock — they only
+    /// refuse to run while a flash-loan callback is in progress.
+    fn check_not_locked(env: &Env) -> Result<(), AmmError> {
+        let locked: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::Locked)
+            .unwrap_or(false);
+        if locked {
+            return Err(AmmError::Reentrancy);
         }
         Ok(())
     }
@@ -493,6 +551,7 @@ impl AmmPool {
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
+        Self::check_not_locked(&env)?;
         provider.require_auth();
         if amount_a <= 0 || amount_b <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -599,6 +658,7 @@ impl AmmPool {
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
+        Self::check_not_locked(&env)?;
         provider.require_auth();
         if shares <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -697,6 +757,7 @@ impl AmmPool {
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
+        Self::check_not_locked(&env)?;
         provider.require_auth();
         if shares <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -906,6 +967,7 @@ impl AmmPool {
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
+        Self::check_not_locked(&env)?;
         trader.require_auth();
         if amount_in <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -1052,6 +1114,7 @@ impl AmmPool {
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
+        Self::check_not_locked(&env)?;
         trader.require_auth();
         if amount_out <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -1197,6 +1260,12 @@ impl AmmPool {
     }
 
     /// Borrow pool liquidity and repay it plus a fee during the receiver callback.
+    ///
+    /// The function holds a reentrancy lock (`DataKey::Locked`) for the entire
+    /// duration of the external `on_flash_loan` callback. Any attempt by the
+    /// receiver to call back into a state-mutating AMM function (swap,
+    /// add_liquidity, remove_liquidity, flash_loan, withdraw_protocol_fees)
+    /// during that window will be rejected with `AmmError::Reentrancy`.
     pub fn flash_loan(
         env: Env,
         receiver: Address,
@@ -1211,6 +1280,9 @@ impl AmmPool {
             return Err(AmmError::ZeroAmount);
         }
 
+        // Reject reentrant calls before touching any state.
+        Self::enter_guard(&env)?;
+
         // Checkpoint TWAP before updating reserves.
         Self::checkpoint_twap(&env);
 
@@ -1221,9 +1293,11 @@ impl AmmPool {
         } else if token == token_b {
             Self::get_reserve_b(env.clone())
         } else {
+            Self::exit_guard(&env);
             return Err(AmmError::InvalidToken);
         };
         if reserve < amount {
+            Self::exit_guard(&env);
             return Err(AmmError::InsufficientLiquidity);
         }
 
@@ -1239,14 +1313,17 @@ impl AmmPool {
 
         token_client.transfer(&pool, &receiver, &amount);
 
+        // External callback — the lock is held here, blocking reentrance.
         let accepted = FlashLoanReceiverClient::new(&env, &receiver)
             .on_flash_loan(&token, &amount, &fee, &data);
         if !accepted {
+            Self::exit_guard(&env);
             return Err(AmmError::InsufficientLiquidity);
         }
 
         let balance_after = token_client.balance(&pool);
         if balance_after < balance_before + fee {
+            Self::exit_guard(&env);
             return Err(AmmError::InsufficientLiquidity);
         }
 
@@ -1271,6 +1348,9 @@ impl AmmPool {
                 .instance()
                 .set(&DataKey::ReserveB, &reserve_after);
         }
+
+        // Release the lock before emitting the event.
+        Self::exit_guard(&env);
 
         env.events().publish(
             (Symbol::new(&env, "flash_loan"), receiver),
