@@ -78,6 +78,10 @@ pub enum OracleError {
     SourceNotFound = 5,
     InsufficientSources = 6,
     InvalidStaleness = 7,
+    /// Returned (internally) when a source's price lies outside the
+    /// configured deviation band around the median. Not panicked
+    /// directly — sources are silently dropped from confidence.
+    OutsideDeviationBand = 8,
 }
 
 // ── Storage layout ──────────────────────────────────────────────────────────
@@ -91,6 +95,11 @@ pub enum DataKey {
     /// Vec<OracleSource>, append-only via `register_source`, trimmed
     /// by `remove_source`.
     Sources,
+    /// Maximum allowed deviation from the median in basis points.
+    /// A source whose price deviates by more than this fraction is
+    /// excluded from confidence. `0` disables the filter (every
+    /// positive, fresh price counts regardless of spread).
+    MaxDeviationBps,
 }
 
 pub const MIN_VALID_SOURCES: u32 = 2;
@@ -116,7 +125,7 @@ impl OracleAggregator {
     /// One-time initialization. Stores admin and the global staleness
     /// cap. Panics if already initialized so an upgrade must go
     /// through a separate path explicitly.
-    pub fn initialize(env: Env, admin: Address, max_staleness_seconds: u64) {
+    pub fn initialize(env: Env, admin: Address, max_staleness_seconds: u64, max_deviation_bps: u32) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, OracleError::AlreadyInitialized);
         }
@@ -128,6 +137,9 @@ impl OracleAggregator {
         env.storage()
             .instance()
             .set(&DataKey::MaxStaleness, &max_staleness_seconds);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxDeviationBps, &max_deviation_bps);
         let empty: Vec<OracleSource> = Vec::new(&env);
         env.storage().instance().set(&DataKey::Sources, &empty);
     }
@@ -195,6 +207,17 @@ impl OracleAggregator {
         env.storage()
             .instance()
             .set(&DataKey::MaxStaleness, &max_staleness_seconds);
+    }
+
+    /// Admin-only. Update the maximum allowed deviation from the
+    /// median (in basis points). Set to `0` to disable filtering —
+    /// every fresh, positive price counts toward confidence regardless
+    /// of how far it deviates from the median.
+    pub fn set_max_deviation_bps(env: Env, admin: Address, max_deviation_bps: u32) {
+        require_admin(&env, &admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaxDeviationBps, &max_deviation_bps);
     }
 
     /// Query every fresh source, return the median + confidence
@@ -283,9 +306,41 @@ impl OracleAggregator {
         }
 
         let median = median_i128(env, &prices);
+
+        // Filter outliers: count only sources whose price falls within
+        // `max_deviation_bps` of the median. A value of 0 disables the
+        // filter and every fresh, positive price contributes.
+        let max_dev: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaxDeviationBps)
+            .unwrap_or(0);
+
+        let agreeing = if max_dev == 0 {
+            prices.len()
+        } else {
+            let mut count: u32 = 0;
+            for i in 0..prices.len() {
+                let p = prices.get_unchecked(i);
+                // |p - median| * 10_000 <= max_dev * median
+                let diff = if p >= median { p - median } else { median - p };
+                if diff * 10_000 <= (max_dev as i128) * median {
+                    count += 1;
+                }
+            }
+            count
+        };
+
+        if agreeing < MIN_VALID_SOURCES {
+            return AggregatedPrice {
+                price: 0,
+                confidence: 0,
+            };
+        }
+
         AggregatedPrice {
             price: median,
-            confidence: prices.len(),
+            confidence: agreeing,
         }
     }
 
@@ -298,6 +353,13 @@ impl OracleAggregator {
         env.storage()
             .instance()
             .get(&DataKey::MaxStaleness)
+            .unwrap_or(0)
+    }
+
+    pub fn get_max_deviation_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MaxDeviationBps)
             .unwrap_or(0)
     }
 
