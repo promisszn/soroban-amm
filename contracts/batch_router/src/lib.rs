@@ -62,6 +62,8 @@ pub enum BatchOpResult {
     RemoveLiquidity(i128, i128),
 }
 
+const MAX_BATCH_OPS: u32 = 200;
+
 #[contract]
 pub struct BatchRouter;
 
@@ -79,6 +81,7 @@ impl BatchRouter {
     ) -> Vec<BatchOpResult> {
         caller.require_auth();
         assert!(!ops.is_empty(), "empty batch");
+        assert!(ops.len() <= MAX_BATCH_OPS, "batch exceeds MAX_BATCH_OPS ceiling");
         assert!(env.ledger().timestamp() <= deadline, "deadline expired");
 
         let mut results = Vec::new(&env);
@@ -370,5 +373,29 @@ mod tests {
         let (individual, batch) = BatchRouter::estimate_call_savings(ops_len);
         let savings_bps = (individual - batch) * 10_000 / individual;
         assert!(savings_bps > 1_500, "expected >15% call overhead savings");
+    }
+
+    #[test]
+    #[should_panic(expected = "batch exceeds MAX_BATCH_OPS ceiling")]
+    fn test_batch_exceeds_max_ops() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (ta, _tb, pool, _) = setup_pool(&env);
+
+        let trader = Address::generate(&env);
+
+        let mut ops = vec![&env];
+        for _ in 0..=MAX_BATCH_OPS {
+            ops.push_back(BatchOp::Swap(SwapOp {
+                pool: pool.clone(),
+                token_in: ta.clone(),
+                amount_in: 1_i128,
+                min_out: 0_i128,
+            }));
+        }
+
+        let deadline = env.ledger().timestamp() + 1000;
+        let batch_addr = env.register_contract(None, BatchRouter);
+        BatchRouterClient::new(&env, &batch_addr).execute_batch(&trader, &ops, &deadline);
     }
 }
