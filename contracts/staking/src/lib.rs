@@ -71,6 +71,8 @@ pub enum DataKey {
     ConfigMinLockDuration,
     /// Configurable max lock duration in seconds.
     ConfigMaxLockDuration,
+    /// Optional maximum reward pool balance (0 = no cap).
+    ConfigMaxRewardPoolBalance,
     /// Circuit-breaker flag; when true new stakes and claims are halted (#360).
     Paused,
     /// Emergency mode flag; when true stakers may reclaim LP without rewards (#359).
@@ -128,6 +130,7 @@ impl Staking {
         env.storage().instance().set(&DataKey::TotalEffectiveStaked, &0i128);
         env.storage().instance().set(&DataKey::AccumulatedRewardsPerShare, &0i128);
         env.storage().instance().set(&DataKey::RewardPoolBalance, &0i128);
+        // ConfigMaxRewardPoolBalance initialized above
         Self::_write_boost_config(&env, MIN_BOOST, DEFAULT_MAX_BOOST, MIN_LOCK_DURATION, MAX_LOCK_DURATION);
     }
 
@@ -154,6 +157,7 @@ impl Staking {
         env.storage().instance().set(&DataKey::TotalEffectiveStaked, &0i128);
         env.storage().instance().set(&DataKey::AccumulatedRewardsPerShare, &0i128);
         env.storage().instance().set(&DataKey::RewardPoolBalance, &0i128);
+        env.storage().instance().set(&DataKey::ConfigMaxRewardPoolBalance, &0i128);
         Self::_write_boost_config(
             &env,
             min_boost_scaled,
@@ -281,18 +285,25 @@ impl Staking {
 
         let reward_token: Address = env.storage().instance().get(&DataKey::RewardToken).unwrap();
         let pool_addr = env.current_contract_address();
-        SepTokenClient::new(&env, &reward_token).transfer(&admin, &pool_addr, &amount);
-
-        let current_balance: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::RewardPoolBalance)
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::RewardPoolBalance, &(current_balance + amount));
-
-        env.events().publish((Symbol::new(&env, "rewards_added"),), (admin, amount));
+        // Record pre‑transfer token balance
+        let token_client = SepTokenClient::new(&env, &reward_token);
+        let pre_balance: i128 = token_client.balance(&pool_addr);
+        // Transfer requested amount from admin to pool
+        token_client.transfer(&admin, &pool_addr, &amount);
+        // Record post‑transfer token balance to determine actual received amount
+        let post_balance: i128 = token_client.balance(&pool_addr);
+        let received: i128 = post_balance - pre_balance;
+        // Update reward pool balance with the actual received amount
+        let current_balance: i128 = env.storage().instance().get(&DataKey::RewardPoolBalance).unwrap_or(0);
+        let new_balance = current_balance + received;
+        // Enforce optional max reward pool balance cap (0 = no cap)
+        let max_balance: i128 = env.storage().instance().get(&DataKey::ConfigMaxRewardPoolBalance).unwrap_or(0);
+        if max_balance != 0 {
+            assert!(new_balance <= max_balance, "exceeds max reward pool balance");
+        }
+        env.storage().instance().set(&DataKey::RewardPoolBalance, &new_balance);
+        // Emit event with the actual amount added
+        env.events().publish((Symbol::new(&env, "rewards_added"),), (admin, received));
     }
 
     /// Halt new stakes and reward claims. Admin only (#360).
@@ -519,6 +530,19 @@ impl Staking {
         env.events()
             .publish((Symbol::new(&env, "emergency_mode"),), (admin, enabled));
     }
+    
+    /// Set the optional maximum reward pool balance. Admin only.
+    pub fn set_max_reward_pool_balance(env: Env, admin: Address, max_balance: i128) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        assert!(admin == stored_admin, "not admin");
+        let current_balance: i128 = env.storage().instance().get(&DataKey::RewardPoolBalance).unwrap_or(0);
+        // 0 means no cap; otherwise ensure the new cap is not below current balance
+        assert!(max_balance == 0 || max_balance >= current_balance, "max_balance less than current pool");
+        env.storage().instance().set(&DataKey::ConfigMaxRewardPoolBalance, &max_balance);
+        env.events().publish((Symbol::new(&env, "max_reward_pool_balance_set"),), (admin, max_balance));
+    }
+
 
     /// Whether emergency mode is currently active (#359).
     pub fn is_emergency_mode(env: Env) -> bool {
