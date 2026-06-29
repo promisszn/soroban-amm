@@ -1,5 +1,6 @@
 #![no_std]
 
+use soroban_sdk::{contract, contractclient, contractimpl, contracttype, symbol_short, Address, Env, Vec};
 use soroban_sdk::{contract, contractclient, contractimpl, contracterror, contracttype, Address, Env, Vec};
 
 #[contractclient(name = "AmmPoolOracleClient")]
@@ -121,6 +122,15 @@ impl TwapConsumer {
         Ok(())
     }
 
+    /// Deletes a price snapshot from persistent storage.
+    pub fn delete_snapshot(env: Env, pool: Address, ledger_ts: u64) {
+        Self::require_keeper(&env);
+        let key = DataKey::Snapshot(pool.clone(), ledger_ts);
+        env.storage().persistent().remove(&key);
+        env.events().publish(
+            (symbol_short!("snap_del"), pool),
+            ledger_ts,
+        );
     pub fn delete_snapshot(env: Env, pool: Address, ledger_ts: u64) -> Result<(), TwapError> {
         Self::require_keeper(&env)?;
         let key = DataKey::Snapshot(pool, ledger_ts);
@@ -800,5 +810,31 @@ mod tests {
             consumer.try_initialize(&Address::generate(&env)),
             Err(Ok(TwapError::AlreadyInitialized))
         );
+    }
+
+    #[test]
+    fn test_delete_snapshot_emits_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let keeper = Address::generate(&env);
+        let pool = Address::generate(&env);
+        let ledger_ts = 100u64;
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&keeper);
+
+        consumer.delete_snapshot(&pool, &ledger_ts);
+
+        let events = env.events().all();
+        let event = events.last().unwrap();
+        let (contract_id, topics, data) = event;
+
+        assert_eq!(contract_id, consumer_addr);
+        // topics are (symbol_short!("snap_del"), pool)
+        assert_eq!(topics.len(), 2);
+        assert_eq!(topics.get(0).unwrap(), symbol_short!("snap_del").to_val());
+        assert_eq!(topics.get(1).unwrap(), pool.to_val());
+        // data is ledger_ts
+        assert_eq!(data, ledger_ts.into_val(&env));
     }
 }
