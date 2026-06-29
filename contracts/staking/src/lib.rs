@@ -696,6 +696,7 @@ impl Staking {
             .instance()
             .get(&DataKey::RewardPoolBalance)
             .unwrap_or(0);
+        assert!(new_rewards <= pool_balance, "insufficient reward pool balance");
         env.storage()
             .instance()
             .set(&DataKey::RewardPoolBalance, &(pool_balance - new_rewards));
