@@ -267,3 +267,44 @@ fn register_source_rejects_non_admin() {
     h.aggregator
         .register_source(&attacker, &s1, &OracleSourceType::AmmTwap);
 }
+
+#[test]
+fn stale_src_event_emitted_when_sources_skipped() {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::IntoVal;
+
+    let env = Env::default();
+    let h = deploy(&env, 60);
+
+    let s1 = deploy_source(&env, 100); // healthy
+    let s2 = deploy_source(&env, 0);   // price=0 → skipped
+    let s3 = deploy_source(&env, 0);   // price=0 → skipped
+
+    h.aggregator
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap);
+    h.aggregator
+        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap);
+    h.aggregator
+        .register_source(&h.admin, &s3, &OracleSourceType::External);
+
+    set_now(&env, 1_000);
+
+    // get_price_safe won't panic even though only 1 source is valid.
+    h.aggregator.get_price_safe(&h.token_a, &h.token_b);
+
+    let events = env.events().all();
+    let agg_id = h.aggregator.address.clone();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("stale_src"),).into_val(&env);
+
+    let stale_event = events
+        .iter()
+        .find(|e| e.0 == agg_id && e.1 == expected_topics)
+        .expect("stale_src event must be emitted when sources are skipped");
+
+    // Data is a tuple wrapping a Vec<Address> of the two skipped sources.
+    let (stale_addrs,): (soroban_sdk::Vec<Address>,) = stale_event.2.into_val(&env);
+    assert_eq!(stale_addrs.len(), 2);
+    assert!(stale_addrs.contains(&s2));
+    assert!(stale_addrs.contains(&s3));
+}

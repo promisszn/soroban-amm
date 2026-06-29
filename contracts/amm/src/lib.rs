@@ -19,6 +19,7 @@ pub const WASM: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../target/wasm32v1-none/release/amm.wasm"
 ));
+
 // Standard SEP-41 interface for pool tokens (token_a, token_b)
 use soroban_sdk::token::Client as SepTokenClient;
 
@@ -53,6 +54,9 @@ pub trait LpTokenInterface {
     fn burn(env: Env, from: Address, amount: i128);
     fn balance(env: Env, id: Address) -> i128;
 }
+
+/// Lifetime of a multisig emergency-withdraw proposal before it expires.
+const MULTISIG_PROPOSAL_TTL_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
 
 // ── Typed errors ─────────────────────────────────────────────────────────────
 
@@ -90,6 +94,10 @@ pub enum AmmError {
     OracleDeviationExceeded = 17,
     /// Flash-loan receiver did not return the borrowed amounts plus fees.
     FlashLoanRepaymentFailed = 18,
+    /// Multisig emergency withdrawal was already executed.
+    AlreadyExecuted = 19,
+    /// Multisig emergency withdrawal proposal has expired.
+    ProposalExpired = 20,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -134,6 +142,10 @@ pub enum DataKey {
     /// Pending emergency-withdraw proposal: (recipient, Vec<Address> approvals).
     MultisigProposalRecipient,
     MultisigProposalApprovals,
+    /// Expiration timestamp for the pending multisig proposal.
+    MultisigProposalExpiresAt,
+    /// Whether the pending multisig proposal has already been executed.
+    MultisigProposalExecuted,
 
     // Issue #294: minimum liquidity lock — LP tokens permanently locked on first deposit.
     /// Whether the minimum liquidity has already been locked (set on first deposit).
@@ -836,6 +848,12 @@ impl AmmPool {
             &DataKey::MultisigProposalApprovals,
             &soroban_sdk::Vec::<Address>::new(&env),
         );
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigProposalExpiresAt, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigProposalExecuted, &false);
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "multisig_set"), admin),
@@ -913,6 +931,13 @@ impl AmmPool {
         env.storage()
             .instance()
             .set(&DataKey::MultisigProposalApprovals, &approvals);
+        env.storage().instance().set(
+            &DataKey::MultisigProposalExpiresAt,
+            &(env.ledger().timestamp() + MULTISIG_PROPOSAL_TTL_SECS),
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigProposalExecuted, &false);
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "ms_proposed"), signer),
@@ -960,12 +985,28 @@ impl AmmPool {
         if !signers.contains(&signer) {
             return Err(AmmError::Unauthorized);
         }
+        let executed: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigProposalExecuted)
+            .unwrap_or(false);
+        if executed {
+            return Err(AmmError::AlreadyExecuted);
+        }
         let recipient: Option<Address> = env
             .storage()
             .instance()
             .get(&DataKey::MultisigProposalRecipient)
             .unwrap_or(None);
         let to = recipient.ok_or(AmmError::NoPendingAdmin)?;
+        let expires_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigProposalExpiresAt)
+            .unwrap_or(0);
+        if env.ledger().timestamp() > expires_at {
+            return Err(AmmError::ProposalExpired);
+        }
         let approvals: soroban_sdk::Vec<Address> = env
             .storage()
             .instance()
@@ -994,7 +1035,11 @@ impl AmmPool {
         }
         env.storage().instance().set(&DataKey::ReserveA, &0_i128);
         env.storage().instance().set(&DataKey::ReserveB, &0_i128);
-        // Clear proposal.
+        // Mark executed so re-execution returns AlreadyExecuted.
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigProposalExecuted, &true);
+        // Clear proposal details.
         env.storage().instance().set(
             &DataKey::MultisigProposalRecipient,
             &Option::<Address>::None,
@@ -1003,6 +1048,9 @@ impl AmmPool {
             &DataKey::MultisigProposalApprovals,
             &soroban_sdk::Vec::<Address>::new(&env),
         );
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigProposalExpiresAt, &0u64);
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "ms_ew"), signer),
@@ -1060,9 +1108,7 @@ impl AmmPool {
     }
 
     fn extend_ttl(env: &Env) {
-        env.storage()
-            .instance()
-            .extend_ttl(172_800, 518_400);
+        env.storage().instance().extend_ttl(172_800, 518_400);
     }
 
     /// Update the swap fee post-deployment. Admin-only.
