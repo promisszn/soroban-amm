@@ -147,6 +147,7 @@ impl LpToken {
     /// Requires authorization from `from`.
     /// Panics if `from` has insufficient balance.
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        assert!(amount > 0, "amount must be positive");
         from.require_auth();
         Self::_transfer(&env, &from, &to, amount);
     }
@@ -157,6 +158,7 @@ impl LpToken {
     /// Panics if the current allowance of `spender` over `from` is less than `amount`.
     /// Panics if `from` has insufficient balance.
     pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
+        assert!(amount > 0, "amount must be positive");
         spender.require_auth();
         let allowance = Self::allowance(env.clone(), from.clone(), spender.clone());
         assert!(
@@ -175,6 +177,7 @@ impl LpToken {
     /// Requires authorization from `from`.
     /// Setting `amount` to `0` effectively revokes the allowance.
     pub fn approve(env: Env, from: Address, spender: Address, amount: i128) {
+        assert!(amount >= 0, "amount must be non-negative");
         from.require_auth();
         env.storage()
             .persistent()
@@ -183,6 +186,7 @@ impl LpToken {
 
     /// Mint new tokens — admin only (called by the AMM contract).
     pub fn mint(env: Env, to: Address, amount: i128) {
+        assert!(amount > 0, "amount must be positive");
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         let supply: i128 = Self::total_supply(env.clone());
@@ -198,6 +202,7 @@ impl LpToken {
 
     /// Burn tokens — admin only (called by the AMM contract).
     pub fn burn(env: Env, from: Address, amount: i128) {
+        assert!(amount > 0, "amount must be positive");
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         let bal = Self::balance(env.clone(), from.clone());
@@ -315,6 +320,7 @@ impl LpToken {
     }
 
     fn _transfer(env: &Env, from: &Address, to: &Address, amount: i128) {
+        assert!(amount > 0, "amount must be positive");
         let from_bal = Self::balance(env.clone(), from.clone());
         let locked = Self::locked_balance(env.clone(), from.clone());
         assert!(
