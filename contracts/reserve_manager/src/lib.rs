@@ -12,11 +12,14 @@
 //!   2. Call `initialize` with the governance address and the factory address.
 //!   3. Governance calls `set_min_reserve` to configure per-pair requirements.
 //!   4. Any caller uses `check_reserves` to verify a pool is compliant.
-//!   5. Governance may call `transfer_governance` to hand off control.
+//!   5. Governance may call `propose_governance` / `accept_governance` to
+//!      securely hand off control.
 
 #![no_std]
 
-use soroban_sdk::{contract, contractclient, contractimpl, contracttype, Address, Env};
+use soroban_sdk::{
+    contract, contractclient, contracterror, contractimpl, contracttype, Address, Env, Symbol,
+};
 
 // ── External contract interfaces ─────────────────────────────────────────────
 
@@ -57,9 +60,20 @@ pub struct ReserveRequirement {
 #[contracttype]
 pub enum DataKey {
     Governance,
+    /// Pending governance nominee for two-step handover.
+    PendingGovernance,
     Factory,
     /// Normalized (smaller_addr, larger_addr) → ReserveRequirement.
     MinReserve(Address, Address),
+}
+
+// ── Typed errors ─────────────────────────────────────────────────────────────
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum ReserveManagerError {
+    NoPendingGovernance = 1,
+    Unauthorized = 2,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -84,11 +98,64 @@ impl ReserveManager {
 
     // ── Governance ────────────────────────────────────────────────────────────
 
-    /// Transfer governance to a new address. Requires current governance auth.
-    pub fn transfer_governance(env: Env, new_governance: Address) {
-        let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
-        gov.require_auth();
-        env.storage().instance().set(&DataKey::Governance, &new_governance);
+    /// Nominate a new governance address.
+    ///
+    /// The nominee must call `accept_governance` to complete the two-step
+    /// handover. Requires current governance auth.
+    pub fn propose_governance(
+        env: Env,
+        current_governance: Address,
+        new_governance: Address,
+    ) -> Result<(), ReserveManagerError> {
+        let stored: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
+        if current_governance != stored {
+            return Err(ReserveManagerError::Unauthorized);
+        }
+        stored.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingGovernance, &Some(new_governance.clone()));
+        Ok(())
+    }
+
+    /// Accept a pending governance nomination.
+    ///
+    /// Only the nominated address can call this, and it must authorize the
+    /// transaction. On success the stored governance is updated, the pending
+    /// nominee is cleared, and a `governance_transferred` event is emitted.
+    pub fn accept_governance(
+        env: Env,
+        new_governance: Address,
+    ) -> Result<(), ReserveManagerError> {
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingGovernance)
+            .unwrap_or(None);
+        let nominee = pending.ok_or(ReserveManagerError::NoPendingGovernance)?;
+        if new_governance != nominee {
+            return Err(ReserveManagerError::Unauthorized);
+        }
+        new_governance.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::Governance, &new_governance);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingGovernance, &Option::<Address>::None);
+        env.events().publish(
+            (Symbol::new(&env, "governance_transferred"),),
+            (new_governance,),
+        );
+        Ok(())
+    }
+
+    /// Return the pending governance nominee, if any.
+    pub fn get_pending_governance(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingGovernance)
+            .unwrap_or(None)
     }
 
     // ── Reserve requirements ──────────────────────────────────────────────────
@@ -314,13 +381,47 @@ mod tests {
     }
 
     #[test]
-    fn test_transfer_governance() {
+    fn test_propose_and_accept_governance() {
         let s = setup();
         let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
         let new_gov = Address::generate(&s.env);
 
-        rm.transfer_governance(&new_gov);
+        rm.propose_governance(&s.governance, &new_gov);
+        assert_eq!(rm.get_pending_governance(), Some(new_gov.clone()));
+
+        rm.accept_governance(&new_gov);
         assert_eq!(rm.get_governance(), new_gov);
+        assert_eq!(rm.get_pending_governance(), None);
+    }
+
+    #[test]
+    fn test_propose_governance_requires_current_governance() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let rando = Address::generate(&s.env);
+        let new_gov = Address::generate(&s.env);
+
+        assert!(rm.try_propose_governance(&rando, &new_gov).is_err());
+    }
+
+    #[test]
+    fn test_accept_governance_requires_pending_nomination() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let rando = Address::generate(&s.env);
+
+        assert!(rm.try_accept_governance(&rando).is_err());
+    }
+
+    #[test]
+    fn test_accept_governance_requires_nominee() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let new_gov = Address::generate(&s.env);
+        let other = Address::generate(&s.env);
+
+        rm.propose_governance(&s.governance, &new_gov);
+        assert!(rm.try_accept_governance(&other).is_err());
     }
 
     #[test]
