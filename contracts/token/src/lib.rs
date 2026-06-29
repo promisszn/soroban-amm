@@ -2,7 +2,9 @@
 
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec,
+};
 
 // Export compiled WASM for tests/dev usage when the `testutils` feature is enabled.
 #[cfg(feature = "testutils")]
@@ -22,13 +24,12 @@ pub enum DataKey {
     Symbol,
     Decimals,
     TotalSupply,
-    /// Historical balance checkpoints for governance snapshots.
     Checkpoints(Address),
+    PendingAdmin,
 }
 
-/// Balance recorded at a ledger sequence (used by `balance_at`).
 #[contracttype]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Checkpoint {
     pub ledger: u32,
     pub balance: i128,
@@ -47,6 +48,10 @@ pub struct LpToken;
 
 #[contractimpl]
 impl LpToken {
+    pub const MIN_TTL: u32 = 120_960;
+    pub const BUMP_TO: u32 = 2_419_200;
+    pub const MAX_CHECKPOINTS: u32 = 1024;
+
     /// Initialize the token with metadata and an admin that can mint/burn.
     ///
     /// `admin` is the only address authorized to call `mint` and `burn`.
@@ -99,24 +104,42 @@ impl LpToken {
             .unwrap_or(0)
     }
 
-    /// Returns the balance of `id` at or before `ledger` (for governance snapshots).
+    /// Returns the amount `spender` is allowed to transfer on behalf of `from`.
+    /// Returns `0` if no allowance has been set.
+    pub fn allowance(env: Env, from: Address, spender: Address) -> i128 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Allowance(from, spender))
+            .unwrap_or(0)
+    }
+
+    /// Returns the account balance at or before `ledger`.
     pub fn balance_at(env: Env, id: Address, ledger: u32) -> i128 {
+        let key = DataKey::Checkpoints(id);
         let checkpoints: Vec<Checkpoint> = env
             .storage()
             .persistent()
-            .get(&DataKey::Checkpoints(id))
-            .unwrap_or(Vec::new(&env));
-        let mut result = 0_i128;
-        for i in 0..checkpoints.len() {
-            let cp = checkpoints.get(i).unwrap();
-            if cp.ledger <= ledger {
-                result = cp.balance;
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let len = checkpoints.len();
+        if len == 0 {
+            return 0;
+        }
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, Self::MIN_TTL, Self::BUMP_TO);
+
+        let mut low = 0;
+        let mut high = len;
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let checkpoint = checkpoints.get(mid).unwrap();
+            if checkpoint.ledger <= ledger {
+                low = mid + 1;
             } else {
-                break;
+                high = mid;
             }
         }
-        result
-    }
 
     /// Returns the SEP-41 allowance value for `spender` over `from`.
     /// Returns `{ amount: 0, live_until_ledger: 0 }` if expired or unset.
@@ -209,11 +232,11 @@ impl LpToken {
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from.clone()), &(bal - amount));
+        Self::write_checkpoint(&env, &from);
         let supply: i128 = Self::total_supply(env.clone());
         env.storage()
             .instance()
             .set(&DataKey::TotalSupply, &(supply - amount));
-        Self::write_checkpoint(&env, &from);
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────
@@ -226,6 +249,37 @@ impl LpToken {
     /// Address allowed to lock/unlock balances (governance).
     pub fn locker(env: Env) -> Address {
         env.storage().instance().get(&DataKey::Locker).unwrap()
+    }
+
+    /// Nominate a new admin. The nominee must call `accept_admin` to complete rotation.
+    pub fn propose_admin(env: Env, current_admin: Address, new_admin: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        assert!(admin == current_admin, "current_admin is not admin");
+        current_admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &Some(new_admin.clone()));
+        env.events().publish(
+            (Symbol::new(&env, "admin_nominated"),),
+            (current_admin, new_admin),
+        );
+    }
+
+    /// Accept a pending admin nomination.
+    pub fn accept_admin(env: Env, new_admin: Address) {
+        new_admin.require_auth();
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None);
+        assert!(pending == Some(new_admin.clone()), "not pending admin");
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &Option::<Address>::None);
+        env.events()
+            .publish((Symbol::new(&env, "admin_transferred"),), (new_admin,));
     }
 
     /// Replace the contract WASM with a new version. Admin-only.
@@ -295,11 +349,11 @@ impl LpToken {
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from.clone()), &(from_bal - amount));
+        Self::write_checkpoint(env, from);
         let to_bal = Self::balance(env.clone(), to.clone());
         env.storage()
             .persistent()
             .set(&DataKey::Balance(to.clone()), &(to_bal + amount));
-        Self::write_checkpoint(env, from);
         Self::write_checkpoint(env, to);
         env.events().publish(
             (Symbol::new(env, "transfer"), from.clone()),
@@ -308,22 +362,38 @@ impl LpToken {
     }
 
     fn write_checkpoint(env: &Env, account: &Address) {
-        let ledger = env.ledger().sequence();
         let balance = Self::balance(env.clone(), account.clone());
         let key = DataKey::Checkpoints(account.clone());
+        let ledger = env.ledger().sequence();
         let mut checkpoints: Vec<Checkpoint> = env
             .storage()
             .persistent()
             .get(&key)
-            .unwrap_or(Vec::new(env));
-        if checkpoints.len() > 0 {
-            let last = checkpoints.get(checkpoints.len() - 1).unwrap();
+            .unwrap_or_else(|| Vec::new(env));
+
+        let len = checkpoints.len();
+        if len > 0 {
+            let last_idx = len - 1;
+            let mut last = checkpoints.get(last_idx).unwrap();
             if last.ledger == ledger {
-                checkpoints.pop_back();
+                last.balance = balance;
+                checkpoints.set(last_idx, last);
+                env.storage().persistent().set(&key, &checkpoints);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, Self::MIN_TTL, Self::BUMP_TO);
+                return;
             }
+        }
+
+        if checkpoints.len() >= Self::MAX_CHECKPOINTS {
+            checkpoints.remove(0);
         }
         checkpoints.push_back(Checkpoint { ledger, balance });
         env.storage().persistent().set(&key, &checkpoints);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, Self::MIN_TTL, Self::BUMP_TO);
     }
 }
 
@@ -332,7 +402,10 @@ impl LpToken {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{testutils::{Address as _, Ledger as _}, Env};
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        Env,
+    };
 
     struct TestSetup {
         env: Env,
@@ -493,21 +566,40 @@ mod tests {
     }
 
     #[test]
-    fn test_balance_at_snapshot() {
+    fn test_balance_at_uses_checkpoints() {
         let ts = setup();
         let client = LpTokenClient::new(&ts.env, &ts.contract_addr);
         let alice = Address::generate(&ts.env);
         let bob = Address::generate(&ts.env);
 
+        ts.env.ledger().set_sequence_number(10);
         client.mint(&alice, &1_000_i128);
-        let ledger_after_mint = ts.env.ledger().sequence();
-        // Advance the ledger so the transfer checkpoint lands at a different sequence,
-        // preserving the mint snapshot at ledger_after_mint.
-        ts.env.ledger().with_mut(|l| l.sequence_number += 1);
-        client.transfer(&alice, &bob, &400_i128);
+        ts.env.ledger().set_sequence_number(20);
+        client.transfer(&alice, &bob, &250_i128);
+        ts.env.ledger().set_sequence_number(30);
+        client.burn(&alice, &100_i128);
 
-        assert_eq!(client.balance_at(&alice, &ledger_after_mint), 1_000);
-        assert_eq!(client.balance(&alice), 600);
+        assert_eq!(client.balance_at(&alice, &9_u32), 0);
+        assert_eq!(client.balance_at(&alice, &10_u32), 1_000);
+        assert_eq!(client.balance_at(&alice, &25_u32), 750);
+        assert_eq!(client.balance_at(&alice, &30_u32), 650);
+        assert_eq!(client.balance_at(&bob, &19_u32), 0);
+        assert_eq!(client.balance_at(&bob, &20_u32), 250);
+    }
+
+    #[test]
+    fn test_transfer_admin_requires_nominee_acceptance() {
+        let ts = setup();
+        let client = LpTokenClient::new(&ts.env, &ts.contract_addr);
+        let nominee = Address::generate(&ts.env);
+        let stranger = Address::generate(&ts.env);
+
+        client.propose_admin(&ts.admin, &nominee);
+        assert_eq!(client.admin(), ts.admin);
+        assert!(client.try_accept_admin(&stranger).is_err());
+
+        client.accept_admin(&nominee);
+        assert_eq!(client.admin(), nominee);
     }
 
     #[test]

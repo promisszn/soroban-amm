@@ -207,6 +207,42 @@ pub struct UpdateFactoryGlobalFeeParams {
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
+pub struct UpdateClOracleParams {
+    pub cl_pool: Address,
+    pub oracle: Option<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateClMaxOracleDeviationParams {
+    pub cl_pool: Address,
+    pub max_deviation_bps: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateClProtocolFeeParams {
+    pub cl_pool: Address,
+    pub recipient: Address,
+    pub bps: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransferClPoolAdminParams {
+    pub cl_pool: Address,
+    pub new_admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetClPositionNftParams {
+    pub cl_pool: Address,
+    pub nft: Option<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CreatePolVestingParams {
     /// POL vesting contract address.
     pub pol_vesting: Address,
@@ -238,6 +274,20 @@ pub enum ProposalKind {
     UpdateFactoryGlobalFee(UpdateFactoryGlobalFeeParams),
     /// Deploy a time-based vesting schedule for protocol-owned LP tokens.
     CreatePolVesting(CreatePolVestingParams),
+    /// Pause a concentrated-liquidity pool.
+    PauseClPool(Address),
+    /// Unpause a concentrated-liquidity pool.
+    UnpauseClPool(Address),
+    /// Attach or remove the oracle aggregator on a CL pool.
+    UpdateClOracle(UpdateClOracleParams),
+    /// Update the maximum oracle deviation (basis points) on a CL pool.
+    UpdateClMaxOracleDeviation(UpdateClMaxOracleDeviationParams),
+    /// Update protocol fee parameters on a CL pool.
+    UpdateClProtocolFee(UpdateClProtocolFeeParams),
+    /// Transfer admin of a CL pool to a new address (two-step handover).
+    TransferClPoolAdmin(TransferClPoolAdminParams),
+    /// Wire or detach the position-NFT contract on a CL pool.
+    SetClPositionNft(SetClPositionNftParams),
 }
 
 #[contracttype]
@@ -317,6 +367,19 @@ pub trait PolVestingInterface {
         cliff_ledger: u32,
         end_ledger: u32,
     );
+}
+
+// ── CL pool client ────────────────────────────────────────────────────────────
+
+#[soroban_sdk::contractclient(name = "ClPoolClient")]
+pub trait ClPoolInterface {
+    fn set_oracle(env: Env, admin: Address, oracle: Option<Address>);
+    fn set_max_oracle_deviation_bps(env: Env, admin: Address, max_deviation_bps: i128);
+    fn pause(env: Env, admin: Address);
+    fn unpause(env: Env, admin: Address);
+    fn propose_admin(env: Env, admin: Address, new_admin: Address);
+    fn set_protocol_fee(env: Env, admin: Address, recipient: Address, bps: i128);
+    fn set_position_nft(env: Env, admin: Address, nft: Option<Address>);
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -527,6 +590,21 @@ impl Governance {
             }
             ProposalKind::UpdateFactoryGlobalFee(_) => {}
             ProposalKind::CreatePolVesting(_) => {}
+            ProposalKind::PauseClPool(_) => {}
+            ProposalKind::UnpauseClPool(_) => {}
+            ProposalKind::UpdateClOracle(_) => {}
+            ProposalKind::UpdateClMaxOracleDeviation(params) => {
+                if !(0..=MAX_BPS).contains(&params.max_deviation_bps) {
+                    return Err(GovernanceError::InvalidFeeBps);
+                }
+            }
+            ProposalKind::UpdateClProtocolFee(params) => {
+                if !(0..=MAX_BPS).contains(&params.bps) {
+                    return Err(GovernanceError::InvalidFeeBps);
+                }
+            }
+            ProposalKind::TransferClPoolAdmin(_) => {}
+            ProposalKind::SetClPositionNft(_) => {}
         }
 
         let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
@@ -804,6 +882,39 @@ impl Governance {
                     &params.cliff_ledger,
                     &params.end_ledger,
                 );
+            }
+            ProposalKind::PauseClPool(cl_pool) => {
+                let self_addr = env.current_contract_address();
+                ClPoolClient::new(&env, cl_pool).pause(&self_addr);
+            }
+            ProposalKind::UnpauseClPool(cl_pool) => {
+                let self_addr = env.current_contract_address();
+                ClPoolClient::new(&env, cl_pool).unpause(&self_addr);
+            }
+            ProposalKind::UpdateClOracle(params) => {
+                let self_addr = env.current_contract_address();
+                ClPoolClient::new(&env, &params.cl_pool)
+                    .set_oracle(&self_addr, &params.oracle);
+            }
+            ProposalKind::UpdateClMaxOracleDeviation(params) => {
+                let self_addr = env.current_contract_address();
+                ClPoolClient::new(&env, &params.cl_pool)
+                    .set_max_oracle_deviation_bps(&self_addr, &params.max_deviation_bps);
+            }
+            ProposalKind::UpdateClProtocolFee(params) => {
+                let self_addr = env.current_contract_address();
+                ClPoolClient::new(&env, &params.cl_pool)
+                    .set_protocol_fee(&self_addr, &params.recipient, &params.bps);
+            }
+            ProposalKind::TransferClPoolAdmin(params) => {
+                let self_addr = env.current_contract_address();
+                ClPoolClient::new(&env, &params.cl_pool)
+                    .propose_admin(&self_addr, &params.new_admin);
+            }
+            ProposalKind::SetClPositionNft(params) => {
+                let self_addr = env.current_contract_address();
+                ClPoolClient::new(&env, &params.cl_pool)
+                    .set_position_nft(&self_addr, &params.nft);
             }
         }
 
@@ -1352,6 +1463,7 @@ impl Governance {
 mod tests {
     use super::*;
     use amm::AmmPool;
+    use concentrated_liquidity::ConcentratedLiquidity;
     use soroban_sdk::token::{Client as StellarTokenClient, StellarAssetClient};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
@@ -2241,6 +2353,273 @@ mod tests {
             .set_timestamp(proposal.vote_start + 100 * 86_400);
         assert_eq!(gov.get_effective_quorum(&pid), 1_000);
     }
+
+    // ── CL pool governance tests ──────────────────────────────────────────────
+
+    fn setup_cl_pool(env: &Env, gov_addr: &Address) -> Address {
+        let token_a = env.register_stellar_asset_contract_v2(Address::generate(env));
+        let token_b = env.register_stellar_asset_contract_v2(Address::generate(env));
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        concentrated_liquidity::ConcentratedLiquidityClient::new(env, &cl_addr).initialize(
+            gov_addr,
+            &token_a.address(),
+            &token_b.address(),
+            &30_i128,
+            &0_i32,
+            &1_i32,
+        );
+        cl_addr
+    }
+
+    fn setup_gov(env: &Env) -> (GovernanceClient, Address, Address) {
+        let admin = Address::generate(env);
+        let lp_addr = env.register_contract(None, LpToken);
+        token::LpTokenClient::new(env, &lp_addr).initialize(
+            &admin,
+            &soroban_sdk::String::from_str(env, "AMM LP"),
+            &soroban_sdk::String::from_str(env, "ALP"),
+            &7u32,
+        );
+        let gov_addr = env.register_contract(None, Governance);
+        let gov = GovernanceClient::new(env, &gov_addr);
+        gov.initialize(
+            &admin,
+            &Address::generate(env),
+            &lp_addr,
+            &(7 * 24 * 60 * 60_u64),
+            &(2 * 24 * 60 * 60_u64),
+            &1_000_i128,
+            &100_i128,
+        );
+        token::LpTokenClient::new(env, &lp_addr).set_locker(&gov_addr);
+        (gov, gov_addr, lp_addr)
+    }
+
+    #[test]
+    fn test_cl_pool_pause_unpause() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000_000);
+
+        let (gov, gov_addr, lp_addr) = setup_gov(&env);
+        let cl_addr = setup_cl_pool(&env, &gov_addr);
+        let cl = concentrated_liquidity::ConcentratedLiquidityClient::new(&env, &cl_addr);
+
+        let lp1 = Address::generate(&env);
+        token::LpTokenClient::new(&env, &lp_addr).mint(&lp1, &1000);
+
+        let pid1 = gov.propose(&lp1, &ProposalKind::PauseClPool(cl_addr.clone()));
+        gov.vote(&lp1, &pid1, &Vote::For);
+        let p = gov.get_proposal(&pid1);
+        env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid1);
+        assert!(cl.is_paused());
+        gov.unlock_vote(&lp1, &pid1);
+
+        let pid2 = gov.propose(&lp1, &ProposalKind::UnpauseClPool(cl_addr));
+        gov.vote(&lp1, &pid2, &Vote::For);
+        let p = gov.get_proposal(&pid2);
+        env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid2);
+        assert!(!cl.is_paused());
+        gov.unlock_vote(&lp1, &pid2);
+    }
+
+    #[test]
+    fn test_cl_pool_set_oracle() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000_000);
+
+        let (gov, gov_addr, lp_addr) = setup_gov(&env);
+        let cl_addr = setup_cl_pool(&env, &gov_addr);
+
+        let lp1 = Address::generate(&env);
+        token::LpTokenClient::new(&env, &lp_addr).mint(&lp1, &1000);
+
+        let oracle_addr = Address::generate(&env);
+        let pid = gov.propose(
+            &lp1,
+            &ProposalKind::UpdateClOracle(UpdateClOracleParams {
+                cl_pool: cl_addr.clone(),
+                oracle: Some(oracle_addr),
+            }),
+        );
+        gov.vote(&lp1, &pid, &Vote::For);
+        let p = gov.get_proposal(&pid);
+        env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid);
+        gov.unlock_vote(&lp1, &pid);
+
+        let pid2 = gov.propose(
+            &lp1,
+            &ProposalKind::UpdateClOracle(UpdateClOracleParams {
+                cl_pool: cl_addr,
+                oracle: None,
+            }),
+        );
+        gov.vote(&lp1, &pid2, &Vote::For);
+        let p = gov.get_proposal(&pid2);
+        env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid2);
+        gov.unlock_vote(&lp1, &pid2);
+    }
+
+    #[test]
+    fn test_cl_pool_max_oracle_deviation() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000_000);
+
+        let (gov, gov_addr, lp_addr) = setup_gov(&env);
+        let cl_addr = setup_cl_pool(&env, &gov_addr);
+
+        let lp1 = Address::generate(&env);
+        token::LpTokenClient::new(&env, &lp_addr).mint(&lp1, &1000);
+
+        let pid = gov.propose(
+            &lp1,
+            &ProposalKind::UpdateClMaxOracleDeviation(UpdateClMaxOracleDeviationParams {
+                cl_pool: cl_addr,
+                max_deviation_bps: 100,
+            }),
+        );
+        gov.vote(&lp1, &pid, &Vote::For);
+        let p = gov.get_proposal(&pid);
+        env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid);
+        gov.unlock_vote(&lp1, &pid);
+    }
+
+    #[test]
+    fn test_cl_pool_protocol_fee() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000_000);
+
+        let (gov, gov_addr, lp_addr) = setup_gov(&env);
+        let cl_addr = setup_cl_pool(&env, &gov_addr);
+
+        let lp1 = Address::generate(&env);
+        token::LpTokenClient::new(&env, &lp_addr).mint(&lp1, &1000);
+        let recipient = Address::generate(&env);
+
+        let pid = gov.propose(
+            &lp1,
+            &ProposalKind::UpdateClProtocolFee(UpdateClProtocolFeeParams {
+                cl_pool: cl_addr,
+                recipient,
+                bps: 25,
+            }),
+        );
+        gov.vote(&lp1, &pid, &Vote::For);
+        let p = gov.get_proposal(&pid);
+        env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid);
+        gov.unlock_vote(&lp1, &pid);
+    }
+
+    #[test]
+    fn test_cl_pool_transfer_admin() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000_000);
+
+        let (gov, gov_addr, lp_addr) = setup_gov(&env);
+        let cl_addr = setup_cl_pool(&env, &gov_addr);
+
+        let lp1 = Address::generate(&env);
+        token::LpTokenClient::new(&env, &lp_addr).mint(&lp1, &1000);
+
+        let pid = gov.propose(
+            &lp1,
+            &ProposalKind::TransferClPoolAdmin(TransferClPoolAdminParams {
+                cl_pool: cl_addr,
+                new_admin: Address::generate(&env),
+            }),
+        );
+        gov.vote(&lp1, &pid, &Vote::For);
+        let p = gov.get_proposal(&pid);
+        env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid);
+        gov.unlock_vote(&lp1, &pid);
+    }
+
+    #[test]
+    fn test_cl_pool_set_position_nft() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000_000);
+
+        let (gov, gov_addr, lp_addr) = setup_gov(&env);
+        let cl_addr = setup_cl_pool(&env, &gov_addr);
+        let cl = concentrated_liquidity::ConcentratedLiquidityClient::new(&env, &cl_addr);
+
+        let lp1 = Address::generate(&env);
+        token::LpTokenClient::new(&env, &lp_addr).mint(&lp1, &1000);
+
+        let nft_addr = Address::generate(&env);
+        let pid = gov.propose(
+            &lp1,
+            &ProposalKind::SetClPositionNft(SetClPositionNftParams {
+                cl_pool: cl_addr.clone(),
+                nft: Some(nft_addr.clone()),
+            }),
+        );
+        gov.vote(&lp1, &pid, &Vote::For);
+        let p = gov.get_proposal(&pid);
+        env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid);
+        assert_eq!(cl.position_nft(), Some(nft_addr));
+        gov.unlock_vote(&lp1, &pid);
+
+        let pid2 = gov.propose(
+            &lp1,
+            &ProposalKind::SetClPositionNft(SetClPositionNftParams {
+                cl_pool: cl_addr,
+                nft: None,
+            }),
+        );
+        gov.vote(&lp1, &pid2, &Vote::For);
+        let p = gov.get_proposal(&pid2);
+        env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid2);
+        assert_eq!(cl.position_nft(), None);
+        gov.unlock_vote(&lp1, &pid2);
+    }
+
+    #[test]
+    fn test_cl_pool_propose_invalid_params_rejected() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000_000);
+
+        let (gov, _, lp_addr) = setup_gov(&env);
+
+        let lp1 = Address::generate(&env);
+        token::LpTokenClient::new(&env, &lp_addr).mint(&lp1, &1000);
+
+        let cl_addr = Address::generate(&env);
+
+        let r = gov.try_propose(
+            &lp1,
+            &ProposalKind::UpdateClMaxOracleDeviation(UpdateClMaxOracleDeviationParams {
+                cl_pool: cl_addr.clone(),
+                max_deviation_bps: 20_000,
+            }),
+        );
+        assert!(r.is_err());
+
+        let r = gov.try_propose(
+            &lp1,
+            &ProposalKind::UpdateClProtocolFee(UpdateClProtocolFeeParams {
+                cl_pool: cl_addr,
+                recipient: Address::generate(&env),
+                bps: -1,
+            }),
+        );
+        assert!(r.is_err());
+    }
 }
 
 // ── Property-based tests ───────────────────────────────────────────────────────
@@ -2263,6 +2642,7 @@ mod prop_tests {
         env: Env,
         gov_addr: Address,
         lp_addr: Address,
+        admin: Address,
     }
 
     fn setup_prop_env() -> PropEnv {
@@ -2310,6 +2690,7 @@ mod prop_tests {
             env,
             gov_addr,
             lp_addr,
+            admin,
         }
     }
 
@@ -2884,7 +3265,7 @@ mod prop_tests {
 
     #[test]
     fn test_propose_admin_requires_current_admin() {
-        let s = setup_suite(30);
+        let s = setup_prop_env();
         let gov = GovernanceClient::new(&s.env, &s.gov_addr);
         let rando = Address::generate(&s.env);
         let nominee = Address::generate(&s.env);
@@ -2893,7 +3274,7 @@ mod prop_tests {
 
     #[test]
     fn test_accept_admin_requires_pending_nomination() {
-        let s = setup_suite(30);
+        let s = setup_prop_env();
         let gov = GovernanceClient::new(&s.env, &s.gov_addr);
         let nominee = Address::generate(&s.env);
         assert!(gov.try_accept_admin(&nominee).is_err());
@@ -2901,7 +3282,7 @@ mod prop_tests {
 
     #[test]
     fn test_admin_rotation_two_step_handover() {
-        let s = setup_suite(30);
+        let s = setup_prop_env();
         let gov = GovernanceClient::new(&s.env, &s.gov_addr);
         let new_admin = Address::generate(&s.env);
 
