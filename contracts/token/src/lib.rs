@@ -35,6 +35,14 @@ pub struct Checkpoint {
     pub balance: i128,
 }
 
+/// SEP-41 allowance value.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct AllowanceValue {
+    pub amount: i128,
+    pub live_until_ledger: u32,
+}
+
 #[contract]
 pub struct LpToken;
 
@@ -133,10 +141,19 @@ impl LpToken {
             }
         }
 
-        if low == 0 {
-            0
+    /// Returns the SEP-41 allowance value for `spender` over `from`.
+    /// Returns `{ amount: 0, live_until_ledger: 0 }` if expired or unset.
+    pub fn allowance(env: Env, from: Address, spender: Address) -> AllowanceValue {
+        let key = DataKey::Allowance(from, spender);
+        let val: AllowanceValue = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or(AllowanceValue { amount: 0, live_until_ledger: 0 });
+        if val.amount > 0 && env.ledger().sequence() > val.live_until_ledger {
+            AllowanceValue { amount: 0, live_until_ledger: 0 }
         } else {
-            checkpoints.get(low - 1).unwrap().balance
+            val
         }
     }
 
@@ -160,12 +177,12 @@ impl LpToken {
         spender.require_auth();
         let allowance = Self::allowance(env.clone(), from.clone(), spender.clone());
         assert!(
-            allowance >= amount,
-            "insufficient allowance: available={allowance}, requested={amount}"
+            allowance.amount >= amount,
+            "insufficient allowance: available={}, requested={amount}", allowance.amount
         );
         env.storage().persistent().set(
             &DataKey::Allowance(from.clone(), spender),
-            &(allowance - amount),
+            &AllowanceValue { amount: allowance.amount - amount, live_until_ledger: allowance.live_until_ledger },
         );
         Self::_transfer(&env, &from, &to, amount);
     }
@@ -173,12 +190,19 @@ impl LpToken {
     /// Approve `spender` to transfer up to `amount` tokens on behalf of `from`.
     ///
     /// Requires authorization from `from`.
+    /// `live_until_ledger` must be >= current ledger sequence when `amount > 0`.
     /// Setting `amount` to `0` effectively revokes the allowance.
-    pub fn approve(env: Env, from: Address, spender: Address, amount: i128) {
+    pub fn approve(env: Env, from: Address, spender: Address, amount: i128, live_until_ledger: u32) {
         from.require_auth();
+        if amount > 0 {
+            assert!(
+                live_until_ledger >= env.ledger().sequence(),
+                "live_until_ledger must be >= current ledger"
+            );
+        }
         env.storage()
             .persistent()
-            .set(&DataKey::Allowance(from, spender), &amount);
+            .set(&DataKey::Allowance(from, spender), &AllowanceValue { amount, live_until_ledger });
     }
 
     /// Mint new tokens — admin only (called by the AMM contract).
@@ -480,13 +504,41 @@ mod tests {
         let carol = Address::generate(&ts.env);
 
         client.mint(&alice, &1_000_i128);
-        client.approve(&alice, &bob, &300_i128);
-        assert_eq!(client.allowance(&alice, &bob), 300);
+        let live_until = ts.env.ledger().sequence() + 100;
+        client.approve(&alice, &bob, &300_i128, &live_until);
+        assert_eq!(client.allowance(&alice, &bob).amount, 300);
 
         client.transfer_from(&bob, &alice, &carol, &200_i128);
         assert_eq!(client.balance(&alice), 800);
         assert_eq!(client.balance(&carol), 200);
-        assert_eq!(client.allowance(&alice, &bob), 100);
+        assert_eq!(client.allowance(&alice, &bob).amount, 100);
+    }
+
+    #[test]
+    fn test_allowance_expires() {
+        let ts = setup();
+        let client = LpTokenClient::new(&ts.env, &ts.contract_addr);
+        let alice = Address::generate(&ts.env);
+        let bob = Address::generate(&ts.env);
+
+        client.mint(&alice, &1_000_i128);
+        let live_until = ts.env.ledger().sequence() + 5;
+        client.approve(&alice, &bob, &300_i128, &live_until);
+        assert_eq!(client.allowance(&alice, &bob).amount, 300);
+
+        // Advance past expiry
+        ts.env.ledger().with_mut(|l| l.sequence_number = live_until + 1);
+        assert_eq!(client.allowance(&alice, &bob).amount, 0);
+    }
+
+    #[test]
+    fn test_approve_past_ledger_panics() {
+        let ts = setup();
+        let client = LpTokenClient::new(&ts.env, &ts.contract_addr);
+        let alice = Address::generate(&ts.env);
+        let bob = Address::generate(&ts.env);
+        let past = ts.env.ledger().sequence().saturating_sub(1);
+        assert!(client.try_approve(&alice, &bob, &100_i128, &past).is_err());
     }
 
     #[test]
@@ -498,7 +550,8 @@ mod tests {
         let carol = Address::generate(&ts.env);
 
         client.mint(&alice, &1_000_i128);
-        client.approve(&alice, &bob, &50_i128);
+        let live_until = ts.env.ledger().sequence() + 100;
+        client.approve(&alice, &bob, &50_i128, &live_until);
         let result = client.try_transfer_from(&bob, &alice, &carol, &100_i128);
         assert!(result.is_err());
     }
