@@ -42,6 +42,10 @@ pub enum OracleError {
     SourceNotFound = 5,
     InsufficientSources = 6,
     InvalidStaleness = 7,
+    /// Returned (internally) when a source's price lies outside the
+    /// configured deviation band around the median. Not panicked
+    /// directly — sources are silently dropped from confidence.
+    OutsideDeviationBand = 8,
 }
 
 // ── Storage ────────────────────────────────────────────────────────────────
@@ -51,6 +55,11 @@ pub enum DataKey {
     Admin,
     MaxStaleness,
     Sources,
+    /// Maximum allowed deviation from the median in basis points.
+    /// A source whose price deviates by more than this fraction is
+    /// excluded from confidence. `0` disables the filter (every
+    /// positive, fresh price counts regardless of spread).
+    MaxDeviationBps,
 }
 
 pub const MIN_VALID_SOURCES: u32 = 2;
@@ -220,7 +229,7 @@ impl OracleAggregator {
 
         AggregatedPrice {
             price: median,
-            confidence: prices.len(),
+            confidence: agreeing,
         }
     }
 

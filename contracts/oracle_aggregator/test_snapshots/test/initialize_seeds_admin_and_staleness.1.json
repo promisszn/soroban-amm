@@ -18,6 +18,9 @@
                 },
                 {
                   "u64": 600
+                },
+                {
+                  "u32": 0
                 }
               ]
             }
@@ -26,6 +29,7 @@
         }
       ]
     ],
+    [],
     [],
     [],
     []
@@ -112,6 +116,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "MaxDeviationBps"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u32": 0
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "MaxStaleness"
                             }
                           ]
@@ -191,6 +207,9 @@
                 },
                 {
                   "u64": 600
+                },
+                {
+                  "u32": 0
                 }
               ]
             }
@@ -308,6 +327,53 @@
             ],
             "data": {
               "u64": 600
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000002"
+              },
+              {
+                "symbol": "get_max_deviation_bps"
+              }
+            ],
+            "data": "void"
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000002",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "get_max_deviation_bps"
+              }
+            ],
+            "data": {
+              "u32": 0
             }
           }
         }
