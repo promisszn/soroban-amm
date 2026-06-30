@@ -6,26 +6,29 @@
 
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracterror, contracttype, token, Address, Env, Symbol};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
+};
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum VestingError {
-    AlreadyInitialized   = 1,
-    NotGovernance        = 2,
-    VestingNotFound      = 3,
+    AlreadyInitialized = 1,
+    NotGovernance = 2,
+    VestingNotFound = 3,
     VestingAlreadyExists = 4,
-    NothingToRelease     = 5,
-    InvalidSchedule      = 6,
-    NotBeneficiary       = 7,
+    NothingToRelease = 5,
+    InvalidSchedule = 6,
+    NotBeneficiary = 7,
+    NoPendingGovernance = 8,
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const MIN_TTL: u32 = 241_920;    // ~14 days (at 5s per ledger)
-const BUMP_TO: u32 = 3_110_400;  // ~180 days (at 5s per ledger)
+const MIN_TTL: u32 = 241_920; // ~14 days (at 5s per ledger)
+const BUMP_TO: u32 = 3_110_400; // ~180 days (at 5s per ledger)
 
 // ── Storage keys ──────────────────────────────────────────────────────────────
 
@@ -33,6 +36,8 @@ const BUMP_TO: u32 = 3_110_400;  // ~180 days (at 5s per ledger)
 pub enum DataKey {
     /// Governance contract address (the only caller allowed to create/revoke).
     Governance,
+    /// Pending governance nominee for two-step governance rotation.
+    PendingGovernance,
     /// Treasury address — receives tokens on revocation.
     Treasury,
     /// Per-beneficiary vesting schedule.
@@ -44,14 +49,14 @@ pub enum DataKey {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PolVesting {
-    pub lp_token:      Address,
-    pub pool:          Address,
-    pub total:         i128,
-    pub released:      i128,
-    pub start_ledger:  u32,
-    pub cliff_ledger:  u32,
-    pub end_ledger:    u32,
-    pub beneficiary:   Address,
+    pub lp_token: Address,
+    pub pool: Address,
+    pub total: i128,
+    pub released: i128,
+    pub start_ledger: u32,
+    pub cliff_ledger: u32,
+    pub end_ledger: u32,
+    pub beneficiary: Address,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -71,9 +76,79 @@ impl PolVestingContract {
         if env.storage().instance().has(&DataKey::Governance) {
             return Err(VestingError::AlreadyInitialized);
         }
-        env.storage().instance().set(&DataKey::Governance, &governance);
+        env.storage()
+            .instance()
+            .set(&DataKey::Governance, &governance);
         env.storage().instance().set(&DataKey::Treasury, &treasury);
         Ok(())
+    }
+
+    /// Nominate a new governance address.
+    ///
+    /// Requires current governance authorization. The nominee must call
+    /// `accept_governance` to complete the handover.
+    pub fn propose_governance(
+        env: Env,
+        current_governance: Address,
+        new_governance: Address,
+    ) -> Result<(), VestingError> {
+        current_governance.require_auth();
+        Self::require_governance(&env, &current_governance)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingGovernance, &Some(new_governance.clone()));
+
+        env.events().publish(
+            (Symbol::new(&env, "governance_proposed"),),
+            (current_governance, new_governance),
+        );
+        Ok(())
+    }
+
+    /// Accept a pending governance nomination.
+    ///
+    /// Only the nominated address can accept. On success, governance is updated,
+    /// the pending nominee is cleared, and a transfer event is emitted.
+    pub fn accept_governance(env: Env, new_governance: Address) -> Result<(), VestingError> {
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingGovernance)
+            .unwrap_or(None);
+        let nominee = pending.ok_or(VestingError::NoPendingGovernance)?;
+
+        if new_governance != nominee {
+            return Err(VestingError::NotGovernance);
+        }
+        new_governance.require_auth();
+
+        let old_governance: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
+        env.storage()
+            .instance()
+            .set(&DataKey::Governance, &new_governance);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingGovernance, &Option::<Address>::None);
+
+        env.events().publish(
+            (Symbol::new(&env, "governance_transferred"),),
+            (old_governance, new_governance),
+        );
+        Ok(())
+    }
+
+    /// Return the active governance address.
+    pub fn get_governance(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Governance).unwrap()
+    }
+
+    /// Return the pending governance nominee, if any.
+    pub fn get_pending_governance(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingGovernance)
+            .unwrap_or(None)
     }
 
     /// Governance creates a vesting schedule for `beneficiary`.
@@ -121,7 +196,9 @@ impl PolVestingContract {
         };
         let key = DataKey::Vesting(beneficiary.clone());
         env.storage().persistent().set(&key, &schedule);
-        env.storage().persistent().extend_ttl(&key, MIN_TTL, BUMP_TO);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, MIN_TTL, BUMP_TO);
 
         env.events().publish(
             (Symbol::new(&env, "vesting_created"),),
@@ -141,7 +218,9 @@ impl PolVestingContract {
             .get(&key)
             .ok_or(VestingError::VestingNotFound)?;
 
-        env.storage().persistent().extend_ttl(&key, MIN_TTL, BUMP_TO);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, MIN_TTL, BUMP_TO);
 
         if schedule.beneficiary != beneficiary {
             return Err(VestingError::NotBeneficiary);
@@ -162,10 +241,8 @@ impl PolVestingContract {
             &releasable,
         );
 
-        env.events().publish(
-            (Symbol::new(&env, "released"),),
-            (beneficiary, releasable),
-        );
+        env.events()
+            .publish((Symbol::new(&env, "released"),), (beneficiary, releasable));
         Ok(releasable)
     }
 
@@ -194,7 +271,9 @@ impl PolVestingContract {
             .get(&key)
             .ok_or(VestingError::VestingNotFound)?;
 
-        env.storage().persistent().extend_ttl(&key, MIN_TTL, BUMP_TO);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, MIN_TTL, BUMP_TO);
 
         let current_ledger = env.ledger().sequence();
         let vested = Self::vested_amount(&schedule, current_ledger);
@@ -288,7 +367,15 @@ mod tests {
         // Mint 1_000_000 LP tokens to the vesting contract.
         StellarAssetClient::new(&env, &lp_token).mint(&contract_id, &1_000_000);
 
-        Setup { env, contract_id, governance, treasury, beneficiary, lp_token, pool }
+        Setup {
+            env,
+            contract_id,
+            governance,
+            treasury,
+            beneficiary,
+            lp_token,
+            pool,
+        }
     }
 
     fn create_schedule(s: &Setup, start: u32, cliff: u32, end: u32) {
@@ -366,5 +453,83 @@ mod tests {
         // Schedule is gone.
         let err = client.try_get_vesting(&s.beneficiary).unwrap_err().unwrap();
         assert_eq!(err, VestingError::VestingNotFound);
+    }
+
+    #[test]
+    fn test_propose_and_accept_governance() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+        let new_governance = Address::generate(&s.env);
+
+        client.propose_governance(&s.governance, &new_governance);
+        assert_eq!(
+            client.get_pending_governance(),
+            Some(new_governance.clone())
+        );
+
+        client.accept_governance(&new_governance);
+        assert_eq!(client.get_governance(), new_governance);
+        assert_eq!(client.get_pending_governance(), None);
+    }
+
+    #[test]
+    fn test_propose_governance_requires_current_governance() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+        let rando = Address::generate(&s.env);
+        let new_governance = Address::generate(&s.env);
+
+        let err = client
+            .try_propose_governance(&rando, &new_governance)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, VestingError::NotGovernance);
+    }
+
+    #[test]
+    fn test_accept_governance_requires_pending_nominee() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+        let new_governance = Address::generate(&s.env);
+        let other = Address::generate(&s.env);
+
+        let err = client
+            .try_accept_governance(&new_governance)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, VestingError::NoPendingGovernance);
+
+        client.propose_governance(&s.governance, &new_governance);
+        let err = client.try_accept_governance(&other).unwrap_err().unwrap();
+        assert_eq!(err, VestingError::NotGovernance);
+    }
+
+    #[test]
+    fn test_new_governance_controls_vesting_after_acceptance() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+        let new_governance = Address::generate(&s.env);
+
+        client.propose_governance(&s.governance, &new_governance);
+        client.accept_governance(&new_governance);
+
+        client.create_vesting(
+            &new_governance,
+            &s.beneficiary,
+            &s.lp_token,
+            &s.pool,
+            &1_000_000,
+            &0,
+            &0,
+            &1000,
+        );
+
+        let old_governance_err = client
+            .try_revoke_vesting(&s.governance, &s.beneficiary)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(old_governance_err, VestingError::NotGovernance);
+
+        client.revoke_vesting(&new_governance, &s.beneficiary);
     }
 }
