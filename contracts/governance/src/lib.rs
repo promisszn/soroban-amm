@@ -207,6 +207,42 @@ pub struct UpdateFactoryGlobalFeeParams {
 
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
+pub struct UpdateClOracleParams {
+    pub cl_pool: Address,
+    pub oracle: Option<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateClMaxOracleDeviationParams {
+    pub cl_pool: Address,
+    pub max_deviation_bps: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct UpdateClProtocolFeeParams {
+    pub cl_pool: Address,
+    pub recipient: Address,
+    pub bps: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TransferClPoolAdminParams {
+    pub cl_pool: Address,
+    pub new_admin: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct SetClPositionNftParams {
+    pub cl_pool: Address,
+    pub nft: Option<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CreatePolVestingParams {
     /// POL vesting contract address.
     pub pol_vesting: Address,
@@ -238,6 +274,20 @@ pub enum ProposalKind {
     UpdateFactoryGlobalFee(UpdateFactoryGlobalFeeParams),
     /// Deploy a time-based vesting schedule for protocol-owned LP tokens.
     CreatePolVesting(CreatePolVestingParams),
+    /// Pause a concentrated-liquidity pool.
+    PauseClPool(Address),
+    /// Unpause a concentrated-liquidity pool.
+    UnpauseClPool(Address),
+    /// Attach or remove the oracle aggregator on a CL pool.
+    UpdateClOracle(UpdateClOracleParams),
+    /// Update the maximum oracle deviation (basis points) on a CL pool.
+    UpdateClMaxOracleDeviation(UpdateClMaxOracleDeviationParams),
+    /// Update protocol fee parameters on a CL pool.
+    UpdateClProtocolFee(UpdateClProtocolFeeParams),
+    /// Transfer admin of a CL pool to a new address (two-step handover).
+    TransferClPoolAdmin(TransferClPoolAdminParams),
+    /// Wire or detach the position-NFT contract on a CL pool.
+    SetClPositionNft(SetClPositionNftParams),
 }
 
 #[contracttype]
@@ -316,7 +366,20 @@ pub trait PolVestingInterface {
         start_ledger: u32,
         cliff_ledger: u32,
         end_ledger: u32,
-    );
+    ) -> u32;
+}
+
+// ── CL pool client ────────────────────────────────────────────────────────────
+
+#[soroban_sdk::contractclient(name = "ClPoolClient")]
+pub trait ClPoolInterface {
+    fn set_oracle(env: Env, admin: Address, oracle: Option<Address>);
+    fn set_max_oracle_deviation_bps(env: Env, admin: Address, max_deviation_bps: i128);
+    fn pause(env: Env, admin: Address);
+    fn unpause(env: Env, admin: Address);
+    fn propose_admin(env: Env, admin: Address, new_admin: Address);
+    fn set_protocol_fee(env: Env, admin: Address, recipient: Address, bps: i128);
+    fn set_position_nft(env: Env, admin: Address, nft: Option<Address>);
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -383,10 +446,7 @@ impl Governance {
     }
 
     /// Admin-only: quorum increases by this many bps per day a proposal is open (#311).
-    pub fn set_quorum_decay_bps_per_day(
-        env: Env,
-        new_rate: i128,
-    ) -> Result<(), GovernanceError> {
+    pub fn set_quorum_decay_bps_per_day(env: Env, new_rate: i128) -> Result<(), GovernanceError> {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         if new_rate < 0 {
@@ -527,6 +587,21 @@ impl Governance {
             }
             ProposalKind::UpdateFactoryGlobalFee(_) => {}
             ProposalKind::CreatePolVesting(_) => {}
+            ProposalKind::PauseClPool(_) => {}
+            ProposalKind::UnpauseClPool(_) => {}
+            ProposalKind::UpdateClOracle(_) => {}
+            ProposalKind::UpdateClMaxOracleDeviation(params) => {
+                if !(0..=MAX_BPS).contains(&params.max_deviation_bps) {
+                    return Err(GovernanceError::InvalidFeeBps);
+                }
+            }
+            ProposalKind::UpdateClProtocolFee(params) => {
+                if !(0..=MAX_BPS).contains(&params.bps) {
+                    return Err(GovernanceError::InvalidFeeBps);
+                }
+            }
+            ProposalKind::TransferClPoolAdmin(_) => {}
+            ProposalKind::SetClPositionNft(_) => {}
         }
 
         let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
@@ -805,6 +880,40 @@ impl Governance {
                     &params.end_ledger,
                 );
             }
+            ProposalKind::PauseClPool(cl_pool) => {
+                let self_addr = env.current_contract_address();
+                ClPoolClient::new(&env, cl_pool).pause(&self_addr);
+            }
+            ProposalKind::UnpauseClPool(cl_pool) => {
+                let self_addr = env.current_contract_address();
+                ClPoolClient::new(&env, cl_pool).unpause(&self_addr);
+            }
+            ProposalKind::UpdateClOracle(params) => {
+                let self_addr = env.current_contract_address();
+                ClPoolClient::new(&env, &params.cl_pool).set_oracle(&self_addr, &params.oracle);
+            }
+            ProposalKind::UpdateClMaxOracleDeviation(params) => {
+                let self_addr = env.current_contract_address();
+                ClPoolClient::new(&env, &params.cl_pool)
+                    .set_max_oracle_deviation_bps(&self_addr, &params.max_deviation_bps);
+            }
+            ProposalKind::UpdateClProtocolFee(params) => {
+                let self_addr = env.current_contract_address();
+                ClPoolClient::new(&env, &params.cl_pool).set_protocol_fee(
+                    &self_addr,
+                    &params.recipient,
+                    &params.bps,
+                );
+            }
+            ProposalKind::TransferClPoolAdmin(params) => {
+                let self_addr = env.current_contract_address();
+                ClPoolClient::new(&env, &params.cl_pool)
+                    .propose_admin(&self_addr, &params.new_admin);
+            }
+            ProposalKind::SetClPositionNft(params) => {
+                let self_addr = env.current_contract_address();
+                ClPoolClient::new(&env, &params.cl_pool).set_position_nft(&self_addr, &params.nft);
+            }
         }
 
         proposal.executed = true;
@@ -948,9 +1057,9 @@ impl Governance {
         }
         Self::add_delegator_index(&env, &to, &from);
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Delegate(from.clone()), &to);
+        let delegate_key = DataKey::Delegate(from.clone());
+        env.storage().persistent().set(&delegate_key, &to);
+        Self::bump_key_ttl(&env, &delegate_key);
 
         env.events()
             .publish((Symbol::new(&env, "delegated"),), (from, to));
@@ -969,7 +1078,7 @@ impl Governance {
             Self::remove_delegator_index(&env, &delegatee, &from);
         }
         env.storage()
-            .instance()
+            .persistent()
             .remove(&DataKey::Delegate(from.clone()));
 
         env.events()
@@ -980,10 +1089,12 @@ impl Governance {
     ///
     /// Returns `None` if no delegation is active.
     pub fn get_delegate(env: Env, from: Address) -> Option<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Delegate(from))
-            .unwrap_or(None)
+        let key = DataKey::Delegate(from);
+        let delegate = env.storage().persistent().get(&key).unwrap_or(None);
+        if delegate.is_some() {
+            Self::bump_key_ttl(&env, &key);
+        }
+        delegate
     }
 
     /// Admin-only: set the protocol multisig that may veto passed proposals.
@@ -1222,17 +1333,15 @@ impl Governance {
             *total += power;
             locks.push_back((holder.clone(), power));
         }
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::DelegatorCount(holder.clone()))
-            .unwrap_or(0);
+        let count_key = DataKey::DelegatorCount(holder.clone());
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        if count > 0 {
+            Self::bump_key_ttl(env, &count_key);
+        }
         for i in 0..count {
-            let delegator: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::Delegator(holder.clone(), i))
-                .unwrap();
+            let delegator_key = DataKey::Delegator(holder.clone(), i);
+            let delegator: Address = env.storage().persistent().get(&delegator_key).unwrap();
+            Self::bump_key_ttl(env, &delegator_key);
             Self::collect_voting_power(
                 env,
                 lp_client,
@@ -1261,65 +1370,72 @@ impl Governance {
     }
 
     fn add_delegator_index(env: &Env, delegatee: &Address, delegator: &Address) {
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::DelegatorCount(delegatee.clone()))
-            .unwrap_or(0);
+        let count_key = DataKey::DelegatorCount(delegatee.clone());
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        if count > 0 {
+            Self::bump_key_ttl(env, &count_key);
+        }
+
+        let delegator_key = DataKey::Delegator(delegatee.clone(), count);
+        env.storage().persistent().set(&delegator_key, delegator);
+        Self::bump_key_ttl(env, &delegator_key);
+
+        let slot_key = DataKey::DelegatorSlot(delegator.clone());
         env.storage()
-            .instance()
-            .set(&DataKey::Delegator(delegatee.clone(), count), delegator);
-        env.storage().instance().set(
-            &DataKey::DelegatorSlot(delegator.clone()),
-            &(delegatee.clone(), count),
-        );
-        env.storage()
-            .instance()
-            .set(&DataKey::DelegatorCount(delegatee.clone()), &(count + 1));
+            .persistent()
+            .set(&slot_key, &(delegatee.clone(), count));
+        Self::bump_key_ttl(env, &slot_key);
+
+        env.storage().persistent().set(&count_key, &(count + 1));
+        Self::bump_key_ttl(env, &count_key);
     }
 
     fn remove_delegator_index(env: &Env, delegatee: &Address, delegator: &Address) {
+        let slot_key = DataKey::DelegatorSlot(delegator.clone());
         let (stored_delegatee, index): (Address, u32) = env
             .storage()
-            .instance()
-            .get(&DataKey::DelegatorSlot(delegator.clone()))
+            .persistent()
+            .get(&slot_key)
             .unwrap_or((delegatee.clone(), 0));
         if stored_delegatee != *delegatee {
             return;
         }
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::DelegatorCount(delegatee.clone()))
-            .unwrap_or(0);
+        Self::bump_key_ttl(env, &slot_key);
+
+        let count_key = DataKey::DelegatorCount(delegatee.clone());
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
         if count == 0 {
             return;
         }
+        Self::bump_key_ttl(env, &count_key);
+
         let last_index = count - 1;
         if index != last_index {
-            let last_delegator: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::Delegator(delegatee.clone(), last_index))
-                .unwrap();
-            env.storage().instance().set(
-                &DataKey::Delegator(delegatee.clone(), index),
-                &last_delegator,
-            );
-            env.storage().instance().set(
-                &DataKey::DelegatorSlot(last_delegator.clone()),
-                &(delegatee.clone(), index),
-            );
+            let last_delegator_key = DataKey::Delegator(delegatee.clone(), last_index);
+            let last_delegator: Address =
+                env.storage().persistent().get(&last_delegator_key).unwrap();
+            Self::bump_key_ttl(env, &last_delegator_key);
+
+            let moved_delegator_key = DataKey::Delegator(delegatee.clone(), index);
+            env.storage()
+                .persistent()
+                .set(&moved_delegator_key, &last_delegator);
+            Self::bump_key_ttl(env, &moved_delegator_key);
+
+            let moved_slot_key = DataKey::DelegatorSlot(last_delegator.clone());
+            env.storage()
+                .persistent()
+                .set(&moved_slot_key, &(delegatee.clone(), index));
+            Self::bump_key_ttl(env, &moved_slot_key);
         }
         env.storage()
-            .instance()
+            .persistent()
             .remove(&DataKey::Delegator(delegatee.clone(), last_index));
         env.storage()
-            .instance()
+            .persistent()
             .remove(&DataKey::DelegatorSlot(delegator.clone()));
-        env.storage()
-            .instance()
-            .set(&DataKey::DelegatorCount(delegatee.clone()), &last_index);
+        env.storage().persistent().set(&count_key, &last_index);
+        Self::bump_key_ttl(env, &count_key);
     }
 
     fn bump_key_ttl(env: &Env, key: &DataKey) {
@@ -1352,6 +1468,7 @@ impl Governance {
 mod tests {
     use super::*;
     use amm::AmmPool;
+    use concentrated_liquidity::ConcentratedLiquidity;
     use soroban_sdk::token::{Client as StellarTokenClient, StellarAssetClient};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
@@ -2068,6 +2185,88 @@ mod tests {
     }
 
     #[test]
+    fn test_delegation_records_use_persistent_storage() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        let delegator = Address::generate(&s.env);
+        let delegatee = Address::generate(&s.env);
+        mint_lp(&s, &delegator, 600);
+
+        gov.delegate(&delegator, &delegatee);
+
+        s.env.as_contract(&s.gov_addr, || {
+            assert!(!s
+                .env
+                .storage()
+                .instance()
+                .has(&DataKey::Delegate(delegator.clone())));
+            assert!(s
+                .env
+                .storage()
+                .persistent()
+                .has(&DataKey::Delegate(delegator.clone())));
+            assert!(!s
+                .env
+                .storage()
+                .instance()
+                .has(&DataKey::DelegatorCount(delegatee.clone())));
+            assert!(s
+                .env
+                .storage()
+                .persistent()
+                .has(&DataKey::DelegatorCount(delegatee.clone())));
+            assert!(!s
+                .env
+                .storage()
+                .instance()
+                .has(&DataKey::Delegator(delegatee.clone(), 0)));
+            assert!(s
+                .env
+                .storage()
+                .persistent()
+                .has(&DataKey::Delegator(delegatee.clone(), 0)));
+            assert!(!s
+                .env
+                .storage()
+                .instance()
+                .has(&DataKey::DelegatorSlot(delegator.clone())));
+            assert!(s
+                .env
+                .storage()
+                .persistent()
+                .has(&DataKey::DelegatorSlot(delegator.clone())));
+        });
+
+        gov.undelegate(&delegator);
+
+        s.env.as_contract(&s.gov_addr, || {
+            assert!(!s
+                .env
+                .storage()
+                .persistent()
+                .has(&DataKey::Delegate(delegator.clone())));
+            assert!(!s
+                .env
+                .storage()
+                .persistent()
+                .has(&DataKey::Delegator(delegatee.clone(), 0)));
+            assert!(!s
+                .env
+                .storage()
+                .persistent()
+                .has(&DataKey::DelegatorSlot(delegator.clone())));
+            let count: u32 = s
+                .env
+                .storage()
+                .persistent()
+                .get(&DataKey::DelegatorCount(delegatee.clone()))
+                .unwrap();
+            assert_eq!(count, 0);
+        });
+    }
+
+    #[test]
     fn test_undelegate_restores_direct_voting() {
         let s = setup_suite(30);
         let gov = GovernanceClient::new(&s.env, &s.gov_addr);
@@ -2241,6 +2440,273 @@ mod tests {
             .set_timestamp(proposal.vote_start + 100 * 86_400);
         assert_eq!(gov.get_effective_quorum(&pid), 1_000);
     }
+
+    // ── CL pool governance tests ──────────────────────────────────────────────
+
+    fn setup_cl_pool(env: &Env, gov_addr: &Address) -> Address {
+        let token_a = env.register_stellar_asset_contract_v2(Address::generate(env));
+        let token_b = env.register_stellar_asset_contract_v2(Address::generate(env));
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        concentrated_liquidity::ConcentratedLiquidityClient::new(env, &cl_addr).initialize(
+            gov_addr,
+            &token_a.address(),
+            &token_b.address(),
+            &30_i128,
+            &0_i32,
+            &1_i32,
+        );
+        cl_addr
+    }
+
+    fn setup_gov(env: &Env) -> (GovernanceClient, Address, Address) {
+        let admin = Address::generate(env);
+        let lp_addr = env.register_contract(None, LpToken);
+        token::LpTokenClient::new(env, &lp_addr).initialize(
+            &admin,
+            &soroban_sdk::String::from_str(env, "AMM LP"),
+            &soroban_sdk::String::from_str(env, "ALP"),
+            &7u32,
+        );
+        let gov_addr = env.register_contract(None, Governance);
+        let gov = GovernanceClient::new(env, &gov_addr);
+        gov.initialize(
+            &admin,
+            &Address::generate(env),
+            &lp_addr,
+            &(7 * 24 * 60 * 60_u64),
+            &(2 * 24 * 60 * 60_u64),
+            &1_000_i128,
+            &100_i128,
+        );
+        token::LpTokenClient::new(env, &lp_addr).set_locker(&gov_addr);
+        (gov, gov_addr, lp_addr)
+    }
+
+    #[test]
+    fn test_cl_pool_pause_unpause() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000_000);
+
+        let (gov, gov_addr, lp_addr) = setup_gov(&env);
+        let cl_addr = setup_cl_pool(&env, &gov_addr);
+        let cl = concentrated_liquidity::ConcentratedLiquidityClient::new(&env, &cl_addr);
+
+        let lp1 = Address::generate(&env);
+        token::LpTokenClient::new(&env, &lp_addr).mint(&lp1, &1000);
+
+        let pid1 = gov.propose(&lp1, &ProposalKind::PauseClPool(cl_addr.clone()));
+        gov.vote(&lp1, &pid1, &Vote::For);
+        let p = gov.get_proposal(&pid1);
+        env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid1);
+        assert!(cl.is_paused());
+        gov.unlock_vote(&lp1, &pid1);
+
+        let pid2 = gov.propose(&lp1, &ProposalKind::UnpauseClPool(cl_addr));
+        gov.vote(&lp1, &pid2, &Vote::For);
+        let p = gov.get_proposal(&pid2);
+        env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid2);
+        assert!(!cl.is_paused());
+        gov.unlock_vote(&lp1, &pid2);
+    }
+
+    #[test]
+    fn test_cl_pool_set_oracle() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000_000);
+
+        let (gov, gov_addr, lp_addr) = setup_gov(&env);
+        let cl_addr = setup_cl_pool(&env, &gov_addr);
+
+        let lp1 = Address::generate(&env);
+        token::LpTokenClient::new(&env, &lp_addr).mint(&lp1, &1000);
+
+        let oracle_addr = Address::generate(&env);
+        let pid = gov.propose(
+            &lp1,
+            &ProposalKind::UpdateClOracle(UpdateClOracleParams {
+                cl_pool: cl_addr.clone(),
+                oracle: Some(oracle_addr),
+            }),
+        );
+        gov.vote(&lp1, &pid, &Vote::For);
+        let p = gov.get_proposal(&pid);
+        env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid);
+        gov.unlock_vote(&lp1, &pid);
+
+        let pid2 = gov.propose(
+            &lp1,
+            &ProposalKind::UpdateClOracle(UpdateClOracleParams {
+                cl_pool: cl_addr,
+                oracle: None,
+            }),
+        );
+        gov.vote(&lp1, &pid2, &Vote::For);
+        let p = gov.get_proposal(&pid2);
+        env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid2);
+        gov.unlock_vote(&lp1, &pid2);
+    }
+
+    #[test]
+    fn test_cl_pool_max_oracle_deviation() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000_000);
+
+        let (gov, gov_addr, lp_addr) = setup_gov(&env);
+        let cl_addr = setup_cl_pool(&env, &gov_addr);
+
+        let lp1 = Address::generate(&env);
+        token::LpTokenClient::new(&env, &lp_addr).mint(&lp1, &1000);
+
+        let pid = gov.propose(
+            &lp1,
+            &ProposalKind::UpdateClMaxOracleDeviation(UpdateClMaxOracleDeviationParams {
+                cl_pool: cl_addr,
+                max_deviation_bps: 100,
+            }),
+        );
+        gov.vote(&lp1, &pid, &Vote::For);
+        let p = gov.get_proposal(&pid);
+        env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid);
+        gov.unlock_vote(&lp1, &pid);
+    }
+
+    #[test]
+    fn test_cl_pool_protocol_fee() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000_000);
+
+        let (gov, gov_addr, lp_addr) = setup_gov(&env);
+        let cl_addr = setup_cl_pool(&env, &gov_addr);
+
+        let lp1 = Address::generate(&env);
+        token::LpTokenClient::new(&env, &lp_addr).mint(&lp1, &1000);
+        let recipient = Address::generate(&env);
+
+        let pid = gov.propose(
+            &lp1,
+            &ProposalKind::UpdateClProtocolFee(UpdateClProtocolFeeParams {
+                cl_pool: cl_addr,
+                recipient,
+                bps: 25,
+            }),
+        );
+        gov.vote(&lp1, &pid, &Vote::For);
+        let p = gov.get_proposal(&pid);
+        env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid);
+        gov.unlock_vote(&lp1, &pid);
+    }
+
+    #[test]
+    fn test_cl_pool_transfer_admin() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000_000);
+
+        let (gov, gov_addr, lp_addr) = setup_gov(&env);
+        let cl_addr = setup_cl_pool(&env, &gov_addr);
+
+        let lp1 = Address::generate(&env);
+        token::LpTokenClient::new(&env, &lp_addr).mint(&lp1, &1000);
+
+        let pid = gov.propose(
+            &lp1,
+            &ProposalKind::TransferClPoolAdmin(TransferClPoolAdminParams {
+                cl_pool: cl_addr,
+                new_admin: Address::generate(&env),
+            }),
+        );
+        gov.vote(&lp1, &pid, &Vote::For);
+        let p = gov.get_proposal(&pid);
+        env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid);
+        gov.unlock_vote(&lp1, &pid);
+    }
+
+    #[test]
+    fn test_cl_pool_set_position_nft() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000_000);
+
+        let (gov, gov_addr, lp_addr) = setup_gov(&env);
+        let cl_addr = setup_cl_pool(&env, &gov_addr);
+        let cl = concentrated_liquidity::ConcentratedLiquidityClient::new(&env, &cl_addr);
+
+        let lp1 = Address::generate(&env);
+        token::LpTokenClient::new(&env, &lp_addr).mint(&lp1, &1000);
+
+        let nft_addr = Address::generate(&env);
+        let pid = gov.propose(
+            &lp1,
+            &ProposalKind::SetClPositionNft(SetClPositionNftParams {
+                cl_pool: cl_addr.clone(),
+                nft: Some(nft_addr.clone()),
+            }),
+        );
+        gov.vote(&lp1, &pid, &Vote::For);
+        let p = gov.get_proposal(&pid);
+        env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid);
+        assert_eq!(cl.position_nft(), Some(nft_addr));
+        gov.unlock_vote(&lp1, &pid);
+
+        let pid2 = gov.propose(
+            &lp1,
+            &ProposalKind::SetClPositionNft(SetClPositionNftParams {
+                cl_pool: cl_addr,
+                nft: None,
+            }),
+        );
+        gov.vote(&lp1, &pid2, &Vote::For);
+        let p = gov.get_proposal(&pid2);
+        env.ledger().set_timestamp(p.execute_after + 1);
+        gov.execute(&pid2);
+        assert_eq!(cl.position_nft(), None);
+        gov.unlock_vote(&lp1, &pid2);
+    }
+
+    #[test]
+    fn test_cl_pool_propose_invalid_params_rejected() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1_000_000);
+
+        let (gov, _, lp_addr) = setup_gov(&env);
+
+        let lp1 = Address::generate(&env);
+        token::LpTokenClient::new(&env, &lp_addr).mint(&lp1, &1000);
+
+        let cl_addr = Address::generate(&env);
+
+        let r = gov.try_propose(
+            &lp1,
+            &ProposalKind::UpdateClMaxOracleDeviation(UpdateClMaxOracleDeviationParams {
+                cl_pool: cl_addr.clone(),
+                max_deviation_bps: 20_000,
+            }),
+        );
+        assert!(r.is_err());
+
+        let r = gov.try_propose(
+            &lp1,
+            &ProposalKind::UpdateClProtocolFee(UpdateClProtocolFeeParams {
+                cl_pool: cl_addr,
+                recipient: Address::generate(&env),
+                bps: -1,
+            }),
+        );
+        assert!(r.is_err());
+    }
 }
 
 // ── Property-based tests ───────────────────────────────────────────────────────
@@ -2263,6 +2729,7 @@ mod prop_tests {
         env: Env,
         gov_addr: Address,
         lp_addr: Address,
+        admin: Address,
     }
 
     fn setup_prop_env() -> PropEnv {
@@ -2310,6 +2777,7 @@ mod prop_tests {
             env,
             gov_addr,
             lp_addr,
+            admin,
         }
     }
 
@@ -2884,7 +3352,7 @@ mod prop_tests {
 
     #[test]
     fn test_propose_admin_requires_current_admin() {
-        let s = setup_suite(30);
+        let s = setup_prop_env();
         let gov = GovernanceClient::new(&s.env, &s.gov_addr);
         let rando = Address::generate(&s.env);
         let nominee = Address::generate(&s.env);
@@ -2893,7 +3361,7 @@ mod prop_tests {
 
     #[test]
     fn test_accept_admin_requires_pending_nomination() {
-        let s = setup_suite(30);
+        let s = setup_prop_env();
         let gov = GovernanceClient::new(&s.env, &s.gov_addr);
         let nominee = Address::generate(&s.env);
         assert!(gov.try_accept_admin(&nominee).is_err());
@@ -2901,7 +3369,7 @@ mod prop_tests {
 
     #[test]
     fn test_admin_rotation_two_step_handover() {
-        let s = setup_suite(30);
+        let s = setup_prop_env();
         let gov = GovernanceClient::new(&s.env, &s.gov_addr);
         let new_admin = Address::generate(&s.env);
 

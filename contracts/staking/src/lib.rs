@@ -71,6 +71,8 @@ pub enum DataKey {
     ConfigMinLockDuration,
     /// Configurable max lock duration in seconds.
     ConfigMaxLockDuration,
+    /// Optional maximum reward pool balance (0 = no cap).
+    ConfigMaxRewardPoolBalance,
     /// Circuit-breaker flag; when true new stakes and claims are halted (#360).
     Paused,
     /// Emergency mode flag; when true stakers may reclaim LP without rewards (#359).
@@ -128,6 +130,7 @@ impl Staking {
         env.storage().instance().set(&DataKey::TotalEffectiveStaked, &0i128);
         env.storage().instance().set(&DataKey::AccumulatedRewardsPerShare, &0i128);
         env.storage().instance().set(&DataKey::RewardPoolBalance, &0i128);
+        // ConfigMaxRewardPoolBalance initialized above
         Self::_write_boost_config(&env, MIN_BOOST, DEFAULT_MAX_BOOST, MIN_LOCK_DURATION, MAX_LOCK_DURATION);
     }
 
@@ -154,6 +157,7 @@ impl Staking {
         env.storage().instance().set(&DataKey::TotalEffectiveStaked, &0i128);
         env.storage().instance().set(&DataKey::AccumulatedRewardsPerShare, &0i128);
         env.storage().instance().set(&DataKey::RewardPoolBalance, &0i128);
+        env.storage().instance().set(&DataKey::ConfigMaxRewardPoolBalance, &0i128);
         Self::_write_boost_config(
             &env,
             min_boost_scaled,
@@ -281,18 +285,25 @@ impl Staking {
 
         let reward_token: Address = env.storage().instance().get(&DataKey::RewardToken).unwrap();
         let pool_addr = env.current_contract_address();
-        SepTokenClient::new(&env, &reward_token).transfer(&admin, &pool_addr, &amount);
-
-        let current_balance: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::RewardPoolBalance)
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::RewardPoolBalance, &(current_balance + amount));
-
-        env.events().publish((Symbol::new(&env, "rewards_added"),), (admin, amount));
+        // Record pre‑transfer token balance
+        let token_client = SepTokenClient::new(&env, &reward_token);
+        let pre_balance: i128 = token_client.balance(&pool_addr);
+        // Transfer requested amount from admin to pool
+        token_client.transfer(&admin, &pool_addr, &amount);
+        // Record post‑transfer token balance to determine actual received amount
+        let post_balance: i128 = token_client.balance(&pool_addr);
+        let received: i128 = post_balance - pre_balance;
+        // Update reward pool balance with the actual received amount
+        let current_balance: i128 = env.storage().instance().get(&DataKey::RewardPoolBalance).unwrap_or(0);
+        let new_balance = current_balance + received;
+        // Enforce optional max reward pool balance cap (0 = no cap)
+        let max_balance: i128 = env.storage().instance().get(&DataKey::ConfigMaxRewardPoolBalance).unwrap_or(0);
+        if max_balance != 0 {
+            assert!(new_balance <= max_balance, "exceeds max reward pool balance");
+        }
+        env.storage().instance().set(&DataKey::RewardPoolBalance, &new_balance);
+        // Emit event with the actual amount added
+        env.events().publish((Symbol::new(&env, "rewards_added"),), (admin, received));
     }
 
     /// Halt new stakes and reward claims. Admin only (#360).
@@ -519,6 +530,19 @@ impl Staking {
         env.events()
             .publish((Symbol::new(&env, "emergency_mode"),), (admin, enabled));
     }
+    
+    /// Set the optional maximum reward pool balance. Admin only.
+    pub fn set_max_reward_pool_balance(env: Env, admin: Address, max_balance: i128) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        assert!(admin == stored_admin, "not admin");
+        let current_balance: i128 = env.storage().instance().get(&DataKey::RewardPoolBalance).unwrap_or(0);
+        // 0 means no cap; otherwise ensure the new cap is not below current balance
+        assert!(max_balance == 0 || max_balance >= current_balance, "max_balance less than current pool");
+        env.storage().instance().set(&DataKey::ConfigMaxRewardPoolBalance, &max_balance);
+        env.events().publish((Symbol::new(&env, "max_reward_pool_balance_set"),), (admin, max_balance));
+    }
+
 
     /// Whether emergency mode is currently active (#359).
     pub fn is_emergency_mode(env: Env) -> bool {
@@ -824,25 +848,42 @@ impl Staking {
         Self::_effective_amount(raw, boost)
     }
 
-    /// Settle pending rewards into debt without transferring (used before
-    /// changing effective stake so rewards earned so far are not lost).
+    /// Transfer any pending rewards to the staker before their effective stake
+    /// changes (used in stake_locked / extend_lock so rewards earned so far
+    /// are not lost when the debt is recomputed against the new effective amount).
     fn _settle_pending(env: &Env, staker: &Address) {
-        let effective = Self::_staker_effective(env, staker);
-        if effective == 0 {
+        let pending = Self::pending_rewards(env.clone(), staker.clone());
+        if pending == 0 {
             return;
         }
+
+        let reward_token: Address = env.storage().instance().get(&DataKey::RewardToken).unwrap();
+        let pool_addr = env.current_contract_address();
+
+        let effective = Self::_staker_effective(env, staker);
         let acc_per_share: i128 = env
             .storage()
             .instance()
             .get(&DataKey::AccumulatedRewardsPerShare)
             .unwrap_or(0);
-        // The current debt already accounts for previously settled rewards.
-        // We do NOT transfer here — just record what has been earned so far
-        // by updating the debt to the current acc_per_share level.
-        // Pending = effective * acc / SCALE - debt  (already owed to staker).
-        // We leave debt unchanged so pending_rewards still returns the right value.
-        // The actual settlement happens in claim() / unstake().
-        let _ = (effective, acc_per_share); // no-op: debt stays, rewards accumulate
+        let new_debt = effective * acc_per_share / SCALE_FACTOR;
+        let key_debt = DataKey::StakerRewardsDebt(staker.clone());
+        env.storage().persistent().set(&key_debt, &new_debt);
+        env.storage().persistent().extend_ttl(&key_debt, MIN_TTL, BUMP_TO);
+
+        SepTokenClient::new(env, &reward_token).transfer(&pool_addr, staker, &pending);
+
+        let pool_balance: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RewardPoolBalance)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::RewardPoolBalance, &(pool_balance - pending));
+
+        env.events()
+            .publish((Symbol::new(env, "claimed"),), (staker.clone(), pending));
     }
 }
 
@@ -987,6 +1028,76 @@ mod tests {
         let (lp_returned, rewards) = staking.unstake(&staker, &1_000_i128);
         assert_eq!(lp_returned, 1_000);
         assert!(rewards > 0);
+    }
+
+    #[test]
+    /// Bug #420: staking or extending after rewards accrued must not forfeit
+    /// unclaimed rewards.  _settle_pending must transfer pending rewards before
+    /// the debt is recomputed against the new effective amount.
+    fn test_stake_twice_preserves_pending_rewards() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staker, staking) = setup(&env);
+
+        // First stake
+        staking.stake(&staker, &1_000_i128);
+        staking.update_rewards(&admin, &100_i128);
+
+        let pending_before = staking.pending_rewards(&staker);
+        assert_eq!(pending_before, 100, "should have 100 pending after first distribution");
+
+        // Second stake — triggers _settle_pending which must pay out the 100
+        // before the debt is recomputed.
+        staking.stake(&staker, &500_i128);
+
+        // After the second stake, the new effective amount defines a fresh debt.
+        // Any rewards accrued before the second stake must have been paid out.
+        let pending_after = staking.pending_rewards(&staker);
+        assert_eq!(pending_after, 0, "no new rewards yet — second stake just happened");
+
+        // The staker's reward balance should have increased by the 100 that
+        // was pending before the second stake.
+        let reward_token = staking.get_pool_info().reward_token;
+        let reward_client = StellarTokenClient::new(&env, &reward_token);
+        assert_eq!(
+            reward_client.balance(&staker),
+            100,
+            "staker should have received the 100 pending rewards"
+        );
+    }
+
+    #[test]
+    fn test_extend_lock_preserves_pending_rewards() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staker, staking) = setup(&env);
+
+        // Stake with a short lock so we can extend later.
+        let stake_amount = 4_000_i128;
+        let reward_amount = 4_000_i128;
+        staking.stake_locked(&staker, &stake_amount, &MIN_LOCK_DURATION);
+        staking.update_rewards(&admin, &reward_amount);
+
+        let pending_before = staking.pending_rewards(&staker);
+        assert!(pending_before > 0, "should have pending rewards before extend");
+
+        // Extend lock — triggers _settle_pending which must transfer the
+        // pending rewards before recomputing debt.
+        staking.extend_lock(&staker, &MAX_LOCK_DURATION);
+
+        // After settlement, no rewards should be pending (no new distributions).
+        let pending_after = staking.pending_rewards(&staker);
+        assert_eq!(pending_after, 0, "no new rewards after extend");
+
+        // The staker's reward balance must have increased by at least the
+        // pending amount (within integer-division rounding).
+        let reward_token = staking.get_pool_info().reward_token;
+        let reward_client = StellarTokenClient::new(&env, &reward_token);
+        let balance = reward_client.balance(&staker);
+        assert!(
+            balance >= pending_before,
+            "staker should have received at least {pending_before} pending rewards on extend, got {balance}"
+        );
     }
 
     #[test]

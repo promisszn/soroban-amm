@@ -11,6 +11,9 @@ use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
 use amm::AmmPoolClient;
 use factory::FactoryClient;
 
+const MIN_TTL: u32 = 172_800;
+const BUMP_TO: u32 = 518_400;
+
 #[contracttype]
 pub enum DataKey {
     Factory,
@@ -39,10 +42,11 @@ impl Router {
         min_amount_out: i128,
         deadline: u64,
     ) -> i128 {
+        Self::extend_ttl(&env);
         trader.require_auth();
         assert!(path.len() >= 2, "path must have at least 2 tokens");
         assert!(amount_in > 0, "amount_in must be positive");
-        
+
         if env.ledger().timestamp() > deadline {
             panic!("DeadlineExpired");
         }
@@ -89,6 +93,7 @@ impl Router {
         max_in: i128,
         deadline: u64,
     ) -> i128 {
+        Self::extend_ttl(&env);
         trader.require_auth();
         assert!(path.len() >= 2, "path must have at least 2 tokens");
         assert!(amount_out > 0, "amount_out must be positive");
@@ -153,6 +158,7 @@ impl Router {
 
     /// Quote the output of a multi-hop swap without executing it.
     pub fn get_amount_out_path(env: Env, path: Vec<Address>, amount_in: i128) -> i128 {
+        Self::extend_ttl(&env);
         assert!(path.len() >= 2, "path must have at least 2 tokens");
         assert!(amount_in > 0, "amount_in must be positive");
 
@@ -180,6 +186,10 @@ impl Router {
 
     pub fn get_factory(env: Env) -> Address {
         env.storage().instance().get(&DataKey::Factory).unwrap()
+    }
+
+    fn extend_ttl(env: &Env) {
+        env.storage().instance().extend_ttl(MIN_TTL, BUMP_TO);
     }
 }
 

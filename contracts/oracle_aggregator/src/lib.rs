@@ -121,6 +121,30 @@ impl OracleAggregator {
         env.storage().instance().set(&DataKey::Sources, &sources);
     }
 
+    pub fn remove_source(env: Env, admin: Address, source_contract: Address) {
+        require_admin(&env, &admin);
+
+        let sources = read_sources(&env);
+        let mut new_sources: Vec<OracleSource> = Vec::new(&env);
+        let mut found = false;
+        for i in 0..sources.len() {
+            let source = sources.get_unchecked(i);
+            if source.source_contract == source_contract {
+                found = true;
+            } else {
+                new_sources.push_back(source);
+            }
+        }
+
+        if !found {
+            panic_with_error!(&env, OracleError::SourceNotFound);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Sources, &new_sources);
+    }
+
     pub fn get_price(env: Env, token_a: Address, token_b: Address) -> AggregatedPrice {
         let result = Self::aggregate_price(&env, token_a.clone(), token_b.clone(), true);
         if result.confidence == 0 {
@@ -220,11 +244,14 @@ impl OracleAggregator {
             .unwrap_or(0)
     }
 
-    pub fn get_max_deviation_bps(env: Env) -> u32 {
+    pub fn set_max_staleness(env: Env, admin: Address, max_staleness_seconds: u64) {
+        require_admin(&env, &admin);
+        if max_staleness_seconds == 0 {
+            panic_with_error!(&env, OracleError::InvalidStaleness);
+        }
         env.storage()
             .instance()
-            .get(&DataKey::MaxDeviationBps)
-            .unwrap_or(0)
+            .set(&DataKey::MaxStaleness, &max_staleness_seconds);
     }
 
     pub fn get_admin(env: Env) -> Address {
