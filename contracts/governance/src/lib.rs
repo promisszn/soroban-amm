@@ -366,7 +366,7 @@ pub trait PolVestingInterface {
         start_ledger: u32,
         cliff_ledger: u32,
         end_ledger: u32,
-    );
+    ) -> u32;
 }
 
 // ── CL pool client ────────────────────────────────────────────────────────────

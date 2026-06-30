@@ -40,8 +40,10 @@ pub enum DataKey {
     PendingGovernance,
     /// Treasury address — receives tokens on revocation.
     Treasury,
-    /// Per-beneficiary vesting schedule.
-    Vesting(Address),
+    /// Next schedule id for a beneficiary.
+    NextScheduleId(Address),
+    /// Per-beneficiary vesting schedule keyed by beneficiary and schedule id.
+    Vesting(Address, u32),
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -49,6 +51,7 @@ pub enum DataKey {
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub struct PolVesting {
+    pub schedule_id: u32,
     pub lp_token: Address,
     pub pool: Address,
     pub total: i128,
@@ -169,22 +172,23 @@ impl PolVestingContract {
         start_ledger: u32,
         cliff_ledger: u32,
         end_ledger: u32,
-    ) -> Result<(), VestingError> {
+    ) -> Result<u32, VestingError> {
         governance.require_auth();
         Self::require_governance(&env, &governance)?;
 
         if cliff_ledger < start_ledger || end_ledger <= cliff_ledger || total <= 0 {
             return Err(VestingError::InvalidSchedule);
         }
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::Vesting(beneficiary.clone()))
-        {
+
+        let next_id_key = DataKey::NextScheduleId(beneficiary.clone());
+        let schedule_id: u32 = env.storage().persistent().get(&next_id_key).unwrap_or(0);
+        let key = DataKey::Vesting(beneficiary.clone(), schedule_id);
+        if env.storage().persistent().has(&key) {
             return Err(VestingError::VestingAlreadyExists);
         }
 
         let schedule = PolVesting {
+            schedule_id,
             lp_token,
             pool,
             total,
@@ -194,24 +198,36 @@ impl PolVestingContract {
             end_ledger,
             beneficiary: beneficiary.clone(),
         };
-        let key = DataKey::Vesting(beneficiary.clone());
         env.storage().persistent().set(&key, &schedule);
         env.storage()
             .persistent()
             .extend_ttl(&key, MIN_TTL, BUMP_TO);
+        env.storage()
+            .persistent()
+            .set(&next_id_key, &(schedule_id + 1));
+        env.storage()
+            .persistent()
+            .extend_ttl(&next_id_key, MIN_TTL, BUMP_TO);
 
         env.events().publish(
             (Symbol::new(&env, "vesting_created"),),
-            (beneficiary, total, start_ledger, cliff_ledger, end_ledger),
+            (
+                beneficiary,
+                schedule_id,
+                total,
+                start_ledger,
+                cliff_ledger,
+                end_ledger,
+            ),
         );
-        Ok(())
+        Ok(schedule_id)
     }
 
     /// Release all currently vested (but unreleased) LP tokens to the beneficiary.
-    pub fn release(env: Env, beneficiary: Address) -> Result<i128, VestingError> {
+    pub fn release(env: Env, beneficiary: Address, schedule_id: u32) -> Result<i128, VestingError> {
         beneficiary.require_auth();
 
-        let key = DataKey::Vesting(beneficiary.clone());
+        let key = DataKey::Vesting(beneficiary.clone(), schedule_id);
         let mut schedule: PolVesting = env
             .storage()
             .persistent()
@@ -241,16 +257,22 @@ impl PolVestingContract {
             &releasable,
         );
 
-        env.events()
-            .publish((Symbol::new(&env, "released"),), (beneficiary, releasable));
+        env.events().publish(
+            (Symbol::new(&env, "released"),),
+            (beneficiary, schedule_id, releasable),
+        );
         Ok(releasable)
     }
 
     /// Read the vesting schedule for a beneficiary.
-    pub fn get_vesting(env: Env, beneficiary: Address) -> Result<PolVesting, VestingError> {
+    pub fn get_vesting(
+        env: Env,
+        beneficiary: Address,
+        schedule_id: u32,
+    ) -> Result<PolVesting, VestingError> {
         env.storage()
             .persistent()
-            .get(&DataKey::Vesting(beneficiary))
+            .get(&DataKey::Vesting(beneficiary, schedule_id))
             .ok_or(VestingError::VestingNotFound)
     }
 
@@ -260,11 +282,12 @@ impl PolVestingContract {
         env: Env,
         governance: Address,
         beneficiary: Address,
+        schedule_id: u32,
     ) -> Result<(), VestingError> {
         governance.require_auth();
         Self::require_governance(&env, &governance)?;
 
-        let key = DataKey::Vesting(beneficiary.clone());
+        let key = DataKey::Vesting(beneficiary.clone(), schedule_id);
         let schedule: PolVesting = env
             .storage()
             .persistent()
@@ -296,7 +319,7 @@ impl PolVestingContract {
 
         env.events().publish(
             (Symbol::new(&env, "vesting_revoked"),),
-            (beneficiary, to_beneficiary, to_treasury),
+            (beneficiary, schedule_id, to_beneficiary, to_treasury),
         );
         Ok(())
     }
@@ -378,7 +401,7 @@ mod tests {
         }
     }
 
-    fn create_schedule(s: &Setup, start: u32, cliff: u32, end: u32) {
+    fn create_schedule(s: &Setup, start: u32, cliff: u32, end: u32) -> u32 {
         let client = PolVestingContractClient::new(&s.env, &s.contract_id);
         client.create_vesting(
             &s.governance,
@@ -389,19 +412,22 @@ mod tests {
             &start,
             &cliff,
             &end,
-        );
+        )
     }
 
     #[test]
     fn test_cliff_enforcement() {
         let s = setup();
         s.env.ledger().set_sequence_number(100);
-        create_schedule(&s, 100, 200, 400);
+        let schedule_id = create_schedule(&s, 100, 200, 400);
 
         // Before cliff — nothing to release.
         s.env.ledger().set_sequence_number(150);
         let client = PolVestingContractClient::new(&s.env, &s.contract_id);
-        let err = client.try_release(&s.beneficiary).unwrap_err().unwrap();
+        let err = client
+            .try_release(&s.beneficiary, &schedule_id)
+            .unwrap_err()
+            .unwrap();
         assert_eq!(err, VestingError::NothingToRelease);
     }
 
@@ -409,29 +435,32 @@ mod tests {
     fn test_linear_vesting() {
         let s = setup();
         // start=0, cliff=0, end=1000 → fully linear from ledger 0
-        create_schedule(&s, 0, 0, 1000);
+        let schedule_id = create_schedule(&s, 0, 0, 1000);
 
         s.env.ledger().set_sequence_number(500);
         let client = PolVestingContractClient::new(&s.env, &s.contract_id);
-        let released = client.release(&s.beneficiary);
+        let released = client.release(&s.beneficiary, &schedule_id);
         assert_eq!(released, 500_000); // 50% of 1_000_000
 
-        let schedule = client.get_vesting(&s.beneficiary);
+        let schedule = client.get_vesting(&s.beneficiary, &schedule_id);
         assert_eq!(schedule.released, 500_000);
     }
 
     #[test]
     fn test_full_release() {
         let s = setup();
-        create_schedule(&s, 0, 0, 1000);
+        let schedule_id = create_schedule(&s, 0, 0, 1000);
 
         s.env.ledger().set_sequence_number(1000);
         let client = PolVestingContractClient::new(&s.env, &s.contract_id);
-        let released = client.release(&s.beneficiary);
+        let released = client.release(&s.beneficiary, &schedule_id);
         assert_eq!(released, 1_000_000);
 
         // Nothing left to release.
-        let err = client.try_release(&s.beneficiary).unwrap_err().unwrap();
+        let err = client
+            .try_release(&s.beneficiary, &schedule_id)
+            .unwrap_err()
+            .unwrap();
         assert_eq!(err, VestingError::NothingToRelease);
     }
 
@@ -439,11 +468,11 @@ mod tests {
     fn test_revoke() {
         let s = setup();
         // start=0, cliff=0, end=1000; revoke at ledger 250 → 25% vested
-        create_schedule(&s, 0, 0, 1000);
+        let schedule_id = create_schedule(&s, 0, 0, 1000);
 
         s.env.ledger().set_sequence_number(250);
         let client = PolVestingContractClient::new(&s.env, &s.contract_id);
-        client.revoke_vesting(&s.governance, &s.beneficiary);
+        client.revoke_vesting(&s.governance, &s.beneficiary, &schedule_id);
 
         let lp = TokenClient::new(&s.env, &s.lp_token);
         // 25% went to beneficiary, 75% to treasury
@@ -451,8 +480,43 @@ mod tests {
         assert_eq!(lp.balance(&s.treasury), 750_000);
 
         // Schedule is gone.
-        let err = client.try_get_vesting(&s.beneficiary).unwrap_err().unwrap();
+        let err = client
+            .try_get_vesting(&s.beneficiary, &schedule_id)
+            .unwrap_err()
+            .unwrap();
         assert_eq!(err, VestingError::VestingNotFound);
+    }
+
+    #[test]
+    fn test_multiple_schedules_for_same_beneficiary() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+
+        let first_id = create_schedule(&s, 0, 0, 1000);
+        let second_id = client.create_vesting(
+            &s.governance,
+            &s.beneficiary,
+            &s.lp_token,
+            &s.pool,
+            &250_000,
+            &100,
+            &200,
+            &600,
+        );
+
+        assert_eq!(first_id, 0);
+        assert_eq!(second_id, 1);
+
+        let first = client.get_vesting(&s.beneficiary, &first_id);
+        let second = client.get_vesting(&s.beneficiary, &second_id);
+        assert_eq!(first.total, 1_000_000);
+        assert_eq!(second.total, 250_000);
+        assert_eq!(first.schedule_id, first_id);
+        assert_eq!(second.schedule_id, second_id);
+
+        s.env.ledger().set_sequence_number(300);
+        assert_eq!(client.release(&s.beneficiary, &first_id), 300_000);
+        assert_eq!(client.release(&s.beneficiary, &second_id), 100_000);
     }
 
     #[test]
@@ -513,7 +577,7 @@ mod tests {
         client.propose_governance(&s.governance, &new_governance);
         client.accept_governance(&new_governance);
 
-        client.create_vesting(
+        let schedule_id = client.create_vesting(
             &new_governance,
             &s.beneficiary,
             &s.lp_token,
@@ -525,11 +589,11 @@ mod tests {
         );
 
         let old_governance_err = client
-            .try_revoke_vesting(&s.governance, &s.beneficiary)
+            .try_revoke_vesting(&s.governance, &s.beneficiary, &schedule_id)
             .unwrap_err()
             .unwrap();
         assert_eq!(old_governance_err, VestingError::NotGovernance);
 
-        client.revoke_vesting(&new_governance, &s.beneficiary);
+        client.revoke_vesting(&new_governance, &s.beneficiary, &schedule_id);
     }
 }
