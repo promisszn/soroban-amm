@@ -151,6 +151,62 @@ impl IncentiveCampaigns {
         );
     }
 
+    /// Recover undistributed reward tokens after a campaign has ended. Governance only.
+    ///
+    /// Computes the maximum total distributable amount (`reward_rate × campaign_duration`)
+    /// and transfers any portion that was never claimed by providers back to `recipient`.
+    /// The campaign is marked **inactive** upon recovery so no further LP claims can be
+    /// made against the already-withdrawn balance.
+    ///
+    /// Governance should allow a reasonable grace period after `end_time` before calling
+    /// this function so that LPs have an opportunity to claim their earned rewards first.
+    pub fn recover_leftover_funds(
+        env: Env,
+        caller: Address,
+        campaign_id: u64,
+        recipient: Address,
+    ) -> i128 {
+        caller.require_auth();
+        Self::require_governance(&env, &caller);
+
+        let mut campaign: Campaign = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Campaign(campaign_id))
+            .expect("campaign not found");
+
+        let now = env.ledger().timestamp();
+        assert!(now > campaign.end_time, "campaign not yet ended");
+
+        // Maximum that could ever be distributed = rate × full duration.
+        let campaign_duration = (campaign.end_time - campaign.start_time) as i128;
+        let max_distributable = campaign.reward_rate * campaign_duration;
+        let leftover = max_distributable - campaign.total_distributed;
+
+        assert!(leftover > 0, "no leftover funds to recover");
+
+        // Mark inactive so future claim_rewards calls revert, protecting the
+        // recipient from having tokens transferred twice.
+        campaign.active = false;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Campaign(campaign_id), &campaign);
+
+        let contract = env.current_contract_address();
+        TokenClient::new(&env, &campaign.reward_token).transfer(
+            &contract,
+            &recipient,
+            &leftover,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "leftover_recovered"),),
+            (campaign_id, recipient.clone(), leftover),
+        );
+
+        leftover
+    }
+
     /// Distribute accrued rewards to a provider proportional to LP balance.
     pub fn claim_rewards(env: Env, provider: Address, campaign_id: u64) -> i128 {
         provider.require_auth();
@@ -163,9 +219,14 @@ impl IncentiveCampaigns {
 
         let now = env.ledger().timestamp();
         assert!(now >= campaign.start_time, "campaign not started");
-        if now > campaign.end_time {
-            panic!("campaign ended");
-        }
+
+        // Cap accrual at end_time so LPs can claim earned rewards even after the campaign
+        // has finished. Without this cap any unclaimed balance would be permanently locked.
+        let claim_time = if now > campaign.end_time {
+            campaign.end_time
+        } else {
+            now
+        };
 
         let lp_balance =
             LpTokenClient::new(&env, &campaign.lp_token).balance(&provider);
@@ -174,8 +235,8 @@ impl IncentiveCampaigns {
         let total_supply = LpTokenClient::new(&env, &campaign.lp_token).total_supply();
         assert!(total_supply > 0, "no LP supply");
 
-        // Proportional share of rewards since campaign start (simplified accrual).
-        let elapsed = (now - campaign.start_time) as i128;
+        // Proportional share of rewards since campaign start, capped at end_time.
+        let elapsed = (claim_time - campaign.start_time) as i128;
         let pool_rewards = campaign.reward_rate * elapsed;
         let provider_share = pool_rewards * lp_balance / total_supply;
 
@@ -377,5 +438,147 @@ mod tests {
         let record = client.get_distribution_record(&1);
         assert_eq!(record.campaign_id, id1);
         assert_eq!(record.provider, provider);
+    }
+
+    /// Regression test for bug #424: claim_rewards must succeed after end_time,
+    /// with rewards capped at end_time rather than panicking.
+    #[test]
+    fn test_claim_after_end_time() {
+        let (env, incentives, pool, lp, reward, provider, gov_addr) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+
+        // Campaign runs from t=1_000 to t=5_000, rate=100.
+        let id = client.create_campaign(
+            &gov_addr,
+            &pool,
+            &lp,
+            &reward,
+            &1_000,
+            &5_000,
+            &100,
+            &1_000_000,
+        );
+
+        // ── Case 1: first claim arrives after end_time ────────────────────────────
+        // Advance to t=8_000 (3_000 seconds past end_time=5_000).
+        env.ledger().with_mut(|l| l.timestamp = 8_000);
+
+        // Must NOT panic. Rewards should reflect exactly end_time - start_time = 4_000 s.
+        let claimed_after_end = client.claim_rewards(&provider, &id);
+        assert!(claimed_after_end > 0, "expected non-zero rewards after end_time");
+
+        // Verify accrual was capped at end_time: elapsed = 5_000 - 1_000 = 4_000.
+        // provider_share = rate * elapsed * lp_balance / total_supply = 100 * 4_000 * 1 = 400_000
+        // (provider holds all LP tokens so share == total pool rewards).
+        assert_eq!(claimed_after_end, 100 * 4_000, "rewards must be capped at end_time");
+
+        // ── Case 2: duplicate claim after campaign has fully paid out ─────────────
+        // All accrued rewards were just claimed; a second call must not double-pay.
+        let result = std::panic::catch_unwind(|| {
+            client.claim_rewards(&provider, &id);
+        });
+        assert!(result.is_err(), "second claim should fail with 'no pending rewards'");
+
+        // ── Case 3: partial claim during campaign, remainder claimed after end ────
+        let id2 = client.create_campaign(
+            &gov_addr,
+            &pool,
+            &lp,
+            &reward,
+            &1_000,
+            &5_000,
+            &100,
+            &1_000_000,
+        );
+
+        // First claim at t=3_000 (2_000 s into campaign).
+        env.ledger().with_mut(|l| l.timestamp = 3_000);
+        let partial = client.claim_rewards(&provider, &id2);
+        assert_eq!(partial, 100 * 2_000, "partial claim should cover t=1_000..3_000");
+
+        // Second claim at t=9_000 (well after end_time=5_000); should yield remaining 2_000 s.
+        env.ledger().with_mut(|l| l.timestamp = 9_000);
+        let remainder = client.claim_rewards(&provider, &id2);
+        assert_eq!(remainder, 100 * 2_000, "remainder should cover t=3_000..5_000");
+
+        // Third call: nothing left to claim.
+        let result2 = std::panic::catch_unwind(|| {
+            client.claim_rewards(&provider, &id2);
+        });
+        assert!(result2.is_err(), "third claim should fail with 'no pending rewards'\");
+    }
+
+    /// Regression test for the leftover-funds issue: governance must be able to recover
+    /// undistributed reward tokens after a campaign ends.
+    #[test]
+    fn test_recover_leftover_funds() {
+        let (env, incentives, pool, lp, reward, provider, gov_addr) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+        let treasury = Address::generate(&env);
+
+        // Campaign: t=1_000..5_000, rate=100 → max_distributable = 100 * 4_000 = 400_000.
+        let id = client.create_campaign(
+            &gov_addr,
+            &pool,
+            &lp,
+            &reward,
+            &1_000,
+            &5_000,
+            &100,
+            &1_000_000,
+        );
+
+        // ── Case 1: partial claim during campaign, then governance recovers the rest ──
+        // LP claims at t=2_000 (1_000 s in) → 100_000 tokens.
+        env.ledger().with_mut(|l| l.timestamp = 2_000);
+        let claimed = client.claim_rewards(&provider, &id);
+        assert_eq!(claimed, 100 * 1_000);
+
+        // Advance past end_time.
+        env.ledger().with_mut(|l| l.timestamp = 8_000);
+
+        // Governance recovers the remaining 300_000 tokens.
+        let recovered = client.recover_leftover_funds(&gov_addr, &id, &treasury);
+        assert_eq!(recovered, 100 * 3_000, "should recover unclaimed 3_000 s of rewards");
+
+        // After recovery the campaign is inactive; LP cannot claim any more.
+        let result = std::panic::catch_unwind(|| {
+            client.claim_rewards(&provider, &id);
+        });
+        assert!(result.is_err(), "claim after recovery must fail (campaign inactive)");
+
+        // ── Case 2: no claims at all → governance recovers the full budget ──────────
+        let id2 = client.create_campaign(
+            &gov_addr,
+            &pool,
+            &lp,
+            &reward,
+            &1_000,
+            &5_000,
+            &100,
+            &1_000_000,
+        );
+
+        env.ledger().with_mut(|l| l.timestamp = 9_000);
+        let full_recovery = client.recover_leftover_funds(&gov_addr, &id2, &treasury);
+        assert_eq!(full_recovery, 100 * 4_000, "full budget should be recoverable when no claims made");
+
+        // ── Case 3: recovery before end_time must be rejected ────────────────────────
+        let id3 = client.create_campaign(
+            &gov_addr,
+            &pool,
+            &lp,
+            &reward,
+            &1_000,
+            &5_000,
+            &100,
+            &1_000_000,
+        );
+
+        env.ledger().with_mut(|l| l.timestamp = 3_000); // still inside campaign
+        let early = std::panic::catch_unwind(|| {
+            client.recover_leftover_funds(&gov_addr, &id3, &treasury);
+        });
+        assert!(early.is_err(), "recovery before end_time must be rejected");
     }
 }

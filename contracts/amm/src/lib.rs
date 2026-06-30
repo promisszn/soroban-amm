@@ -750,7 +750,14 @@ impl AmmPool {
         }
         admin.require_auth();
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
-        if protocol_fee_bps < 0 || protocol_fee_bps > fee_bps {
+        // Fix M-02: protocol_fee_bps must be *strictly* less than fee_bps so LPs
+        // always retain a portion of swap income. Allowing protocol_fee_bps == fee_bps
+        // would route 100% of swap fees to the protocol, leaving LPs with nothing.
+        // Special case: both zero is valid (fees entirely disabled).
+        if protocol_fee_bps < 0
+            || (fee_bps > 0 && protocol_fee_bps >= fee_bps)
+            || (fee_bps == 0 && protocol_fee_bps != 0)
+        {
             return Err(AmmError::InvalidFeeBps);
         }
         env.storage()
@@ -759,6 +766,11 @@ impl AmmPool {
         env.storage()
             .instance()
             .set(&DataKey::ProtocolFeeBps, &protocol_fee_bps);
+        // Emit an event so LPs and indexers can monitor protocol-fee changes.
+        env.events().publish(
+            (Symbol::new(&env, "protocol_fee_set"),),
+            (protocol_fee_bps, recipient),
+        );
         Ok(())
     }
 
