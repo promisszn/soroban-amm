@@ -366,7 +366,7 @@ pub trait PolVestingInterface {
         start_ledger: u32,
         cliff_ledger: u32,
         end_ledger: u32,
-    );
+    ) -> u32;
 }
 
 // ── CL pool client ────────────────────────────────────────────────────────────
@@ -446,10 +446,7 @@ impl Governance {
     }
 
     /// Admin-only: quorum increases by this many bps per day a proposal is open (#311).
-    pub fn set_quorum_decay_bps_per_day(
-        env: Env,
-        new_rate: i128,
-    ) -> Result<(), GovernanceError> {
+    pub fn set_quorum_decay_bps_per_day(env: Env, new_rate: i128) -> Result<(), GovernanceError> {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         if new_rate < 0 {
@@ -893,8 +890,7 @@ impl Governance {
             }
             ProposalKind::UpdateClOracle(params) => {
                 let self_addr = env.current_contract_address();
-                ClPoolClient::new(&env, &params.cl_pool)
-                    .set_oracle(&self_addr, &params.oracle);
+                ClPoolClient::new(&env, &params.cl_pool).set_oracle(&self_addr, &params.oracle);
             }
             ProposalKind::UpdateClMaxOracleDeviation(params) => {
                 let self_addr = env.current_contract_address();
@@ -903,8 +899,11 @@ impl Governance {
             }
             ProposalKind::UpdateClProtocolFee(params) => {
                 let self_addr = env.current_contract_address();
-                ClPoolClient::new(&env, &params.cl_pool)
-                    .set_protocol_fee(&self_addr, &params.recipient, &params.bps);
+                ClPoolClient::new(&env, &params.cl_pool).set_protocol_fee(
+                    &self_addr,
+                    &params.recipient,
+                    &params.bps,
+                );
             }
             ProposalKind::TransferClPoolAdmin(params) => {
                 let self_addr = env.current_contract_address();
@@ -913,8 +912,7 @@ impl Governance {
             }
             ProposalKind::SetClPositionNft(params) => {
                 let self_addr = env.current_contract_address();
-                ClPoolClient::new(&env, &params.cl_pool)
-                    .set_position_nft(&self_addr, &params.nft);
+                ClPoolClient::new(&env, &params.cl_pool).set_position_nft(&self_addr, &params.nft);
             }
         }
 
