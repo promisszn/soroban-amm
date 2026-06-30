@@ -446,10 +446,7 @@ impl Governance {
     }
 
     /// Admin-only: quorum increases by this many bps per day a proposal is open (#311).
-    pub fn set_quorum_decay_bps_per_day(
-        env: Env,
-        new_rate: i128,
-    ) -> Result<(), GovernanceError> {
+    pub fn set_quorum_decay_bps_per_day(env: Env, new_rate: i128) -> Result<(), GovernanceError> {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         if new_rate < 0 {
@@ -893,8 +890,7 @@ impl Governance {
             }
             ProposalKind::UpdateClOracle(params) => {
                 let self_addr = env.current_contract_address();
-                ClPoolClient::new(&env, &params.cl_pool)
-                    .set_oracle(&self_addr, &params.oracle);
+                ClPoolClient::new(&env, &params.cl_pool).set_oracle(&self_addr, &params.oracle);
             }
             ProposalKind::UpdateClMaxOracleDeviation(params) => {
                 let self_addr = env.current_contract_address();
@@ -903,8 +899,11 @@ impl Governance {
             }
             ProposalKind::UpdateClProtocolFee(params) => {
                 let self_addr = env.current_contract_address();
-                ClPoolClient::new(&env, &params.cl_pool)
-                    .set_protocol_fee(&self_addr, &params.recipient, &params.bps);
+                ClPoolClient::new(&env, &params.cl_pool).set_protocol_fee(
+                    &self_addr,
+                    &params.recipient,
+                    &params.bps,
+                );
             }
             ProposalKind::TransferClPoolAdmin(params) => {
                 let self_addr = env.current_contract_address();
@@ -913,8 +912,7 @@ impl Governance {
             }
             ProposalKind::SetClPositionNft(params) => {
                 let self_addr = env.current_contract_address();
-                ClPoolClient::new(&env, &params.cl_pool)
-                    .set_position_nft(&self_addr, &params.nft);
+                ClPoolClient::new(&env, &params.cl_pool).set_position_nft(&self_addr, &params.nft);
             }
         }
 
@@ -1059,9 +1057,9 @@ impl Governance {
         }
         Self::add_delegator_index(&env, &to, &from);
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Delegate(from.clone()), &to);
+        let delegate_key = DataKey::Delegate(from.clone());
+        env.storage().persistent().set(&delegate_key, &to);
+        Self::bump_key_ttl(&env, &delegate_key);
 
         env.events()
             .publish((Symbol::new(&env, "delegated"),), (from, to));
@@ -1080,7 +1078,7 @@ impl Governance {
             Self::remove_delegator_index(&env, &delegatee, &from);
         }
         env.storage()
-            .instance()
+            .persistent()
             .remove(&DataKey::Delegate(from.clone()));
 
         env.events()
@@ -1091,10 +1089,12 @@ impl Governance {
     ///
     /// Returns `None` if no delegation is active.
     pub fn get_delegate(env: Env, from: Address) -> Option<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Delegate(from))
-            .unwrap_or(None)
+        let key = DataKey::Delegate(from);
+        let delegate = env.storage().persistent().get(&key).unwrap_or(None);
+        if delegate.is_some() {
+            Self::bump_key_ttl(&env, &key);
+        }
+        delegate
     }
 
     /// Admin-only: set the protocol multisig that may veto passed proposals.
@@ -1333,17 +1333,15 @@ impl Governance {
             *total += power;
             locks.push_back((holder.clone(), power));
         }
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::DelegatorCount(holder.clone()))
-            .unwrap_or(0);
+        let count_key = DataKey::DelegatorCount(holder.clone());
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        if count > 0 {
+            Self::bump_key_ttl(env, &count_key);
+        }
         for i in 0..count {
-            let delegator: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::Delegator(holder.clone(), i))
-                .unwrap();
+            let delegator_key = DataKey::Delegator(holder.clone(), i);
+            let delegator: Address = env.storage().persistent().get(&delegator_key).unwrap();
+            Self::bump_key_ttl(env, &delegator_key);
             Self::collect_voting_power(
                 env,
                 lp_client,
@@ -1372,65 +1370,72 @@ impl Governance {
     }
 
     fn add_delegator_index(env: &Env, delegatee: &Address, delegator: &Address) {
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::DelegatorCount(delegatee.clone()))
-            .unwrap_or(0);
+        let count_key = DataKey::DelegatorCount(delegatee.clone());
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        if count > 0 {
+            Self::bump_key_ttl(env, &count_key);
+        }
+
+        let delegator_key = DataKey::Delegator(delegatee.clone(), count);
+        env.storage().persistent().set(&delegator_key, delegator);
+        Self::bump_key_ttl(env, &delegator_key);
+
+        let slot_key = DataKey::DelegatorSlot(delegator.clone());
         env.storage()
-            .instance()
-            .set(&DataKey::Delegator(delegatee.clone(), count), delegator);
-        env.storage().instance().set(
-            &DataKey::DelegatorSlot(delegator.clone()),
-            &(delegatee.clone(), count),
-        );
-        env.storage()
-            .instance()
-            .set(&DataKey::DelegatorCount(delegatee.clone()), &(count + 1));
+            .persistent()
+            .set(&slot_key, &(delegatee.clone(), count));
+        Self::bump_key_ttl(env, &slot_key);
+
+        env.storage().persistent().set(&count_key, &(count + 1));
+        Self::bump_key_ttl(env, &count_key);
     }
 
     fn remove_delegator_index(env: &Env, delegatee: &Address, delegator: &Address) {
+        let slot_key = DataKey::DelegatorSlot(delegator.clone());
         let (stored_delegatee, index): (Address, u32) = env
             .storage()
-            .instance()
-            .get(&DataKey::DelegatorSlot(delegator.clone()))
+            .persistent()
+            .get(&slot_key)
             .unwrap_or((delegatee.clone(), 0));
         if stored_delegatee != *delegatee {
             return;
         }
-        let count: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::DelegatorCount(delegatee.clone()))
-            .unwrap_or(0);
+        Self::bump_key_ttl(env, &slot_key);
+
+        let count_key = DataKey::DelegatorCount(delegatee.clone());
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
         if count == 0 {
             return;
         }
+        Self::bump_key_ttl(env, &count_key);
+
         let last_index = count - 1;
         if index != last_index {
-            let last_delegator: Address = env
-                .storage()
-                .instance()
-                .get(&DataKey::Delegator(delegatee.clone(), last_index))
-                .unwrap();
-            env.storage().instance().set(
-                &DataKey::Delegator(delegatee.clone(), index),
-                &last_delegator,
-            );
-            env.storage().instance().set(
-                &DataKey::DelegatorSlot(last_delegator.clone()),
-                &(delegatee.clone(), index),
-            );
+            let last_delegator_key = DataKey::Delegator(delegatee.clone(), last_index);
+            let last_delegator: Address =
+                env.storage().persistent().get(&last_delegator_key).unwrap();
+            Self::bump_key_ttl(env, &last_delegator_key);
+
+            let moved_delegator_key = DataKey::Delegator(delegatee.clone(), index);
+            env.storage()
+                .persistent()
+                .set(&moved_delegator_key, &last_delegator);
+            Self::bump_key_ttl(env, &moved_delegator_key);
+
+            let moved_slot_key = DataKey::DelegatorSlot(last_delegator.clone());
+            env.storage()
+                .persistent()
+                .set(&moved_slot_key, &(delegatee.clone(), index));
+            Self::bump_key_ttl(env, &moved_slot_key);
         }
         env.storage()
-            .instance()
+            .persistent()
             .remove(&DataKey::Delegator(delegatee.clone(), last_index));
         env.storage()
-            .instance()
+            .persistent()
             .remove(&DataKey::DelegatorSlot(delegator.clone()));
-        env.storage()
-            .instance()
-            .set(&DataKey::DelegatorCount(delegatee.clone()), &last_index);
+        env.storage().persistent().set(&count_key, &last_index);
+        Self::bump_key_ttl(env, &count_key);
     }
 
     fn bump_key_ttl(env: &Env, key: &DataKey) {
@@ -2177,6 +2182,88 @@ mod tests {
 
         let p = gov.get_proposal(&pid);
         assert_eq!(p.votes_for, 600);
+    }
+
+    #[test]
+    fn test_delegation_records_use_persistent_storage() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        let delegator = Address::generate(&s.env);
+        let delegatee = Address::generate(&s.env);
+        mint_lp(&s, &delegator, 600);
+
+        gov.delegate(&delegator, &delegatee);
+
+        s.env.as_contract(&s.gov_addr, || {
+            assert!(!s
+                .env
+                .storage()
+                .instance()
+                .has(&DataKey::Delegate(delegator.clone())));
+            assert!(s
+                .env
+                .storage()
+                .persistent()
+                .has(&DataKey::Delegate(delegator.clone())));
+            assert!(!s
+                .env
+                .storage()
+                .instance()
+                .has(&DataKey::DelegatorCount(delegatee.clone())));
+            assert!(s
+                .env
+                .storage()
+                .persistent()
+                .has(&DataKey::DelegatorCount(delegatee.clone())));
+            assert!(!s
+                .env
+                .storage()
+                .instance()
+                .has(&DataKey::Delegator(delegatee.clone(), 0)));
+            assert!(s
+                .env
+                .storage()
+                .persistent()
+                .has(&DataKey::Delegator(delegatee.clone(), 0)));
+            assert!(!s
+                .env
+                .storage()
+                .instance()
+                .has(&DataKey::DelegatorSlot(delegator.clone())));
+            assert!(s
+                .env
+                .storage()
+                .persistent()
+                .has(&DataKey::DelegatorSlot(delegator.clone())));
+        });
+
+        gov.undelegate(&delegator);
+
+        s.env.as_contract(&s.gov_addr, || {
+            assert!(!s
+                .env
+                .storage()
+                .persistent()
+                .has(&DataKey::Delegate(delegator.clone())));
+            assert!(!s
+                .env
+                .storage()
+                .persistent()
+                .has(&DataKey::Delegator(delegatee.clone(), 0)));
+            assert!(!s
+                .env
+                .storage()
+                .persistent()
+                .has(&DataKey::DelegatorSlot(delegator.clone())));
+            let count: u32 = s
+                .env
+                .storage()
+                .persistent()
+                .get(&DataKey::DelegatorCount(delegatee.clone()))
+                .unwrap();
+            assert_eq!(count, 0);
+        });
     }
 
     #[test]
