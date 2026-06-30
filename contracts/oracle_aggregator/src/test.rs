@@ -29,11 +29,14 @@ impl MockAdapter {
             .set(&soroban_sdk::symbol_short!("price"), &price);
     }
 
-    pub fn quote(env: Env, _token_a: Address, _token_b: Address) -> i128 {
-        env.storage()
+    pub fn quote(env: Env, _token_a: Address, _token_b: Address) -> (i128, u64) {
+        let price: i128 = env
+            .storage()
             .instance()
             .get(&soroban_sdk::symbol_short!("price"))
-            .unwrap_or(0)
+            .unwrap_or(0);
+        // Report the current ledger time so a configured (price > 0) source is fresh.
+        (price, env.ledger().timestamp())
     }
 }
 

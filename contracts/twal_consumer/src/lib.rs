@@ -184,26 +184,6 @@ impl TwalConsumer {
     /// Returns the time‑weighted average active liquidity for a CL pool over `window_seconds`.
     pub fn get_cl_twal(env: Env, pool: Address, window_seconds: u64) -> i128 {
         assert!(window_seconds > 0, "window_seconds must be > 0");
-        // Current active liquidity and pool timestamp
-        let active = ClPoolLiquidityClient::new(&env, &pool).active_liquidity();
-        let (_, pool_ts_now) = ClPoolLiquidityClient::new(&env, &pool).get_tick_cumulative();
-        let ledger_ts_now = env.ledger().timestamp();
-        assert!(ledger_ts_now >= window_seconds, "ledger timestamp is smaller than requested window");
-        let then_ts = ledger_ts_now - window_seconds;
-        let snapshot: LiquiditySnapshot = env
-            .storage()
-            .persistent()
-            .get(&DataKey::LiquiditySnapshot(pool, then_ts))
-            .unwrap_or_else(|| panic!("missing liquidity snapshot at {then_ts}"));
-        let delta = (active as u128).wrapping_sub(snapshot.cum_liquidity as u128) as i128;
-        let elapsed = (pool_ts_now - snapshot.pool_ts) as i128;
-        assert!(elapsed > 0, "window too small (pool time did not advance)");
-        delta / elapsed
-    }
-
-    /// Returns the time‑weighted average active liquidity for a CL pool over `window_seconds`.
-    pub fn get_cl_twal(env: Env, pool: Address, window_seconds: u64) -> i128 {
-        assert!(window_seconds > 0, "window_seconds must be > 0");
 
         // Current active liquidity and pool timestamp
         let active = ClPoolLiquidityClient::new(&env, &pool).active_liquidity();

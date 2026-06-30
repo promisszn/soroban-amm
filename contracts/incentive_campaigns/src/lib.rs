@@ -468,16 +468,17 @@ mod tests {
         assert!(claimed_after_end > 0, "expected non-zero rewards after end_time");
 
         // Verify accrual was capped at end_time: elapsed = 5_000 - 1_000 = 4_000.
-        // provider_share = rate * elapsed * lp_balance / total_supply = 100 * 4_000 * 1 = 400_000
-        // (provider holds all LP tokens so share == total pool rewards).
-        assert_eq!(claimed_after_end, 100 * 4_000, "rewards must be capped at end_time");
+        // provider_share = rate * elapsed * lp_balance / total_supply.
+        // The AMM permanently locks MINIMUM_LIQUIDITY (1_000) on the first deposit, so the
+        // provider holds 999_000 / 1_000_000 of supply: 100 * 4_000 * 999_000 / 1_000_000 = 399_600.
+        assert_eq!(claimed_after_end, 399_600, "rewards must be capped at end_time");
 
         // ── Case 2: duplicate claim after campaign has fully paid out ─────────────
         // All accrued rewards were just claimed; a second call must not double-pay.
-        let result = std::panic::catch_unwind(|| {
-            client.claim_rewards(&provider, &id);
-        });
-        assert!(result.is_err(), "second claim should fail with 'no pending rewards'");
+        assert!(
+            client.try_claim_rewards(&provider, &id).is_err(),
+            "second claim should fail with 'no pending rewards'"
+        );
 
         // ── Case 3: partial claim during campaign, remainder claimed after end ────
         let id2 = client.create_campaign(
@@ -494,18 +495,20 @@ mod tests {
         // First claim at t=3_000 (2_000 s into campaign).
         env.ledger().with_mut(|l| l.timestamp = 3_000);
         let partial = client.claim_rewards(&provider, &id2);
-        assert_eq!(partial, 100 * 2_000, "partial claim should cover t=1_000..3_000");
+        // 100 * 2_000 * 999_000 / 1_000_000 = 199_800 (provider's 99.9% share of supply).
+        assert_eq!(partial, 199_800, "partial claim should cover t=1_000..3_000");
 
         // Second claim at t=9_000 (well after end_time=5_000); should yield remaining 2_000 s.
         env.ledger().with_mut(|l| l.timestamp = 9_000);
         let remainder = client.claim_rewards(&provider, &id2);
-        assert_eq!(remainder, 100 * 2_000, "remainder should cover t=3_000..5_000");
+        // Cumulative share at end_time is 399_600; 199_800 already claimed, leaving 199_800.
+        assert_eq!(remainder, 199_800, "remainder should cover t=3_000..5_000");
 
         // Third call: nothing left to claim.
-        let result2 = std::panic::catch_unwind(|| {
-            client.claim_rewards(&provider, &id2);
-        });
-        assert!(result2.is_err(), "third claim should fail with 'no pending rewards'\");
+        assert!(
+            client.try_claim_rewards(&provider, &id2).is_err(),
+            "third claim should fail with 'no pending rewards'"
+        );
     }
 
     /// Regression test for the leftover-funds issue: governance must be able to recover
@@ -529,23 +532,25 @@ mod tests {
         );
 
         // ── Case 1: partial claim during campaign, then governance recovers the rest ──
-        // LP claims at t=2_000 (1_000 s in) → 100_000 tokens.
+        // LP claims at t=2_000 (1_000 s in). The AMM locks MINIMUM_LIQUIDITY on the first
+        // deposit, so the provider's share is 100 * 1_000 * 999_000 / 1_000_000 = 99_900.
         env.ledger().with_mut(|l| l.timestamp = 2_000);
         let claimed = client.claim_rewards(&provider, &id);
-        assert_eq!(claimed, 100 * 1_000);
+        assert_eq!(claimed, 99_900);
 
         // Advance past end_time.
         env.ledger().with_mut(|l| l.timestamp = 8_000);
 
-        // Governance recovers the remaining 300_000 tokens.
+        // Governance recovers the unclaimed remainder: max_distributable - total_distributed
+        // = 400_000 - 99_900 = 300_100.
         let recovered = client.recover_leftover_funds(&gov_addr, &id, &treasury);
-        assert_eq!(recovered, 100 * 3_000, "should recover unclaimed 3_000 s of rewards");
+        assert_eq!(recovered, 300_100, "should recover unclaimed rewards");
 
         // After recovery the campaign is inactive; LP cannot claim any more.
-        let result = std::panic::catch_unwind(|| {
-            client.claim_rewards(&provider, &id);
-        });
-        assert!(result.is_err(), "claim after recovery must fail (campaign inactive)");
+        assert!(
+            client.try_claim_rewards(&provider, &id).is_err(),
+            "claim after recovery must fail (campaign inactive)"
+        );
 
         // ── Case 2: no claims at all → governance recovers the full budget ──────────
         let id2 = client.create_campaign(
@@ -576,9 +581,11 @@ mod tests {
         );
 
         env.ledger().with_mut(|l| l.timestamp = 3_000); // still inside campaign
-        let early = std::panic::catch_unwind(|| {
-            client.recover_leftover_funds(&gov_addr, &id3, &treasury);
-        });
-        assert!(early.is_err(), "recovery before end_time must be rejected");
+        assert!(
+            client
+                .try_recover_leftover_funds(&gov_addr, &id3, &treasury)
+                .is_err(),
+            "recovery before end_time must be rejected"
+        );
     }
 }

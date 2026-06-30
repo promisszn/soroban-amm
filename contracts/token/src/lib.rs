@@ -104,15 +104,6 @@ impl LpToken {
             .unwrap_or(0)
     }
 
-    /// Returns the amount `spender` is allowed to transfer on behalf of `from`.
-    /// Returns `0` if no allowance has been set.
-    pub fn allowance(env: Env, from: Address, spender: Address) -> i128 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Allowance(from, spender))
-            .unwrap_or(0)
-    }
-
     /// Returns the account balance at or before `ledger`.
     pub fn balance_at(env: Env, id: Address, ledger: u32) -> i128 {
         let key = DataKey::Checkpoints(id);
@@ -140,6 +131,13 @@ impl LpToken {
                 high = mid;
             }
         }
+
+        if low == 0 {
+            0
+        } else {
+            checkpoints.get(low - 1).unwrap().balance
+        }
+    }
 
     /// Returns the SEP-41 allowance value for `spender` over `from`.
     /// Returns `{ amount: 0, live_until_ledger: 0 }` if expired or unset.
@@ -542,7 +540,9 @@ mod tests {
         let client = LpTokenClient::new(&ts.env, &ts.contract_addr);
         let alice = Address::generate(&ts.env);
         let bob = Address::generate(&ts.env);
-        let past = ts.env.ledger().sequence().saturating_sub(1);
+        // Advance past genesis so `past` is genuinely an earlier ledger than the current one.
+        ts.env.ledger().with_mut(|l| l.sequence_number = 100);
+        let past = ts.env.ledger().sequence() - 1;
         assert!(client.try_approve(&alice, &bob, &100_i128, &past).is_err());
     }
 

@@ -1,7 +1,6 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractclient, contractimpl, contracttype, symbol_short, Address, Env, Vec};
-use soroban_sdk::{contract, contractclient, contractimpl, contracterror, contracttype, Address, Env, Vec};
+use soroban_sdk::{contract, contractclient, contractimpl, contracterror, contracttype, symbol_short, Address, Env, Vec};
 
 #[contractclient(name = "AmmPoolOracleClient")]
 pub trait AmmPoolOracle {
@@ -123,18 +122,14 @@ impl TwapConsumer {
     }
 
     /// Deletes a price snapshot from persistent storage.
-    pub fn delete_snapshot(env: Env, pool: Address, ledger_ts: u64) {
-        Self::require_keeper(&env);
+    pub fn delete_snapshot(env: Env, pool: Address, ledger_ts: u64) -> Result<(), TwapError> {
+        Self::require_keeper(&env)?;
         let key = DataKey::Snapshot(pool.clone(), ledger_ts);
         env.storage().persistent().remove(&key);
         env.events().publish(
             (symbol_short!("snap_del"), pool),
             ledger_ts,
         );
-    pub fn delete_snapshot(env: Env, pool: Address, ledger_ts: u64) -> Result<(), TwapError> {
-        Self::require_keeper(&env)?;
-        let key = DataKey::Snapshot(pool, ledger_ts);
-        env.storage().persistent().remove(&key);
         Ok(())
     }
 
@@ -321,9 +316,9 @@ mod tests {
 
     use amm::{AmmPool, AmmPoolClient};
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
+        testutils::{Address as _, Events as _, Ledger},
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
-        Address, Env,
+        Address, Env, IntoVal,
     };
     use token::LpToken;
 
@@ -831,10 +826,12 @@ mod tests {
 
         assert_eq!(contract_id, consumer_addr);
         // topics are (symbol_short!("snap_del"), pool)
-        assert_eq!(topics.len(), 2);
-        assert_eq!(topics.get(0).unwrap(), symbol_short!("snap_del").to_val());
-        assert_eq!(topics.get(1).unwrap(), pool.to_val());
+        let mut expected_topics: Vec<soroban_sdk::Val> = Vec::new(&env);
+        expected_topics.push_back(symbol_short!("snap_del").into_val(&env));
+        expected_topics.push_back(pool.clone().into_val(&env));
+        assert_eq!(topics, expected_topics);
         // data is ledger_ts
-        assert_eq!(data, ledger_ts.into_val(&env));
+        let data_ts: u64 = data.into_val(&env);
+        assert_eq!(data_ts, ledger_ts);
     }
 }
