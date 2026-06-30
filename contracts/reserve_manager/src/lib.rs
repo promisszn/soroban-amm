@@ -92,7 +92,9 @@ impl ReserveManager {
             !env.storage().instance().has(&DataKey::Governance),
             "already initialized"
         );
-        env.storage().instance().set(&DataKey::Governance, &governance);
+        env.storage()
+            .instance()
+            .set(&DataKey::Governance, &governance);
         env.storage().instance().set(&DataKey::Factory, &factory);
     }
 
@@ -123,10 +125,7 @@ impl ReserveManager {
     /// Only the nominated address can call this, and it must authorize the
     /// transaction. On success the stored governance is updated, the pending
     /// nominee is cleared, and a `governance_transferred` event is emitted.
-    pub fn accept_governance(
-        env: Env,
-        new_governance: Address,
-    ) -> Result<(), ReserveManagerError> {
+    pub fn accept_governance(env: Env, new_governance: Address) -> Result<(), ReserveManagerError> {
         let pending: Option<Address> = env
             .storage()
             .instance()
@@ -179,19 +178,28 @@ impl ReserveManager {
         assert!(min_reserve_a >= 0, "min_reserve_a must be non-negative");
         assert!(min_reserve_b >= 0, "min_reserve_b must be non-negative");
 
-        let (ta, tb) = Self::normalize(token_a, token_b);
-        let req = ReserveRequirement { min_reserve_a, min_reserve_b };
+        let token_a_is_first = token_a < token_b;
+        let (ta, tb) = if token_a_is_first {
+            (token_a, token_b)
+        } else {
+            (token_b, token_a)
+        };
+        let (normalized_min_a, normalized_min_b) = if token_a_is_first {
+            (min_reserve_a, min_reserve_b)
+        } else {
+            (min_reserve_b, min_reserve_a)
+        };
+        let req = ReserveRequirement {
+            min_reserve_a: normalized_min_a,
+            min_reserve_b: normalized_min_b,
+        };
         env.storage()
             .instance()
             .set(&DataKey::MinReserve(ta, tb), &req);
     }
 
     /// Return the minimum reserve requirement for a pair, or (0, 0) if none.
-    pub fn get_min_reserve(
-        env: Env,
-        token_a: Address,
-        token_b: Address,
-    ) -> ReserveRequirement {
+    pub fn get_min_reserve(env: Env, token_a: Address, token_b: Address) -> ReserveRequirement {
         let (ta, tb) = Self::normalize(token_a, token_b);
         env.storage()
             .instance()
@@ -212,7 +220,17 @@ impl ReserveManager {
     /// Does not modify any state.
     pub fn check_reserves(env: Env, pool: Address) -> bool {
         let info = AmmPoolClient::new(&env, &pool).get_info();
-        let (ta, tb) = Self::normalize(info.token_a, info.token_b);
+        let token_a_is_first = info.token_a < info.token_b;
+        let (ta, tb) = if token_a_is_first {
+            (info.token_a, info.token_b)
+        } else {
+            (info.token_b, info.token_a)
+        };
+        let (reserve_a, reserve_b) = if token_a_is_first {
+            (info.reserve_a, info.reserve_b)
+        } else {
+            (info.reserve_b, info.reserve_a)
+        };
 
         let req: ReserveRequirement = env
             .storage()
@@ -223,7 +241,7 @@ impl ReserveManager {
                 min_reserve_b: 0,
             });
 
-        info.reserve_a >= req.min_reserve_a && info.reserve_b >= req.min_reserve_b
+        reserve_a >= req.min_reserve_a && reserve_b >= req.min_reserve_b
     }
 
     /// Return the governance address.
@@ -239,7 +257,11 @@ impl ReserveManager {
     // ── Internals ─────────────────────────────────────────────────────────────
 
     fn normalize(a: Address, b: Address) -> (Address, Address) {
-        if a < b { (a, b) } else { (b, a) }
+        if a < b {
+            (a, b)
+        } else {
+            (b, a)
+        }
     }
 }
 
@@ -249,11 +271,7 @@ impl ReserveManager {
 mod tests {
     use super::*;
     use amm::AmmPool;
-    use soroban_sdk::{
-        testutils::Address as _,
-        token::StellarAssetClient,
-        Env, String,
-    };
+    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, Env, String};
     use token::{LpToken, LpTokenClient};
 
     struct Setup {
@@ -273,8 +291,12 @@ mod tests {
         let governance = Address::generate(&env);
 
         // Deploy token pair.
-        let ta = env.register_stellar_asset_contract_v2(admin.clone()).address();
-        let tb = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let ta = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let tb = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
 
         // Deploy AMM pool directly (native — avoids WASM serialization mismatches).
         let lp_addr = env.register_contract(None, LpToken);
@@ -291,14 +313,18 @@ mod tests {
         let provider = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&provider, &1_000_000_i128);
         StellarAssetClient::new(&env, &tb).mint(&provider, &1_000_000_i128);
-        amm::AmmPoolClient::new(&env, &pool_addr)
-            .add_liquidity(&provider, &1_000_000_i128, &1_000_000_i128, &0_i128, &u64::MAX);
+        amm::AmmPoolClient::new(&env, &pool_addr).add_liquidity(
+            &provider,
+            &1_000_000_i128,
+            &1_000_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
 
         // factory_addr is not used in check_reserves, just needed for initialize.
         let factory_addr = Address::generate(&env);
         let rm_addr = env.register_contract(None, ReserveManager);
-        ReserveManagerClient::new(&env, &rm_addr)
-            .initialize(&governance, &factory_addr);
+        ReserveManagerClient::new(&env, &rm_addr).initialize(&governance, &factory_addr);
 
         Setup {
             env,
@@ -372,6 +398,28 @@ mod tests {
     }
 
     #[test]
+    fn test_set_min_reserve_preserves_amounts_for_reversed_token_args() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+
+        let (larger_token, smaller_token) = if s.ta < s.tb {
+            (&s.tb, &s.ta)
+        } else {
+            (&s.ta, &s.tb)
+        };
+
+        // The AMM pool reserves are 1_000_000 for both tokens. This call
+        // intentionally passes the larger token first, so set_min_reserve must
+        // swap the amounts before storing them under the normalized key.
+        rm.set_min_reserve(larger_token, smaller_token, &2_000_000_i128, &500_000_i128);
+
+        let req = rm.get_min_reserve(&s.ta, &s.tb);
+        assert_eq!(req.min_reserve_a, 500_000);
+        assert_eq!(req.min_reserve_b, 2_000_000);
+        assert!(!rm.check_reserves(&s.pool));
+    }
+
+    #[test]
     fn test_check_reserves_passes_with_no_requirement() {
         let s = setup();
         let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
@@ -440,6 +488,8 @@ mod tests {
     fn test_negative_min_reserve_panics() {
         let s = setup();
         let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
-        assert!(rm.try_set_min_reserve(&s.ta, &s.tb, &-1_i128, &0_i128).is_err());
+        assert!(rm
+            .try_set_min_reserve(&s.ta, &s.tb, &-1_i128, &0_i128)
+            .is_err());
     }
 }
