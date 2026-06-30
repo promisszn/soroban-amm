@@ -848,25 +848,42 @@ impl Staking {
         Self::_effective_amount(raw, boost)
     }
 
-    /// Settle pending rewards into debt without transferring (used before
-    /// changing effective stake so rewards earned so far are not lost).
+    /// Transfer any pending rewards to the staker before their effective stake
+    /// changes (used in stake_locked / extend_lock so rewards earned so far
+    /// are not lost when the debt is recomputed against the new effective amount).
     fn _settle_pending(env: &Env, staker: &Address) {
-        let effective = Self::_staker_effective(env, staker);
-        if effective == 0 {
+        let pending = Self::pending_rewards(env.clone(), staker.clone());
+        if pending == 0 {
             return;
         }
+
+        let reward_token: Address = env.storage().instance().get(&DataKey::RewardToken).unwrap();
+        let pool_addr = env.current_contract_address();
+
+        let effective = Self::_staker_effective(env, staker);
         let acc_per_share: i128 = env
             .storage()
             .instance()
             .get(&DataKey::AccumulatedRewardsPerShare)
             .unwrap_or(0);
-        // The current debt already accounts for previously settled rewards.
-        // We do NOT transfer here — just record what has been earned so far
-        // by updating the debt to the current acc_per_share level.
-        // Pending = effective * acc / SCALE - debt  (already owed to staker).
-        // We leave debt unchanged so pending_rewards still returns the right value.
-        // The actual settlement happens in claim() / unstake().
-        let _ = (effective, acc_per_share); // no-op: debt stays, rewards accumulate
+        let new_debt = effective * acc_per_share / SCALE_FACTOR;
+        let key_debt = DataKey::StakerRewardsDebt(staker.clone());
+        env.storage().persistent().set(&key_debt, &new_debt);
+        env.storage().persistent().extend_ttl(&key_debt, MIN_TTL, BUMP_TO);
+
+        SepTokenClient::new(env, &reward_token).transfer(&pool_addr, staker, &pending);
+
+        let pool_balance: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RewardPoolBalance)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::RewardPoolBalance, &(pool_balance - pending));
+
+        env.events()
+            .publish((Symbol::new(env, "claimed"),), (staker.clone(), pending));
     }
 }
 
@@ -1011,6 +1028,76 @@ mod tests {
         let (lp_returned, rewards) = staking.unstake(&staker, &1_000_i128);
         assert_eq!(lp_returned, 1_000);
         assert!(rewards > 0);
+    }
+
+    #[test]
+    /// Bug #420: staking or extending after rewards accrued must not forfeit
+    /// unclaimed rewards.  _settle_pending must transfer pending rewards before
+    /// the debt is recomputed against the new effective amount.
+    fn test_stake_twice_preserves_pending_rewards() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staker, staking) = setup(&env);
+
+        // First stake
+        staking.stake(&staker, &1_000_i128);
+        staking.update_rewards(&admin, &100_i128);
+
+        let pending_before = staking.pending_rewards(&staker);
+        assert_eq!(pending_before, 100, "should have 100 pending after first distribution");
+
+        // Second stake — triggers _settle_pending which must pay out the 100
+        // before the debt is recomputed.
+        staking.stake(&staker, &500_i128);
+
+        // After the second stake, the new effective amount defines a fresh debt.
+        // Any rewards accrued before the second stake must have been paid out.
+        let pending_after = staking.pending_rewards(&staker);
+        assert_eq!(pending_after, 0, "no new rewards yet — second stake just happened");
+
+        // The staker's reward balance should have increased by the 100 that
+        // was pending before the second stake.
+        let reward_token = staking.get_pool_info().reward_token;
+        let reward_client = StellarTokenClient::new(&env, &reward_token);
+        assert_eq!(
+            reward_client.balance(&staker),
+            100,
+            "staker should have received the 100 pending rewards"
+        );
+    }
+
+    #[test]
+    fn test_extend_lock_preserves_pending_rewards() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staker, staking) = setup(&env);
+
+        // Stake with a short lock so we can extend later.
+        let stake_amount = 4_000_i128;
+        let reward_amount = 4_000_i128;
+        staking.stake_locked(&staker, &stake_amount, &MIN_LOCK_DURATION);
+        staking.update_rewards(&admin, &reward_amount);
+
+        let pending_before = staking.pending_rewards(&staker);
+        assert!(pending_before > 0, "should have pending rewards before extend");
+
+        // Extend lock — triggers _settle_pending which must transfer the
+        // pending rewards before recomputing debt.
+        staking.extend_lock(&staker, &MAX_LOCK_DURATION);
+
+        // After settlement, no rewards should be pending (no new distributions).
+        let pending_after = staking.pending_rewards(&staker);
+        assert_eq!(pending_after, 0, "no new rewards after extend");
+
+        // The staker's reward balance must have increased by at least the
+        // pending amount (within integer-division rounding).
+        let reward_token = staking.get_pool_info().reward_token;
+        let reward_client = StellarTokenClient::new(&env, &reward_token);
+        let balance = reward_client.balance(&staker);
+        assert!(
+            balance >= pending_before,
+            "staker should have received at least {pending_before} pending rewards on extend, got {balance}"
+        );
     }
 
     #[test]
