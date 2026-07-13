@@ -882,7 +882,7 @@ See [packages/amm-simulator/README.md](packages/amm-simulator/README.md) for the
 
 ## Contributing
 
-Contributions are welcome. Please follow the guidelines below to keep the codebase consistent and review cycles short.
+Contributions are welcome. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full contributor guide — setup, project layout, testing, and the pull-request process. New contributors should start with issues labeled [`good first issue`](https://github.com/promisszn/soroban-amm/labels/good%20first%20issue) and [`help wanted`](https://github.com/promisszn/soroban-amm/labels/help%20wanted). The guidelines below summarize the key points.
 
 ### Reporting Issues
 
