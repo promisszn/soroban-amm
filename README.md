@@ -34,6 +34,7 @@ A full-stack AMM protocol built on Stellar's Soroban smart contract platform. It
   - [TypeScript Client Example](#typescript-client-example)
   - [Python Client Example](#python-client-example)
 - [Off-chain Simulator](#off-chain-simulator)
+- [Roadmap](#roadmap)
 - [Contributing](#contributing)
 - [Changelog](#changelog)
 - [Security](#security)
@@ -877,6 +878,17 @@ The repository now includes `packages/amm-simulator`, a Rust library and CLI for
 - Monte Carlo stress testing
 
 See [packages/amm-simulator/README.md](packages/amm-simulator/README.md) for the command-line usage and JSON formats.
+
+---
+
+## Roadmap
+
+See **[ROADMAP.md](ROADMAP.md)** for the full phased plan. In brief: the V2
+constant-product core (AMM, LP token, factory, governance, TWAP oracle) is
+shipped and covered by 460+ tests and a fuzz suite; the V3-style concentrated
+liquidity engine and the routing/ecosystem contracts are in active development;
+and a formal third-party audit, testnet/mainnet deployment, and a web frontend
+are planned.
 
 ---
 
