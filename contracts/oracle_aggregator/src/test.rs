@@ -53,7 +53,7 @@ fn deploy(env: &Env, max_staleness: u64) -> Harness<'_> {
     let admin = Address::generate(env);
     let aggregator_id = env.register_contract(None, OracleAggregator);
     let aggregator = OracleAggregatorClient::new(env, &aggregator_id);
-    aggregator.initialize(&admin, &max_staleness);
+    aggregator.initialize(&admin, &max_staleness, &0u32); // deviation filtering disabled by default
     let token_a = Address::generate(env);
     let token_b = Address::generate(env);
     Harness {
@@ -91,6 +91,7 @@ fn initialize_seeds_admin_and_staleness() {
     let h = deploy(&env, 600);
     assert_eq!(h.aggregator.get_admin(), h.admin);
     assert_eq!(h.aggregator.get_max_staleness(), 600);
+    assert_eq!(h.aggregator.get_max_deviation_bps(), 0);
     assert_eq!(h.aggregator.list_sources().len(), 0);
 }
 
@@ -99,7 +100,7 @@ fn initialize_seeds_admin_and_staleness() {
 fn initialize_is_one_time() {
     let env = Env::default();
     let h = deploy(&env, 600);
-    h.aggregator.initialize(&h.admin, &600);
+    h.aggregator.initialize(&h.admin, &600, &0u32);
 }
 
 #[test]
@@ -310,4 +311,70 @@ fn stale_src_event_emitted_when_sources_skipped() {
     assert_eq!(stale_addrs.len(), 2);
     assert!(stale_addrs.contains(&s2));
     assert!(stale_addrs.contains(&s3));
+}
+
+// ── Deviation-bound tests ───────────────────────────────────────────────────
+
+#[test]
+fn outlier_excluded_from_confidence() {
+    // Three sources: 100, 105, 1_000_000 (wildly off).
+    // Median = 105; max_deviation_bps = 500 (5%).
+    // 100: |100-105|/105 = 4.76% → within band.
+    // 105: deviation = 0 → within band.
+    // 1_000_000: deviation >> 5% → outside band.
+    // Agreeing = 2, so confidence = 2 (not 3).
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let agg_id = env.register_contract(None, OracleAggregator);
+    let agg = OracleAggregatorClient::new(&env, &agg_id);
+    agg.initialize(&admin, &600u64, &500u32); // 5% band
+    let token_a = Address::generate(&env);
+    let token_b = Address::generate(&env);
+
+    let s1 = deploy_source(&env, 100);
+    let s2 = deploy_source(&env, 105);
+    let s3 = deploy_source(&env, 1_000_000);
+    agg.register_source(&admin, &s1, &OracleSourceType::AmmTwap);
+    agg.register_source(&admin, &s2, &OracleSourceType::ClTwap);
+    agg.register_source(&admin, &s3, &OracleSourceType::External);
+    set_now(&env, 1_000);
+
+    let result = agg.get_price(&token_a, &token_b);
+    assert_eq!(result.price, 105); // median of (100, 105, 1_000_000)
+    assert_eq!(result.confidence, 2); // s3 excluded
+}
+
+#[test]
+fn set_max_deviation_bps_updates_and_is_readable() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    assert_eq!(h.aggregator.get_max_deviation_bps(), 0);
+    h.aggregator.set_max_deviation_bps(&h.admin, &200u32);
+    assert_eq!(h.aggregator.get_max_deviation_bps(), 200);
+}
+
+#[test]
+fn deviation_bound_zero_disables_filtering() {
+    // With max_deviation_bps = 0 the outlier must still count.
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let agg_id = env.register_contract(None, OracleAggregator);
+    let agg = OracleAggregatorClient::new(&env, &agg_id);
+    agg.initialize(&admin, &600u64, &0u32); // filtering disabled
+    let token_a = Address::generate(&env);
+    let token_b = Address::generate(&env);
+
+    let s1 = deploy_source(&env, 100);
+    let s2 = deploy_source(&env, 105);
+    let s3 = deploy_source(&env, 1_000_000);
+    agg.register_source(&admin, &s1, &OracleSourceType::AmmTwap);
+    agg.register_source(&admin, &s2, &OracleSourceType::ClTwap);
+    agg.register_source(&admin, &s3, &OracleSourceType::External);
+    set_now(&env, 1_000);
+
+    let result = agg.get_price(&token_a, &token_b);
+    assert_eq!(result.price, 105);
+    assert_eq!(result.confidence, 3); // all three sources counted
 }
