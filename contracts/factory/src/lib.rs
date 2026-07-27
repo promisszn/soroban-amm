@@ -19,6 +19,9 @@ use soroban_sdk::{
     Address, BytesN, Env, Symbol, Vec,
 };
 
+const MIN_TTL: u32 = 172_800;
+const BUMP_TO: u32 = 518_400;
+
 // ── Typed errors ─────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -185,6 +188,7 @@ impl Factory {
         env.storage()
             .instance()
             .set(&DataKey::DefaultFeeTier, &2i128);
+        Self::extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -280,6 +284,7 @@ impl Factory {
             .get(&DataKey::PoolCount)
             .unwrap_or(0);
         env.storage().instance().set(&DataKey::PoolCount, &(n + 1));
+        Self::extend_instance_ttl(&env);
 
         let lp_salt = Self::make_salt(&env, n * 3);
         let pool_salt = Self::make_salt(&env, n * 3 + 1);
@@ -343,24 +348,26 @@ impl Factory {
         // so they belong in persistent storage (each with its own TTL) rather
         // than instance storage, which is a single blob loaded on every call
         // to the contract (issue #468).
-        env.storage()
-            .persistent()
-            .set(&DataKey::Pool(ta.clone(), tb.clone()), &pool_addr);
-        env.storage()
-            .persistent()
-            .set(&DataKey::LpToken(pool_addr.clone()), &lp_addr);
-        env.storage()
-            .persistent()
-            .set(&DataKey::GovernanceFor(pool_addr.clone()), &gov_addr);
-        // Store reverse token-pair lookup used by sweep_fees to forward tokens.
-        env.storage().persistent().set(
-            &DataKey::PoolTokens(pool_addr.clone()),
-            &(ta.clone(), tb.clone()),
-        );
+        let pool_key = DataKey::Pool(ta.clone(), tb.clone());
+        env.storage().persistent().set(&pool_key, &pool_addr);
+        Self::extend_persistent_ttl(&env, &pool_key);
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::PoolByIndex(n), &pool_addr);
+        let lp_key = DataKey::LpToken(pool_addr.clone());
+        env.storage().persistent().set(&lp_key, &lp_addr);
+        Self::extend_persistent_ttl(&env, &lp_key);
+
+        let governance_key = DataKey::GovernanceFor(pool_addr.clone());
+        env.storage().persistent().set(&governance_key, &gov_addr);
+        Self::extend_persistent_ttl(&env, &governance_key);
+
+        // Store reverse token-pair lookup used by sweep_fees to forward tokens.
+        let tokens_key = DataKey::PoolTokens(pool_addr.clone());
+        env.storage().persistent().set(&tokens_key, &(ta.clone(), tb.clone()));
+        Self::extend_persistent_ttl(&env, &tokens_key);
+
+        let pool_index_key = DataKey::PoolByIndex(n);
+        env.storage().persistent().set(&pool_index_key, &pool_addr);
+        Self::extend_persistent_ttl(&env, &pool_index_key);
 
         soroban_amm_sdk::emit_versioned_event!(
             env,
@@ -399,6 +406,7 @@ impl Factory {
         if let Some(ref h) = token_wasm_hash {
             env.storage().instance().set(&DataKey::TokenWasmHash, h);
         }
+        Self::extend_instance_ttl(&env);
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "wasm_updated"),),
@@ -422,6 +430,7 @@ impl Factory {
         env.storage()
             .instance()
             .set(&DataKey::DefaultFeeTier, &fee_tier);
+        Self::extend_instance_ttl(&env);
         env.events().publish(
             (Symbol::new(&env, "default_fee_tier_updated"),),
             (fee_tier,),
@@ -450,6 +459,7 @@ impl Factory {
         env.storage()
             .instance()
             .set(&DataKey::ClWasmHash, &cl_wasm_hash);
+        Self::extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -459,6 +469,7 @@ impl Factory {
         env.storage()
             .instance()
             .set(&DataKey::CreationPaused, &true);
+        Self::extend_instance_ttl(&env);
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "creation_paused"),),
@@ -473,6 +484,7 @@ impl Factory {
         env.storage()
             .instance()
             .set(&DataKey::CreationPaused, &false);
+        Self::extend_instance_ttl(&env);
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "creation_unpaused"),),
@@ -552,6 +564,7 @@ impl Factory {
         env.storage()
             .instance()
             .set(&DataKey::ClPoolCount, &(n + 1));
+        Self::extend_instance_ttl(&env);
 
         let pool_addr = env
             .deployer()
@@ -575,10 +588,11 @@ impl Factory {
         );
 
         env.storage().persistent().set(&cl_key, &pool_addr);
+        Self::extend_persistent_ttl(&env, &cl_key);
 
-        env.storage()
-            .persistent()
-            .set(&DataKey::ClPoolByIndex(n), &pool_addr);
+        let cl_pool_index_key = DataKey::ClPoolByIndex(n);
+        env.storage().persistent().set(&cl_pool_index_key, &pool_addr);
+        Self::extend_persistent_ttl(&env, &cl_pool_index_key);
 
         soroban_amm_sdk::emit_versioned_event!(
             env,
@@ -605,6 +619,7 @@ impl Factory {
         env.storage()
             .instance()
             .set(&DataKey::PermissionlessMode, &enabled);
+        Self::extend_instance_ttl(&env);
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "mode_changed"),),
@@ -632,6 +647,7 @@ impl Factory {
         env.storage()
             .instance()
             .set(&DataKey::PoolCreationFee, &fee_amount);
+        Self::extend_instance_ttl(&env);
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "creation_fee_set"),),
@@ -650,6 +666,7 @@ impl Factory {
         env.storage()
             .instance()
             .set(&DataKey::RateLimitLedgers, &min_ledgers);
+        Self::extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -865,6 +882,7 @@ impl Factory {
         env.storage()
             .instance()
             .set(&DataKey::GlobalProtocolFeeBps, &global_protocol_fee_bps);
+        Self::extend_instance_ttl(&env);
         let updated = Self::sync_global_fee_page(
             &env,
             &admin,
@@ -929,6 +947,7 @@ impl Factory {
         env.storage()
             .instance()
             .set(&DataKey::GlobalProtocolFeeBps, &protocol_fee_bps);
+        Self::extend_instance_ttl(&env);
         let updated =
             Self::sync_global_fee_page(&env, &admin, protocol_fee_bps, 0, Self::pool_count(&env));
         soroban_amm_sdk::emit_versioned_event!(
@@ -1097,6 +1116,14 @@ impl Factory {
 
     // ── Internals ─────────────────────────────────────────────────────────────
 
+    fn extend_instance_ttl(env: &Env) {
+        env.storage().instance().extend_ttl(MIN_TTL, BUMP_TO);
+    }
+
+    fn extend_persistent_ttl(env: &Env, key: &DataKey) {
+        env.storage().persistent().extend_ttl(key, MIN_TTL, BUMP_TO);
+    }
+
     fn pool_count(env: &Env) -> u32 {
         env.storage()
             .instance()
@@ -1198,9 +1225,9 @@ impl Factory {
                 }
             }
 
-            env.storage()
-                .persistent()
-                .set(&DataKey::LastPoolCreation(caller.clone()), &current_ledger);
+            let last_creation_key = DataKey::LastPoolCreation(caller.clone());
+            env.storage().persistent().set(&last_creation_key, &current_ledger);
+            Self::extend_persistent_ttl(&env, &last_creation_key);
         }
 
         Ok(())
@@ -1294,12 +1321,25 @@ impl Factory {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
+        testutils::{Address as _, Ledger, LedgerInfo},
         Env, IntoVal,
     };
 
     // Embed compiled WASM at test-compile time.
     // Use compiled WASM exported by the `amm` and `token` crates (feature `testutils`).
+
+    fn set_test_ledger(env: &Env, sequence_number: u64) {
+        env.ledger().set(LedgerInfo {
+            protocol_version: 21,
+            sequence_number: sequence_number.try_into().unwrap(),
+            timestamp: 0,
+            network_id: Default::default(),
+            base_reserve: 10,
+            min_temp_entry_ttl: 1,
+            min_persistent_entry_ttl: 1,
+            max_entry_ttl: 6_312_000,
+        });
+    }
 
     fn token_fee_for_pool(
         factory: &FactoryClient<'_>,
@@ -1341,6 +1381,32 @@ mod tests {
         assert_eq!(factory.all_pools().len(), 1);
         assert_eq!(gov, None);
         assert_eq!(factory.get_governance(&pool), None);
+    }
+
+    #[test]
+    fn test_factory_storage_ttl_is_extended() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+        set_test_ledger(&env, 0);
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+        let (pool, _) = factory.create_pool_with_fee_bps(&admin, &ta, &tb, &30_i128, &None);
+
+        set_test_ledger(&env, 250_000);
+
+        assert_eq!(factory.get_pool(&ta, &tb), Some(pool));
+        assert_eq!(factory.get_default_fee_tier(), 2);
+        assert_eq!(factory.get_pool_count(), 1);
     }
 
     #[test]
