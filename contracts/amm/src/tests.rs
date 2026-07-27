@@ -1702,10 +1702,54 @@ fn test_remove_liquidity_one_sided_circuit_breaker() {
     ta_sac.mint(&trader, &5_000_000_i128);
     Swap::new(&amm, &trader, &ts.ta_addr, 5_000_000).execute();
 
-    // Now attempting a large remove_liquidity_one_sided in the same ledger sequence will trip circuit breaker.
-    let res =
-        amm.try_remove_liquidity_one_sided(&provider, &shares, &ts.ta_addr, &1_i128, &u64::MAX);
+    // Now attempting a large remove_liquidity_one_sided in the same ledger sequence will trip circuit breaker and pause pool.
+    let _ = amm.try_remove_liquidity_one_sided(&provider, &shares, &ts.ta_addr, &1_i128, &u64::MAX);
+    assert!(amm.is_paused());
+    assert!(amm.get_circuit_breaker_config().tripped);
+}
+
+#[test]
+fn test_circuit_breaker_auto_pause_persists_and_recovers() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    env.ledger().with_mut(|li| li.sequence_number = 100);
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+
+    // Set circuit breaker threshold to 500 bps (5%) and cooldown to 600 seconds.
+    amm.set_circuit_breaker_config(&500_i128, &600_u64);
+
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let trader = Address::generate(env);
+    ta_sac.mint(&trader, &10_000_000_i128);
+    tb_sac.mint(&trader, &10_000_000_i128);
+
+    // Baseline swap to initialize CircuitBreakerLastPrice & CircuitBreakerLastSeqno in seq 100
+    Swap::new(&amm, &trader, &ts.ta_addr, 100_000).execute();
+
+    // Second swap in the same ledger sequence moves price significantly (>5% threshold)
+    Swap::new(&amm, &trader, &ts.ta_addr, 5_000_000).execute();
+
+    // Verify circuit breaker tripped and Paused state persisted in storage
+    assert!(amm.is_paused());
+    let cfg = amm.get_circuit_breaker_config();
+    assert!(cfg.tripped);
+    assert_ne!(cfg.triggered_at, 0);
+
+    // Subsequent swap attempt must fail with Paused error
+    let res = amm.try_swap(&trader, &ts.ta_addr, &100_000_i128, &1_i128, &u64::MAX);
     assert!(res.is_err());
+
+    // Advance time beyond cooldown (600s)
+    let triggered = cfg.triggered_at;
+    env.ledger().with_mut(|li| li.timestamp = triggered + 601);
+
+    // Attempt automatic recovery
+    let recovered = amm.try_circuit_breaker_recovery();
+    assert_eq!(recovered, Ok(true));
+    assert!(!amm.is_paused());
+    assert!(!amm.get_circuit_breaker_config().tripped);
 }
 
 #[test]

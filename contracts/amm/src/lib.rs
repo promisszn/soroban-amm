@@ -733,7 +733,9 @@ impl AmmPool {
                 (baseline_price, current_price, deviation_bps, threshold_bps)
             );
 
-            return Err(AmmError::CircuitBreaker);
+            // Return Ok(()) so Soroban commits storage changes (DataKey::Paused = true and
+            // DataKey::CircuitBreakerTriggeredAt = now) rather than reverting them on error.
+            return Ok(());
         }
 
         Ok(())
