@@ -339,6 +339,18 @@ impl Factory {
 
         let pool_admin = gov_addr.clone().unwrap_or_else(|| admin.clone());
 
+        let (fee_recipient, protocol_fee_bps) = if env.storage().instance().has(&DataKey::Treasury)
+        {
+            let protocol_fee_bps: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::GlobalProtocolFeeBps)
+                .unwrap_or(0);
+            (env.current_contract_address(), protocol_fee_bps)
+        } else {
+            (admin.clone(), 0_i128)
+        };
+
         // Initialize AMM pool.
         AmmPoolClient::new(&env, &pool_addr).initialize(
             &pool_admin,
@@ -346,8 +358,8 @@ impl Factory {
             &tb,
             &lp_addr,
             &fee_bps,
-            &admin,  // fee_recipient
-            &0_i128, // protocol_fee_bps (disabled by default)
+            &fee_recipient,
+            &protocol_fee_bps,
         );
 
         // Register pool in lookup indexes and record the LP token address.
@@ -2112,6 +2124,33 @@ mod tests {
         let treasury2 = Address::generate(&env);
         factory.set_treasury(&admin, &treasury2, &50_i128);
         assert_eq!(factory.get_treasury(), Some((treasury2, 50_i128)));
+    }
+
+    #[test]
+    fn test_create_pool_inherits_global_fee_config_after_treasury_setup() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        factory.set_treasury(&admin, &treasury, &25_i128);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+        let (pool_addr, _) = factory.create_pool_with_fee_bps(&admin, &ta, &tb, &30_i128, &None);
+
+        let amm_client = amm::AmmPoolClient::new(&env, &pool_addr);
+        let (recipient, bps) = amm_client.get_protocol_fee();
+        assert_eq!(recipient, Some(factory_addr.clone()));
+        assert_eq!(bps, 25_i128);
     }
 
     #[test]
