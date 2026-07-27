@@ -300,7 +300,13 @@ impl IncentiveCampaigns {
             .get(&campaign_key)
             .expect("campaign not found");
         extend_persistent_ttl(&env, &campaign_key);
-        Self::checkpoint_campaign_rewards(&env, campaign_id, &campaign, env.ledger().timestamp());
+
+        let now = env.ledger().timestamp();
+        let end_time = campaign.end_time;
+        let total_supply = LpTokenClient::new(&env, &campaign.lp_token).total_supply();
+        campaign = advance_accumulator(campaign, now.min(end_time), total_supply);
+
+        Self::checkpoint_campaign_rewards(&env, campaign_id, &campaign, now);
         campaign.reward_rate = new_rate;
         env.storage().persistent().set(&campaign_key, &campaign);
 
@@ -336,6 +342,8 @@ impl IncentiveCampaigns {
             .expect("campaign not found");
         extend_persistent_ttl(&env, &campaign_key);
 
+        assert!(campaign.active, "campaign inactive");
+
         let now = env.ledger().timestamp();
         assert!(now > campaign.end_time, "campaign not yet ended");
         Self::checkpoint_campaign_rewards(&env, campaign_id, &campaign, now);
@@ -343,8 +351,9 @@ impl IncentiveCampaigns {
         let leftover = campaign.funding_amount - campaign.total_distributed;
         assert!(leftover > 0, "no leftover funds to recover");
 
-        // Mark inactive so future claim_rewards calls revert, protecting the
-        // recipient from having tokens transferred twice.
+        // Mark inactive and update total_distributed so future claim_rewards and
+        // recover_leftover_funds calls revert, preventing duplicate fund drains.
+        campaign.total_distributed += leftover;
         campaign.active = false;
         env.storage().persistent().set(&campaign_key, &campaign);
 
@@ -1058,6 +1067,14 @@ mod tests {
         let full_recovery = client.recover_leftover_funds(&gov_addr, &id2, &treasury);
         assert_eq!(full_recovery, 1_000_000);
 
+        // Repeat recovery call must fail (campaign inactive & total_distributed updated).
+        assert!(
+            client
+                .try_recover_leftover_funds(&gov_addr, &id2, &treasury)
+                .is_err(),
+            "repeat recovery call must fail (campaign inactive)"
+        );
+
         // ── Recovery before end_time must be rejected ─────────────────────────────
         let id3 = client.create_campaign(
             &gov_addr, &pool, &lp, &reward, &1_000, &5_000, &100, &1_000_000,
@@ -1117,6 +1134,9 @@ mod tests {
             &gov_addr, &pool, &lp, &reward, &1_000, &5_000, &100, &2_000_000,
         );
 
+        // Establish the provider snapshot at campaign start.
+        assert_eq!(client.claim_rewards(&provider, &id), 0);
+
         env.ledger().with_mut(|l| l.timestamp = 2_000);
         let first_claim = client.claim_rewards(&provider, &id);
         assert_eq!(first_claim, 99_900);
@@ -1141,6 +1161,9 @@ mod tests {
         let id = client.create_campaign(
             &gov_addr, &pool, &lp, &reward, &1_000, &5_000, &200, &2_000_000,
         );
+
+        // Establish the provider snapshot at campaign start.
+        assert_eq!(client.claim_rewards(&provider, &id), 0);
 
         env.ledger().with_mut(|l| l.timestamp = 3_000);
         let first_claim = client.claim_rewards(&provider, &id);
