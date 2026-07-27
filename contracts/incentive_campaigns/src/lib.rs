@@ -217,6 +217,12 @@ impl IncentiveCampaigns {
         assert!(end_time > start_time, "invalid campaign window");
         assert!(reward_rate > 0, "reward_rate must be positive");
         assert!(funding_amount > 0, "funding required");
+        let duration = (end_time - start_time) as i128;
+        let max_payout = reward_rate * duration;
+        assert!(
+            funding_amount >= max_payout,
+            "funding must cover reward_rate * duration"
+        );
 
         let lp_admin = LpTokenClient::new(&env, &lp_token).admin();
         assert!(lp_admin == pool, "lp_token does not match pool");
@@ -914,7 +920,7 @@ mod tests {
             &gov_addr, &pool, &lp, &reward, &1_000, &10_000, &100, &1_000_000,
         );
         let id2 = client.create_campaign(
-            &gov_addr, &pool, &lp, &reward, &1_000, &20_000, &50, &500_000,
+            &gov_addr, &pool, &lp, &reward, &1_000, &20_000, &50, &1_000_000,
         );
         assert_eq!(id1, 1);
         assert_eq!(id2, 2);

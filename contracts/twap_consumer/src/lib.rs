@@ -394,9 +394,57 @@ impl TwapConsumer {
             Self::SNAPSHOT_TTL_LEDGERS,
         );
         Self::record_snapshot_timestamp(&env, &pool, ledger_ts);
+
+        // Fix #537: register the CL pool in TrackedPoolsPersistent so that
+        // get_tracked_pools() and get_twap_all() include it. Previously only
+        // save_snapshot (V2 pools) performed this registration; CL pools
+        // snapshotted exclusively via save_cl_snapshot were silently omitted.
+        let mut tracked: Vec<Address> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::TrackedPoolsPersistent)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut already_tracked = false;
+        for i in 0..tracked.len() {
+            if tracked.get(i).unwrap() == pool {
+                already_tracked = true;
+                break;
+            }
+        }
+        if !already_tracked {
+            tracked.push_back(pool);
+            env.storage()
+                .persistent()
+                .set(&DataKey::TrackedPoolsPersistent, &tracked);
+            env.storage().persistent().extend_ttl(
+                &DataKey::TrackedPoolsPersistent,
+                Self::SNAPSHOT_TTL_LEDGERS / 2,
+                Self::SNAPSHOT_TTL_LEDGERS,
+            );
+        }
         Ok(())
     }
 }
+
+/// Minimal mock CL pool used by tests only. Satisfies the `ClPoolOracle`
+/// interface (`get_tick_cumulative`) without requiring the full CL contract.
+#[cfg(test)]
+mod mock_cl_pool {
+    use soroban_sdk::{contract, contractimpl, Env};
+
+    #[contract]
+    pub struct MockClPool;
+
+    #[contractimpl]
+    impl MockClPool {
+        pub fn get_tick_cumulative(_env: Env) -> (i64, u64) {
+            (1_000_i64, 10_000_u64)
+        }
+    }
+}
+
+#[cfg(test)]
+use mock_cl_pool::MockClPool;
 
 #[cfg(test)]
 mod tests {
@@ -1107,5 +1155,49 @@ mod tests {
         // data is ledger_ts
         let data_ts: u64 = data.into_val(&env);
         assert_eq!(data_ts, ledger_ts);
+    }
+
+    // ── Issue #537: save_cl_snapshot must register the pool in
+    // TrackedPoolsPersistent so get_tracked_pools / get_twap_all include it ──
+
+    #[test]
+    fn test_save_cl_snapshot_registers_pool_in_tracked_pools() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+
+        let admin = Address::generate(&env);
+        let cl_addr = env.register_contract(None, MockClPool);
+
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&admin);
+
+        // Before any CL snapshot, the tracked list must be empty.
+        assert_eq!(
+            consumer.get_tracked_pools().len(),
+            0,
+            "no pools should be tracked before first snapshot"
+        );
+
+        // A single save_cl_snapshot call must register the pool (fix #537).
+        consumer.save_cl_snapshot(&cl_addr);
+
+        let tracked = consumer.get_tracked_pools();
+        assert_eq!(tracked.len(), 1, "CL pool must appear in tracked pools");
+        assert!(
+            tracked.contains(&cl_addr),
+            "tracked pools must contain the CL pool address"
+        );
+
+        // Calling save_cl_snapshot again (different ledger timestamp) must not
+        // create a duplicate entry in TrackedPoolsPersistent.
+        env.ledger().set_timestamp(10_060);
+        consumer.save_cl_snapshot(&cl_addr);
+        assert_eq!(
+            consumer.get_tracked_pools().len(),
+            1,
+            "duplicate registration must be suppressed"
+        );
     }
 }

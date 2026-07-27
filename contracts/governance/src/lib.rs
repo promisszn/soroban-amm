@@ -656,7 +656,15 @@ impl Governance {
             .get(&DataKey::ProposalCount)
             .unwrap();
 
-        let snapshot_ledger = env.ledger().sequence();
+        // Snapshot the last already-closed ledger, never the current still-open
+        // one. LpToken::write_checkpoint overwrites (not appends) the checkpoint
+        // when a balance change lands in the same ledger, so using the current
+        // ledger would fold any mint/transfer included in this same ledger —
+        // even in a later transaction — into balance_at(holder, snapshot_ledger),
+        // letting an attacker inflate their snapshotted voting power. Any change
+        // at the current ledger or later is written at a ledger strictly greater
+        // than this snapshot and is therefore excluded.
+        let snapshot_ledger = env.ledger().sequence().saturating_sub(1);
 
         let proposal = Proposal {
             id,
@@ -2202,6 +2210,34 @@ mod tests {
         s.env.ledger().set_timestamp(proposal.execute_after + 1);
         gov.execute(&pid);
         assert_eq!(gov.proposal_status(&pid), ProposalStatus::Executed);
+    }
+
+    #[test]
+    fn test_propose_snapshot_excludes_same_ledger_mint() {
+        // Regression for #559: a mint landing in the *same* ledger as propose()
+        // (even in a later transaction) must not count toward snapshot voting
+        // power, because the snapshot is taken as of the last closed ledger.
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        let proposer = Address::generate(&s.env);
+        let attacker = Address::generate(&s.env);
+        mint_lp(&s, &proposer, 600);
+
+        // Advance to a real (non-genesis) ledger and create the proposal there.
+        s.env.ledger().with_mut(|l| l.sequence_number = 100);
+        let pid = gov.propose(&proposer, &ProposalKind::UpdateFee(50));
+
+        // Same ledger, later transaction: attacker acquires LP.
+        mint_lp(&s, &attacker, 1_000);
+
+        // The same-ledger acquisition is excluded from the snapshot.
+        assert_eq!(gov.get_snapshot_balance(&pid, &attacker), 0);
+        assert!(gov.try_vote(&attacker, &pid, &Vote::For).is_err());
+
+        // The proposer, who held their balance in an earlier closed ledger,
+        // retains their legitimate voting power.
+        assert_eq!(gov.get_snapshot_balance(&pid, &proposer), 600);
     }
 
     #[test]

@@ -131,16 +131,24 @@ impl LpToken {
             .persistent()
             .extend_ttl(&key, Self::MIN_TTL, Self::BUMP_TO);
 
-        // Keep the truncation flag's TTL in lockstep with the checkpoints it
-        // guards. If it were allowed to expire while checkpoints survive, a
-        // pre-window query would silently return 0 again — the exact bug.
-        let trunc_key = DataKey::CheckpointsTruncated(id);
-        let truncated: bool = env.storage().persistent().get(&trunc_key).unwrap_or(false);
-        if truncated {
-            env.storage()
-                .persistent()
-                .extend_ttl(&trunc_key, Self::MIN_TTL, Self::BUMP_TO);
-        }
+        // The truncation flag is written only inside the eviction branch, which
+        // fires exclusively once the list has reached `MAX_CHECKPOINTS` (and the
+        // list then stays at capacity). Below capacity the flag is provably
+        // absent, so we skip the storage read entirely and only probe — and keep
+        // its TTL in lockstep with the checkpoints it guards — when a query could
+        // actually have been truncated.
+        let truncated: bool = if len >= Self::MAX_CHECKPOINTS {
+            let trunc_key = DataKey::CheckpointsTruncated(id);
+            let t: bool = env.storage().persistent().get(&trunc_key).unwrap_or(false);
+            if t {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&trunc_key, Self::MIN_TTL, Self::BUMP_TO);
+            }
+            t
+        } else {
+            false
+        };
 
         let mut low = 0;
         let mut high = len;
@@ -435,9 +443,7 @@ impl LpToken {
                 last.balance = balance;
                 checkpoints.set(last_idx, last);
                 env.storage().persistent().set(&key, &checkpoints);
-                env.storage()
-                    .persistent()
-                    .extend_ttl(&key, Self::MIN_TTL, Self::BUMP_TO);
+                Self::bump_checkpoint_ttl(env, account, checkpoints.len());
                 return;
             }
         }
@@ -456,15 +462,37 @@ impl LpToken {
             if !env.storage().persistent().has(&trunc_key) {
                 env.storage().persistent().set(&trunc_key, &true);
             }
+        }
+        checkpoints.push_back(Checkpoint { ledger, balance });
+        env.storage().persistent().set(&key, &checkpoints);
+        Self::bump_checkpoint_ttl(env, account, checkpoints.len());
+    }
+
+    /// Extends the TTL of an account's checkpoint list and, when present, its
+    /// truncation flag, keeping the two entries alive together so `balance_at`
+    /// never sees checkpoints without the flag that guards them.
+    ///
+    /// `checkpoint_count` is the post-write length of the list. The truncation
+    /// flag can only exist once the list has reached `MAX_CHECKPOINTS` (it is set
+    /// exclusively in the eviction branch, after which the list stays at
+    /// capacity), so below capacity the flag is provably absent and we skip the
+    /// storage probe entirely — keeping the common write path free of the extra
+    /// read that would otherwise run on every checkpoint.
+    fn bump_checkpoint_ttl(env: &Env, account: &Address, checkpoint_count: u32) {
+        env.storage().persistent().extend_ttl(
+            &DataKey::Checkpoints(account.clone()),
+            Self::MIN_TTL,
+            Self::BUMP_TO,
+        );
+        if checkpoint_count < Self::MAX_CHECKPOINTS {
+            return;
+        }
+        let trunc_key = DataKey::CheckpointsTruncated(account.clone());
+        if env.storage().persistent().has(&trunc_key) {
             env.storage()
                 .persistent()
                 .extend_ttl(&trunc_key, Self::MIN_TTL, Self::BUMP_TO);
         }
-        checkpoints.push_back(Checkpoint { ledger, balance });
-        env.storage().persistent().set(&key, &checkpoints);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, Self::MIN_TTL, Self::BUMP_TO);
     }
 }
 

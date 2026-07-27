@@ -31,6 +31,7 @@ pub enum MigrationError {
     InvalidRange = 5,
     SlippageExceeded = 6,
     MigrationFailed = 7,
+    TokenMismatch = 8,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -94,6 +95,9 @@ pub trait V3PoolInterface {
     ) -> Result<i128, soroban_sdk::Error>;
 
     fn get_current_tick(env: Env) -> i32;
+
+    /// Returns the V3 pool's token pair (token_a, token_b).
+    fn get_tokens(env: Env) -> (Address, Address);
 }
 
 // ── Migration result ──────────────────────────────────────────────────────────
@@ -142,6 +146,18 @@ impl MigrationContract {
             return Err(MigrationError::AlreadyInitialized);
         }
         admin.require_auth();
+
+        // Verify V2 and V3 pools trade the same token pair.
+        let v2_client = V2PoolClient::new(&env, &v2_pool);
+        let v2_info = v2_client.get_info();
+        let v3_client = V3PoolClient::new(&env, &v3_pool);
+        let (v3_token_a, v3_token_b) = v3_client.get_tokens();
+        if !((v2_info.token_a == v3_token_a && v2_info.token_b == v3_token_b)
+            || (v2_info.token_a == v3_token_b && v2_info.token_b == v3_token_a))
+        {
+            return Err(MigrationError::TokenMismatch);
+        }
+
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::V2Pool, &v2_pool);
         env.storage().instance().set(&DataKey::V3Pool, &v3_pool);
@@ -194,18 +210,25 @@ impl MigrationContract {
         let v2_pool: Address = env.storage().instance().get(&DataKey::V2Pool).unwrap();
         let v3_pool: Address = env.storage().instance().get(&DataKey::V3Pool).unwrap();
 
-        // ── Step 1: withdraw from V2 ─────────────────────────────────────────
+        // ── Step 0: verify V2 and V3 pools trade the same pair ──────────────
         let v2_client = V2PoolClient::new(&env, &v2_pool);
         let pool_info = v2_client.get_info();
         let token_a = pool_info.token_a.clone();
         let token_b = pool_info.token_b.clone();
 
-        // Remove liquidity from V2; tokens land in provider's wallet.
+        let v3_client = V3PoolClient::new(&env, &v3_pool);
+        let (v3_token_a, v3_token_b) = v3_client.get_tokens();
+        if !((token_a == v3_token_a && token_b == v3_token_b)
+            || (token_a == v3_token_b && token_b == v3_token_a))
+        {
+            return Err(MigrationError::TokenMismatch);
+        }
+
+        // ── Step 1: withdraw from V2 ─────────────────────────────────────────
         let (received_a, received_b) =
             v2_client.remove_liquidity(&provider, &v2_shares, &min_a, &min_b, &deadline);
 
         // ── Step 2: compute optimal V3 tick range ────────────────────────────
-        let v3_client = V3PoolClient::new(&env, &v3_pool);
         let (final_tick_lower, final_tick_upper) =
             Self::compute_range(&env, &v3_client, tick_lower, tick_upper, range_width_ticks)?;
 
@@ -242,6 +265,14 @@ impl MigrationContract {
             &deadline,
             &true, // fee_discount: migration incentive
         );
+
+        // ── Revoke approvals granted to v3_pool (fix #542) ────────────────────
+        // Setting amount=0 with any expiry revokes the allowance. A ledger of 0
+        // is only valid when the amount is 0 (SEP-41 permits it), so we use the
+        // current ledger sequence which is always valid.
+        let revoke_expiry = env.ledger().sequence();
+        ta_client.approve(&contract_addr, &v3_pool, &0, &revoke_expiry);
+        tb_client.approve(&contract_addr, &v3_pool, &0, &revoke_expiry);
 
         // ── Step 4: refund leftover dust to provider ──────────────────────────
         // Computed as the call-scoped delta, not the contract's absolute

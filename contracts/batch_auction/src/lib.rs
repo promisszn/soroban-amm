@@ -492,6 +492,10 @@ impl BatchAuction {
                         );
                     } else {
                         results.push_back(amount_out);
+                        env.events().publish(
+                            (Symbol::new(&env, "order_settled"), order.trader.clone()),
+                            (order_id, amount_out),
+                        );
                     }
                 }
                 Err(()) => {

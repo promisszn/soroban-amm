@@ -400,11 +400,13 @@ impl Staking {
     pub fn stake_locked(env: Env, staker: Address, amount: i128, lock_duration_secs: u64) {
         assert!(!Self::is_paused(env.clone()), "contract is paused");
         staker.require_auth();
-        assert!(amount > 0, "amount must be positive");
+        assert!(amount > 0 || lock_duration_secs > 0, "nothing to do: amount or lock duration required");
 
-        let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
-        let pool_addr = env.current_contract_address();
-        SepTokenClient::new(&env, &lp_token).transfer(&staker, &pool_addr, &amount);
+        if amount > 0 {
+            let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
+            let pool_addr = env.current_contract_address();
+            SepTokenClient::new(&env, &lp_token).transfer(&staker, &pool_addr, &amount);
+        }
 
         // Settle any pending rewards before changing effective stake.
         Self::_settle_pending(&env, &staker);
@@ -1162,6 +1164,77 @@ mod tests {
         let (lp_returned, rewards) = staking.unstake(&staker, &1_000_i128);
         assert_eq!(lp_returned, 1_000);
         assert!(rewards > 0);
+    }
+
+    #[test]
+    /// Post-expiry re-lock: stake with a lock, let it expire, then re-lock
+    /// without adding new LP (amount = 0, lock_duration > 0).
+    fn test_relock_post_expiry() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, staker, staking) = setup(&env);
+
+        // Stake with a lock
+        let stake_amount = 1_000_i128;
+        staking.stake_locked(&staker, &stake_amount, &MIN_LOCK_DURATION);
+
+        let pos_before = staking.get_locked_position(&staker);
+        assert!(pos_before.lock_expiry > 0);
+        assert!(pos_before.boost_multiplier > BOOST_SCALE);
+
+        // Advance time past lock expiry
+        env.ledger().with_mut(|l| {
+            l.timestamp = l.timestamp + MIN_LOCK_DURATION + 1;
+        });
+
+        // After expiry, the stored boost hasn't changed (it's only updated on
+        // write), but the lock_expiry is in the past so _boost_for_remaining
+        // would return min_boost if called now — which is what the re-lock
+        // below will replace.
+
+        // Re-lock the same stake without adding new LP
+        staking.stake_locked(&staker, &0_i128, &MIN_LOCK_DURATION);
+
+        let pos_after = staking.get_locked_position(&staker);
+        assert!(pos_after.boost_multiplier > BOOST_SCALE, "boost should be restored");
+        assert!(pos_after.lock_expiry > env.ledger().timestamp(), "lock expiry should be in the future");
+        assert_eq!(pos_after.amount, stake_amount, "staked amount should be unchanged");
+    }
+
+    #[test]
+    /// Zero amount without lock duration should panic.
+    fn test_stake_locked_zero_amount_no_lock_panics() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, staker, staking) = setup(&env);
+
+        staking.stake(&staker, &1_000_i128);
+
+        let result = staking.try_stake_locked(&staker, &0_i128, &0_u64);
+        assert!(result.is_err(), "should panic: nothing to do");
+    }
+
+    #[test]
+    /// A staker with no lock can acquire one on existing stake via amount=0.
+    fn test_no_lock_to_locked_via_zero_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, staker, staking) = setup(&env);
+
+        // Stake without a lock
+        staking.stake(&staker, &1_000_i128);
+
+        let pos_before = staking.get_locked_position(&staker);
+        assert_eq!(pos_before.boost_multiplier, BOOST_SCALE);
+        assert_eq!(pos_before.lock_expiry, 0);
+
+        // Acquire a lock on existing stake
+        staking.stake_locked(&staker, &0_i128, &MIN_LOCK_DURATION);
+
+        let pos_after = staking.get_locked_position(&staker);
+        assert!(pos_after.boost_multiplier > BOOST_SCALE);
+        assert!(pos_after.lock_expiry > 0);
+        assert_eq!(pos_after.amount, 1_000);
     }
 
     #[test]
