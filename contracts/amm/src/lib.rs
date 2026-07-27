@@ -477,6 +477,7 @@ impl AmmPool {
     /// Admin-only, callable via a timed governance proposal.
     pub fn emergency_withdraw(env: Env, to: Address) -> Result<(), AmmError> {
         Self::extend_ttl(&env);
+        Self::enter_lock(&env)?;
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
@@ -533,7 +534,7 @@ impl AmmPool {
             (Symbol::new(&env, "emergency_withdraw"), admin.clone()),
             (to, reserve_a, reserve_b)
         );
-
+        Self::exit_lock(&env);
         Ok(())
     }
 
@@ -986,6 +987,7 @@ impl AmmPool {
     /// Any signer may call this after enough approvals have been collected.
     pub fn exec_multisig_emergency_wd(env: Env, signer: Address) -> Result<(), AmmError> {
         Self::extend_ttl(&env);
+        Self::enter_lock(&env)?;
         signer.require_auth();
         let quorum: u32 = env
             .storage()
@@ -1074,6 +1076,7 @@ impl AmmPool {
             (Symbol::new(&env, "ms_ew"), signer),
             (to, reserve_a, reserve_b)
         );
+        Self::exit_lock(&env);
         Ok(())
     }
 
@@ -1414,10 +1417,8 @@ impl AmmPool {
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
-        // Block reentrant calls from flash loan receivers.
-        if Self::is_locked(&env) {
-            return Err(AmmError::Reentrant);
-        }
+        // Acquire reentrancy lock for the duration of state changes.
+        Self::enter_lock(&env)?;
         provider.require_auth();
         if amount_a <= 0 || amount_b <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -1502,6 +1503,7 @@ impl AmmPool {
             (amount_a, amount_b, shares_to_provider)
         );
 
+        Self::exit_lock(&env);
         Ok(shares_to_provider)
     }
 
@@ -1546,10 +1548,8 @@ impl AmmPool {
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
-        // Block reentrant calls from flash loan receivers.
-        if Self::is_locked(&env) {
-            return Err(AmmError::Reentrant);
-        }
+        // Acquire reentrancy lock for the duration of state changes.
+        Self::enter_lock(&env)?;
         provider.require_auth();
         if shares <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -1602,6 +1602,7 @@ impl AmmPool {
             (provider.clone(), shares, out_a, out_b)
         );
 
+        Self::exit_lock(&env);
         Ok((out_a, out_b))
     }
 
@@ -1647,10 +1648,8 @@ impl AmmPool {
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
-        // Block reentrant calls from flash loan receivers.
-        if Self::is_locked(&env) {
-            return Err(AmmError::Reentrant);
-        }
+        // Acquire reentrancy lock for the duration of state changes.
+        Self::enter_lock(&env)?;
         provider.require_auth();
         if shares <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -1814,6 +1813,7 @@ impl AmmPool {
             (provider.clone(), shares, token_out.clone(), total_out)
         );
 
+        Self::exit_lock(&env);
         Ok(total_out)
     }
 
@@ -1862,10 +1862,8 @@ impl AmmPool {
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
-        // Block reentrant calls from flash loan receivers.
-        if Self::is_locked(&env) {
-            return Err(AmmError::Reentrant);
-        }
+        // Acquire reentrancy lock for the duration of state changes.
+        Self::enter_lock(&env)?;
         trader.require_auth();
         if amount_in <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -1984,6 +1982,7 @@ impl AmmPool {
             (token_in, amount_in, token_out, amount_out)
         );
 
+        Self::exit_lock(&env);
         Ok(amount_out)
     }
 
@@ -2023,10 +2022,8 @@ impl AmmPool {
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
-        // Block reentrant calls from flash loan receivers.
-        if Self::is_locked(&env) {
-            return Err(AmmError::Reentrant);
-        }
+        // Acquire reentrancy lock for the duration of state changes.
+        Self::enter_lock(&env)?;
         trader.require_auth();
         if amount_out <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -2136,6 +2133,7 @@ impl AmmPool {
             (token_in, amount_in, token_out, amount_out)
         );
 
+        Self::exit_lock(&env);
         Ok(amount_in)
     }
 
@@ -2147,6 +2145,7 @@ impl AmmPool {
     /// Returns `(fee_a_withdrawn, fee_b_withdrawn)`.
     pub fn withdraw_protocol_fees(env: Env) -> Result<(i128, i128), AmmError> {
         Self::extend_ttl(&env);
+        Self::enter_lock(&env)?;
         let fee_recipient: Address = env
             .storage()
             .instance()
@@ -2186,6 +2185,7 @@ impl AmmPool {
             env.storage().instance().set(&DataKey::AccruedFeeB, &0_i128);
         }
 
+        Self::exit_lock(&env);
         Ok((fee_a, fee_b))
     }
 
@@ -2576,9 +2576,8 @@ impl AmmPool {
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
-        if Self::is_locked(&env) {
-            return Err(AmmError::Reentrant);
-        }
+        // Acquire reentrancy lock for the duration of state changes.
+        Self::enter_lock(&env)?;
         trader.require_auth();
         if amount_in <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -2703,6 +2702,7 @@ impl AmmPool {
             (token_in, actual_received, token_out, amount_out, referrer)
         );
 
+        Self::exit_lock(&env);
         Ok((amount_out, actual_received))
     }
 
@@ -2734,9 +2734,8 @@ impl AmmPool {
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
-        if Self::is_locked(&env) {
-            return Err(AmmError::Reentrant);
-        }
+        // Acquire reentrancy lock for the duration of state changes.
+        Self::enter_lock(&env)?;
         provider.require_auth();
         if amount_a <= 0 || amount_b <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -2805,6 +2804,7 @@ impl AmmPool {
             (actual_a, actual_b, shares)
         );
 
+        Self::exit_lock(&env);
         Ok(shares)
     }
 
