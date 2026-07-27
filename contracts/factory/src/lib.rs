@@ -240,8 +240,6 @@ impl Factory {
 
         if permissionless {
             caller.require_auth();
-            Self::check_and_update_rate_limit(&env, &caller)?;
-            Self::charge_pool_creation_fee(&env, &caller, &admin)?;
         } else {
             admin.require_auth();
         }
@@ -263,6 +261,11 @@ impl Factory {
             .has(&DataKey::Pool(ta.clone(), tb.clone()))
         {
             return Err(FactoryError::PoolAlreadyExists);
+        }
+
+        if permissionless {
+            Self::check_and_update_rate_limit(&env, &caller)?;
+            Self::charge_pool_creation_fee(&env, &caller, &admin)?;
         }
 
         let amm_wasm: BytesN<32> = env.storage().instance().get(&DataKey::AmmWasmHash).unwrap();
@@ -509,8 +512,6 @@ impl Factory {
 
         if permissionless {
             caller.require_auth();
-            Self::check_and_update_rate_limit(&env, &caller)?;
-            Self::charge_pool_creation_fee(&env, &caller, &admin)?;
         } else {
             admin.require_auth();
         }
@@ -529,6 +530,11 @@ impl Factory {
         let cl_key = DataKey::ClPool(ta.clone(), tb.clone(), fee_bps);
         if env.storage().persistent().has(&cl_key) {
             return Err(FactoryError::ClPoolAlreadyExists);
+        }
+
+        if permissionless {
+            Self::check_and_update_rate_limit(&env, &caller)?;
+            Self::charge_pool_creation_fee(&env, &caller, &admin)?;
         }
 
         let cl_wasm: BytesN<32> = env
