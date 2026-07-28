@@ -7,8 +7,9 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol,
+    contract, contracterror, contractimpl, contracttype, token, Address, Env, Symbol, panic_with_error,
 };
+
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -23,6 +24,108 @@ pub enum VestingError {
     InvalidSchedule = 6,
     NotBeneficiary = 7,
     NoPendingGovernance = 8,
+}
+
+// 1. Define a specific error for underfunding
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+pub enum VestingError {
+    Underfunded = 1,
+    InvalidSchedule = 2,
+}
+
+#[derive(Clone)]
+#[contracttype]
+pub enum DataKey {
+    Admin,
+    Vesting(Address), // Map user to schedule
+    TotalObligations, // New: Tracks sum of all totals committed
+}
+
+// ... inside the contract implementation ...
+
+pub fn create_vesting(
+    e: Env,
+    lp_token: Address,
+    beneficiary: Address,
+    start_ledger: u32,
+    cliff_ledger: u32,
+    end_ledger: u32,
+    total: i128,
+) {
+    // A: Existing Validations
+    if !(cliff_ledger >= start_ledger && end_ledger > cliff_ledger && total > 0) {
+        panic_with_error!(&e, VestingError::InvalidSchedule);
+    }
+
+    // B: COLLATERAL CHECK (The Fix for #551)
+    let token_client = token::Client::new(&e, &lp_token);
+    let contract_balance = token_client.balance(&e.current_contract_address());
+    
+    // Get current total obligations from storage
+    let mut current_obligations: i128 = e.storage().instance().get(&DataKey::TotalObligations).unwrap_or(0);
+
+    // Ensure contract holds enough tokens to back all existing schedules PLUS this new one
+    let required_total = current_obligations.checked_add(total).expect("Overflow");
+    
+    if contract_balance < required_total {
+        // Distinguish between "Logic error" and "Underfunded contract"
+        panic_with_error!(&e, VestingError::Underfunded);
+    }
+
+    // C: Update accounting and save
+    current_obligations = required_total;
+    e.storage().instance().set(&DataKey::TotalObligations, &current_obligations);
+
+    // ... save the schedule (DataKey::Vesting(beneficiary)) as before ...
+}
+
+pub fn release(e: Env, beneficiary: Address) {
+    // ... logic to calculate 'amount_to_release' ...
+
+    // D: Decrease obligations on transfer
+    if amount_to_release > 0 {
+        let mut obligations: i128 = e.storage().instance().get(&DataKey::TotalObligations).unwrap_or(0);
+        obligations = obligations.checked_sub(amount_to_release).expect("Underflow");
+        e.storage().instance().set(&DataKey::TotalObligations, &obligations);
+
+        // Perform token transfer
+        // token_client.transfer(&e.current_contract_address(), &beneficiary, &amount_to_release);
+    }
+}
+3. Unit Test: contracts/pol_vesting/src/test.rs
+You must add a test that verifies the contract rejects schedule creation if the tokens haven't been transferred yet.
+code
+Rust
+#[test]
+#[should_panic(expected = "Error(Contract, #1)")] // VestingError::Underfunded
+fn test_create_vesting_underfunded_rejection() {
+    let e = Env::default();
+    let admin = Address::generate(&e);
+    let user = Address::generate(&e);
+    let lp_token = e.register_stellar_asset_contract(admin.clone());
+    
+    let client = PolVestingClient::new(&e, &e.register_contract(None, PolVesting));
+    client.initialize(&admin, &lp_token);
+
+    // The contract has 0 balance of lp_token. 
+    // Trying to create a vesting for 100 should panic.
+    client.create_vesting(&user, &0, &10, &100, &100);
+}
+
+#[test]
+fn test_create_vesting_success_after_transfer() {
+    let e = Env::default();
+    // ... standard setup ...
+    
+    // Admin transfers 100 LP tokens to the contract first
+    token::Client::new(&e, &lp_token).mint(&client.address, &100);
+
+    // Now creating vesting for 100 should succeed
+    client.create_vesting(&user, &0, &10, &100, &100);
+    
+    // Assert obligations are 100
+    // ...
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
