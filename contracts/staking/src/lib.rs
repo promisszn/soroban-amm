@@ -400,10 +400,7 @@ impl Staking {
     pub fn stake_locked(env: Env, staker: Address, amount: i128, lock_duration_secs: u64) {
         assert!(!Self::is_paused(env.clone()), "contract is paused");
         staker.require_auth();
-        assert!(
-            amount > 0 || lock_duration_secs > 0,
-            "nothing to do: amount or lock duration required"
-        );
+        assert!(amount > 0 || lock_duration_secs > 0, "nothing to do: amount or lock duration required");
 
         if amount > 0 {
             let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
@@ -1199,18 +1196,9 @@ mod tests {
         staking.stake_locked(&staker, &0_i128, &MIN_LOCK_DURATION);
 
         let pos_after = staking.get_locked_position(&staker);
-        assert!(
-            pos_after.boost_multiplier > BOOST_SCALE,
-            "boost should be restored"
-        );
-        assert!(
-            pos_after.lock_expiry > env.ledger().timestamp(),
-            "lock expiry should be in the future"
-        );
-        assert_eq!(
-            pos_after.amount, stake_amount,
-            "staked amount should be unchanged"
-        );
+        assert!(pos_after.boost_multiplier > BOOST_SCALE, "boost should be restored");
+        assert!(pos_after.lock_expiry > env.ledger().timestamp(), "lock expiry should be in the future");
+        assert_eq!(pos_after.amount, stake_amount, "staked amount should be unchanged");
     }
 
     #[test]

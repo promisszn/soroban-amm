@@ -408,8 +408,7 @@ impl<'a> AmmPoolSdk<'a> {
         amount_b: i128,
         data: Bytes,
     ) -> Result<(i128, i128), SdkAmmError> {
-        Ok(self
-            .client
+        Ok(self.client
             .flash_loan(receiver, &amount_a, &amount_b, &data))
     }
 }

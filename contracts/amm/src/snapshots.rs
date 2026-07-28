@@ -22,11 +22,7 @@ pub fn snapshot_position(env: &Env) {
     let total_shares = super::AmmPool::get_total_shares(env.clone());
     let (accrued_a, accrued_b) = super::AmmPool::get_accrued_fees_internal(env.clone());
 
-    let price = if reserve_a > 0 {
-        reserve_b * 1_000_000 / reserve_a
-    } else {
-        0
-    };
+    let price = if reserve_a > 0 { reserve_b * 1_000_000 / reserve_a } else { 0 };
     let low = price * 9 / 10;
     let high = price * 11 / 10;
     let snap = Snapshot {
@@ -45,9 +41,7 @@ pub fn snapshot_position(env: &Env) {
         snaps.remove(0);
     }
     snaps.push_back(snap);
-    env.storage()
-        .instance()
-        .set(&super::DataKey::Snapshots, &snaps);
+    env.storage().instance().set(&super::DataKey::Snapshots, &snaps);
 }
 
 pub fn get_snapshots(env: &Env) -> Vec<Snapshot> {

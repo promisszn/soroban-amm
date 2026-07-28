@@ -209,7 +209,7 @@ mod tests {
         let tb = env
             .register_stellar_asset_contract_v2(admin.clone())
             .address();
-
+        
         let factory = FactoryClient::new(env, factory_addr);
         factory.create_pool(&admin, &ta, &tb, &2_i128, &None);
         let pool = factory.get_pool(&ta, &tb).unwrap();
@@ -264,7 +264,7 @@ mod tests {
         let batch_addr = env.register_contract(None, BatchRouter);
         let batch_client = BatchRouterClient::new(&env, &batch_addr);
         batch_client.initialize(&factory_addr);
-
+        
         let deadline = env.ledger().timestamp() + 1000;
         let results = batch_client.execute_batch(&trader, &ops, &deadline);
 
@@ -439,7 +439,7 @@ mod tests {
         let batch_addr = env.register_contract(None, BatchRouter);
         let batch_client = BatchRouterClient::new(&env, &batch_addr);
         batch_client.initialize(&factory_addr);
-
+        
         batch_client.execute_batch(&trader, &ops, &deadline);
     }
 }

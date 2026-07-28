@@ -543,16 +543,10 @@ fn test_update_fee_works_with_zero_protocol_fee() {
     );
 
     // Both zero is valid.
-    assert!(
-        amm.try_update_fee(&0_i128).is_ok(),
-        "fee_bps=0 with protocol_fee=0 must be accepted"
-    );
+    assert!(amm.try_update_fee(&0_i128).is_ok(), "fee_bps=0 with protocol_fee=0 must be accepted");
 
     // Setting fee to any valid value when protocol is disabled is fine.
-    assert!(
-        amm.try_update_fee(&50_i128).is_ok(),
-        "fee_bps=50 with protocol_fee=0 must be accepted"
-    );
+    assert!(amm.try_update_fee(&50_i128).is_ok(), "fee_bps=50 with protocol_fee=0 must be accepted");
 }
 
 #[test]
@@ -1792,7 +1786,15 @@ fn test_fot_first_deposit_locks_minimum_liquidity() {
     // sqrt(2_000_000 * 2_000_000) = 2_000_000 shares.
     // After MINIMUM_LIQUIDITY lock, provider gets 2_000_000 - 1_000 = 1_999_000.
     let shares = amm
-        .try_add_liquidity_fot(&provider, &2_000_000, &2_000_000, &0, &0, &0, &u64::MAX)
+        .try_add_liquidity_fot(
+            &provider,
+            &2_000_000,
+            &2_000_000,
+            &0,
+            &0,
+            &0,
+            &u64::MAX,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(shares, 1_999_000);
@@ -1829,14 +1831,30 @@ fn test_fot_first_deposit_rejects_insufficient_shares() {
     // sqrt(1_000 * 1_000) = 1_000 shares → equal to MINIMUM_LIQUIDITY → rejected.
     ta_sac.mint(&provider, &1_000);
     tb_sac.mint(&provider, &1_000);
-    let result = amm.try_add_liquidity_fot(&provider, &1_000, &1_000, &0, &0, &0, &u64::MAX);
+    let result = amm.try_add_liquidity_fot(
+        &provider,
+        &1_000,
+        &1_000,
+        &0,
+        &0,
+        &0,
+        &u64::MAX,
+    );
     assert_eq!(result, Err(Ok(AmmError::InsufficientShares)));
 
     // Even smaller: sqrt(500 * 500) = 500 → rejected.
     let provider2 = Address::generate(&env);
     ta_sac.mint(&provider2, &500);
     tb_sac.mint(&provider2, &500);
-    let result2 = amm.try_add_liquidity_fot(&provider2, &500, &500, &0, &0, &0, &u64::MAX);
+    let result2 = amm.try_add_liquidity_fot(
+        &provider2,
+        &500,
+        &500,
+        &0,
+        &0,
+        &0,
+        &u64::MAX,
+    );
     assert_eq!(result2, Err(Ok(AmmError::InsufficientShares)));
 }
 
@@ -1865,7 +1883,15 @@ fn test_fot_subsequent_deposit_no_extra_lock() {
 
     // First deposit locks MINIMUM_LIQUIDITY.
     let shares1 = amm
-        .try_add_liquidity_fot(&provider, &2_000_000, &2_000_000, &0, &0, &0, &u64::MAX)
+        .try_add_liquidity_fot(
+            &provider,
+            &2_000_000,
+            &2_000_000,
+            &0,
+            &0,
+            &0,
+            &u64::MAX,
+        )
         .unwrap()
         .unwrap();
     assert_eq!(shares1, 1_999_000);
@@ -1874,7 +1900,15 @@ fn test_fot_subsequent_deposit_no_extra_lock() {
     ta_sac.mint(&provider, &1_000_000);
     tb_sac.mint(&provider, &1_000_000);
     let shares2 = amm
-        .try_add_liquidity_fot(&provider, &1_000_000, &1_000_000, &0, &0, &0, &u64::MAX)
+        .try_add_liquidity_fot(
+            &provider,
+            &1_000_000,
+            &1_000_000,
+            &0,
+            &0,
+            &0,
+            &u64::MAX,
+        )
         .unwrap()
         .unwrap();
 

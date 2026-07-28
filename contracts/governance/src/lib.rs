@@ -895,7 +895,8 @@ impl Governance {
                 // the proposal cannot be marked executed while pools remain
                 // untouched.
                 let pool_count: u64 = factory_client.get_pool_count();
-                let window_end: u64 = (params.offset as u64).saturating_add(params.limit as u64);
+                let window_end: u64 = (params.offset as u64)
+                    .saturating_add(params.limit as u64);
                 // Both conditions must hold:
                 //  - offset == 0: the window starts from the first pool
                 //  - window_end >= pool_count: the window reaches the last pool
@@ -2842,9 +2843,7 @@ mod tests {
     impl MockFactory {
         /// Store the pool count that this mock should report.
         pub fn set_pool_count(env: Env, count: u64) {
-            env.storage()
-                .instance()
-                .set(&Symbol::new(&env, "count"), &count);
+            env.storage().instance().set(&Symbol::new(&env, "count"), &count);
         }
 
         /// Return the number of pools set via `set_pool_count`.
@@ -2856,12 +2855,7 @@ mod tests {
         }
 
         /// Record that this was called so tests can assert it ran.
-        pub fn set_global_fee_paginated(
-            env: Env,
-            _admin: Address,
-            _offset: u32,
-            limit: u32,
-        ) -> u32 {
+        pub fn set_global_fee_paginated(env: Env, _admin: Address, _offset: u32, limit: u32) -> u32 {
             let prev: u32 = env
                 .storage()
                 .instance()
@@ -2962,12 +2956,7 @@ mod tests {
         let proposer = Address::generate(&env);
         token::LpTokenClient::new(&env, &lp_addr).mint(&proposer, &1_000_i128);
 
-        FactoryGovSuite {
-            env,
-            gov_addr,
-            proposer,
-            factory_addr,
-        }
+        FactoryGovSuite { env, gov_addr, proposer, factory_addr }
     }
 
     /// propose() must reject a proposal with limit == 0.

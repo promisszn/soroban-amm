@@ -185,7 +185,7 @@ pub fn decode_amm_event(
     topics: soroban_sdk::Vec<soroban_sdk::Val>,
     data: soroban_sdk::Val,
 ) -> Option<AmmEvent> {
-    use soroban_sdk::{IntoVal, Symbol, TryFromVal, TryIntoVal};
+    use soroban_sdk::{IntoVal, TryFromVal, TryIntoVal, Symbol};
 
     if topics.is_empty() {
         return None;
@@ -194,21 +194,15 @@ pub fn decode_amm_event(
     let symbol_val = topics.get(0)?;
     let symbol = Symbol::try_from_val(env, &symbol_val).ok()?;
 
-    let (version, payload_val): (u32, soroban_sdk::Val) =
-        TryFromVal::try_from_val(env, &data).ok()?;
+    let (version, payload_val): (u32, soroban_sdk::Val) = TryFromVal::try_from_val(env, &data).ok()?;
     if version != crate::EVENT_SCHEMA_VERSION {
         return None;
     }
 
     if symbol == Symbol::new(env, symbols::SWAP) {
         let trader: Address = topics.get(1)?.try_into_val(env).ok()?;
-        let (token_in, amount_in, token_out, amount_out, referrer): (
-            Address,
-            i128,
-            Address,
-            i128,
-            Option<Address>,
-        ) = TryFromVal::try_from_val(env, &payload_val).ok()?;
+        let (token_in, amount_in, token_out, amount_out, referrer): (Address, i128, Address, i128, Option<Address>) =
+            TryFromVal::try_from_val(env, &payload_val).ok()?;
         Some(AmmEvent::Swap(SwapEvent {
             trader,
             token_in,
@@ -239,14 +233,12 @@ pub fn decode_amm_event(
     } else if symbol == Symbol::new(env, symbols::REMOVE_LIQUIDITY_ONE_SIDED) {
         let (provider, shares_burned, token_out, total_out): (Address, i128, Address, i128) =
             TryFromVal::try_from_val(env, &payload_val).ok()?;
-        Some(AmmEvent::RemoveLiquidityOneSided(
-            RemoveLiquidityOneSidedEvent {
-                provider,
-                shares_burned,
-                token_out,
-                total_out,
-            },
-        ))
+        Some(AmmEvent::RemoveLiquidityOneSided(RemoveLiquidityOneSidedEvent {
+            provider,
+            shares_burned,
+            token_out,
+            total_out,
+        }))
     } else if symbol == Symbol::new(env, symbols::FLASH_LOAN) {
         let receiver: Address = topics.get(1)?.try_into_val(env).ok()?;
         let (token, amount, fee): (Address, i128, i128) =
@@ -259,15 +251,14 @@ pub fn decode_amm_event(
         }))
     } else if symbol == Symbol::new(env, symbols::FEE_UPDATED) {
         let admin: Address = topics.get(1)?.try_into_val(env).ok()?;
-        let (new_fee_bps,): (i128,) = TryFromVal::try_from_val(env, &payload_val).ok()?;
+        let (new_fee_bps,): (i128,) =
+            TryFromVal::try_from_val(env, &payload_val).ok()?;
         Some(AmmEvent::FeeUpdated(FeeUpdatedEvent { admin, new_fee_bps }))
     } else if symbol == Symbol::new(env, symbols::FLASH_FEE_UPDATED) {
         let admin: Address = topics.get(1)?.try_into_val(env).ok()?;
-        let (new_fee_bps,): (i128,) = TryFromVal::try_from_val(env, &payload_val).ok()?;
-        Some(AmmEvent::FlashFeeUpdated(FlashFeeUpdatedEvent {
-            admin,
-            new_fee_bps,
-        }))
+        let (new_fee_bps,): (i128,) =
+            TryFromVal::try_from_val(env, &payload_val).ok()?;
+        Some(AmmEvent::FlashFeeUpdated(FlashFeeUpdatedEvent { admin, new_fee_bps }))
     } else if symbol == Symbol::new(env, symbols::ADMIN_NOMINATED) {
         let (current_admin, new_admin): (Address, Address) =
             TryFromVal::try_from_val(env, &payload_val).ok()?;
