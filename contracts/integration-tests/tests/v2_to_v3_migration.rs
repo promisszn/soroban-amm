@@ -156,6 +156,20 @@ impl<'a> Fixture<'a> {
         let migration = MigrationContractClient::new(env, &migration_addr);
         migration.initialize(&admin, &v2_addr, &v3_addr);
 
+        // Pre-approve migration contract to pull LP's withdrawn tokens via transfer_from (Issue #519)
+        ta.approve(
+            &lp,
+            &migration_addr,
+            &i128::MAX,
+            &(env.ledger().sequence() + 1000),
+        );
+        tb.approve(
+            &lp,
+            &migration_addr,
+            &i128::MAX,
+            &(env.ledger().sequence() + 1000),
+        );
+
         Fixture {
             env: env.clone(),
             lp,
@@ -505,4 +519,48 @@ fn test_approval_revoked_after_migrate() {
         100_i128,
         "migration contract must not retain token_b from the migration"
     );
+}
+
+// ── Test 9: Reserve movement within slippage tolerance (Issue #519) ─────────
+//
+// Verifies that when pool reserves shift between simulation/quote time and
+// actual execution (e.g. another trader executes a swap), the migration still
+// succeeds as long as outputs remain above min_a and min_b.
+
+#[test]
+fn test_reserve_movement_within_slippage_tolerance_succeeds() {
+    let env = Env::default();
+    let f = Fixture::setup(&env);
+
+    let trader = Address::generate(&env);
+    f.token_a_sac.mint(&trader, &500_000_i128);
+
+    let lp_shares = f.v2_lp.balance(&f.lp);
+    assert!(lp_shares > 0);
+
+    // Trader executes a swap on V2, changing reserves prior to migration execution
+    f.v2.swap(
+        &trader,
+        &f.token_a.address,
+        &100_000_i128,
+        &0_i128,
+        &DEADLINE,
+    );
+
+    // LP executes migration with slippage bounds (min_a = 0, min_b = 0)
+    let result = f.migration.migrate(
+        &f.lp,
+        &lp_shares,
+        &0_i128,
+        &0_i128,
+        &i32::MIN,
+        &i32::MAX,
+        &500_i32,
+        &0_i128,
+        &DEADLINE,
+    );
+
+    assert_eq!(result.position_id, 42_i128);
+    assert_eq!(f.v2_lp.balance(&f.lp), 0);
+    assert!(result.deposited_a > 0 || result.deposited_b > 0);
 }

@@ -2816,12 +2816,10 @@ impl AmmPool {
         env.storage()
             .instance()
             .set(&DataKey::ReserveB, &(reserve_b + actual_b));
-        env.storage()
-            .instance()
-            .set(
-                &DataKey::TotalShares,
-                &(total_shares + shares_to_provider + shares_locked),
-            );
+        env.storage().instance().set(
+            &DataKey::TotalShares,
+            &(total_shares + shares_to_provider + shares_locked),
+        );
 
         let lp_client = LpTokenClient::new(&env, &lp_token);
         if shares_locked > 0 {

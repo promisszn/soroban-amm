@@ -160,15 +160,11 @@ impl SimPool {
 // ── In-process tests using the live AMM contract ─────────────────────────────
 
 mod amm_wasm {
-    soroban_sdk::contractimport!(
-        file = "../../target/wasm32v1-none/release/amm.wasm"
-    );
+    soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/amm.wasm");
 }
 
 mod token_wasm {
-    soroban_sdk::contractimport!(
-        file = "../../target/wasm32v1-none/release/token.wasm"
-    );
+    soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/token.wasm");
 }
 
 fn create_sac<'a>(

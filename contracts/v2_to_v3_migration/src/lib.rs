@@ -233,7 +233,9 @@ impl MigrationContract {
             Self::compute_range(&env, &v3_client, tick_lower, tick_upper, range_width_ticks)?;
 
         // ── Step 3: deposit into V3 with fee discount for migrating LPs ──────
-        // Provider transfers tokens to this contract so we can forward them.
+        // We use transfer_from to pull the dynamically-computed withdrawal amounts
+        // from provider without requiring an exact-amount authorization entry that
+        // would fail if pool reserves move within slippage tolerance (Issue #519).
         let ta_client = TokenClient::new(&env, &token_a);
         let tb_client = TokenClient::new(&env, &token_b);
         let contract_addr = env.current_contract_address();
@@ -244,8 +246,8 @@ impl MigrationContract {
         let balance_a_before = ta_client.balance(&contract_addr);
         let balance_b_before = tb_client.balance(&contract_addr);
 
-        ta_client.transfer(&provider, &contract_addr, &received_a);
-        tb_client.transfer(&provider, &contract_addr, &received_b);
+        ta_client.transfer_from(&contract_addr, &provider, &contract_addr, &received_a);
+        tb_client.transfer_from(&contract_addr, &provider, &contract_addr, &received_b);
 
         // Approve V3 pool to pull from this contract.
         // live_until_ledger must be >= current ledger sequence when amount > 0.
@@ -356,9 +358,11 @@ impl MigrationContract {
             let current_tick = v3_client.get_current_tick();
             // Align to tick spacing of 1 (V3 implementations may enforce spacing;
             // callers should pass a width that is a multiple of their pool's spacing).
-            let lower = current_tick.checked_sub(range_width_ticks)
+            let lower = current_tick
+                .checked_sub(range_width_ticks)
                 .ok_or(MigrationError::InvalidRange)?;
-            let upper = current_tick.checked_add(range_width_ticks)
+            let upper = current_tick
+                .checked_add(range_width_ticks)
                 .ok_or(MigrationError::InvalidRange)?;
             return Ok((lower, upper));
         }
