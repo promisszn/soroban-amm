@@ -363,6 +363,7 @@ impl IncentiveCampaigns {
         Self::checkpoint_campaign_rewards(&env, campaign_id, &campaign, env.ledger().timestamp());
         campaign.reward_rate = new_rate;
         env.storage().persistent().set(&campaign_key, &campaign);
+        extend_persistent_ttl(&env, &campaign_key);
 
         env.events().publish(
             (Symbol::new(&env, "rate_updated"),),
@@ -407,6 +408,7 @@ impl IncentiveCampaigns {
         // recipient from having tokens transferred twice.
         campaign.active = false;
         env.storage().persistent().set(&campaign_key, &campaign);
+        extend_persistent_ttl(&env, &campaign_key);
 
         let contract = env.current_contract_address();
         TokenClient::new(&env, &campaign.reward_token).transfer(&contract, &recipient, &leftover);
@@ -732,7 +734,7 @@ mod tests {
     use super::*;
     use amm::{AmmPool, AmmPoolClient};
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
+        testutils::{storage::Persistent as _, Address as _, Ledger},
         token::StellarAssetClient,
         Address, Env,
     };
@@ -1216,5 +1218,100 @@ mod tests {
         // t=3_000..4_000 @ 100 = 100_000 pool rewards
         // Provider's cumulative share is 499_500, so 99_900 remains claimable.
         assert_eq!(second_claim, 99_900);
+    }
+
+    // -------------------------------------------------------------------------
+    // Bug #548: persistent campaign entries must bump TTL (like pol_vesting)
+    // -------------------------------------------------------------------------
+
+    /// Creating a campaign, claiming rewards, and reading audit records must
+    /// extend persistent TTLs so long-running campaigns are not archived.
+    #[test]
+    fn test_persistent_entries_extend_ttl_on_write_and_read() {
+        let (env, incentives, pool, lp, reward, provider, gov_addr) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+
+        let id = client.create_campaign(
+            &gov_addr, &pool, &lp, &reward, &1_000, &5_000, &100, &1_000_000,
+        );
+
+        // After create: Campaign, index, and accrual keys must be bumped.
+        env.as_contract(&incentives, || {
+            let campaign_ttl = env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::Campaign(id));
+            let index_ttl = env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::CampaignIdByIndex(id - 1));
+            let accrued_ttl = env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::CampaignAccruedRewards(id));
+            let last_accrual_ttl = env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::CampaignLastAccrualTime(id));
+            assert!(
+                campaign_ttl >= BUMP_TO - 1,
+                "Campaign TTL {campaign_ttl} should be bumped toward BUMP_TO"
+            );
+            assert!(
+                index_ttl >= BUMP_TO - 1,
+                "CampaignIdByIndex TTL {index_ttl} should be bumped toward BUMP_TO"
+            );
+            assert!(
+                accrued_ttl >= BUMP_TO - 1,
+                "CampaignAccruedRewards TTL {accrued_ttl} should be bumped toward BUMP_TO"
+            );
+            assert!(
+                last_accrual_ttl >= BUMP_TO - 1,
+                "CampaignLastAccrualTime TTL {last_accrual_ttl} should be bumped toward BUMP_TO"
+            );
+        });
+
+        // Claim once to init snapshot (returns 0), then claim again for a payout
+        // so a DistributionRecord is written.
+        env.ledger().with_mut(|l| l.timestamp = 2_000);
+        assert_eq!(client.claim_rewards(&provider, &id), 0);
+        env.ledger().with_mut(|l| l.timestamp = 3_000);
+        let paid = client.claim_rewards(&provider, &id);
+        assert!(paid > 0);
+
+        env.as_contract(&incentives, || {
+            let snapshot_ttl = env.storage().persistent().get_ttl(&DataKey::ProviderSnapshot(
+                id,
+                provider.clone(),
+            ));
+            let dist_ttl = env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::DistributionRecord(1));
+            assert!(
+                snapshot_ttl >= BUMP_TO - 1,
+                "ProviderSnapshot TTL {snapshot_ttl} should be bumped toward BUMP_TO"
+            );
+            assert!(
+                dist_ttl >= BUMP_TO - 1,
+                "DistributionRecord TTL {dist_ttl} should be bumped toward BUMP_TO"
+            );
+        });
+
+        // Read paths must also refresh TTL (get_campaign / get_distribution_record).
+        let _ = client.get_campaign(&id);
+        let _ = client.get_distribution_record(&1);
+        let _ = client.get_active_campaigns();
+
+        env.as_contract(&incentives, || {
+            let campaign_ttl = env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::Campaign(id));
+            assert!(
+                campaign_ttl >= BUMP_TO - 1,
+                "get_campaign must refresh Campaign TTL, got {campaign_ttl}"
+            );
+        });
     }
 }
