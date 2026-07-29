@@ -589,24 +589,24 @@ mod tests {
         let s = setup();
         // start=100, cliff=200, end=400: a 100-ledger gap between start and
         // cliff. Vesting must accrue linearly over [cliff, end], not [start, end].
-        create_schedule(&s, 100, 200, 400);
+        let schedule_id = create_schedule(&s, 100, 200, 400);
         let client = PolVestingContractClient::new(&s.env, &s.contract_id);
 
         // At the cliff exactly: nothing has accrued yet — no lump-sum unlock.
         s.env.ledger().set_sequence_number(200);
-        let err = client.try_release(&s.beneficiary).unwrap_err().unwrap();
+        let err = client.try_release(&s.beneficiary, &schedule_id).unwrap_err().unwrap();
         assert_eq!(err, VestingError::NothingToRelease);
 
         // Halfway between cliff (200) and end (400): 50% vested.
         s.env.ledger().set_sequence_number(300);
-        let released = client.release(&s.beneficiary);
+        let released = client.release(&s.beneficiary, &schedule_id);
         assert_eq!(released, 500_000);
 
         // At end: the remainder becomes releasable, totalling `total`.
         s.env.ledger().set_sequence_number(400);
-        let released = client.release(&s.beneficiary);
+        let released = client.release(&s.beneficiary, &schedule_id);
         assert_eq!(released, 500_000);
-        assert_eq!(client.get_vesting(&s.beneficiary).released, 1_000_000);
+        assert_eq!(client.get_vesting(&s.beneficiary, &schedule_id).released, 1_000_000);
     }
 
     #[test]
@@ -679,7 +679,7 @@ mod tests {
 
         s.env.ledger().set_sequence_number(300);
         assert_eq!(client.release(&s.beneficiary, &first_id), 300_000);
-        assert_eq!(client.release(&s.beneficiary, &second_id), 100_000);
+        assert_eq!(client.release(&s.beneficiary, &second_id), 62_500);
     }
 
     #[test]
