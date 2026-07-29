@@ -225,6 +225,123 @@ fn test_emergency_withdraw() {
     });
 }
 
+/// Regression test for issue #569.
+///
+/// After `emergency_withdraw` drains the reserves, `TotalShares` must be reset
+/// to 0 so that a subsequent `add_liquidity` call takes the initial-deposit
+/// path (geometric-mean shares) rather than dividing by the now-zero reserve,
+/// which would cause an unconditional panic.
+#[test]
+fn test_emergency_withdraw_zeros_total_shares_and_allows_redeposit() {
+    let (env, admin, amm_addr, lp_addr, _) = setup();
+    let (ta_client, ta_sac) = create_sac(&env, &admin);
+    let (tb_client, tb_sac) = create_sac(&env, &admin);
+    let amm = AmmPoolClient::new(&env, &amm_addr);
+
+    amm.initialize(
+        &admin,
+        &ta_client.address,
+        &tb_client.address,
+        &lp_addr,
+        &30_i128,
+        &admin,
+        &0_i128,
+    );
+
+    let provider = Address::generate(&env);
+    ta_sac.mint(&provider, &4_000_000_i128);
+    tb_sac.mint(&provider, &2_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 2_000_000, 1_000_000).execute();
+
+    // Sanity: pool has reserves and shares.
+    let info = amm.get_info();
+    assert_eq!(info.reserve_a, 2_000_000);
+    assert_eq!(info.reserve_b, 1_000_000);
+    assert!(info.total_shares > 0);
+
+    // Emergency drain.
+    let recipient = Address::generate(&env);
+    amm.emergency_withdraw(&recipient);
+
+    // After drain: reserves AND total_shares must all be 0.
+    let info_after = amm.get_info();
+    assert_eq!(info_after.reserve_a, 0, "reserve_a not zeroed");
+    assert_eq!(info_after.reserve_b, 0, "reserve_b not zeroed");
+    assert_eq!(
+        info_after.total_shares, 0,
+        "total_shares must be zeroed after emergency_withdraw (issue #569)"
+    );
+
+    // Re-deposit must not panic (was previously bricked by divide-by-zero).
+    let new_provider = Address::generate(&env);
+    ta_sac.mint(&new_provider, &2_000_000_i128);
+    tb_sac.mint(&new_provider, &1_000_000_i128);
+    let shares = AddLiquidity::new(&amm, &new_provider, 2_000_000, 1_000_000).execute();
+    assert!(shares > 0, "re-deposit after emergency_withdraw must mint shares");
+
+    let info_final = amm.get_info();
+    assert!(info_final.reserve_a > 0);
+    assert!(info_final.reserve_b > 0);
+    assert!(info_final.total_shares > 0);
+}
+
+/// Regression test for issue #569 — multisig path.
+///
+/// `exec_multisig_emergency_wd` must also zero `TotalShares` so that
+/// add_liquidity can be called successfully after the multisig drain.
+#[test]
+fn test_multisig_emergency_wd_zeros_total_shares_and_allows_redeposit() {
+    let (env, admin, amm_addr, lp_addr, _) = setup();
+    let (ta_client, ta_sac) = create_sac(&env, &admin);
+    let (tb_client, tb_sac) = create_sac(&env, &admin);
+    let amm = AmmPoolClient::new(&env, &amm_addr);
+
+    amm.initialize(
+        &admin,
+        &ta_client.address,
+        &tb_client.address,
+        &lp_addr,
+        &30_i128,
+        &admin,
+        &0_i128,
+    );
+
+    // Configure a 1-of-1 multisig so the multisig path is active.
+    let signer = Address::generate(&env);
+    let mut signers = soroban_sdk::Vec::new(&env);
+    signers.push_back(signer.clone());
+    amm.set_multisig(&admin, &signers, &1_u32);
+
+    let provider = Address::generate(&env);
+    ta_sac.mint(&provider, &4_000_000_i128);
+    tb_sac.mint(&provider, &2_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 2_000_000, 1_000_000).execute();
+
+    let info = amm.get_info();
+    assert!(info.total_shares > 0);
+
+    // Propose + execute the multisig emergency withdrawal.
+    let recipient = Address::generate(&env);
+    amm.propose_emergency_withdraw(&signer, &recipient);
+    amm.exec_multisig_emergency_wd(&signer);
+
+    // After drain: reserves AND total_shares must all be 0.
+    let info_after = amm.get_info();
+    assert_eq!(info_after.reserve_a, 0, "reserve_a not zeroed");
+    assert_eq!(info_after.reserve_b, 0, "reserve_b not zeroed");
+    assert_eq!(
+        info_after.total_shares, 0,
+        "total_shares must be zeroed after exec_multisig_emergency_wd (issue #569)"
+    );
+
+    // Re-deposit must not panic.
+    let new_provider = Address::generate(&env);
+    ta_sac.mint(&new_provider, &2_000_000_i128);
+    tb_sac.mint(&new_provider, &1_000_000_i128);
+    let shares = AddLiquidity::new(&amm, &new_provider, 2_000_000, 1_000_000).execute();
+    assert!(shares > 0, "re-deposit after multisig emergency_wd must mint shares");
+}
+
 #[test]
 #[should_panic]
 fn test_emergency_withdraw_requires_admin_auth() {

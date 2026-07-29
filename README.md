@@ -18,6 +18,7 @@ A full-stack AMM protocol built on Stellar's Soroban smart contract platform. It
   - [Governance Contract](#governance-contract)
   - [TWAP Consumer Contract](#twap-consumer-contract)
   - [Concentrated Liquidity Contract](#concentrated-liquidity-contract)
+  - [Staking Contract](#staking-contract)
 - [Error Codes](#error-codes)
   - [AMM Pool Contract (`AmmError`)](#amm-pool-contract-ammerror)
   - [Factory Contract (`FactoryError`)](#factory-contract-factoryerror)
@@ -361,6 +362,32 @@ Located in [contracts/token/src/lib.rs](contracts/token/src/lib.rs).
 | `balance(id) → i128` | Read account balance |
 | `allowance(from, spender) → i128` | Read spending allowance |
 | `total_supply() → i128` | Read total tokens minted |
+
+---
+
+### Staking Contract
+
+Located in [contracts/staking/src/lib.rs](contracts/staking/src/lib.rs). See [contracts/staking/README.md](contracts/staking/README.md) for a full overview.
+
+Lets liquidity providers stake LP tokens to earn a separate reward token, distributed through a rewards-per-share accumulator. Stakers can optionally lock their stake for a fixed duration to earn a boost multiplier on their reward share, modelled on Curve's veToken design.
+
+| Function | Description |
+|---|---|
+| `initialize(lp_token, reward_token, admin)` | One-time setup with default boost and lock bounds |
+| `initialize_with_boost_config(lp_token, reward_token, admin, min_boost_scaled, max_boost_scaled, min_lock_duration_secs, max_lock_duration_secs)` | One-time setup with custom boost and lock bounds |
+| `stake(staker, amount)` | Stake LP tokens with no lock (1x boost) |
+| `stake_locked(staker, amount, lock_duration_secs)` | Stake with an optional lock duration for a boost multiplier |
+| `lock(staker, amount, lock_duration_seconds)` | Escrow LP tokens for a fixed lock at a boosted rate |
+| `extend_lock(staker, new_duration_seconds)` | Extend an existing lock forward in time only |
+| `unlock(staker) → (amount, rewards)` | Withdraw all LP and accrued rewards after the lock expires |
+| `unstake(staker, amount) → (amount, rewards)` | Unstake LP and claim pending rewards; panics if still locked |
+| `add_rewards(admin, amount)` | Transfer reward tokens into the pool; admin only |
+| `update_rewards(admin, new_rewards)` | Distribute new rewards across all stakers; admin only |
+| `claim(staker) → rewards` | Claim accrued rewards without unstaking |
+| `pending_rewards(staker) → i128` | Read a staker's unclaimed rewards |
+| `get_pool_info() → PoolInfo` | Read pool state |
+| `get_staker_info(staker) → StakerInfo` | Read a staker's amounts, debt, lock, and boost |
+| `get_locked_position(staker) → LockedPosition` | Read a staker's locked amount, expiry, and boost |
 
 ---
 

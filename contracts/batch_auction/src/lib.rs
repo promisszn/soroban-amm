@@ -43,6 +43,10 @@ pub enum AuctionError {
     InvalidPoolTokenPair = 10,
     /// Token transfer to/from a trader failed (issue #546).
     TransferFailed = 11,
+    /// `accept_admin` called without a prior `propose_admin` (issue #553).
+    NoPendingAdmin = 12,
+    /// `accept_admin` caller is not the pending nominee (issue #553).
+    WrongAdmin = 13,
 }
 
 // ── Storage types ─────────────────────────────────────────────────────────────
@@ -94,6 +98,8 @@ pub struct Order {
 #[contracttype]
 pub enum DataKey {
     Admin,
+    /// Nominated admin awaiting `accept_admin` (two-step rotation, issue #553).
+    PendingAdmin,
     BatchWindowSecs,
     BatchOpenedAt,
     MaxOrders,
@@ -765,6 +771,65 @@ impl BatchAuction {
         env.events()
             .publish((Symbol::new(&env, "max_orders_updated"),), (n,));
         Ok(())
+    }
+
+    /// Nominate a new admin. The nominee must call `accept_admin` to complete
+    /// the transfer (two-step rotation, matching `pol_vesting` / AMM).
+    ///
+    /// Prevents a mistyped address from permanently locking `set_batch_window`
+    /// and `set_max_orders` (issue #553).
+    pub fn propose_admin(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), AuctionError> {
+        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if current_admin != stored {
+            return Err(AuctionError::Unauthorized);
+        }
+        current_admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &Some(new_admin.clone()));
+        env.events().publish(
+            (Symbol::new(&env, "admin_nominated"),),
+            (current_admin, new_admin),
+        );
+        Ok(())
+    }
+
+    /// Accept the pending admin nomination. Caller becomes the new admin.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), AuctionError> {
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None);
+        let nominee = pending.ok_or(AuctionError::NoPendingAdmin)?;
+        if new_admin != nominee {
+            return Err(AuctionError::WrongAdmin);
+        }
+        new_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &Option::<Address>::None);
+        env.events()
+            .publish((Symbol::new(&env, "admin_changed"),), (new_admin,));
+        Ok(())
+    }
+
+    /// Return the active admin address.
+    pub fn get_admin(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Admin).unwrap()
+    }
+
+    /// Return the pending admin nominee, or `None` if no transfer is in progress.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None)
     }
 }
 
@@ -1697,5 +1762,101 @@ mod tests {
         let results = client.settle_batch();
         assert_eq!(results.len(), 0);
         assert_eq!(client.get_pending_orders().len(), 0);
+    }
+
+    // ── Issue #553: two-step admin rotation ─────────────────────────────────────
+
+    #[test]
+    fn test_propose_and_accept_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let nominee = Address::generate(&env);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+
+        assert_eq!(client.get_admin(), admin);
+        assert_eq!(client.get_pending_admin(), None);
+
+        client.propose_admin(&admin, &nominee);
+        assert_eq!(client.get_pending_admin(), Some(nominee.clone()));
+        // Admin is unchanged until accept.
+        assert_eq!(client.get_admin(), admin);
+
+        client.accept_admin(&nominee);
+        assert_eq!(client.get_admin(), nominee);
+        assert_eq!(client.get_pending_admin(), None);
+
+        // New admin can call admin-only setters; old admin cannot.
+        client.set_max_orders(&nominee, &10_u32);
+        let err = client
+            .try_set_max_orders(&admin, &5_u32)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, AuctionError::Unauthorized);
+    }
+
+    #[test]
+    fn test_propose_admin_requires_current_admin() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let rando = Address::generate(&env);
+        let nominee = Address::generate(&env);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+
+        let err = client
+            .try_propose_admin(&rando, &nominee)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, AuctionError::Unauthorized);
+    }
+
+    #[test]
+    fn test_accept_admin_requires_pending_nominee() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let nominee = Address::generate(&env);
+        let other = Address::generate(&env);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+
+        let err = client.try_accept_admin(&nominee).err().unwrap().unwrap();
+        assert_eq!(err, AuctionError::NoPendingAdmin);
+
+        client.propose_admin(&admin, &nominee);
+        let err = client.try_accept_admin(&other).err().unwrap().unwrap();
+        assert_eq!(err, AuctionError::WrongAdmin);
+    }
+
+    #[test]
+    fn test_new_admin_controls_batch_window_after_acceptance() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let nominee = Address::generate(&env);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+
+        client.propose_admin(&admin, &nominee);
+        client.accept_admin(&nominee);
+
+        // Nominee (new admin) can update the window; auth is checked against
+        // the stored admin inside set_batch_window.
+        client.set_batch_window(&60_u64);
+        let (_, _, _, window) = client.get_batch_info();
+        assert_eq!(window, 60);
     }
 }
