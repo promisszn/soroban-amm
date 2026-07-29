@@ -138,6 +138,9 @@ impl TwapConsumer {
     pub fn delete_snapshot(env: Env, pool: Address, ledger_ts: u64) -> Result<(), TwapError> {
         Self::require_keeper(&env)?;
         let key = DataKey::Snapshot(pool.clone(), ledger_ts);
+        if !env.storage().persistent().has(&key) {
+            return Err(TwapError::NoSnapshotFound);
+        }
         env.storage().persistent().remove(&key);
         Self::remove_snapshot_timestamp(&env, &pool, ledger_ts);
         env.events()
@@ -1133,14 +1136,16 @@ mod tests {
     fn test_delete_snapshot_emits_event() {
         let env = Env::default();
         env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
         let keeper = Address::generate(&env);
-        let pool = Address::generate(&env);
-        let ledger_ts = 100u64;
+        let pool = env.register_contract(None, MockClPool);
         let consumer_addr = env.register_contract(None, TwapConsumer);
         let consumer = TwapConsumerClient::new(&env, &consumer_addr);
         consumer.initialize(&keeper);
 
-        consumer.delete_snapshot(&pool, &ledger_ts);
+        // First save a snapshot so deletion succeeds
+        consumer.save_cl_snapshot(&pool);
+        consumer.delete_snapshot(&pool, &10_000);
 
         let events = env.events().all();
         let event = events.last().unwrap();
@@ -1154,7 +1159,22 @@ mod tests {
         assert_eq!(topics, expected_topics);
         // data is ledger_ts
         let data_ts: u64 = data.into_val(&env);
-        assert_eq!(data_ts, ledger_ts);
+        assert_eq!(data_ts, 10_000);
+    }
+
+    #[test]
+    fn test_delete_snapshot_fails_when_not_found() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let keeper = Address::generate(&env);
+        let pool = Address::generate(&env);
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&keeper);
+
+        let result = consumer.try_delete_snapshot(&pool, &100);
+        assert_eq!(result, Err(Ok(TwapError::NoSnapshotFound)));
     }
 
     // ── Issue #537: save_cl_snapshot must register the pool in
