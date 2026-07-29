@@ -17,6 +17,7 @@
 
 use amm::AmmPoolClient;
 use concentrated_liquidity::ConcentratedLiquidityClient;
+use factory::FactoryClient;
 use soroban_sdk::token::Client as SepTokenClient;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
@@ -43,6 +44,8 @@ pub enum AuctionError {
     InvalidPoolTokenPair = 10,
     /// Token transfer to/from a trader failed (issue #546).
     TransferFailed = 11,
+    /// Pool address is not registered in the trusted factory whitelist.
+    UnrecognizedPool = 12,
 }
 
 // ── Storage types ─────────────────────────────────────────────────────────────
@@ -94,6 +97,7 @@ pub struct Order {
 #[contracttype]
 pub enum DataKey {
     Admin,
+    Factory,
     BatchWindowSecs,
     BatchOpenedAt,
     MaxOrders,
@@ -144,6 +148,45 @@ impl BatchAuction {
             .instance()
             .set(&DataKey::BatchOpenedAt, &env.ledger().timestamp());
         Ok(())
+    }
+
+    /// Set the trusted factory used to whitelist settlement venues.
+    ///
+    /// When configured, all submitted orders must target a pool address that
+    /// has been registered by the trusted factory.
+    pub fn set_factory(
+        env: Env,
+        admin: Address,
+        factory: Address,
+    ) -> Result<(), AuctionError> {
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if stored_admin != admin {
+            return Err(AuctionError::Unauthorized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Factory, &factory);
+        Ok(())
+    }
+
+    fn factory_client(env: &Env) -> Option<FactoryClient> {
+        env.storage().instance().get(&DataKey::Factory).map(|factory: Address| {
+            FactoryClient::new(env, &factory)
+        })
+    }
+
+    fn is_registered_pool(
+        env: &Env,
+        pool: &Address,
+        pool_type: PoolType,
+    ) -> bool {
+        if let Some(factory_client) = Self::factory_client(env) {
+            match pool_type {
+                PoolType::Amm => factory_client.get_pool_tokens(pool).is_some(),
+                PoolType::Cl => factory_client.get_cl_pool_tokens(pool).is_some(),
+            }
+        } else {
+            true
+        }
     }
 
     /// Submit a constant-product (AMM) swap order and escrow `amount_in` of
@@ -254,6 +297,9 @@ impl BatchAuction {
         // until each order is cancelled individually (issue #361). AMM and CL
         // pools expose their token pair through different interfaces, so the
         // lookup must branch on pool_type (issue #470).
+        if !Self::is_registered_pool(&env, &pool, pool_type) {
+            return Err(AuctionError::UnrecognizedPool);
+        }
         if !Self::pool_matches_pair(&env, &pool, pool_type, &token_in, &token_out) {
             return Err(AuctionError::InvalidPoolTokenPair);
         }
@@ -265,6 +311,9 @@ impl BatchAuction {
                 PoolType::Amm => PoolType::Cl,
                 PoolType::Cl => PoolType::Amm,
             };
+            if !Self::is_registered_pool(&env, alt, alt_type) {
+                return Err(AuctionError::UnrecognizedPool);
+            }
             if !Self::pool_matches_pair(&env, alt, alt_type, &token_in, &token_out) {
                 return Err(AuctionError::InvalidPoolTokenPair);
             }
@@ -577,6 +626,10 @@ impl BatchAuction {
     /// (issue #546) so a trustline/auth failure on the refund leg cannot
     /// revert the caller.
     fn execute_op(env: &Env, order: &Order, sender: &Address, deadline: u64) -> Result<i128, ()> {
+        if !Self::is_registered_pool(env, &order.pool, order.pool_type) {
+            return Err(());
+        }
+
         let (_, venue, venue_type) = Self::best_venue(env, order);
 
         let spent_before = SepTokenClient::new(env, &order.token_in).balance(sender);
@@ -640,7 +693,9 @@ impl BatchAuction {
             // Re-check the alternate venue's token pair at routing time so a
             // malformed order written before validation was added can never be
             // routed into the wrong output asset.
-            if Self::pool_matches_pair(env, &alt, alt_type, &order.token_in, &order.token_out) {
+            if Self::is_registered_pool(env, &alt, alt_type)
+                && Self::pool_matches_pair(env, &alt, alt_type, &order.token_in, &order.token_out)
+            {
                 if let Some(alt_q) = Self::try_quote(env, &alt, alt_type, order) {
                     if alt_q > primary_q {
                         return (alt_q, alt, alt_type);
@@ -674,6 +729,9 @@ impl BatchAuction {
     /// Read-only output quote for `order` on `pool` interpreted as `pool_type`.
     /// Returns `None` if the venue rejects the quote (e.g. wrong token pair).
     fn try_quote(env: &Env, pool: &Address, pool_type: PoolType, order: &Order) -> Option<i128> {
+        if !Self::is_registered_pool(env, pool, pool_type) {
+            return None;
+        }
         match pool_type {
             PoolType::Amm => AmmPoolClient::new(env, pool)
                 .try_get_amount_out(&order.token_in, &order.amount_in)
@@ -775,6 +833,7 @@ mod tests {
     use super::*;
     use amm::AmmPool;
     use concentrated_liquidity::{ConcentratedLiquidity, ConcentratedLiquidityClient};
+    use factory::{Factory, FactoryClient};
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
@@ -841,6 +900,20 @@ mod tests {
             &u64::MAX,
         );
         (ta, tb, pool, admin)
+    }
+
+    fn setup_factory(env: &Env, admin: &Address) -> Address {
+        env.budget().reset_unlimited();
+        let amm_wasm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let lp_wasm_hash = env.deployer().upload_contract_wasm(token::WASM);
+        let cl_wasm_hash = env
+            .deployer()
+            .upload_contract_wasm(concentrated_liquidity::WASM);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(env, &factory_addr);
+        factory.initialize(admin, &amm_wasm_hash, &lp_wasm_hash);
+        factory.set_cl_wasm_hash(admin, &cl_wasm_hash);
+        factory_addr
     }
 
     #[test]
@@ -919,6 +992,46 @@ mod tests {
             StellarTokenClient::new(&env, &ta).balance(&trader),
             100_000_i128
         );
+        assert_eq!(client.get_pending_orders().len(), 0);
+    }
+
+    #[test]
+    fn test_submit_order_rejects_unrecognized_pool_when_factory_set() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let admin = Address::generate(&env);
+        let factory_addr = setup_factory(&env, &admin);
+        let factory = FactoryClient::new(&env, &factory_addr);
+
+        let ta = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let tb = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        factory.create_pool(&admin, &ta, &tb, &2_i128, &None);
+
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+        client.set_factory(&admin, &factory_addr).unwrap();
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
+
+        let unknown_pool = Address::generate(&env);
+        let result = client.try_submit_order(
+            &trader,
+            &unknown_pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+        assert_eq!(result, Err(Ok(AuctionError::UnrecognizedPool)));
         assert_eq!(client.get_pending_orders().len(), 0);
     }
 
@@ -1405,6 +1518,53 @@ mod tests {
             &u64::MAX,
         );
         assert_eq!(result, Err(Ok(AuctionError::InvalidPoolTokenPair)));
+        assert_eq!(
+            StellarTokenClient::new(&env, &ta).balance(&trader),
+            100_000_i128
+        );
+        assert_eq!(client.get_pending_orders().len(), 0);
+    }
+
+    #[test]
+    fn test_submit_order_cl_rejects_unrecognized_alt_pool_when_factory_set() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let admin = Address::generate(&env);
+        let factory_addr = setup_factory(&env, &admin);
+        let factory = FactoryClient::new(&env, &factory_addr);
+
+        let ta = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let tb = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let cl_pool = factory.create_cl_pool(&admin, &ta, &tb, &30_i128, &0_i32);
+
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+        client.set_factory(&admin, &factory_addr).unwrap();
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
+
+        let unknown_pool = Address::generate(&env);
+        let result = client.try_submit_order_cl(
+            &trader,
+            &cl_pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &true,
+            &0_u128,
+            &Some(unknown_pool),
+            &u64::MAX,
+        );
+        assert_eq!(result, Err(Ok(AuctionError::UnrecognizedPool)));
         assert_eq!(
             StellarTokenClient::new(&env, &ta).balance(&trader),
             100_000_i128

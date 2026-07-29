@@ -18,6 +18,7 @@ testutils = [
 soroban-sdk = { workspace = true }
 amm = { path = "../amm" }
 concentrated_liquidity = { path = "../concentrated_liquidity" }
+factory = { path = "../factory" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
