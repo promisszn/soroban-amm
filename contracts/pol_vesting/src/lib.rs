@@ -23,6 +23,7 @@ pub enum VestingError {
     InvalidSchedule = 6,
     NotBeneficiary = 7,
     NoPendingGovernance = 8,
+    NoPendingTreasury = 9,
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -38,6 +39,8 @@ pub enum DataKey {
     Governance,
     /// Pending governance nominee for two-step governance rotation.
     PendingGovernance,
+    /// Pending treasury nominee for two-step treasury rotation.
+    PendingTreasury,
     /// Treasury address — receives tokens on revocation.
     Treasury,
     /// Next schedule id for a beneficiary.
@@ -151,6 +154,74 @@ impl PolVestingContract {
         env.storage()
             .instance()
             .get(&DataKey::PendingGovernance)
+            .unwrap_or(None)
+    }
+
+    /// Nominate a new treasury address.
+    ///
+    /// Requires governance authorization. The nominee must call
+    /// `accept_treasury` to complete the handover.
+    pub fn propose_treasury(
+        env: Env,
+        governance: Address,
+        new_treasury: Address,
+    ) -> Result<(), VestingError> {
+        governance.require_auth();
+        Self::require_governance(&env, &governance)?;
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingTreasury, &Some(new_treasury.clone()));
+
+        env.events().publish(
+            (Symbol::new(&env, "treasury_proposed"),),
+            (new_treasury,),
+        );
+        Ok(())
+    }
+
+    /// Accept a pending treasury nomination.
+    ///
+    /// Only the nominated address can accept. On success, treasury is updated,
+    /// the pending nominee is cleared, and a transfer event is emitted.
+    pub fn accept_treasury(env: Env, new_treasury: Address) -> Result<(), VestingError> {
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingTreasury)
+            .unwrap_or(None);
+        let nominee = pending.ok_or(VestingError::NoPendingTreasury)?;
+
+        if new_treasury != nominee {
+            return Err(VestingError::NotGovernance); // Reusing NotGovernance error is a bit misleading, but fits existing error set. Maybe create NotAuthorized?
+        }
+        new_treasury.require_auth();
+
+        let old_treasury: Address = env.storage().instance().get(&DataKey::Treasury).unwrap();
+        env.storage()
+            .instance()
+            .set(&DataKey::Treasury, &new_treasury);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingTreasury, &Option::<Address>::None);
+
+        env.events().publish(
+            (Symbol::new(&env, "treasury_transferred"),),
+            (old_treasury, new_treasury),
+        );
+        Ok(())
+    }
+
+    /// Return the active treasury address.
+    pub fn get_treasury(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::Treasury).unwrap()
+    }
+
+    /// Return the pending treasury nominee, if any.
+    pub fn get_pending_treasury(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingTreasury)
             .unwrap_or(None)
     }
 
@@ -718,5 +789,75 @@ mod tests {
         assert_eq!(schedule.cliff_ledger, 100);
         assert_eq!(schedule.end_ledger, 1000);
         assert_eq!(schedule.released, 0);
+    }
+
+    #[test]
+    fn test_propose_and_accept_treasury() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+        let new_treasury = Address::generate(&s.env);
+
+        client.propose_treasury(&s.governance, &new_treasury);
+        assert_eq!(
+            client.get_pending_treasury(),
+            Some(new_treasury.clone())
+        );
+
+        client.accept_treasury(&new_treasury);
+        assert_eq!(client.get_treasury(), new_treasury);
+        assert_eq!(client.get_pending_treasury(), None);
+    }
+
+    #[test]
+    fn test_propose_treasury_requires_governance() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+        let rando = Address::generate(&s.env);
+        let new_treasury = Address::generate(&s.env);
+
+        let err = client
+            .try_propose_treasury(&rando, &new_treasury)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, VestingError::NotGovernance);
+    }
+
+    #[test]
+    fn test_accept_treasury_requires_pending_nominee() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+        let new_treasury = Address::generate(&s.env);
+        let other = Address::generate(&s.env);
+
+        let err = client
+            .try_accept_treasury(&new_treasury)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, VestingError::NoPendingTreasury);
+
+        client.propose_treasury(&s.governance, &new_treasury);
+        let err = client.try_accept_treasury(&other).unwrap_err().unwrap();
+        assert_eq!(err, VestingError::NotGovernance);
+    }
+
+    #[test]
+    fn test_revoke_vesting_uses_new_treasury() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+        let new_treasury = Address::generate(&s.env);
+
+        client.propose_treasury(&s.governance, &new_treasury);
+        client.accept_treasury(&new_treasury);
+
+        let schedule_id = create_schedule(&s, 0, 0, 1000);
+
+        s.env.ledger().set_sequence_number(250);
+        client.revoke_vesting(&s.governance, &s.beneficiary, &schedule_id);
+
+        let lp = TokenClient::new(&s.env, &s.lp_token);
+        // 25% went to beneficiary, 75% to new_treasury
+        assert_eq!(lp.balance(&s.beneficiary), 250_000);
+        assert_eq!(lp.balance(&new_treasury), 750_000);
+        assert_eq!(lp.balance(&s.treasury), 0); // Original treasury gets nothing
     }
 }
