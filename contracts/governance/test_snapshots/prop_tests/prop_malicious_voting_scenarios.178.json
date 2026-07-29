@@ -79,7 +79,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1649
+                    "lo": 5236
                   }
                 }
               ]
@@ -104,7 +104,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 6148
+                    "lo": 7023
                   }
                 }
               ]
@@ -129,7 +129,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 2502
+                    "lo": 3424
                   }
                 }
               ]
@@ -154,7 +154,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 7036
+                    "lo": 7968
                   }
                 }
               ]
@@ -179,7 +179,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 5099
+                    "lo": 664
                   }
                 }
               ]
@@ -788,7 +788,7 @@
                 "val": {
                   "i128": {
                     "hi": 0,
-                    "lo": 1649
+                    "lo": 5236
                   }
                 }
               }
@@ -836,7 +836,7 @@
                 "val": {
                   "i128": {
                     "hi": 0,
-                    "lo": 6148
+                    "lo": 7023
                   }
                 }
               }
@@ -884,7 +884,7 @@
                 "val": {
                   "i128": {
                     "hi": 0,
-                    "lo": 2502
+                    "lo": 3424
                   }
                 }
               }
@@ -932,7 +932,7 @@
                 "val": {
                   "i128": {
                     "hi": 0,
-                    "lo": 7036
+                    "lo": 7968
                   }
                 }
               }
@@ -980,7 +980,7 @@
                 "val": {
                   "i128": {
                     "hi": 0,
-                    "lo": 5099
+                    "lo": 664
                   }
                 }
               }
@@ -1132,7 +1132,7 @@
                           "val": {
                             "i128": {
                               "hi": 0,
-                              "lo": 1649
+                              "lo": 5236
                             }
                           }
                         },
@@ -1152,7 +1152,7 @@
             },
             "ext": "v0"
           },
-          4095
+          2419200
         ]
       ],
       [
@@ -1201,7 +1201,7 @@
                           "val": {
                             "i128": {
                               "hi": 0,
-                              "lo": 6148
+                              "lo": 7023
                             }
                           }
                         },
@@ -1221,7 +1221,7 @@
             },
             "ext": "v0"
           },
-          4095
+          2419200
         ]
       ],
       [
@@ -1270,7 +1270,7 @@
                           "val": {
                             "i128": {
                               "hi": 0,
-                              "lo": 2502
+                              "lo": 3424
                             }
                           }
                         },
@@ -1290,7 +1290,7 @@
             },
             "ext": "v0"
           },
-          4095
+          2419200
         ]
       ],
       [
@@ -1339,7 +1339,7 @@
                           "val": {
                             "i128": {
                               "hi": 0,
-                              "lo": 7036
+                              "lo": 7968
                             }
                           }
                         },
@@ -1359,7 +1359,7 @@
             },
             "ext": "v0"
           },
-          4095
+          2419200
         ]
       ],
       [
@@ -1408,7 +1408,7 @@
                           "val": {
                             "i128": {
                               "hi": 0,
-                              "lo": 5099
+                              "lo": 664
                             }
                           }
                         },
@@ -1428,7 +1428,7 @@
             },
             "ext": "v0"
           },
-          4095
+          2419200
         ]
       ],
       [
@@ -1497,7 +1497,7 @@
             },
             "ext": "v0"
           },
-          4095
+          2419200
         ]
       ],
       [
@@ -1566,7 +1566,7 @@
             },
             "ext": "v0"
           },
-          4095
+          2419200
         ]
       ],
       [
@@ -1607,7 +1607,7 @@
                 "val": {
                   "i128": {
                     "hi": 0,
-                    "lo": 1649
+                    "lo": 5236
                   }
                 }
               }
@@ -1711,7 +1711,7 @@
                         "val": {
                           "i128": {
                             "hi": 0,
-                            "lo": 24434
+                            "lo": 26315
                           }
                         }
                       }
@@ -2168,6 +2168,199 @@
             "key": {
               "vec": [
                 {
+                  "symbol": "Delegate"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA2ZMN"
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "Delegate"
+                    },
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA2ZMN"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4BV5"
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          259200
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "Delegator"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4BV5"
+                },
+                {
+                  "u32": 0
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "Delegator"
+                    },
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4BV5"
+                    },
+                    {
+                      "u32": 0
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA2ZMN"
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          259200
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "DelegatorCount"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4BV5"
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "DelegatorCount"
+                    },
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4BV5"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "u32": 1
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          259200
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "DelegatorSlot"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA2ZMN"
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "DelegatorSlot"
+                    },
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA2ZMN"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "vec": [
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4BV5"
+                    },
+                    {
+                      "u32": 0
+                    }
+                  ]
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          259200
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4",
+            "key": {
+              "vec": [
+                {
                   "symbol": "HasVoted"
                 },
                 {
@@ -2260,7 +2453,7 @@
                 "val": {
                   "i128": {
                     "hi": 0,
-                    "lo": 1649
+                    "lo": 5236
                   }
                 }
               }
@@ -2394,7 +2587,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 24434
+                          "lo": 26315
                         }
                       }
                     },
@@ -2463,7 +2656,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 1649
+                          "lo": 5236
                         }
                       }
                     }
@@ -2521,76 +2714,6 @@
                         },
                         "val": {
                           "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
-                              "symbol": "Delegate"
-                            },
-                            {
-                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA2ZMN"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4BV5"
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
-                              "symbol": "Delegator"
-                            },
-                            {
-                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4BV5"
-                            },
-                            {
-                              "u32": 0
-                            }
-                          ]
-                        },
-                        "val": {
-                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA2ZMN"
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
-                              "symbol": "DelegatorCount"
-                            },
-                            {
-                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4BV5"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "u32": 1
-                        }
-                      },
-                      {
-                        "key": {
-                          "vec": [
-                            {
-                              "symbol": "DelegatorSlot"
-                            },
-                            {
-                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA2ZMN"
-                            }
-                          ]
-                        },
-                        "val": {
-                          "vec": [
-                            {
-                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA4BV5"
-                            },
-                            {
-                              "u32": 0
-                            }
-                          ]
                         }
                       },
                       {
@@ -3599,7 +3722,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1649
+                    "lo": 5236
                   }
                 }
               ]
@@ -3656,7 +3779,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 6148
+                    "lo": 7023
                   }
                 }
               ]
@@ -3713,7 +3836,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 2502
+                    "lo": 3424
                   }
                 }
               ]
@@ -3770,7 +3893,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 7036
+                    "lo": 7968
                   }
                 }
               ]
@@ -3827,7 +3950,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 5099
+                    "lo": 664
                   }
                 }
               ]
@@ -4057,7 +4180,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 24434
+                "lo": 26315
               }
             }
           }
@@ -4109,7 +4232,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 1649
+                "lo": 5236
               }
             }
           }
@@ -4284,7 +4407,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 1649
+                "lo": 5236
               }
             }
           }
@@ -4336,7 +4459,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 1649
+                "lo": 5236
               }
             }
           }
@@ -4370,7 +4493,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 1649
+                    "lo": 5236
                   }
                 }
               ]
@@ -4436,7 +4559,7 @@
                     {
                       "i128": {
                         "hi": 0,
-                        "lo": 1649
+                        "lo": 5236
                       }
                     }
                   ]
@@ -4738,7 +4861,7 @@
                   "val": {
                     "i128": {
                       "hi": 0,
-                      "lo": 24434
+                      "lo": 26315
                     }
                   }
                 },
@@ -4807,7 +4930,7 @@
                   "val": {
                     "i128": {
                       "hi": 0,
-                      "lo": 1649
+                      "lo": 5236
                     }
                   }
                 }

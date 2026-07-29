@@ -1,6 +1,6 @@
 {
   "generators": {
-    "address": 9,
+    "address": 10,
     "nonce": 0
   },
   "auth": [
@@ -79,7 +79,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 6065
+                    "lo": 337
                   }
                 }
               ]
@@ -104,7 +104,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 2617
+                    "lo": 6656
                   }
                 }
               ]
@@ -129,7 +129,32 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 2376
+                    "lo": 374
+                  }
+                }
+              ]
+            }
+          },
+          "sub_invocations": []
+        }
+      ]
+    ],
+    [
+      [
+        "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+        {
+          "function": {
+            "contract_fn": {
+              "contract_address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+              "function_name": "mint",
+              "args": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVAX5"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 2617
                   }
                 }
               ]
@@ -189,7 +214,7 @@
                 {
                   "vec": [
                     {
-                      "symbol": "Against"
+                      "symbol": "For"
                     }
                   ]
                 }
@@ -219,7 +244,7 @@
                 {
                   "vec": [
                     {
-                      "symbol": "For"
+                      "symbol": "Abstain"
                     }
                   ]
                 }
@@ -230,6 +255,7 @@
         }
       ]
     ],
+    [],
     [],
     [],
     [],
@@ -503,6 +529,39 @@
       [
         {
           "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+            "key": {
+              "ledger_key_nonce": {
+                "nonce": 8370022561469687789
+              }
+            },
+            "durability": "temporary"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
+                "key": {
+                  "ledger_key_nonce": {
+                    "nonce": 8370022561469687789
+                  }
+                },
+                "durability": "temporary",
+                "val": "void"
+              }
+            },
+            "ext": "v0"
+          },
+          6311999
+        ]
+      ],
+      [
+        {
+          "contract_data": {
             "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
             "key": {
               "vec": [
@@ -538,7 +597,7 @@
                 "val": {
                   "i128": {
                     "hi": 0,
-                    "lo": 6065
+                    "lo": 337
                   }
                 }
               }
@@ -586,7 +645,7 @@
                 "val": {
                   "i128": {
                     "hi": 0,
-                    "lo": 2617
+                    "lo": 6656
                   }
                 }
               }
@@ -634,7 +693,55 @@
                 "val": {
                   "i128": {
                     "hi": 0,
-                    "lo": 2376
+                    "lo": 374
+                  }
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          4095
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "Balance"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVAX5"
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "Balance"
+                    },
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVAX5"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 2617
                   }
                 }
               }
@@ -690,7 +797,7 @@
                           "val": {
                             "i128": {
                               "hi": 0,
-                              "lo": 6065
+                              "lo": 337
                             }
                           }
                         },
@@ -710,7 +817,7 @@
             },
             "ext": "v0"
           },
-          4095
+          2419200
         ]
       ],
       [
@@ -744,6 +851,144 @@
                     },
                     {
                       "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAARQG5"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "vec": [
+                    {
+                      "map": [
+                        {
+                          "key": {
+                            "symbol": "balance"
+                          },
+                          "val": {
+                            "i128": {
+                              "hi": 0,
+                              "lo": 6656
+                            }
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "ledger"
+                          },
+                          "val": {
+                            "u32": 0
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          2419200
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "Checkpoints"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "Checkpoints"
+                    },
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
+                    }
+                  ]
+                },
+                "durability": "persistent",
+                "val": {
+                  "vec": [
+                    {
+                      "map": [
+                        {
+                          "key": {
+                            "symbol": "balance"
+                          },
+                          "val": {
+                            "i128": {
+                              "hi": 0,
+                              "lo": 374
+                            }
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "ledger"
+                          },
+                          "val": {
+                            "u32": 0
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            },
+            "ext": "v0"
+          },
+          2419200
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+            "key": {
+              "vec": [
+                {
+                  "symbol": "Checkpoints"
+                },
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVAX5"
+                }
+              ]
+            },
+            "durability": "persistent"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
+                "key": {
+                  "vec": [
+                    {
+                      "symbol": "Checkpoints"
+                    },
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVAX5"
                     }
                   ]
                 },
@@ -779,76 +1024,7 @@
             },
             "ext": "v0"
           },
-          4095
-        ]
-      ],
-      [
-        {
-          "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
-            "key": {
-              "vec": [
-                {
-                  "symbol": "Checkpoints"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
-                }
-              ]
-            },
-            "durability": "persistent"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4",
-                "key": {
-                  "vec": [
-                    {
-                      "symbol": "Checkpoints"
-                    },
-                    {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON"
-                    }
-                  ]
-                },
-                "durability": "persistent",
-                "val": {
-                  "vec": [
-                    {
-                      "map": [
-                        {
-                          "key": {
-                            "symbol": "balance"
-                          },
-                          "val": {
-                            "i128": {
-                              "hi": 0,
-                              "lo": 2376
-                            }
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "ledger"
-                          },
-                          "val": {
-                            "u32": 0
-                          }
-                        }
-                      ]
-                    }
-                  ]
-                }
-              }
-            },
-            "ext": "v0"
-          },
-          4095
+          2419200
         ]
       ],
       [
@@ -889,7 +1065,7 @@
                 "val": {
                   "i128": {
                     "hi": 0,
-                    "lo": 6065
+                    "lo": 337
                   }
                 }
               }
@@ -937,7 +1113,7 @@
                 "val": {
                   "i128": {
                     "hi": 0,
-                    "lo": 2376
+                    "lo": 374
                   }
                 }
               }
@@ -1041,7 +1217,7 @@
                         "val": {
                           "i128": {
                             "hi": 0,
-                            "lo": 11058
+                            "lo": 9984
                           }
                         }
                       }
@@ -1488,7 +1664,7 @@
             },
             "ext": "v0"
           },
-          4095
+          518400
         ]
       ],
       [
@@ -1535,7 +1711,7 @@
                 "val": {
                   "vec": [
                     {
-                      "symbol": "VotedAgainst"
+                      "symbol": "VotedFor"
                     }
                   ]
                 }
@@ -1590,7 +1766,7 @@
                 "val": {
                   "vec": [
                     {
-                      "symbol": "VotedFor"
+                      "symbol": "VotedAbstain"
                     }
                   ]
                 }
@@ -1645,7 +1821,7 @@
                 "val": {
                   "i128": {
                     "hi": 0,
-                    "lo": 6065
+                    "lo": 337
                   }
                 }
               }
@@ -1699,7 +1875,7 @@
                 "val": {
                   "i128": {
                     "hi": 0,
-                    "lo": 2376
+                    "lo": 374
                   }
                 }
               }
@@ -1833,7 +2009,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 11058
+                          "lo": 9984
                         }
                       }
                     },
@@ -1880,7 +2056,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 0
+                          "lo": 374
                         }
                       }
                     },
@@ -1891,7 +2067,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 6065
+                          "lo": 0
                         }
                       }
                     },
@@ -1902,7 +2078,7 @@
                       "val": {
                         "i128": {
                           "hi": 0,
-                          "lo": 2376
+                          "lo": 337
                         }
                       }
                     }
@@ -2071,6 +2247,39 @@
             "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
             "key": {
               "ledger_key_nonce": {
+                "nonce": 5806905060045992000
+              }
+            },
+            "durability": "temporary"
+          }
+        },
+        [
+          {
+            "last_modified_ledger_seq": 0,
+            "data": {
+              "contract_data": {
+                "ext": "v0",
+                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
+                "key": {
+                  "ledger_key_nonce": {
+                    "nonce": 5806905060045992000
+                  }
+                },
+                "durability": "temporary",
+                "val": "void"
+              }
+            },
+            "ext": "v0"
+          },
+          6311999
+        ]
+      ],
+      [
+        {
+          "contract_data": {
+            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
+            "key": {
+              "ledger_key_nonce": {
                 "nonce": 6277191135259896685
               }
             },
@@ -2101,43 +2310,10 @@
       [
         {
           "contract_data": {
-            "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
-            "key": {
-              "ledger_key_nonce": {
-                "nonce": 8370022561469687789
-              }
-            },
-            "durability": "temporary"
-          }
-        },
-        [
-          {
-            "last_modified_ledger_seq": 0,
-            "data": {
-              "contract_data": {
-                "ext": "v0",
-                "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOLZM",
-                "key": {
-                  "ledger_key_nonce": {
-                    "nonce": 8370022561469687789
-                  }
-                },
-                "durability": "temporary",
-                "val": "void"
-              }
-            },
-            "ext": "v0"
-          },
-          6311999
-        ]
-      ],
-      [
-        {
-          "contract_data": {
             "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON",
             "key": {
               "ledger_key_nonce": {
-                "nonce": 5806905060045992000
+                "nonce": 1194852393571756375
               }
             },
             "durability": "temporary"
@@ -2152,7 +2328,7 @@
                 "contract": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAATYON",
                 "key": {
                   "ledger_key_nonce": {
-                    "nonce": 5806905060045992000
+                    "nonce": 1194852393571756375
                   }
                 },
                 "durability": "temporary",
@@ -2406,7 +2582,7 @@
             },
             "ext": "v0"
           },
-          4095
+          518400
         ]
       ]
     ]
@@ -2935,7 +3111,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 6065
+                    "lo": 337
                   }
                 }
               ]
@@ -2992,7 +3168,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 2617
+                    "lo": 6656
                   }
                 }
               ]
@@ -3049,7 +3225,64 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 2376
+                    "lo": 374
+                  }
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000002",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "mint"
+              }
+            ],
+            "data": "void"
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000002"
+              },
+              {
+                "symbol": "mint"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVAX5"
+                },
+                {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 2617
                   }
                 }
               ]
@@ -3165,7 +3398,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 11058
+                "lo": 9984
               }
             }
           }
@@ -3217,7 +3450,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 6065
+                "lo": 337
               }
             }
           }
@@ -3330,7 +3563,7 @@
                 {
                   "vec": [
                     {
-                      "symbol": "Against"
+                      "symbol": "For"
                     }
                   ]
                 }
@@ -3392,7 +3625,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 6065
+                "lo": 337
               }
             }
           }
@@ -3444,7 +3677,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 6065
+                "lo": 337
               }
             }
           }
@@ -3478,7 +3711,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 6065
+                    "lo": 337
                   }
                 }
               ]
@@ -3537,14 +3770,14 @@
                     {
                       "vec": [
                         {
-                          "symbol": "Against"
+                          "symbol": "For"
                         }
                       ]
                     },
                     {
                       "i128": {
                         "hi": 0,
-                        "lo": 6065
+                        "lo": 337
                       }
                     }
                   ]
@@ -3621,7 +3854,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 6065
+                "lo": 337
               }
             }
           }
@@ -3658,7 +3891,7 @@
                 {
                   "vec": [
                     {
-                      "symbol": "For"
+                      "symbol": "Abstain"
                     }
                   ]
                 }
@@ -3720,7 +3953,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 2376
+                "lo": 374
               }
             }
           }
@@ -3772,7 +4005,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 2376
+                "lo": 374
               }
             }
           }
@@ -3806,7 +4039,7 @@
                 {
                   "i128": {
                     "hi": 0,
-                    "lo": 2376
+                    "lo": 374
                   }
                 }
               ]
@@ -3865,14 +4098,14 @@
                     {
                       "vec": [
                         {
-                          "symbol": "For"
+                          "symbol": "Abstain"
                         }
                       ]
                     },
                     {
                       "i128": {
                         "hi": 0,
-                        "lo": 2376
+                        "lo": 374
                       }
                     }
                   ]
@@ -3949,7 +4182,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 2376
+                "lo": 374
               }
             }
           }
@@ -4087,7 +4320,7 @@
                   "val": {
                     "i128": {
                       "hi": 0,
-                      "lo": 11058
+                      "lo": 9984
                     }
                   }
                 },
@@ -4134,7 +4367,7 @@
                   "val": {
                     "i128": {
                       "hi": 0,
-                      "lo": 0
+                      "lo": 374
                     }
                   }
                 },
@@ -4145,7 +4378,7 @@
                   "val": {
                     "i128": {
                       "hi": 0,
-                      "lo": 6065
+                      "lo": 0
                     }
                   }
                 },
@@ -4156,7 +4389,7 @@
                   "val": {
                     "i128": {
                       "hi": 0,
-                      "lo": 2376
+                      "lo": 337
                     }
                   }
                 }
@@ -4211,7 +4444,7 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 6065
+                "lo": 337
               }
             }
           }
@@ -4315,7 +4548,59 @@
             "data": {
               "i128": {
                 "hi": 0,
-                "lo": 2376
+                "lo": 374
+              }
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": null,
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000002"
+              },
+              {
+                "symbol": "locked_balance"
+              }
+            ],
+            "data": {
+              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAVAX5"
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000002",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "locked_balance"
+              }
+            ],
+            "data": {
+              "i128": {
+                "hi": 0,
+                "lo": 0
               }
             }
           }
