@@ -503,7 +503,7 @@ fn test_update_fee_rejects_equal_or_below_protocol_fee() {
     // Values above protocol_fee_bps (10) are valid.
     let ok = amm.try_update_fee(&11_i128);
     assert!(ok.is_ok(), "fee_bps > protocol_fee_bps must be accepted");
-    assert_eq!(amm.get_fee_bps(), 11);
+    assert_eq!(amm.get_info().fee_bps, 11);
 
     // Re-set to 30 for the next checks.
     amm.update_fee(&30_i128);
