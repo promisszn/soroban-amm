@@ -2836,7 +2836,7 @@ impl AmmPool {
         );
 
         Self::exit_lock(&env);
-        Ok(shares_to_provider)
+        Ok(shares)
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────
