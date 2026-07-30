@@ -219,7 +219,10 @@ impl OracleAggregator {
 
             let client = OracleSourceAdapterClient::new(env, &source.source_contract);
 
-            let (price, source_timestamp) = client.quote(&token_a, &token_b);
+            let (price, source_timestamp) = match client.try_quote(&token_a, &token_b) {
+                Ok(Ok(res)) => res,
+                _ => (0, 0),
+            };
 
             let is_fresh = source_timestamp > 0
                 && source_timestamp <= now
@@ -241,7 +244,7 @@ impl OracleAggregator {
             updated.push_back(source);
         }
 
-        if !stale_sources.is_empty() {
+        if persist_sources && !stale_sources.is_empty() {
             env.events()
                 .publish((symbol_short!("stale_src"),), (stale_sources,));
         }
@@ -276,7 +279,7 @@ impl OracleAggregator {
             }
         }
 
-        if !deviant_sources.is_empty() {
+        if persist_sources && !deviant_sources.is_empty() {
             env.events()
                 .publish((symbol_short!("deviant"),), (deviant_sources,));
         }

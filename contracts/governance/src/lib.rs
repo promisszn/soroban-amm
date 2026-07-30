@@ -1371,8 +1371,12 @@ impl Governance {
         locks: &mut Vec<(Address, i128)>,
         depth: u32,
     ) -> Result<(), GovernanceError> {
+        // Depth is a traversal bound, not a validity check: `delegate` already
+        // rejects cycles, so a chain longer than MAX_DELEGATION_DEPTH is simply a
+        // long honest chain. Stop walking instead of erroring, otherwise the
+        // terminal delegatee could never vote at all.
         if depth > MAX_DELEGATION_DEPTH {
-            return Err(GovernanceError::DelegationCycle);
+            return Ok(());
         }
         let voted_key = DataKey::HasVoted(proposal.id, holder.clone());
         if !env.storage().persistent().has(&voted_key) {
