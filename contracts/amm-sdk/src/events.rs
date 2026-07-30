@@ -185,7 +185,7 @@ pub fn decode_amm_event(
     topics: soroban_sdk::Vec<soroban_sdk::Val>,
     data: soroban_sdk::Val,
 ) -> Option<AmmEvent> {
-    use soroban_sdk::{IntoVal, TryFromVal, TryIntoVal, Symbol};
+    use soroban_sdk::{TryFromVal, TryIntoVal, Symbol};
 
     if topics.is_empty() {
         return None;

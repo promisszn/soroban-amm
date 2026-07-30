@@ -86,7 +86,36 @@ pub struct SdkPoolInfo {
 /// change their code.
 pub type PoolInfo = SdkPoolInfo;
 
+// ── Swap simulation ───────────────────────────────────────────────────────────
+
+/// Detailed breakdown of a hypothetical swap, mirroring the on-chain
+/// `SwapSimulation` struct returned by `AmmPool::simulate_swap`.
+///
+/// Named `SdkSwapSimulation` (with a `SwapSimulation` alias below) for the
+/// same reason as `SdkPoolInfo`: avoiding a duplicate-type collision in the
+/// WASM spec when the AMM contract is compiled with this SDK crate as a
+/// dependency.
+#[contracttype]
+#[derive(Debug, Clone, PartialEq)]
+pub struct SdkSwapSimulation {
+    /// Expected output amount after fees.
+    pub amount_out: i128,
+    /// Fee charged on the input (in input-token units).
+    pub fee_amount: i128,
+    /// Price impact in basis points — how far the execution price is from spot.
+    pub price_impact_bps: i128,
+    /// Effective execution price × 1 000 000 (amount_out / amount_in).
+    pub effective_price: i128,
+    /// Spot price of `token_out` in terms of `token_in` × 1 000 000.
+    pub spot_price: i128,
+}
+
+/// Backward-compatible type alias so existing SDK consumers do not need to
+/// change their code.
+pub type SwapSimulation = SdkSwapSimulation;
+
 // ── Quote types ───────────────────────────────────────────────────────────────
+
 
 /// Result of a `quote_swap_in` call — how much you receive for a known input.
 #[contracttype]
