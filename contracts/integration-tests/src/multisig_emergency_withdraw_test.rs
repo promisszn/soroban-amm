@@ -48,15 +48,21 @@ fn setup_suite() -> Suite {
         .register_stellar_asset_contract_v2(admin.clone())
         .address();
 
+    // Register the pool first so the LP token can be administered by it. The LP
+    // token's admin must be the pool contract (not an EOA) so the pool is
+    // authorized to mint/burn LP tokens — including the minimum-liquidity lock
+    // minted to the pool's own address on the first deposit. Using an EOA here
+    // trips a non-root-authorization panic under `mock_all_auths()`.
+    let amm_addr = env.register_contract(None, AmmPool);
+
     let lp_addr = env.register_contract(None, LpToken);
     token::LpTokenClient::new(&env, &lp_addr).initialize(
-        &admin,
+        &amm_addr,
         &soroban_sdk::String::from_str(&env, "AMM LP"),
         &soroban_sdk::String::from_str(&env, "ALP"),
         &7u32,
     );
 
-    let amm_addr = env.register_contract(None, AmmPool);
     let amm = AmmPoolClient::new(&env, &amm_addr);
     amm.initialize(
         &admin, &token_a, &token_b, &lp_addr, &30_i128, &admin, &0_i128,
@@ -147,7 +153,9 @@ fn scenario_multisig_quorum_triggers_emergency_withdrawal() {
     let recipient_a_before = TokenClient::new(&s.env, &s.token_a).balance(&recipient);
     let recipient_b_before = TokenClient::new(&s.env, &s.token_b).balance(&recipient);
 
+    // Collect quorum (2 approvals) before executing.
     amm.propose_emergency_withdraw(&a, &recipient);
+    amm.propose_emergency_withdraw(&b, &recipient);
     amm.exec_multisig_emergency_wd(&b);
 
     // Pool reserves should have been drained to the recipient.
@@ -187,7 +195,9 @@ fn scenario_multisig_re_execution_returns_already_executed() {
         &2u32,
     );
 
+    // Collect quorum (2 approvals) so the first execution succeeds.
     amm.propose_emergency_withdraw(&a, &recipient);
+    amm.propose_emergency_withdraw(&b, &recipient);
     amm.exec_multisig_emergency_wd(&b);
 
     // Re-executing the same proposal must fail with AlreadyExecuted.

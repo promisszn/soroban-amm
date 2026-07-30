@@ -6,7 +6,7 @@ use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, vec, Address, Env, Vec,
 };
 
-use amm::{AmmPoolClient, PoolInfo};
+use amm::AmmPoolClient;
 use factory::FactoryClient;
 
 const MIN_TTL: u32 = 172_800;
@@ -92,8 +92,10 @@ pub struct RouteQuote {
 
 #[contracttype]
 pub enum DataKey {
+    Admin,
     Factory,
     MaxHops,
+    RoutingTokens,
     ClPoolCount,
     ClPool(u32),
 }
@@ -109,11 +111,15 @@ impl DexAggregator {
     pub const MAX_CL_POOLS: u32 = 50;
     pub const CL_FEE_TIERS: [i128; 3] = [30, 100, 500];
 
-    pub fn initialize(env: Env, factory: Address) {
+    pub const MIN_SQRT_PRICE: u128 = 4_295_128_739_u128;
+    pub const MAX_SQRT_PRICE: u128 = 340_275_971_719_517_849_884_931_781_110_561_029_923_u128;
+
+    pub fn initialize(env: Env, admin: Address, factory: Address) {
         assert!(
             !env.storage().instance().has(&DataKey::Factory),
             "already initialized"
         );
+        env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Factory, &factory);
         env.storage()
             .instance()
@@ -137,6 +143,9 @@ impl DexAggregator {
         token_b: Address,
         fee_bps: i128,
     ) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
         Self::extend_ttl(&env);
         let count: u32 = env
             .storage()
@@ -172,6 +181,43 @@ impl DexAggregator {
         env.storage()
             .instance()
             .set(&DataKey::ClPoolCount, &(count + 1));
+    }
+
+    pub fn set_routing_tokens(env: Env, tokens: Vec<Address>) {
+        env.storage().instance().set(&DataKey::RoutingTokens, &tokens);
+    }
+
+    pub fn remove_cl_pool(env: Env, pool: Address) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        Self::extend_ttl(&env);
+        let count: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ClPoolCount)
+            .unwrap_or(0);
+
+        for i in 0..count {
+            let entry: ClPoolInfo = env
+                .storage()
+                .instance()
+                .get(&DataKey::ClPool(i))
+                .unwrap();
+            if entry.pool == pool {
+                if i != count - 1 {
+                    let last: ClPoolInfo = env
+                        .storage()
+                        .instance()
+                        .get(&DataKey::ClPool(count - 1))
+                        .unwrap();
+                    env.storage().instance().set(&DataKey::ClPool(i), &last);
+                }
+                env.storage().instance().remove(&DataKey::ClPool(count - 1));
+                env.storage().instance().set(&DataKey::ClPoolCount, &(count - 1));
+                return;
+            }
+        }
     }
 
     /// Find the best route up to `max_hops` pools deep (#319).
@@ -283,7 +329,7 @@ impl DexAggregator {
     ) -> Result<RouteQuote, AggregatorError> {
         let factory: Address = env.storage().instance().get(&DataKey::Factory).unwrap();
         let factory_client = FactoryClient::new(env, &factory);
-        let tokens = Self::discover_tokens(env, &factory_client);
+        let tokens = Self::discover_tokens(env, token_in, token_out);
 
         let mut best_out: i128 = 0;
         let mut best_hops: Vec<RouteHop> = Vec::new(env);
@@ -385,14 +431,21 @@ impl DexAggregator {
                     &hop_min,
                     &deadline,
                 ),
-                PoolKind::Cl => ClPoolClient::new(env, &hop.pool).swap(
-                    trader,
-                    &hop.zero_for_one,
-                    &current,
-                    &0u128,
-                    &hop_min,
-                    &deadline,
-                ),
+                PoolKind::Cl => {
+                    let limit = if hop.zero_for_one {
+                        Self::MIN_SQRT_PRICE + 1
+                    } else {
+                        Self::MAX_SQRT_PRICE - 1
+                    };
+                    ClPoolClient::new(env, &hop.pool).swap(
+                        trader,
+                        &hop.zero_for_one,
+                        &current,
+                        &limit,
+                        &hop_min,
+                        &deadline,
+                    )
+                }
             };
         }
         Ok(current)
@@ -493,7 +546,12 @@ impl DexAggregator {
         let mut best: i128 = 0;
         let mut zfo = true;
         for direction in [true, false] {
-            let est = client.estimate_price_impact(&direction, &amount_in, &0u128);
+            let limit = if direction {
+                Self::MIN_SQRT_PRICE + 1
+            } else {
+                Self::MAX_SQRT_PRICE - 1
+            };
+            let est = client.estimate_price_impact(&direction, &amount_in, &limit);
             if est.amount_out > best {
                 best = est.amount_out;
                 zfo = direction;
@@ -506,15 +564,14 @@ impl DexAggregator {
         }
     }
 
-    fn discover_tokens(env: &Env, factory: &FactoryClient) -> Vec<Address> {
-        let pools = factory.all_pools();
-        let mut tokens: Vec<Address> = Vec::new(env);
-        for i in 0..pools.len() {
-            let pool = pools.get(i).unwrap();
-            let info: PoolInfo = AmmPoolClient::new(env, &pool).get_info();
-            Self::push_unique(&mut tokens, info.token_a);
-            Self::push_unique(&mut tokens, info.token_b);
-        }
+    fn discover_tokens(env: &Env, token_in: &Address, token_out: &Address) -> Vec<Address> {
+        let mut tokens: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoutingTokens)
+            .unwrap_or_else(|| Vec::new(env));
+        Self::push_unique(&mut tokens, token_in.clone());
+        Self::push_unique(&mut tokens, token_out.clone());
 
         let cl_count: u32 = env.storage().instance().get(&DataKey::ClPoolCount).unwrap_or(0);
         for i in 0..cl_count {
@@ -622,14 +679,17 @@ mod tests {
 
         let agg_addr = env.register_contract(None, DexAggregator);
         let agg = DexAggregatorClient::new(&env, &agg_addr);
-        agg.initialize(&factory_addr);
+        let agg_admin = Address::generate(&env);
+        agg.initialize(&agg_admin, &factory_addr);
 
         let token_a = Address::generate(&env);
         let token_b = Address::generate(&env);
         let cl_pool = Address::generate(&env);
+        
+        env.mock_all_auths();
         agg.register_cl_pool(&cl_pool, &token_a, &token_b, &30_i128);
 
-        let tokens = DexAggregator::discover_tokens(&env, &factory);
+        let tokens = DexAggregator::discover_tokens(&env, &token_a, &token_b);
         assert_eq!(tokens.len(), 2);
 
         let mut found_a = false;

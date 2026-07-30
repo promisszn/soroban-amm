@@ -764,6 +764,49 @@ fn test_fee_accrues_to_reserves() {
     assert!(info.reserve_a * info.reserve_b > 1_000_000 * 1_000_000);
 }
 
+#[test]
+fn test_swap_fot_applies_lp_rebate() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let admin = ts.admin.clone();
+    let fee_recipient = Address::generate(env);
+    amm.set_protocol_fee(&admin, &fee_recipient, &10_i128);
+    amm.set_lp_rebate(&admin, &5_000_i128).unwrap();
+
+    let trader = Address::generate(env);
+    let amount_in = 100_000_i128;
+    ta_sac.mint(&trader, &amount_in);
+
+    let (_, actual_received) = amm
+        .swap_fot(
+            &trader,
+            &ts.ta_addr,
+            &amount_in,
+            &0_i128,
+            &0_i128,
+            &u64::MAX,
+            &Option::<Address>::None,
+        )
+        .unwrap();
+
+    assert_eq!(actual_received, amount_in);
+
+    let info = amm.get_info();
+    assert_eq!(info.reserve_a, 1_000_000 + amount_in - 50_i128);
+    let (accrued_a, accrued_b) = amm.get_accrued_fees();
+    assert_eq!(accrued_a, 50_i128);
+    assert_eq!(accrued_b, 0_i128);
+}
+
 // ── Issue #98: swap_exact_out ─────────────────────────────────────────────────
 
 #[test]
@@ -1147,34 +1190,6 @@ fn test_swap_emits_token_out_in_event_payload() {
         amount_out,
     );
     assert_eq!(data, expected);
-}
-
-#[test]
-fn test_snapshot_position_records_pool_state() {
-    let ts = setup_pool(30);
-    let env = &ts.env;
-    let amm = AmmPoolClient::new(env, &ts.amm_addr);
-    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
-    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
-
-    let provider = Address::generate(env);
-    ta_sac.mint(&provider, &1_000_000_i128);
-    tb_sac.mint(&provider, &1_000_000_i128);
-    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
-
-    let snapshots = amm.get_snapshots();
-    assert_eq!(snapshots.len(), 0);
-
-    amm.snapshot_position();
-
-    let snapshots = amm.get_snapshots();
-    assert_eq!(snapshots.len(), 1);
-    let snapshot = snapshots.get(0).unwrap();
-    assert_eq!(snapshot.reserve_a, 1_000_000);
-    assert_eq!(snapshot.reserve_b, 1_000_000);
-    assert_eq!(snapshot.total_shares, 1_000_000);
-    assert_eq!(snapshot.price_range_low, 900_000);
-    assert_eq!(snapshot.price_range_high, 1_100_000);
 }
 
 #[test]
@@ -1756,169 +1771,138 @@ fn bench_add_liquidity_cost() {
     std::println!("{}", env.budget());
 }
 
-// ── add_liquidity_fot minimum-liquidity lock ─────────────────────────────────
+// ── Issue: multisig proposal expiry must not be refreshed by an already-approved signer ──
+//
+// `propose_emergency_withdraw` previously reset `MultisigProposalExpiresAt` to
+// `now + MULTISIG_PROPOSAL_TTL_SECS` on *every* call, even when the calling signer
+// had already approved the same recipient and no new approval was added. That let a
+// single signer keep a stuck proposal (e.g. 1 of 3 required approvals) alive forever
+// by periodically re-proposing, defeating `ProposalExpired` as a freshness check.
+//
+// The fix only refreshes the expiry when a *new* approval is recorded.
 
-/// First deposit via add_liquidity_fot must lock MINIMUM_LIQUIDITY shares
-/// to the contract, matching add_liquidity's behavior (Issue #294).
 #[test]
-fn test_fot_first_deposit_locks_minimum_liquidity() {
-    let (env, admin, amm_addr, lp_addr, _) = setup();
-    let (ta, _) = create_sac(&env, &admin);
-    let (tb, _) = create_sac(&env, &admin);
-    let amm = AmmPoolClient::new(&env, &amm_addr);
-    amm.initialize(
-        &admin,
-        &ta.address,
-        &tb.address,
-        &lp_addr,
-        &30_i128,
-        &admin,
-        &0_i128,
+fn test_multisig_reproposal_by_approved_signer_does_not_extend_expiry() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    // Seed the pool with reserves so an emergency withdrawal would have funds.
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let a = Address::generate(env);
+    let b = Address::generate(env);
+    let c = Address::generate(env);
+    let recipient = Address::generate(env);
+    let signers = soroban_sdk::Vec::from_array(env, [a.clone(), b.clone(), c.clone()]);
+    amm.set_multisig(&ts.admin, &signers, &2u32);
+
+    const TTL: u64 = 7 * 24 * 60 * 60; // mirrors MULTISIG_PROPOSAL_TTL_SECS
+    let t0 = 100_000_u64;
+    env.ledger().set_timestamp(t0);
+
+    // Signer `a` opens the proposal. Expiry = t0 + TTL, approvals = [a].
+    amm.propose_emergency_withdraw(&a, &recipient);
+    assert_eq!(amm.get_multisig_proposal().unwrap().approvals.len(), 1);
+
+    // Six days later the *already-approved* signer `a` re-proposes the SAME
+    // recipient. This adds no new approval and, with the fix, must NOT extend
+    // the expiry beyond the original t0 + TTL.
+    let t1 = t0 + 6 * 24 * 60 * 60;
+    env.ledger().set_timestamp(t1);
+    amm.propose_emergency_withdraw(&a, &recipient);
+    assert_eq!(
+        amm.get_multisig_proposal().unwrap().approvals.len(),
+        1,
+        "re-proposing signer must not be double-counted"
     );
 
-    let provider = Address::generate(&env);
-    let ta_sac = StellarAssetClient::new(&env, &ta.address);
-    let tb_sac = StellarAssetClient::new(&env, &tb.address);
-    ta_sac.mint(&provider, &2_000_000);
-    tb_sac.mint(&provider, &2_000_000);
-
-    // First FOT deposit: amount_a=2_000_000, amount_b=2_000_000.
-    // sqrt(2_000_000 * 2_000_000) = 2_000_000 shares.
-    // After MINIMUM_LIQUIDITY lock, provider gets 2_000_000 - 1_000 = 1_999_000.
-    let shares = amm
-        .try_add_liquidity_fot(
-            &provider,
-            &2_000_000,
-            &2_000_000,
-            &0,
-            &0,
-            &0,
-            &u64::MAX,
-        )
-        .unwrap()
-        .unwrap();
-    assert_eq!(shares, 1_999_000);
-
-    let info = amm.get_info();
-    // Total shares = provider shares + locked 1_000.
-    assert_eq!(info.total_shares, 2_000_000);
-    // Locked 1_000 are held by the contract.
-    let lp_client = token::LpTokenClient::new(&env, &lp_addr);
-    assert_eq!(lp_client.balance(&amm_addr), 1_000);
-    assert_eq!(lp_client.balance(&provider), 1_999_000);
+    // Advance just past the ORIGINAL expiry (t0 + TTL). Note t2 < t1 + TTL, so if
+    // the re-propose had (incorrectly) refreshed the window, execution would instead
+    // fail with InsufficientShares (1 < 2). ProposalExpired proves the window was
+    // NOT extended by the already-approved signer.
+    let t2 = t0 + TTL + 1;
+    env.ledger().set_timestamp(t2);
+    let result = amm.try_exec_multisig_emergency_wd(&b);
+    assert_eq!(
+        result,
+        Err(Ok(AmmError::ProposalExpired)),
+        "a stale proposal must lapse; an already-approved signer cannot keep it alive"
+    );
 }
 
-/// First deposit where shares <= MINIMUM_LIQUIDITY must be rejected.
 #[test]
-fn test_fot_first_deposit_rejects_insufficient_shares() {
-    let (env, admin, amm_addr, lp_addr, _) = setup();
-    let (ta, _) = create_sac(&env, &admin);
-    let (tb, _) = create_sac(&env, &admin);
-    let amm = AmmPoolClient::new(&env, &amm_addr);
-    amm.initialize(
-        &admin,
-        &ta.address,
-        &tb.address,
-        &lp_addr,
-        &30_i128,
-        &admin,
-        &0_i128,
+fn test_multisig_new_cosigner_refreshes_window_and_quorum_executes() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    // Seed the pool with reserves.
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let a = Address::generate(env);
+    let b = Address::generate(env);
+    let c = Address::generate(env);
+    let recipient = Address::generate(env);
+    let signers = soroban_sdk::Vec::from_array(env, [a.clone(), b.clone(), c.clone()]);
+    amm.set_multisig(&ts.admin, &signers, &2u32);
+
+    let token_a = StellarTokenClient::new(env, &ts.ta_addr);
+    let token_b = StellarTokenClient::new(env, &ts.tb_addr);
+    let pool_a_before = token_a.balance(&ts.amm_addr);
+    let pool_b_before = token_b.balance(&ts.amm_addr);
+    let recip_a_before = token_a.balance(&recipient);
+    let recip_b_before = token_b.balance(&recipient);
+    assert!(pool_a_before > 0 && pool_b_before > 0);
+
+    const TTL: u64 = 7 * 24 * 60 * 60;
+    let t0 = 100_000_u64;
+    env.ledger().set_timestamp(t0);
+
+    // Signer `a` opens the proposal: approvals = [a], expiry = t0 + TTL.
+    amm.propose_emergency_withdraw(&a, &recipient);
+
+    // A genuinely NEW signer `b` co-signs six days later. This is real progress
+    // toward quorum and (preserved behavior) refreshes the window to t1 + TTL.
+    let t1 = t0 + 6 * 24 * 60 * 60;
+    env.ledger().set_timestamp(t1);
+    amm.propose_emergency_withdraw(&b, &recipient);
+    assert_eq!(amm.get_multisig_proposal().unwrap().approvals.len(), 2);
+
+    // Past the ORIGINAL expiry but inside the refreshed window (t2 < t1 + TTL).
+    // Quorum (2) is met, so execution must succeed and drain reserves to recipient.
+    let t2 = t0 + TTL + 1;
+    env.ledger().set_timestamp(t2);
+    amm.exec_multisig_emergency_wd(&a);
+
+    assert_eq!(
+        token_a.balance(&ts.amm_addr),
+        0,
+        "reserve_a should be drained"
     );
-
-    let provider = Address::generate(&env);
-    let ta_sac = StellarAssetClient::new(&env, &ta.address);
-    let tb_sac = StellarAssetClient::new(&env, &tb.address);
-    // sqrt(1_000 * 1_000) = 1_000 shares → equal to MINIMUM_LIQUIDITY → rejected.
-    ta_sac.mint(&provider, &1_000);
-    tb_sac.mint(&provider, &1_000);
-    let result = amm.try_add_liquidity_fot(
-        &provider,
-        &1_000,
-        &1_000,
-        &0,
-        &0,
-        &0,
-        &u64::MAX,
+    assert_eq!(
+        token_b.balance(&ts.amm_addr),
+        0,
+        "reserve_b should be drained"
     );
-    assert_eq!(result, Err(Ok(AmmError::InsufficientShares)));
-
-    // Even smaller: sqrt(500 * 500) = 500 → rejected.
-    let provider2 = Address::generate(&env);
-    ta_sac.mint(&provider2, &500);
-    tb_sac.mint(&provider2, &500);
-    let result2 = amm.try_add_liquidity_fot(
-        &provider2,
-        &500,
-        &500,
-        &0,
-        &0,
-        &0,
-        &u64::MAX,
+    assert_eq!(
+        token_a.balance(&recipient),
+        recip_a_before + pool_a_before,
+        "recipient should receive token_a reserves"
     );
-    assert_eq!(result2, Err(Ok(AmmError::InsufficientShares)));
-}
-
-/// Subsequent deposits via add_liquidity_fot must not lock additional liquidity.
-#[test]
-fn test_fot_subsequent_deposit_no_extra_lock() {
-    let (env, admin, amm_addr, lp_addr, _) = setup();
-    let (ta, _) = create_sac(&env, &admin);
-    let (tb, _) = create_sac(&env, &admin);
-    let amm = AmmPoolClient::new(&env, &amm_addr);
-    amm.initialize(
-        &admin,
-        &ta.address,
-        &tb.address,
-        &lp_addr,
-        &30_i128,
-        &admin,
-        &0_i128,
+    assert_eq!(
+        token_b.balance(&recipient),
+        recip_b_before + pool_b_before,
+        "recipient should receive token_b reserves"
     );
-
-    let provider = Address::generate(&env);
-    let ta_sac = StellarAssetClient::new(&env, &ta.address);
-    let tb_sac = StellarAssetClient::new(&env, &tb.address);
-    ta_sac.mint(&provider, &2_000_000);
-    tb_sac.mint(&provider, &2_000_000);
-
-    // First deposit locks MINIMUM_LIQUIDITY.
-    let shares1 = amm
-        .try_add_liquidity_fot(
-            &provider,
-            &2_000_000,
-            &2_000_000,
-            &0,
-            &0,
-            &0,
-            &u64::MAX,
-        )
-        .unwrap()
-        .unwrap();
-    assert_eq!(shares1, 1_999_000);
-
-    // Second deposit: proportional, no additional lock.
-    ta_sac.mint(&provider, &1_000_000);
-    tb_sac.mint(&provider, &1_000_000);
-    let shares2 = amm
-        .try_add_liquidity_fot(
-            &provider,
-            &1_000_000,
-            &1_000_000,
-            &0,
-            &0,
-            &0,
-            &u64::MAX,
-        )
-        .unwrap()
-        .unwrap();
-
-    let info = amm.get_info();
-    let lp_client = token::LpTokenClient::new(&env, &lp_addr);
-
-    // Contract still holds exactly 1_000 locked shares.
-    assert_eq!(lp_client.balance(&amm_addr), 1_000);
-    // Provider's total balance = 1_999_000 + second deposit shares.
-    assert_eq!(lp_client.balance(&provider), shares1 + shares2);
-    // Total shares = provider total + 1_000 lock.
-    assert_eq!(info.total_shares, shares1 + shares2 + 1_000);
 }

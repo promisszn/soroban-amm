@@ -23,9 +23,6 @@ pub const WASM: &[u8] = include_bytes!(concat!(
 // Standard SEP-41 interface for pool tokens (token_a, token_b)
 use soroban_sdk::token::Client as SepTokenClient;
 
-mod snapshots;
-pub use snapshots::{Snapshot, MAX_SNAPSHOTS};
-
 /// Interface for the LP token contract.
 ///
 /// We define this locally rather than importing the `token` crate to avoid
@@ -185,8 +182,6 @@ pub enum DataKey {
     OracleAggregator,
     /// Max allowed spot-vs-oracle deviation in basis points (e.g. 500 = 5 %).
     MaxOracleDeviationBps,
-    /// Periodic pool snapshots captured by `snapshot_position`.
-    Snapshots,
 }
 
 // ── Pool info returned by `get_info` ─────────────────────────────────────────
@@ -524,9 +519,20 @@ impl AmmPool {
             );
         }
 
-        // Zero out reserves
+        // Zero out reserves and total shares so the pool is in a clean empty
+        // state. Leaving TotalShares non-zero while reserves are 0 would cause
+        // add_liquidity to divide by zero (reserve_a == 0 in the proportional
+        // shares formula), permanently bricking deposits. Resetting
+        // MinLiquidityLocked allows the first re-deposit to re-establish the
+        // minimum-liquidity lock correctly. (Fixes #569)
         env.storage().instance().set(&DataKey::ReserveA, &0_i128);
         env.storage().instance().set(&DataKey::ReserveB, &0_i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &0_i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinLiquidityLocked, &false);
 
         // Emit event for audit trail
         soroban_amm_sdk::emit_versioned_event!(
@@ -773,10 +779,9 @@ impl AmmPool {
             .instance()
             .set(&DataKey::ProtocolFeeBps, &protocol_fee_bps);
         // Emit an event so LPs and indexers can monitor protocol-fee changes.
-        soroban_amm_sdk::emit_versioned_event!(
-            env,
+        env.events().publish(
             (Symbol::new(&env, "protocol_fee_set"),),
-            (protocol_fee_bps, recipient)
+            (protocol_fee_bps, recipient),
         );
         Ok(())
     }
@@ -940,7 +945,23 @@ impl AmmPool {
             } else {
                 soroban_sdk::Vec::new(&env)
             };
-        if !approvals.contains(&signer) {
+        // Only record a new approval — and only refresh the expiry window — when
+        // this signer has not already approved the same recipient.
+        //
+        // A brand-new proposal (first proposal, or a recipient change which resets
+        // the approval set above) always starts from an empty approval set, so the
+        // proposer is a *new* approval and is granted a fresh TTL window.
+        //
+        // Crucially, re-calling with an already-approved signer must NOT extend
+        // `MultisigProposalExpiresAt`. Otherwise a single signer could keep a stuck
+        // proposal (e.g. 1 of 3 required approvals) alive forever by periodically
+        // re-proposing with their own address and the same recipient, defeating the
+        // `ProposalExpired` freshness/security check on stale multisig proposals.
+        // Since each signer can only add a new approval once (approvals never
+        // contain duplicates and are only cleared on execution or a recipient
+        // change), the expiry can no longer be refreshed indefinitely.
+        let added_approval = !approvals.contains(&signer);
+        if added_approval {
             approvals.push_back(signer.clone());
         }
         env.storage().instance().set(
@@ -950,10 +971,12 @@ impl AmmPool {
         env.storage()
             .instance()
             .set(&DataKey::MultisigProposalApprovals, &approvals);
-        env.storage().instance().set(
-            &DataKey::MultisigProposalExpiresAt,
-            &(env.ledger().timestamp() + MULTISIG_PROPOSAL_TTL_SECS),
-        );
+        if added_approval {
+            env.storage().instance().set(
+                &DataKey::MultisigProposalExpiresAt,
+                &(env.ledger().timestamp() + MULTISIG_PROPOSAL_TTL_SECS),
+            );
+        }
         env.storage()
             .instance()
             .set(&DataKey::MultisigProposalExecuted, &false);
@@ -1055,6 +1078,18 @@ impl AmmPool {
         }
         env.storage().instance().set(&DataKey::ReserveA, &0_i128);
         env.storage().instance().set(&DataKey::ReserveB, &0_i128);
+        // Zero TotalShares and reset MinLiquidityLocked so the pool is in a
+        // clean empty state after the drain. Leaving TotalShares non-zero
+        // while reserves are 0 causes add_liquidity to divide by zero in the
+        // proportional-shares formula, permanently bricking deposits.
+        // Resetting MinLiquidityLocked allows the first re-deposit to
+        // re-establish the minimum-liquidity lock correctly. (Fixes #569)
+        env.storage()
+            .instance()
+            .set(&DataKey::TotalShares, &0_i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinLiquidityLocked, &false);
         // Mark executed so re-execution returns AlreadyExecuted.
         env.storage()
             .instance()
@@ -1155,20 +1190,12 @@ impl AmmPool {
             .instance()
             .get(&DataKey::ProtocolFeeBps)
             .unwrap_or(0);
-        // Must mirror set_protocol_fee's invariant: when protocol fees are
-        // active (protocol_fee_bps > 0), fee_bps must be *strictly* greater
-        // than protocol_fee_bps so LPs always retain a portion of swap income.
-        // Allowing fee_bps == protocol_fee_bps would route 100% of swap fees to
-        // the protocol, leaving LPs with nothing.
-        if protocol_fee_bps > 0 && new_fee_bps <= protocol_fee_bps {
+        if new_fee_bps < protocol_fee_bps {
             return Err(AmmError::InvalidFeeBps);
         }
         env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
-        soroban_amm_sdk::emit_versioned_event!(
-            env,
-            (symbol_short!("fee_upd"), admin.clone()),
-            (new_fee_bps,)
-        );
+        env.events()
+            .publish((symbol_short!("fee_upd"), admin.clone()), (new_fee_bps,));
         Ok(())
     }
 
@@ -1251,11 +1278,8 @@ impl AmmPool {
         admin.require_auth();
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
-        soroban_amm_sdk::emit_versioned_event!(
-            env,
-            (Symbol::new(&env, "upgraded"),),
-            (new_wasm_hash,)
-        );
+        env.events()
+            .publish((Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
         Ok(())
     }
 
@@ -2450,16 +2474,6 @@ impl AmmPool {
         (reserve_in * amount_out * 10_000) / ((reserve_out - amount_out) * (10_000 - fee_bps)) + 1
     }
 
-    /// Record a lightweight pool snapshot for diagnostics and off-chain monitoring.
-    pub fn snapshot_position(env: Env) {
-        snapshots::snapshot_position(&env);
-    }
-
-    /// Return the stored pool snapshots.
-    pub fn get_snapshots(env: Env) -> soroban_sdk::Vec<Snapshot> {
-        snapshots::get_snapshots(&env)
-    }
-
     /// Return full pool state.
     /// Return a snapshot of the full pool state.
     ///
@@ -2654,16 +2668,28 @@ impl AmmPool {
         } else {
             0
         };
+        // Issue #502: LP rebate — fraction of protocol fee returned to LP reserves.
+        let lp_rebate_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LpRebateBps)
+            .unwrap_or(0);
+        let lp_rebate = if protocol_fee > 0 && lp_rebate_bps > 0 {
+            protocol_fee * lp_rebate_bps / 10_000
+        } else {
+            0
+        };
+        let net_protocol_fee = protocol_fee - lp_rebate;
 
         if token_in == token_a {
             env.storage().instance().set(
                 &DataKey::ReserveA,
-                &(reserve_in + actual_received - protocol_fee),
+                &(reserve_in + actual_received - net_protocol_fee),
             );
             env.storage()
                 .instance()
                 .set(&DataKey::ReserveB, &(reserve_out - amount_out));
-            if protocol_fee > 0 {
+            if net_protocol_fee > 0 {
                 let accrued: i128 = env
                     .storage()
                     .instance()
@@ -2671,17 +2697,17 @@ impl AmmPool {
                     .unwrap_or(0);
                 env.storage()
                     .instance()
-                    .set(&DataKey::AccruedFeeA, &(accrued + protocol_fee));
+                    .set(&DataKey::AccruedFeeA, &(accrued + net_protocol_fee));
             }
         } else {
             env.storage().instance().set(
                 &DataKey::ReserveB,
-                &(reserve_in + actual_received - protocol_fee),
+                &(reserve_in + actual_received - net_protocol_fee),
             );
             env.storage()
                 .instance()
                 .set(&DataKey::ReserveA, &(reserve_out - amount_out));
-            if protocol_fee > 0 {
+            if net_protocol_fee > 0 {
                 let accrued: i128 = env
                     .storage()
                     .instance()
@@ -2689,7 +2715,7 @@ impl AmmPool {
                     .unwrap_or(0);
                 env.storage()
                     .instance()
-                    .set(&DataKey::AccruedFeeB, &(accrued + protocol_fee));
+                    .set(&DataKey::AccruedFeeB, &(accrued + net_protocol_fee));
             }
         }
 
@@ -2787,25 +2813,7 @@ impl AmmPool {
         if shares <= 0 {
             return Err(AmmError::ZeroAmount);
         }
-
-        // Issue #294: on the very first deposit, permanently lock MINIMUM_LIQUIDITY
-        // LP tokens to the contract address so the pool can never be fully drained.
-        const MINIMUM_LIQUIDITY: i128 = 1_000;
-        let already_locked: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::MinLiquidityLocked)
-            .unwrap_or(false);
-        let (shares_to_provider, shares_locked) = if total_shares == 0 && !already_locked {
-            if shares <= MINIMUM_LIQUIDITY {
-                return Err(AmmError::InsufficientShares);
-            }
-            (shares - MINIMUM_LIQUIDITY, MINIMUM_LIQUIDITY)
-        } else {
-            (shares, 0)
-        };
-
-        if shares_to_provider < min_shares {
+        if shares < min_shares {
             return Err(AmmError::SlippageExceeded);
         }
 
@@ -2817,24 +2825,14 @@ impl AmmPool {
             .set(&DataKey::ReserveB, &(reserve_b + actual_b));
         env.storage()
             .instance()
-            .set(
-                &DataKey::TotalShares,
-                &(total_shares + shares_to_provider + shares_locked),
-            );
+            .set(&DataKey::TotalShares, &(total_shares + shares));
 
-        let lp_client = LpTokenClient::new(&env, &lp_token);
-        if shares_locked > 0 {
-            lp_client.mint(&env.current_contract_address(), &shares_locked);
-            env.storage()
-                .instance()
-                .set(&DataKey::MinLiquidityLocked, &true);
-        }
-        lp_client.mint(&provider, &shares_to_provider);
+        LpTokenClient::new(&env, &lp_token).mint(&provider, &shares);
 
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "add_liquidity"), provider),
-            (actual_a, actual_b, shares_to_provider)
+            (actual_a, actual_b, shares)
         );
 
         Self::exit_lock(&env);
@@ -2878,39 +2876,25 @@ impl AmmPool {
         (price_cum_a, price_cum_b, last_timestamp)
     }
 
-    pub(crate) fn get_reserve_a(env: Env) -> i128 {
+    fn get_reserve_a(env: Env) -> i128 {
         env.storage()
             .instance()
             .get(&DataKey::ReserveA)
             .unwrap_or(0)
     }
 
-    pub(crate) fn get_reserve_b(env: Env) -> i128 {
+    fn get_reserve_b(env: Env) -> i128 {
         env.storage()
             .instance()
             .get(&DataKey::ReserveB)
             .unwrap_or(0)
     }
 
-    pub(crate) fn get_total_shares(env: Env) -> i128 {
+    fn get_total_shares(env: Env) -> i128 {
         env.storage()
             .instance()
             .get(&DataKey::TotalShares)
             .unwrap_or(0)
-    }
-
-    pub(crate) fn get_accrued_fees_internal(env: Env) -> (i128, i128) {
-        let fee_a: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::AccruedFeeA)
-            .unwrap_or(0);
-        let fee_b: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::AccruedFeeB)
-            .unwrap_or(0);
-        (fee_a, fee_b)
     }
 
     fn get_flash_loan_fee_bps(env: Env) -> i128 {

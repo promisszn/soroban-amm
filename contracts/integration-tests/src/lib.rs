@@ -515,7 +515,8 @@ mod tests {
 
         let agg_addr = env.register_contract(None, DexAggregator);
         let agg = DexAggregatorClient::new(&env, &agg_addr);
-        agg.initialize(&factory_addr);
+        let agg_admin = Address::generate(&env);
+        agg.initialize(&agg_admin, &factory_addr);
         let quote = agg
             .find_best_route(&token_a, &token_c, &50_000_i128, &4u32)
             .unwrap();
