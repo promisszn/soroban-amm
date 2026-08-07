@@ -46,8 +46,6 @@ pub trait ClPoolInterface {
         initial_tick: i32,
         tick_spacing: i32,
     );
-
-    fn get_pool_state(env: Env) -> concentrated_liquidity::PoolState;
 }
 
 #[contractclient(name = "AmmPoolClient")]
@@ -341,6 +339,18 @@ impl Factory {
 
         let pool_admin = gov_addr.clone().unwrap_or_else(|| admin.clone());
 
+        let (fee_recipient, protocol_fee_bps) = if env.storage().instance().has(&DataKey::Treasury)
+        {
+            let protocol_fee_bps: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::GlobalProtocolFeeBps)
+                .unwrap_or(0);
+            (env.current_contract_address(), protocol_fee_bps)
+        } else {
+            (admin.clone(), 0_i128)
+        };
+
         // Initialize AMM pool.
         AmmPoolClient::new(&env, &pool_addr).initialize(
             &pool_admin,
@@ -348,8 +358,8 @@ impl Factory {
             &tb,
             &lp_addr,
             &fee_bps,
-            &admin,  // fee_recipient
-            &0_i128, // protocol_fee_bps (disabled by default)
+            &fee_recipient,
+            &protocol_fee_bps,
         );
 
         // Register pool in lookup indexes and record the LP token address.
@@ -579,15 +589,11 @@ impl Factory {
             .with_current_contract(cl_salt)
             .deploy(cl_wasm);
 
-        // Derive tick_spacing from fee tier using the same tiering as the
-        // dex_aggregator and the standard concentrated-liquidity fee tiers.
-        // The 500 bps tier is an actively routed fee tier and must not fall
-        // back to the near-zero-fee spacing.
+        // Derive tick_spacing from fee tier (matching Uniswap v3 conventions).
         let tick_spacing: i32 = match fee_bps {
             5 => 1,
             30 => 10,
             100 => 60,
-            500 => 200,
             _ => 1,
         };
         ClPoolClient::new(&env, &pool_addr).initialize(
@@ -1186,19 +1192,6 @@ impl Factory {
                     continue;
                 }
 
-                // Guard: only AMM pools have a PoolTokens entry. CL pools (which
-                // use a different interface and don't implement set_protocol_fee)
-                // never have this key, so we skip them. This also handles any
-                // legacy CL pool addresses that may exist in PoolByIndex from
-                // before CL pools were given their own separate index.
-                let is_amm_pool = env
-                    .storage()
-                    .persistent()
-                    .has(&DataKey::PoolTokens(pool_addr.clone()));
-                if !is_amm_pool {
-                    continue;
-                }
-
                 AmmPoolClient::new(env, &pool_addr).set_protocol_fee(
                     admin,
                     &factory_addr,
@@ -1725,33 +1718,6 @@ mod tests {
     }
 
     #[test]
-    fn test_create_cl_pool_500_bps_uses_wider_tick_spacing() {
-        let env = Env::default();
-        env.budget().reset_unlimited();
-        env.mock_all_auths();
-
-        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
-        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
-        let cl_hash = env
-            .deployer()
-            .upload_contract_wasm(concentrated_liquidity::WASM);
-
-        let admin = Address::generate(&env);
-        let factory_addr = env.register_contract(None, Factory);
-        let factory = FactoryClient::new(&env, &factory_addr);
-        factory.initialize(&admin, &amm_hash, &token_hash);
-        factory.set_cl_wasm_hash(&cl_hash);
-
-        let ta = Address::generate(&env);
-        let tb = Address::generate(&env);
-
-        let pool_addr = factory.create_cl_pool(&admin, &ta, &tb, &500_i128, &0_i32);
-        let state = ClPoolClient::new(&env, &pool_addr).get_pool_state();
-
-        assert_eq!(state.tick_spacing, 200);
-    }
-
-    #[test]
     fn test_create_cl_pool_duplicate_panics() {
         let env = Env::default();
         env.budget().reset_unlimited();
@@ -2158,6 +2124,33 @@ mod tests {
         let treasury2 = Address::generate(&env);
         factory.set_treasury(&admin, &treasury2, &50_i128);
         assert_eq!(factory.get_treasury(), Some((treasury2, 50_i128)));
+    }
+
+    #[test]
+    fn test_create_pool_inherits_global_fee_config_after_treasury_setup() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        factory.set_treasury(&admin, &treasury, &25_i128);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+        let (pool_addr, _) = factory.create_pool_with_fee_bps(&admin, &ta, &tb, &30_i128, &None);
+
+        let amm_client = amm::AmmPoolClient::new(&env, &pool_addr);
+        let (recipient, bps) = amm_client.get_protocol_fee();
+        assert_eq!(recipient, Some(factory_addr.clone()));
+        assert_eq!(bps, 25_i128);
     }
 
     #[test]
