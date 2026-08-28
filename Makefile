@@ -7,7 +7,7 @@ WASM_DIR := target/wasm32v1-none/release
 SHELL := bash
 
 .PHONY: all help build optimize test test-all fmt lint check check-docs \
-        size size-check doc audit bench deploy e2e clean
+        size size-check doc audit bench deploy e2e clean fuzz-cl
 
 # Bare `make` explains itself instead of building.
 .DEFAULT_GOAL := help
@@ -39,6 +39,10 @@ test: build ## Build, then run the default-members test suite
 
 test-all: ## Run tests for the whole workspace, bypassing default-members
 	cargo test --workspace
+
+fuzz-cl: ## Build the CL wasm, then run the full amm-fuzz suite incl. CL stateful properties
+	cargo build --release --target wasm32v1-none -p concentrated_liquidity
+	cargo test -p amm-fuzz --features cl
 
 fmt: ## cargo fmt --all
 	cargo fmt --all
