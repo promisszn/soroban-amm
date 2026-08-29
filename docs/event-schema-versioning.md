@@ -268,3 +268,19 @@ emit site: `swap_exact_out` emits a `swap_out` event through
 plus reuses the existing `price_upd` event on a price-moving trade,
 consistent with every other state-mutating call in this contract. The row
 for it is listed in the Concentrated-liquidity AMM event table above.
+
+## Update (#689)
+
+`contracts/oracle_aggregator/src/lib.rs` gained a new unversioned `src_wt`
+event emitted by `set_source_weight`, consistent with the oracle aggregator's
+existing plain-event convention (predating the `emit_versioned_event!` scheme).
+The event is emitted via `env.events().publish(...)` directly.
+
+### Oracle Aggregator — `contracts/oracle_aggregator/src/lib.rs` (unversioned, plain events)
+
+| Event | Topics | Payload |
+|---|---|---|
+| `stale_src` | — | `(stale_sources: Vec<Address>)` |
+| `deviant` | — | `(deviant_sources: Vec<Address>)` |
+| `price` | — | `(token_a: Address, token_b: Address, price: i128, confidence: u32)` |
+| `src_wt` | — | `(source: Address, old_weight: u32, new_weight: u32)` |
