@@ -348,6 +348,8 @@ pub trait FlashLoanReceiver {
 
 During `flash_loan`, the AMM transfers `amount` of `token` to `receiver`, invokes `on_flash_loan`, and then checks that the pool's token balance increased by at least `fee`. If the receiver does not return `amount + fee` before the callback finishes, the transaction reverts.
 
+**Reference Implementation:** See [examples/flash_loan_receiver/README.md](examples/flash_loan_receiver/README.md) for a canonical example implementation covering arbitrage, collateral swaps, and all failure modes.
+
 ### LP Token Contract
 
 Located in [contracts/token/src/lib.rs](contracts/token/src/lib.rs).
