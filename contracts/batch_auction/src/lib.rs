@@ -2943,7 +2943,12 @@ mod tests {
         env.ledger().set_timestamp(1031);
         client.set_max_orders(&admin, &3_u32);
         let results = client.settle_batch();
-        assert_eq!(results.len(), 1); // only A settled
+        // A actually settles (real output); B's expiry also successfully
+        // refunds and is recorded as a `0` output (pre-existing behavior);
+        // C (venue removed) and D (left pending) contribute nothing here.
+        assert_eq!(results.len(), 2);
+        assert!(results.get(0).unwrap() > 0);
+        assert_eq!(results.get(1).unwrap(), 0);
         assert_eq!(client.get_pending_orders().len(), 1); // D remains
 
         // The contract's real balances equal exactly D's still-escrowed
