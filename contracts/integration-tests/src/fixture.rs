@@ -8,16 +8,15 @@
 
 use soroban_sdk::{
     testutils::{Address as _, Ledger, LedgerInfo},
-    token::Client as TokenClient,
+    token::StellarAssetClient,
     Address, BytesN, Env,
 };
 
-// WASM artifacts from compiled contracts
+// WASM artifacts from compiled contracts. Only the AMM pool and SEP-41 token
+// are deployed from uploaded WASM (the factory deploys pool instances from
+// these hashes); the other contracts here are registered natively via their
+// Rust contract type instead.
 use amm::WASM as AMM_WASM;
-use concentrated_liquidity::WASM as CL_WASM;
-use factory::WASM as FACTORY_WASM;
-use governance::WASM as GOV_WASM;
-use staking::WASM as STAKING_WASM;
 use token::WASM as TOKEN_WASM;
 
 /// A complete protocol instance for testing.
@@ -33,11 +32,11 @@ use token::WASM as TOKEN_WASM;
 pub struct Protocol {
     pub env: Env,
     pub admin: Address,
-    
+
     // Tokens
     pub token_a: Address,
     pub token_b: Address,
-    
+
     // Core contracts
     pub factory: Address,
     pub v2_pool: Address,
@@ -62,7 +61,7 @@ impl Protocol {
         let ts = 1_000_000u64;
         env.ledger().set(LedgerInfo {
             timestamp: ts,
-            protocol_version: 22,
+            protocol_version: 21,
             sequence_number: 1,
             network_id: Default::default(),
             base_reserve: 10,
@@ -83,19 +82,13 @@ impl Protocol {
             .address();
 
         // Mint tokens to admin
-        let ta = TokenClient::new(&env, &token_a);
-        let tb = TokenClient::new(&env, &token_b);
-        ta.mint(&admin, &1_000_000_000_i128);
-        tb.mint(&admin, &1_000_000_000_i128);
+        StellarAssetClient::new(&env, &token_a).mint(&admin, &1_000_000_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&admin, &1_000_000_000_i128);
 
         // ── Upload WASM hashes ──────────────────────────────────────────────
 
         let amm_hash: BytesN<32> = env.deployer().upload_contract_wasm(AMM_WASM);
         let token_hash: BytesN<32> = env.deployer().upload_contract_wasm(TOKEN_WASM);
-        let factory_hash: BytesN<32> = env.deployer().upload_contract_wasm(FACTORY_WASM);
-        let gov_hash: BytesN<32> = env.deployer().upload_contract_wasm(GOV_WASM);
-        let staking_hash: BytesN<32> = env.deployer().upload_contract_wasm(STAKING_WASM);
-        let cl_hash: BytesN<32> = env.deployer().upload_contract_wasm(CL_WASM);
 
         // ── Deploy factory ───────────────────────────────────────────────────
 
@@ -107,33 +100,33 @@ impl Protocol {
 
         // ── Deploy V2 pool ──────────────────────────────────────────────────
 
-        // Create pool via factory
-        let pool_result = factory_client.create_pool(
-            &token_a,
-            &token_b,
-            &30i128, // 30 bps = 0.3% fee
-        );
-
-        let v2_pool = pool_result;
-        let v2_lp_token = factory_client.get_lp_token(&token_a, &token_b);
+        // Create pool via factory (fee tier 2 = 30 bps = 0.3% fee)
+        let (v2_pool, _pool_governance) =
+            factory_client.create_pool(&admin, &token_a, &token_b, &2i128, &None);
+        let v2_lp_token = factory_client
+            .get_lp_token(&v2_pool)
+            .expect("LP token should exist for a freshly created pool");
 
         // ── Deploy governance ───────────────────────────────────────────────
 
         let governance = env.register_contract(None, governance::Governance);
         let gov_client = governance::GovernanceClient::new(&env, &governance);
         gov_client.initialize(
-            &v2_lp_token, // Use V2 LP token as voting token
             &admin,
-            &3,    // quorum 3
-            &7200, // voting period
-            &1,    // proposal minimum
+            &v2_pool,
+            &v2_lp_token, // Use V2 LP token as voting token
+            &7200u64,     // voting period (secs)
+            &86400u64,    // timelock (secs)
+            &3000i128,    // quorum (bps)
+            &100i128,     // min proposer stake (bps)
         );
 
         // ── Deploy staking ──────────────────────────────────────────────────
 
         let staking = env.register_contract(None, staking::Staking);
         let staking_client = staking::StakingClient::new(&env, &staking);
-        staking_client.initialize(&v2_lp_token);
+        // Reward and staked token are both the V2 LP token for this fixture.
+        staking_client.initialize(&v2_lp_token, &v2_lp_token, &admin);
 
         // ── Deploy CL pool ──────────────────────────────────────────────────
 
@@ -170,7 +163,7 @@ impl Protocol {
         let current_ts = self.env.ledger().timestamp();
         self.env.ledger().set(LedgerInfo {
             timestamp: current_ts + seconds,
-            protocol_version: 22,
+            protocol_version: 21,
             sequence_number: current + 1,
             network_id: Default::default(),
             base_reserve: 10,
@@ -184,19 +177,28 @@ impl Protocol {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::token::Client as TokenClient;
 
     #[test]
     fn protocol_deployment_succeeds() {
         let protocol = Protocol::deploy();
-        assert_ne!(protocol.admin, Address::generate(&protocol.env), "Admin should be set");
-        assert_ne!(protocol.v2_pool, Address::generate(&protocol.env), "Pool should be deployed");
+        assert_ne!(
+            protocol.admin,
+            Address::generate(&protocol.env),
+            "Admin should be set"
+        );
+        assert_ne!(
+            protocol.v2_pool,
+            Address::generate(&protocol.env),
+            "Pool should be deployed"
+        );
     }
 
     #[test]
     fn tokens_are_minted_to_admin() {
         let protocol = Protocol::deploy();
-        let token_a_balance = TokenClient::new(&protocol.env, &protocol.token_a)
-            .balance(&protocol.admin);
+        let token_a_balance =
+            TokenClient::new(&protocol.env, &protocol.token_a).balance(&protocol.admin);
         assert!(token_a_balance > 0, "Admin should have token A");
     }
 }

@@ -75,8 +75,6 @@ pub fn execute_collateral_swap(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn collateral_swap_succeeds() {
         // Tested in flash_loan_test.rs with real pool interaction
