@@ -3,6 +3,11 @@
 //! The simulator mirrors the on-chain constant-product math used by
 //! `contracts/amm` so strategy testing, historical replay, and Monte Carlo
 //! experiments can use the same pricing model without paying gas.
+//!
+//! Now includes concentrated liquidity (CL) pool support for V3-style simulation,
+//! with full tick math and LP outcome analytics.
+
+pub mod cl;
 
 mod cli;
 mod engine;
