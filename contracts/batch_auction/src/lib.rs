@@ -1295,6 +1295,13 @@ mod tests {
         }
     }
 
+    /// A deadline safely within `MAX_ORDER_LIFETIME_SECS` of `env`'s current
+    /// ledger time, for tests that don't care about deadline expiry and
+    /// previously used `u64::MAX` before the ceiling existed (issue #700).
+    fn far_future_deadline(env: &Env) -> u64 {
+        env.ledger().timestamp() + MAX_ORDER_LIFETIME_SECS - 1
+    }
+
     /// Deploy a concentrated-liquidity pool over `(token_a, token_b)`, seed a
     /// wide in-range position, and return the pool address. The pool starts at
     /// tick 0 with tick spacing 10 and a 30 bps fee.
@@ -1351,7 +1358,7 @@ mod tests {
             &1_000_000_i128,
             &1_000_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(env),
         );
         (ta, tb, pool, admin)
     }
@@ -1378,7 +1385,7 @@ mod tests {
             &tb,
             &10_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         // Advance past the batch window.
@@ -1423,7 +1430,7 @@ mod tests {
             &foreign,
             &10_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
         assert_eq!(result, Err(Ok(AuctionError::InvalidPoolTokenPair)));
 
@@ -1458,7 +1465,7 @@ mod tests {
             &tb,
             &10_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         // Tokens were escrowed — trader's balance decreased.
@@ -1496,7 +1503,7 @@ mod tests {
             &tb,
             &10_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         // Window has not elapsed — should return BatchWindowOpen error.
@@ -1598,7 +1605,7 @@ mod tests {
             &tb,
             &5_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
         BatchAuctionClient::new(&env, &auction_addr).submit_order(
             &trader2,
@@ -1607,7 +1614,7 @@ mod tests {
             &tb,
             &5_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         env.ledger().set_timestamp(1061);
@@ -1652,7 +1659,7 @@ mod tests {
             &tb,
             &5_000_i128,
             &1_000_000_000_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
         client.submit_order(
             &good_trader,
@@ -1661,7 +1668,7 @@ mod tests {
             &tb,
             &5_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         env.ledger().set_timestamp(1031);
@@ -1705,11 +1712,34 @@ mod tests {
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &10_000_i128);
 
-        client.submit_order(&trader, &pool, &ta, &tb, &1_000_i128, &0_i128, &u64::MAX);
-        client.submit_order(&trader, &pool, &ta, &tb, &1_000_i128, &0_i128, &u64::MAX);
+        client.submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &1_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+        client.submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &1_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
 
-        let result =
-            client.try_submit_order(&trader, &pool, &ta, &tb, &1_000_i128, &0_i128, &u64::MAX);
+        let result = client.try_submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &1_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
         assert_eq!(result, Err(Ok(AuctionError::BatchFull)));
 
         let (pending_count, max_orders, opened_at, window_secs) = client.get_batch_info();
@@ -1740,7 +1770,15 @@ mod tests {
         StellarAssetClient::new(&env, &ta).mint(&trader, &10_000_i128);
 
         for _ in 0..3 {
-            client.submit_order(&trader, &pool, &ta, &tb, &1_000_i128, &0_i128, &u64::MAX);
+            client.submit_order(
+                &trader,
+                &pool,
+                &ta,
+                &tb,
+                &1_000_i128,
+                &0_i128,
+                &far_future_deadline(&env),
+            );
         }
 
         env.ledger().set_timestamp(1031);
@@ -1797,7 +1835,7 @@ mod tests {
             &true,
             &0_u128,
             &None,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         env.ledger().set_timestamp(1031);
@@ -1839,7 +1877,7 @@ mod tests {
             &1_000_000_i128,
             &1_000_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
         let cl_pool = deploy_cl_pool(&env, &admin, &ta, &tb);
 
@@ -1863,7 +1901,7 @@ mod tests {
             &true,
             &0_u128,
             &Some(amm_pool.clone()),
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         // Independently quote both venues; the best of the two must match the
@@ -1928,7 +1966,7 @@ mod tests {
             &true,
             &0_u128,
             &Some(wrong_amm_pool),
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
         assert_eq!(result, Err(Ok(AuctionError::InvalidPoolTokenPair)));
         assert_eq!(
@@ -2008,7 +2046,15 @@ mod tests {
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
-        let id = client.submit_order(&trader, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        let id = client.submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
 
         let order = client.get_pending_orders().get(0).unwrap();
         assert_eq!(order.pool_type, PoolType::Amm);
@@ -2040,8 +2086,24 @@ mod tests {
         StellarAssetClient::new(&env, &ta).mint(&trader1, &100_000_i128);
         StellarAssetClient::new(&env, &ta).mint(&trader2, &100_000_i128);
 
-        client.submit_order(&trader1, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
-        client.submit_order(&trader2, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        client.submit_order(
+            &trader1,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+        client.submit_order(
+            &trader2,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
 
         // Increase max_orders so we can submit a 3rd order, but set max_orders to 1 before settlement
         client.set_max_orders(&admin, &1_u32);
@@ -2064,7 +2126,15 @@ mod tests {
         client.set_max_orders(&admin, &5_u32);
         let trader3 = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader3, &100_000_i128);
-        client.submit_order(&trader3, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        client.submit_order(
+            &trader3,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
 
         // Attempting settle_batch at t=1035 must fail because opened_at is 1030 and window is 30s
         let err = client.try_settle_batch().err().unwrap().unwrap();
@@ -2100,7 +2170,7 @@ mod tests {
             &tb,
             &5_000_i128,
             &1_000_000_000_i128, // impossible min_out
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         env.ledger().set_timestamp(1031);
@@ -2151,7 +2221,7 @@ mod tests {
             &tb,
             &10_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
         client.submit_order(
             &good_trader,
@@ -2160,7 +2230,7 @@ mod tests {
             &tb,
             &10_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         // Mutate the bad order's token_out to a non-existent contract
@@ -2382,7 +2452,7 @@ mod tests {
             &tb,
             &10_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
         assert_eq!(result, Err(Ok(AuctionError::UnknownVenue)));
 
@@ -2433,7 +2503,7 @@ mod tests {
             &true,
             &0_u128,
             &Some(hostile_addr),
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
         assert_eq!(result, Err(Ok(AuctionError::UnknownVenue)));
         assert_eq!(
@@ -2461,7 +2531,7 @@ mod tests {
             &1_000_000_i128,
             &1_000_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         let auction_addr = env.register_contract(None, BatchAuction);
@@ -2475,8 +2545,24 @@ mod tests {
         StellarAssetClient::new(&env, &ta).mint(&trader1, &10_000_i128);
         StellarAssetClient::new(&env, &ta).mint(&trader2, &10_000_i128);
 
-        client.submit_order(&trader1, &pool, &ta, &tb, &5_000_i128, &0_i128, &u64::MAX);
-        client.submit_order(&trader2, &pool2, &ta, &tb, &5_000_i128, &0_i128, &u64::MAX);
+        client.submit_order(
+            &trader1,
+            &pool,
+            &ta,
+            &tb,
+            &5_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+        client.submit_order(
+            &trader2,
+            &pool2,
+            &ta,
+            &tb,
+            &5_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
 
         // Admin removes trader1's venue before settlement.
         client.remove_venue(&admin, &pool);
@@ -2610,7 +2696,7 @@ mod tests {
             &true,
             &0_u128,
             &None,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
         assert_eq!(client.get_pending_orders().len(), 1);
     }
@@ -2702,7 +2788,15 @@ mod tests {
         StellarAssetClient::new(&env, &ta).mint(&t2, &10_000_i128);
 
         let id1 = client.submit_order(&t1, &pool, &ta, &tb, &1_000_i128, &0_i128, &1_010_u64);
-        let id2 = client.submit_order(&t2, &pool, &ta, &tb, &1_000_i128, &0_i128, &u64::MAX);
+        let id2 = client.submit_order(
+            &t2,
+            &pool,
+            &ta,
+            &tb,
+            &1_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
 
         env.ledger().set_timestamp(1_020);
 
@@ -2783,7 +2877,7 @@ mod tests {
             &1_000_000_i128,
             &1_000_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         let auction_addr = env.register_contract(None, BatchAuction);
@@ -2795,7 +2889,15 @@ mod tests {
         // Order A: settles normally against `pool`.
         let trader_a = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader_a, &10_000_i128);
-        client.submit_order(&trader_a, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        client.submit_order(
+            &trader_a,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
 
         // Order B: expires before settlement.
         let trader_b = Address::generate(&env);
@@ -2820,7 +2922,7 @@ mod tests {
             &tb,
             &10_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
         client.remove_venue(&admin, &pool2);
 
@@ -2828,7 +2930,15 @@ mod tests {
         // count right before settlement so it is not processed this round.
         let trader_d = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader_d, &10_000_i128);
-        client.submit_order(&trader_d, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        client.submit_order(
+            &trader_d,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
 
         env.ledger().set_timestamp(1031);
         client.set_max_orders(&admin, &3_u32);
