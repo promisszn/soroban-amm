@@ -11,17 +11,22 @@ pub fn load_pool_state(path: impl AsRef<Path>) -> Result<PoolState> {
         path: path.display().to_string(),
         source,
     })?;
-    let pool: PoolState = serde_json::from_str(&contents).map_err(|source| SimulationError::Json {
-        path: path.display().to_string(),
-        source,
-    })?;
+    let pool: PoolState =
+        serde_json::from_str(&contents).map_err(|source| SimulationError::Json {
+            path: path.display().to_string(),
+            source,
+        })?;
     pool.validate()?;
     Ok(pool)
 }
 
 pub fn load_trade_records(path: impl AsRef<Path>) -> Result<Vec<TradeRecord>> {
     let path = path.as_ref();
-    match path.extension().and_then(|ext| ext.to_str()).unwrap_or_default() {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+    {
         "csv" => load_trade_records_csv(path),
         _ => load_trade_records_json(path),
     }

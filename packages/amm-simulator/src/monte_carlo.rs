@@ -37,7 +37,11 @@ pub struct MonteCarloReport {
 }
 
 impl MonteCarloReport {
-    pub fn run(base_pool: &PoolState, trades: &[TradeRecord], config: MonteCarloConfig) -> Result<Self> {
+    pub fn run(
+        base_pool: &PoolState,
+        trades: &[TradeRecord],
+        config: MonteCarloConfig,
+    ) -> Result<Self> {
         let mut rng = SmallRng::seed_from_u64(config.seed);
         let mut reserve_a_samples = Vec::with_capacity(config.iterations);
         let mut reserve_b_samples = Vec::with_capacity(config.iterations);
@@ -122,7 +126,11 @@ impl MonteCarloReport {
     }
 }
 
-fn perturb_trades(trades: &[TradeRecord], amount_shock_bps: u32, rng: &mut SmallRng) -> Vec<TradeRecord> {
+fn perturb_trades(
+    trades: &[TradeRecord],
+    amount_shock_bps: u32,
+    rng: &mut SmallRng,
+) -> Vec<TradeRecord> {
     if amount_shock_bps == 0 {
         return trades.to_vec();
     }

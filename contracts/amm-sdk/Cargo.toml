@@ -11,7 +11,7 @@ readme = "README.md"
 
 [lib]
 name = "soroban_amm_sdk"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [features]
 default = []
