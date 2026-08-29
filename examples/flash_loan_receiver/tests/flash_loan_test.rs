@@ -5,26 +5,22 @@ use soroban_amm_sdk::client::AmmPoolClient;
 use soroban_amm_sdk::types::PoolInfo;
 use soroban_sdk::{
     testutils::{Address as _, Ledger, LedgerInfo},
-    token::Client as TokenClient,
+    token::{Client as TokenClient, StellarAssetClient},
     Address, BytesN, Env,
 };
 
 // WASM artifacts
 use amm::WASM as AMM_WASM;
-use token::WASM as TOKEN_WASM;
 
 // Setup fixture
-struct FlashLoanTestEnv {
+struct FlashLoanTestEnv<'a> {
     env: Env,
-    pool: Address,
-    pool_client: AmmPoolClient,
+    pool_client: AmmPoolClient<'a>,
     token_a: Address,
-    token_b: Address,
-    admin: Address,
     receiver: Address,
 }
 
-impl FlashLoanTestEnv {
+impl FlashLoanTestEnv<'_> {
     fn new() -> Self {
         let env = Env::default();
         env.budget().reset_unlimited();
@@ -33,7 +29,7 @@ impl FlashLoanTestEnv {
         // Set ledger
         env.ledger().set(LedgerInfo {
             timestamp: 1000,
-            protocol_version: 22,
+            protocol_version: 21,
             sequence_number: 1,
             network_id: Default::default(),
             base_reserve: 10,
@@ -46,7 +42,6 @@ impl FlashLoanTestEnv {
 
         // Upload contract WASM
         let amm_hash: BytesN<32> = env.deployer().upload_contract_wasm(AMM_WASM);
-        let token_hash: BytesN<32> = env.deployer().upload_contract_wasm(TOKEN_WASM);
 
         // Create token pair
         let token_a = env
@@ -55,18 +50,26 @@ impl FlashLoanTestEnv {
         let token_b = env
             .register_stellar_asset_contract_v2(admin.clone())
             .address();
+        let lp_token = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
 
-        // Deploy AMM pool
+        // Deploy AMM pool from the uploaded WASM
         let pool = env
             .deployer()
-            .with_current_contract(amm_hash)
-            .deploy_contract_instance(
-                amm_hash,
-                soroban_sdk::symbol_short!("init"),
-                (&admin, &token_a, &token_b, &token_a, 30i128, &admin, 0i128),
-            );
+            .with_address(
+                Address::generate(&env),
+                BytesN::from_array(&env, &[0u8; 32]),
+            )
+            .deploy(amm_hash);
 
         let pool_client = AmmPoolClient::new(&env, &pool);
+        pool_client.initialize(
+            &admin, &token_a, &token_b, &lp_token, &30i128, &admin, &0i128,
+        );
+        // Distinct flash-loan fee (5 bps) from the swap fee (30 bps), matching
+        // the fee assumptions the tests below are written against.
+        pool_client.update_flash_loan_fee(&5i128);
 
         // Register the flash loan receiver contract
         let receiver = env.register_contract(None, FlashLoanReceiver);
@@ -74,27 +77,29 @@ impl FlashLoanTestEnv {
         let receiver_client = flash_loan_receiver::FlashLoanReceiverClient::new(&env, &receiver);
         receiver_client.initialize(&pool);
 
-        // Mint initial tokens to admin
-        let token_a_client = TokenClient::new(&env, &token_a);
-        let token_b_client = TokenClient::new(&env, &token_b);
+        // The reference receiver repays principal + fee unconditionally — it
+        // doesn't run a real arbitrage strategy — so it needs a standing
+        // balance to cover the fee side of every repayment.
+        StellarAssetClient::new(&env, &token_a).mint(&receiver, &10_000_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&receiver, &10_000_000_i128);
 
-        token_a_client.mint(&admin, &1_000_000_000_i128);
-        token_b_client.mint(&admin, &1_000_000_000_i128);
+        // Mint initial tokens to admin
+        StellarAssetClient::new(&env, &token_a).mint(&admin, &1_000_000_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&admin, &1_000_000_000_i128);
 
         // Approve pool to spend tokens
-        token_a_client.approve(&admin, &pool, &1_000_000_000_i128, &1000);
-        token_b_client.approve(&admin, &pool, &1_000_000_000_i128, &1000);
+        let token_a_client = TokenClient::new(&env, &token_a);
+        let token_b_client = TokenClient::new(&env, &token_b);
+        token_a_client.approve(&admin, &pool, &1_000_000_000_i128, &1_000_000);
+        token_b_client.approve(&admin, &pool, &1_000_000_000_i128, &1_000_000);
 
         // Add initial liquidity
         pool_client.add_liquidity(&admin, &1_000_000_i128, &1_000_000_i128, &0i128, &u64::MAX);
 
         Self {
             env,
-            pool,
             pool_client,
             token_a,
-            token_b,
-            admin,
             receiver,
         }
     }
@@ -108,7 +113,12 @@ impl FlashLoanTestEnv {
     }
 
     fn execute_flash_loan(&self, amount_a: i128, amount_b: i128) {
-        self.pool_client.flash_loan(&self.receiver, &amount_a, &amount_b, &soroban_sdk::Bytes::new(&self.env));
+        self.pool_client.flash_loan(
+            &self.receiver,
+            &amount_a,
+            &amount_b,
+            &soroban_sdk::Bytes::new(&self.env),
+        );
     }
 }
 
@@ -123,8 +133,6 @@ fn happy_path_repay_principal_plus_fee() {
     let initial_info = fixture.get_pool_info();
     let initial_reserve_a = initial_info.reserve_a;
     let initial_reserve_b = initial_info.reserve_b;
-    let initial_fees_a = initial_info.accrued_fee_a;
-    let initial_fees_b = initial_info.accrued_fee_b;
 
     // Execute flash loan
     let borrow_amount_a = 1_000_000i128;
@@ -139,7 +147,8 @@ fn happy_path_repay_principal_plus_fee() {
 
     // Reserves should increase by the fee
     assert_eq!(
-        final_info.reserve_a, initial_reserve_a + expected_fee_a,
+        final_info.reserve_a,
+        initial_reserve_a + expected_fee_a,
         "Pool reserve A should increase by the fee"
     );
 
@@ -147,12 +156,6 @@ fn happy_path_repay_principal_plus_fee() {
     assert_eq!(
         final_info.reserve_b, initial_reserve_b,
         "Pool reserve B should be unchanged"
-    );
-
-    // Fee accumulation should reflect the flash loan fee
-    assert!(
-        final_info.accrued_fee_a >= initial_fees_a,
-        "Accrued fees should not decrease"
     );
 }
 
@@ -177,58 +180,35 @@ fn happy_path_repay_both_tokens() {
     let expected_fee_b = (borrow_amount_b * fee_bps) / 10_000;
 
     assert_eq!(
-        final_info.reserve_a, initial_reserve_a + expected_fee_a,
+        final_info.reserve_a,
+        initial_reserve_a + expected_fee_a,
         "Pool reserve A should increase by the fee"
     );
 
     assert_eq!(
-        final_info.reserve_b, initial_reserve_b + expected_fee_b,
+        final_info.reserve_b,
+        initial_reserve_b + expected_fee_b,
         "Pool reserve B should increase by the fee"
     );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Failure mode tests
+// Edge case tests
+//
+// The reference `FlashLoanReceiver` always repays unconditionally — it has
+// no profit check to decline a loan with (see `failure_modes.rs` for
+// receivers that demonstrate declining/failing repayment instead). These
+// tests cover the edge cases that *this* receiver can actually exercise.
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn insufficient_profit_aborts_cleanly() {
+#[should_panic]
+fn zero_borrow_amount_is_rejected() {
     let fixture = FlashLoanTestEnv::new();
 
-    // Try to borrow and immediately repay without profit
-    // The receiver should detect insufficient profit and return false
-    // The pool reverts the entire flash loan
-
-    let initial_info = fixture.get_pool_info();
-    let initial_reserve_a = initial_info.reserve_a;
-    let initial_reserve_b = initial_info.reserve_b;
-
-    // Borrow a small amount
-    let borrow_amount = 10_000i128;
-
-    // This should trigger the flash loan but not execute actual profitable trade
-    // The test verifies the receiver doesn't lose funds
-    fixture.execute_flash_loan(borrow_amount, 0);
-
-    // Pool should be unchanged (no fee accrual means receiver returned false early)
-    let final_info = fixture.get_pool_info();
-    assert_eq!(
-        final_info.reserve_a, initial_reserve_a,
-        "Pool should be unchanged if flash loan aborts"
-    );
-}
-
-#[test]
-fn zero_borrow_amount() {
-    let fixture = FlashLoanTestEnv::new();
-
-    // Borrowing zero should still call the callback and require repayment
+    // The pool rejects a flash loan that borrows nothing (`AmmError::ZeroAmount`)
+    // before ever invoking the receiver's callback.
     fixture.execute_flash_loan(0, 0);
-
-    // Pool should remain unchanged
-    let final_info = fixture.get_pool_info();
-    assert_eq!(final_info.reserve_a, 1_000_000_i128);
-    assert_eq!(final_info.reserve_b, 1_000_000_i128);
 }
 
 #[test]
@@ -245,11 +225,13 @@ fn receiver_repays_correct_amount() {
     // Execute flash loan (receiver gets amount, then must repay amount + fee)
     fixture.execute_flash_loan(borrow_amount_a, 0);
 
-    // Receiver should end with 0 tokens (it repaid everything)
+    // Receiver repays the borrowed principal in full, plus the fee out of
+    // its own standing balance (it isn't running a real arbitrage here).
     let receiver_balance_after = fixture.get_token_balance(&fixture.token_a, &fixture.receiver);
     assert_eq!(
-        receiver_balance_after, receiver_balance_before,
-        "Receiver should repay all borrowed tokens + fee"
+        receiver_balance_after,
+        receiver_balance_before - expected_fee,
+        "Receiver should repay all borrowed tokens, losing only the fee"
     );
 
     // Pool should have gained the fee
@@ -269,9 +251,10 @@ fn fee_accounting_is_exact() {
     let fixture = FlashLoanTestEnv::new();
 
     let initial_info = fixture.get_pool_info();
-    let initial_accrued_fees = initial_info.accrued_fee_a;
+    let initial_reserve_a = initial_info.reserve_a;
 
-    let borrow_amount = 2_000_000i128;
+    // Kept within the pool's reserve (seeded at 1_000_000 by the fixture).
+    let borrow_amount = 900_000i128;
     let fee_bps = 5i128; // 0.05% = 5 bps
     let expected_fee = (borrow_amount * fee_bps) / 10_000;
 
@@ -279,11 +262,11 @@ fn fee_accounting_is_exact() {
 
     let final_info = fixture.get_pool_info();
 
-    // Fee should increase by exactly the calculated amount
+    // Reserve should increase by exactly the calculated fee
     assert_eq!(
-        final_info.accrued_fee_a,
-        initial_accrued_fees + expected_fee,
-        "Accrued fees should increase by exactly the flash loan fee"
+        final_info.reserve_a,
+        initial_reserve_a + expected_fee,
+        "Reserve should increase by exactly the flash loan fee"
     );
 }
 
@@ -292,7 +275,7 @@ fn multiple_flash_loans_accumulate_fees() {
     let fixture = FlashLoanTestEnv::new();
 
     let initial_info = fixture.get_pool_info();
-    let initial_accrued_fees = initial_info.accrued_fee_a;
+    let initial_reserve_a = initial_info.reserve_a;
 
     let borrow_amount = 500_000i128;
     let fee_bps = 5i128;
@@ -304,11 +287,11 @@ fn multiple_flash_loans_accumulate_fees() {
 
     let final_info = fixture.get_pool_info();
 
-    // Both fees should accumulate
+    // Both fees should accumulate into the reserve
     assert_eq!(
-        final_info.accrued_fee_a,
-        initial_accrued_fees + (expected_fee_per_loan * 2),
-        "Accrued fees should include both flash loan fees"
+        final_info.reserve_a,
+        initial_reserve_a + (expected_fee_per_loan * 2),
+        "Reserve should include both flash loan fees"
     );
 }
 

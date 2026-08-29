@@ -83,8 +83,6 @@ pub fn execute_arbitrage(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn arbitrage_profitable() {
         // Tested in flash_loan_test.rs with real pool interaction
