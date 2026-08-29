@@ -29,7 +29,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, Address, Env, Symbol,
+    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
+    Env, Symbol, Vec,
 };
 
 // ── Storage TTL ──────────────────────────────────────────────────────────────
@@ -38,6 +39,13 @@ use soroban_sdk::{
 const MIN_PERSISTENT_TTL: u32 = 172_800; // ~10 days at 5s/ledger
 /// Target TTL to extend per-pair requirements to on write.
 const PERSISTENT_TTL_BUMP_TO: u32 = 259_200; // ~15 days at 5s/ledger
+
+// ── Pagination / batching ────────────────────────────────────────────────────
+
+/// Upper bound on the number of entries a single paginated read or batch health
+/// check may touch. Keeps every read path within the per-transaction resource
+/// limit no matter how many pairs governance has configured.
+pub const MAX_PAGE: u32 = 50;
 
 // ── External contract interfaces ─────────────────────────────────────────────
 
@@ -73,6 +81,31 @@ pub struct ReserveRequirement {
     pub min_reserve_b: i128,
 }
 
+/// Structured health report for a single pool.
+///
+/// Every amount is expressed in the pool's own token order, so `reserve_a` and
+/// `min_a` both refer to `token_a` regardless of how the requirement was
+/// normalised in storage.
+///
+/// When a pool could not be read (see `check_reserves_batch`), `token_a` and
+/// `token_b` are set to the pool address itself, the reserves and minimums are
+/// zero, and `healthy` is `false`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReserveReport {
+    pub pool: Address,
+    pub token_a: Address,
+    pub token_b: Address,
+    pub reserve_a: i128,
+    pub reserve_b: i128,
+    pub min_a: i128,
+    pub min_b: i128,
+    pub healthy: bool,
+    /// Shortfall on each side; 0 when the side is at or above its floor.
+    pub shortfall_a: i128,
+    pub shortfall_b: i128,
+}
+
 // ── Storage keys ─────────────────────────────────────────────────────────────
 
 #[contracttype]
@@ -83,6 +116,9 @@ pub enum DataKey {
     Factory,
     /// Normalized (smaller_addr, larger_addr) → ReserveRequirement.
     MinReserve(Address, Address),
+    /// Insertion-ordered index of every pair that currently has a non-zero
+    /// requirement, stored normalised as (smaller_addr, larger_addr).
+    ConfiguredPairs,
 }
 
 // ── Typed errors ─────────────────────────────────────────────────────────────
@@ -94,6 +130,8 @@ pub enum ReserveManagerError {
     Unauthorized = 2,
     AlreadyInitialized = 3,
     NegativeReserveAmount = 4,
+    /// A batch health check was handed more pools than `MAX_PAGE`.
+    BatchTooLarge = 5,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -216,9 +254,13 @@ impl ReserveManager {
         let key = DataKey::MinReserve(ta, tb);
 
         // Both minimums zero means "no requirement": delete the entry so it does
-        // not linger, matching the documented behaviour above.
+        // not linger, matching the documented behaviour above, and drop the pair
+        // from the enumeration index so it cannot grow without bound.
         if min_reserve_a == 0 && min_reserve_b == 0 {
             env.storage().persistent().remove(&key);
+            if let DataKey::MinReserve(ta, tb) = &key {
+                Self::deindex_pair(&env, ta, tb);
+            }
             return Ok(());
         }
 
@@ -235,7 +277,36 @@ impl ReserveManager {
         env.storage()
             .persistent()
             .extend_ttl(&key, MIN_PERSISTENT_TTL, PERSISTENT_TTL_BUMP_TO);
+        if let DataKey::MinReserve(ta, tb) = &key {
+            Self::index_pair(&env, ta, tb);
+        }
         Ok(())
+    }
+
+    // -- Enumeration ----------------------------------------------------------
+
+    /// Number of pairs that currently have a non-zero requirement configured.
+    pub fn get_configured_pair_count(env: Env) -> u32 {
+        Self::configured_pairs(&env).len()
+    }
+
+    /// Page through the configured pairs in the order they were first written.
+    ///
+    /// `limit` is clamped to [`MAX_PAGE`]; an `offset` at or beyond the current
+    /// count yields an empty `Vec` rather than panicking. Pairs are returned
+    /// normalised, i.e. the lexicographically smaller address comes first.
+    pub fn list_configured_pairs(env: Env, offset: u32, limit: u32) -> Vec<(Address, Address)> {
+        let pairs = Self::configured_pairs(&env);
+        let count = pairs.len();
+        let mut page: Vec<(Address, Address)> = Vec::new(&env);
+        if offset >= count || limit == 0 {
+            return page;
+        }
+        let end = offset.saturating_add(limit.min(MAX_PAGE)).min(count);
+        for i in offset..end {
+            page.push_back(pairs.get(i).unwrap());
+        }
+        page
     }
 
     /// Return the minimum reserve requirement for a pair, or (0, 0) if none.
@@ -284,6 +355,62 @@ impl ReserveManager {
         reserve_a >= req.min_reserve_a && reserve_b >= req.min_reserve_b
     }
 
+    /// Structured version of [`ReserveManager::check_reserves`] that reports the
+    /// actual numbers instead of a bare boolean.
+    ///
+    /// `healthy` always agrees with `check_reserves` for the same pool. Like
+    /// `check_reserves`, this call propagates a failure of the pool's
+    /// `get_info()`; use [`ReserveManager::check_reserves_batch`] for
+    /// fault-isolated reads.
+    ///
+    /// Does not modify any state.
+    pub fn check_reserves_detailed(env: Env, pool: Address) -> ReserveReport {
+        let info = AmmPoolClient::new(&env, &pool).get_info();
+        Self::build_report(&env, &pool, &info)
+    }
+
+    /// Health-check up to [`MAX_PAGE`] pools in one call.
+    ///
+    /// The read of each pool is fault-isolated: a pool whose `get_info()` call
+    /// fails (not an AMM pool, archived, panicking) is reported with
+    /// `healthy: false` and zeroed amounts instead of aborting the whole batch.
+    ///
+    /// When at least one pool is unhealthy a `res_warn` event is emitted
+    /// carrying the offending pool addresses, so keepers can subscribe rather
+    /// than poll.
+    ///
+    /// Returns [`ReserveManagerError::BatchTooLarge`] when `pools.len()` exceeds
+    /// `MAX_PAGE`; truncating silently would hide pools from a health check.
+    pub fn check_reserves_batch(
+        env: Env,
+        pools: Vec<Address>,
+    ) -> Result<Vec<ReserveReport>, ReserveManagerError> {
+        if pools.len() > MAX_PAGE {
+            return Err(ReserveManagerError::BatchTooLarge);
+        }
+
+        let mut reports: Vec<ReserveReport> = Vec::new(&env);
+        let mut unhealthy: Vec<Address> = Vec::new(&env);
+
+        for pool in pools.iter() {
+            let report = match AmmPoolClient::new(&env, &pool).try_get_info() {
+                Ok(Ok(info)) => Self::build_report(&env, &pool, &info),
+                _ => Self::unreadable_report(&pool),
+            };
+            if !report.healthy {
+                unhealthy.push_back(pool.clone());
+            }
+            reports.push_back(report);
+        }
+
+        if !unhealthy.is_empty() {
+            env.events()
+                .publish((symbol_short!("res_warn"),), (unhealthy,));
+        }
+
+        Ok(reports)
+    }
+
     /// Return the governance address.
     pub fn get_governance(env: Env) -> Address {
         env.storage().instance().get(&DataKey::Governance).unwrap()
@@ -303,6 +430,119 @@ impl ReserveManager {
             (b, a)
         }
     }
+
+    /// Load the pair index, or an empty vector when nothing is configured yet.
+    fn configured_pairs(env: &Env) -> Vec<(Address, Address)> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::ConfiguredPairs)
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn save_configured_pairs(env: &Env, pairs: &Vec<(Address, Address)>) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::ConfiguredPairs, pairs);
+        env.storage().persistent().extend_ttl(
+            &DataKey::ConfiguredPairs,
+            MIN_PERSISTENT_TTL,
+            PERSISTENT_TTL_BUMP_TO,
+        );
+    }
+
+    /// Append a normalised pair to the index on its first write. Re-writing an
+    /// existing pair is a no-op, so the index never holds duplicates.
+    fn index_pair(env: &Env, token_a: &Address, token_b: &Address) {
+        let mut pairs = Self::configured_pairs(env);
+        for i in 0..pairs.len() {
+            let (a, b) = pairs.get(i).unwrap();
+            if a == *token_a && b == *token_b {
+                // Already indexed: still refresh the TTL so the index does not
+                // expire while the entries it points at are being kept alive.
+                Self::save_configured_pairs(env, &pairs);
+                return;
+            }
+        }
+        pairs.push_back((token_a.clone(), token_b.clone()));
+        Self::save_configured_pairs(env, &pairs);
+    }
+
+    /// Drop a normalised pair from the index, preserving the order of the rest.
+    fn deindex_pair(env: &Env, token_a: &Address, token_b: &Address) {
+        let pairs = Self::configured_pairs(env);
+        for i in 0..pairs.len() {
+            let (a, b) = pairs.get(i).unwrap();
+            if a == *token_a && b == *token_b {
+                let mut remaining = pairs.clone();
+                remaining.remove(i);
+                Self::save_configured_pairs(env, &remaining);
+                return;
+            }
+        }
+    }
+
+    /// Build a report from a pool's own `PoolInfo`, expressed in the pool's
+    /// token order.
+    fn build_report(env: &Env, pool: &Address, info: &PoolInfo) -> ReserveReport {
+        let token_a_is_first = info.token_a < info.token_b;
+        let (ta, tb) = if token_a_is_first {
+            (info.token_a.clone(), info.token_b.clone())
+        } else {
+            (info.token_b.clone(), info.token_a.clone())
+        };
+
+        let req: ReserveRequirement = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MinReserve(ta, tb))
+            .unwrap_or(ReserveRequirement {
+                min_reserve_a: 0,
+                min_reserve_b: 0,
+            });
+
+        // Requirements are stored under the normalised pair; map them back onto
+        // the pool's own token order so `min_a` always describes `token_a`.
+        let (min_a, min_b) = if token_a_is_first {
+            (req.min_reserve_a, req.min_reserve_b)
+        } else {
+            (req.min_reserve_b, req.min_reserve_a)
+        };
+
+        let shortfall_a = (min_a - info.reserve_a).max(0);
+        let shortfall_b = (min_b - info.reserve_b).max(0);
+
+        ReserveReport {
+            pool: pool.clone(),
+            token_a: info.token_a.clone(),
+            token_b: info.token_b.clone(),
+            reserve_a: info.reserve_a,
+            reserve_b: info.reserve_b,
+            min_a,
+            min_b,
+            healthy: shortfall_a == 0 && shortfall_b == 0,
+            shortfall_a,
+            shortfall_b,
+        }
+    }
+
+    /// Placeholder report for a pool whose `get_info()` could not be read.
+    ///
+    /// The pool address stands in for the unknown token pair so the struct stays
+    /// a plain `#[contracttype]` without optional fields.
+    fn unreadable_report(pool: &Address) -> ReserveReport {
+        ReserveReport {
+            pool: pool.clone(),
+            token_a: pool.clone(),
+            token_b: pool.clone(),
+            reserve_a: 0,
+            reserve_b: 0,
+            min_a: 0,
+            min_b: 0,
+            healthy: false,
+            shortfall_a: 0,
+            shortfall_b: 0,
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -311,7 +551,11 @@ impl ReserveManager {
 mod tests {
     use super::*;
     use amm::AmmPool;
-    use soroban_sdk::{testutils::Address as _, token::StellarAssetClient, Env, String};
+    use soroban_sdk::{
+        testutils::{Address as _, Events as _},
+        token::StellarAssetClient,
+        Env, IntoVal, String,
+    };
     use token::{LpToken, LpTokenClient};
 
     struct Setup {
@@ -556,5 +800,230 @@ mod tests {
             rm.try_set_min_reserve(&s.ta, &s.tb, &-1_i128, &0_i128),
             Err(Ok(ReserveManagerError::NegativeReserveAmount))
         );
+    }
+
+    // -- #682: pair indexing, pagination, detailed / batch reporting ----------
+
+    /// Normalised (smaller, larger) ordering of a pair, matching storage.
+    fn norm(a: &Address, b: &Address) -> (Address, Address) {
+        if a < b {
+            (a.clone(), b.clone())
+        } else {
+            (b.clone(), a.clone())
+        }
+    }
+
+    #[test]
+    fn test_configured_pairs_indexed_in_insertion_order_without_duplicates() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let tc = Address::generate(&s.env);
+        let td = Address::generate(&s.env);
+
+        rm.set_min_reserve(&s.ta, &s.tb, &1_i128, &1_i128);
+        rm.set_min_reserve(&tc, &td, &2_i128, &2_i128);
+        // Re-writing an existing pair (in either token order) must not duplicate.
+        rm.set_min_reserve(&s.tb, &s.ta, &5_i128, &5_i128);
+
+        assert_eq!(rm.get_configured_pair_count(), 2);
+        let pairs = rm.list_configured_pairs(&0, &10);
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(pairs.get(0).unwrap(), norm(&s.ta, &s.tb));
+        assert_eq!(pairs.get(1).unwrap(), norm(&tc, &td));
+    }
+
+    #[test]
+    fn test_list_configured_pairs_pagination_edges() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+
+        let mut expected: soroban_sdk::Vec<(Address, Address)> = soroban_sdk::Vec::new(&s.env);
+        for _ in 0..5 {
+            let a = Address::generate(&s.env);
+            let b = Address::generate(&s.env);
+            rm.set_min_reserve(&a, &b, &1_i128, &1_i128);
+            expected.push_back(norm(&a, &b));
+        }
+        assert_eq!(rm.get_configured_pair_count(), 5);
+
+        // Mid-range page.
+        let page = rm.list_configured_pairs(&1, &2);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page.get(0).unwrap(), expected.get(1).unwrap());
+        assert_eq!(page.get(1).unwrap(), expected.get(2).unwrap());
+
+        // offset == count and offset > count yield an empty page, not a panic.
+        assert_eq!(rm.list_configured_pairs(&5, &10).len(), 0);
+        assert_eq!(rm.list_configured_pairs(&99, &10).len(), 0);
+
+        // limit == 0 yields an empty page.
+        assert_eq!(rm.list_configured_pairs(&0, &0).len(), 0);
+
+        // limit > MAX_PAGE is clamped, not rejected; only 5 pairs exist so the
+        // whole set comes back.
+        let all = rm.list_configured_pairs(&0, &(MAX_PAGE + 1_000));
+        assert_eq!(all.len(), 5);
+
+        // A partial trailing page is truncated to the remaining entries.
+        assert_eq!(rm.list_configured_pairs(&4, &10).len(), 1);
+    }
+
+    #[test]
+    fn test_setting_zero_requirement_deindexes_pair() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let tc = Address::generate(&s.env);
+        let td = Address::generate(&s.env);
+
+        rm.set_min_reserve(&s.ta, &s.tb, &1_i128, &1_i128);
+        rm.set_min_reserve(&tc, &td, &2_i128, &2_i128);
+        assert_eq!(rm.get_configured_pair_count(), 2);
+
+        rm.set_min_reserve(&s.ta, &s.tb, &0_i128, &0_i128);
+        assert_eq!(rm.get_configured_pair_count(), 1);
+        let pairs = rm.list_configured_pairs(&0, &10);
+        assert_eq!(pairs.get(0).unwrap(), norm(&tc, &td));
+
+        // De-indexing an already-removed pair is a no-op.
+        rm.set_min_reserve(&s.ta, &s.tb, &0_i128, &0_i128);
+        assert_eq!(rm.get_configured_pair_count(), 1);
+    }
+
+    #[test]
+    fn test_check_reserves_detailed_healthy_has_zero_shortfalls() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        rm.set_min_reserve(&s.ta, &s.tb, &500_000_i128, &500_000_i128);
+
+        let report = rm.check_reserves_detailed(&s.pool);
+        assert!(report.healthy);
+        assert_eq!(report.healthy, rm.check_reserves(&s.pool));
+        assert_eq!(report.pool, s.pool);
+        assert_eq!(report.reserve_a, 1_000_000);
+        assert_eq!(report.reserve_b, 1_000_000);
+        assert_eq!(report.min_a, 500_000);
+        assert_eq!(report.min_b, 500_000);
+        assert_eq!(report.shortfall_a, 0);
+        assert_eq!(report.shortfall_b, 0);
+    }
+
+    #[test]
+    fn test_check_reserves_detailed_reports_shortfall_arithmetic() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+
+        // Below the floor on token_a only; token_b stays comfortably above it.
+        let (smaller, larger) = norm(&s.ta, &s.tb);
+        rm.set_min_reserve(&smaller, &larger, &1_500_000_i128, &400_000_i128);
+
+        let report = rm.check_reserves_detailed(&s.pool);
+        assert!(!report.healthy);
+        assert_eq!(report.healthy, rm.check_reserves(&s.pool));
+
+        // The report is expressed in the pool's own token order.
+        let pool_info = amm::AmmPoolClient::new(&s.env, &s.pool).get_info();
+        assert_eq!(report.token_a, pool_info.token_a);
+        assert_eq!(report.token_b, pool_info.token_b);
+        let (exp_a, exp_b) = if pool_info.token_a == smaller {
+            (1_500_000_i128, 400_000_i128)
+        } else {
+            (400_000_i128, 1_500_000_i128)
+        };
+        assert_eq!(report.min_a, exp_a);
+        assert_eq!(report.min_b, exp_b);
+        assert_eq!(report.shortfall_a, (exp_a - 1_000_000).max(0));
+        assert_eq!(report.shortfall_b, (exp_b - 1_000_000).max(0));
+    }
+
+    #[test]
+    fn test_check_reserves_detailed_without_requirement_is_healthy() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let report = rm.check_reserves_detailed(&s.pool);
+        assert!(report.healthy);
+        assert_eq!(report.min_a, 0);
+        assert_eq!(report.min_b, 0);
+        assert_eq!(report.shortfall_a, 0);
+        assert_eq!(report.shortfall_b, 0);
+    }
+
+    #[test]
+    fn test_check_reserves_batch_is_fault_isolated() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        rm.set_min_reserve(&s.ta, &s.tb, &500_000_i128, &500_000_i128);
+
+        // The middle entry is a plain account address, not an AMM pool.
+        let not_a_pool = Address::generate(&s.env);
+        let pools = soroban_sdk::vec![&s.env, s.pool.clone(), not_a_pool.clone(), s.pool.clone()];
+
+        let reports = rm.check_reserves_batch(&pools);
+        assert_eq!(reports.len(), 3);
+
+        let bad = reports.get(1).unwrap();
+        assert_eq!(bad.pool, not_a_pool);
+        assert!(!bad.healthy);
+        assert_eq!(bad.reserve_a, 0);
+        assert_eq!(bad.reserve_b, 0);
+
+        // Every other pool in the batch still gets a real report.
+        assert!(reports.get(0).unwrap().healthy);
+        assert!(reports.get(2).unwrap().healthy);
+    }
+
+    #[test]
+    fn test_check_reserves_batch_emits_res_warn_with_unhealthy_pools() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        rm.set_min_reserve(&s.ta, &s.tb, &2_000_000_i128, &2_000_000_i128);
+
+        let pools = soroban_sdk::vec![&s.env, s.pool.clone()];
+        let reports = rm.check_reserves_batch(&pools);
+        assert!(!reports.get(0).unwrap().healthy);
+
+        let events = s.env.events().all();
+        let (contract, topics, data) = events.last().unwrap();
+        assert_eq!(contract, s.rm_addr);
+        assert_eq!(
+            topics,
+            soroban_sdk::vec![&s.env, symbol_short!("res_warn").into_val(&s.env)]
+        );
+        let (unhealthy,): (soroban_sdk::Vec<Address>,) = data.into_val(&s.env);
+        assert_eq!(unhealthy, soroban_sdk::vec![&s.env, s.pool.clone()]);
+    }
+
+    #[test]
+    fn test_check_reserves_batch_stays_silent_when_all_pools_healthy() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        rm.set_min_reserve(&s.ta, &s.tb, &1_000_i128, &1_000_i128);
+
+        let before = s.env.events().all().len();
+        let reports = rm.check_reserves_batch(&soroban_sdk::vec![&s.env, s.pool.clone()]);
+        assert!(reports.get(0).unwrap().healthy);
+        assert_eq!(s.env.events().all().len(), before);
+    }
+
+    #[test]
+    fn test_check_reserves_batch_rejects_oversized_batch() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+
+        let mut pools: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&s.env);
+        for _ in 0..(MAX_PAGE + 1) {
+            pools.push_back(s.pool.clone());
+        }
+        assert_eq!(
+            rm.try_check_reserves_batch(&pools),
+            Err(Ok(ReserveManagerError::BatchTooLarge))
+        );
+    }
+
+    #[test]
+    fn test_check_reserves_batch_on_empty_input() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let reports = rm.check_reserves_batch(&soroban_sdk::Vec::new(&s.env));
+        assert_eq!(reports.len(), 0);
     }
 }

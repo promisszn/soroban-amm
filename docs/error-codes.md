@@ -377,6 +377,7 @@ Defined in [contracts/reserve_manager/src/lib.rs](../contracts/reserve_manager/s
 | 2 | `Unauthorized` | Action invoked by non-governance account. | Call from authorized governance account. |
 | 3 | `AlreadyInitialized` | Reserve manager initialized twice. | Initialize once upon deployment. |
 | 4 | `NegativeReserveAmount` | `min_reserve` specified as negative value. | Pass non-negative reserve amount. |
+| 5 | `BatchTooLarge` | `check_reserves_batch` called with more than `MAX_PAGE` (50) pools. | Split the pool list into batches of at most 50. |
 
 ---
 
