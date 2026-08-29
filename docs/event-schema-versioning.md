@@ -220,6 +220,29 @@ schema version together when selecting a decoder.
 | `batch_op` | `(op_index: u32, kind: Symbol, result: BatchOpResult)` — emitted once per operation, in order, before the batch-level event. |
 | `batch_executed` | `(ops_len: u32)` |
 
+### DEX aggregator — `contracts/dex_aggregator/src/lib.rs`
+
+`venue` is the pool a route is *entered* through: the venue that won the
+first-hop decision. `venue_kind` is the `PoolKind` enum (`Amm` for the
+constant-product V2 pools, `Cl` for concentrated liquidity).
+
+| Event | Topics | Payload |
+|---|---|---|
+| `cl_reg` | — | `(token_a: Address, token_b: Address, fee_bps: i128, pool: Address)` |
+| `route_sel` | — | `(venue: Address, venue_kind: PoolKind, amount_in: i128, amount_out: i128)` |
+| `route_alt` | — | `(venue: Address, amount_out: i128, alt_venue: Address, alt_venue_kind: PoolKind, alt_amount_out: i128)` |
+| `route_exe` | — | `(trader: Address, token_in: Address, token_out: Address, amount_in: i128, amount_out: i128, pool: Address)` |
+| `tol_fail` | — | `(pool: Address, observed_bps: i128, tolerance_bps: i128)` |
+
+`route_sel` is emitted by `find_best_route` (and therefore by `get_quote`,
+`swap_best` and `is_price_within_tolerance`, which all route through it).
+`route_alt` accompanies it only when a second venue actually completed a
+quote to the destination token, so the improvement the aggregator delivered
+is measurable; a single-venue pair emits `route_sel` alone. `route_exe` is
+emitted by `execute_route` (and so by `swap_best`) after the swap settles and
+carries the output the pools actually returned, not the quoted amount.
+`tol_fail` is emitted only when `is_price_within_tolerance` rejects a quote.
+
 ### Staking — `contracts/staking/src/lib.rs` (unversioned, plain events)
 
 Staking predates this scheme and is not yet migrated (see note above), so
@@ -242,6 +265,19 @@ this catalogue. It may decode a version it explicitly supports, quarantine a
 newer version, and ignore an unknown topic. A payload shape change requires a
 single global version bump even if the change affects only one event; adding a
 new topic does not require a bump by itself.
+
+## Update (#685)
+
+`contracts/dex_aggregator/src/lib.rs` previously emitted nothing at all, so a
+swap routed through the aggregator was invisible: the underlying pool emitted
+its own `swap` event, but nothing recorded that the aggregator chose that
+venue, what the alternatives quoted, or who requested the route. It now emits
+five events -- `cl_reg`, `route_sel`, `route_alt`, `route_exe` and `tol_fail`
+-- all through `emit_versioned_event!`, listed in the new DEX aggregator table
+above and decodable through `soroban_amm_sdk::events`.
+
+The execution event is named `route_exe` rather than `route_exec` because
+`symbol_short!` accepts at most nine characters.
 
 ## Update (#711)
 

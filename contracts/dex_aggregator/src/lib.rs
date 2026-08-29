@@ -3,7 +3,8 @@
 //! DEX aggregator — routes trades across multiple AMM and CL pools for best execution.
 
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, vec, Address, Env, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, vec,
+    Address, Env, Vec,
 };
 
 use pool_interfaces::{AmmPoolClient, FactoryClient};
@@ -169,6 +170,12 @@ impl DexAggregator {
         env.storage()
             .instance()
             .set(&DataKey::ClPoolCount, &(count + 1));
+
+        soroban_amm_sdk::emit_versioned_event!(
+            &env,
+            (symbol_short!("cl_reg"),),
+            (token_a, token_b, fee_bps, pool)
+        );
     }
 
     pub fn set_routing_tokens(env: Env, tokens: Vec<Address>) {
@@ -228,7 +235,40 @@ impl DexAggregator {
         if cap == 0 {
             return Err(AggregatorError::NoRouteFound);
         }
-        Self::search_best_bfs(&env, &token_in, &token_out, amount_in, cap)
+        let (quote, runner_up) =
+            Self::search_best_bfs(&env, &token_in, &token_out, amount_in, cap)?;
+
+        // The venue a route is *entered* through identifies the decision: it is
+        // the pool the aggregator picked over every alternative first hop.
+        let venue = quote.hops.get(0).unwrap();
+        soroban_amm_sdk::emit_versioned_event!(
+            &env,
+            (symbol_short!("route_sel"),),
+            (
+                venue.pool.clone(),
+                venue.pool_kind.clone(),
+                amount_in,
+                quote.amount_out
+            )
+        );
+
+        // Only meaningful when a second venue actually produced a quote; with a
+        // single venue there is no improvement to measure.
+        if let Some((alt_pool, alt_kind, alt_out)) = runner_up {
+            soroban_amm_sdk::emit_versioned_event!(
+                &env,
+                (symbol_short!("route_alt"),),
+                (
+                    venue.pool.clone(),
+                    quote.amount_out,
+                    alt_pool,
+                    alt_kind,
+                    alt_out
+                )
+            );
+        }
+
+        Ok(quote)
     }
 
     /// Read-only quote for off-chain simulation (#319).
@@ -259,7 +299,27 @@ impl DexAggregator {
         if deadline < env.ledger().timestamp() {
             return Err(AggregatorError::SlippageExceeded);
         }
-        Self::execute_hops(&env, &route.hops, &trader, amount_in, min_out, deadline)
+        let entry = route.hops.get(0).unwrap();
+        let exit = route.hops.get(route.hops.len() - 1).unwrap();
+        let amount_out =
+            Self::execute_hops(&env, &route.hops, &trader, amount_in, min_out, deadline)?;
+
+        // `amount_out` is what the pools actually returned, not `route.amount_out`,
+        // which is only the quote the route was planned against.
+        soroban_amm_sdk::emit_versioned_event!(
+            &env,
+            (symbol_short!("route_exe"),),
+            (
+                trader,
+                entry.token_in.clone(),
+                exit.token_out.clone(),
+                amount_in,
+                amount_out,
+                entry.pool.clone()
+            )
+        );
+
+        Ok(amount_out)
     }
 
     pub fn swap_best(
@@ -294,7 +354,8 @@ impl DexAggregator {
             .instance()
             .get(&DataKey::MaxHops)
             .unwrap_or(Self::DEFAULT_MAX_HOPS);
-        let Ok(best) = Self::find_best_route(env, token_in, token_out, amount_in, max_hops) else {
+        let Ok(best) = Self::find_best_route(env.clone(), token_in, token_out, amount_in, max_hops)
+        else {
             return quoted_out == 0;
         };
         if best.amount_out == 0 {
@@ -305,22 +366,43 @@ impl DexAggregator {
         } else {
             quoted_out - best.amount_out
         };
-        diff * Self::BPS / best.amount_out <= Self::PRICE_TOLERANCE_BPS
+        let observed_bps = diff * Self::BPS / best.amount_out;
+        if observed_bps > Self::PRICE_TOLERANCE_BPS {
+            soroban_amm_sdk::emit_versioned_event!(
+                &env,
+                (symbol_short!("tol_fail"),),
+                (
+                    best.hops.get(0).unwrap().pool,
+                    observed_bps,
+                    Self::PRICE_TOLERANCE_BPS
+                )
+            );
+            return false;
+        }
+        true
     }
 
+    /// Breadth-first search for the best route, plus the runner-up quote.
+    ///
+    /// The second element is the best *other* venue that completed a route to
+    /// `token_out`, or `None` when only one venue ever quoted. Callers use it to
+    /// report how much the winning venue actually improved on the alternative.
+    #[allow(clippy::type_complexity)]
     fn search_best_bfs(
         env: &Env,
         token_in: &Address,
         token_out: &Address,
         amount_in: i128,
         max_hops: u32,
-    ) -> Result<RouteQuote, AggregatorError> {
+    ) -> Result<(RouteQuote, Option<(Address, PoolKind, i128)>), AggregatorError> {
         let factory: Address = env.storage().instance().get(&DataKey::Factory).unwrap();
         let factory_client = FactoryClient::new(env, &factory);
         let tokens = Self::discover_tokens(env, token_in, token_out);
 
         let mut best_out: i128 = 0;
         let mut best_hops: Vec<RouteHop> = Vec::new(env);
+        // Best completed route whose entry venue differs from the winner's.
+        let mut runner_up: Option<(Address, PoolKind, i128)> = None;
 
         let mut frontier_token: Vec<Address> = Vec::new(env);
         let mut frontier_amount: Vec<i128> = Vec::new(env);
@@ -375,8 +457,22 @@ impl DexAggregator {
 
                 if next_token == *token_out {
                     if step.amount_out > best_out {
+                        // The old winner becomes the alternative to compare against.
+                        if !best_hops.is_empty() {
+                            let prev = best_hops.get(0).unwrap();
+                            runner_up =
+                                Self::better_alt(runner_up, prev.pool, prev.pool_kind, best_out);
+                        }
                         best_out = step.amount_out;
                         best_hops = new_hops;
+                    } else {
+                        let entry = new_hops.get(0).unwrap();
+                        runner_up = Self::better_alt(
+                            runner_up,
+                            entry.pool,
+                            entry.pool_kind,
+                            step.amount_out,
+                        );
                     }
                 } else if depth + 1 < max_hops
                     && !Self::is_visited_and_worse(
@@ -397,10 +493,35 @@ impl DexAggregator {
         if best_out <= 0 || best_hops.is_empty() {
             return Err(AggregatorError::NoRouteFound);
         }
-        Ok(RouteQuote {
-            amount_out: best_out,
-            hops: best_hops,
-        })
+
+        // A route that re-enters through the winning venue is the same venue
+        // decision, not an alternative to it.
+        let winner_pool = best_hops.get(0).unwrap().pool;
+        let runner_up = match runner_up {
+            Some((pool, _, _)) if pool == winner_pool => None,
+            other => other,
+        };
+
+        Ok((
+            RouteQuote {
+                amount_out: best_out,
+                hops: best_hops,
+            },
+            runner_up,
+        ))
+    }
+
+    /// Keep whichever of the two alternatives quoted more output.
+    fn better_alt(
+        current: Option<(Address, PoolKind, i128)>,
+        pool: Address,
+        kind: PoolKind,
+        amount_out: i128,
+    ) -> Option<(Address, PoolKind, i128)> {
+        match current {
+            Some((_, _, best)) if best >= amount_out => current,
+            _ => Some((pool, kind, amount_out)),
+        }
     }
 
     fn execute_hops(
@@ -628,7 +749,11 @@ impl DexAggregator {
 mod tests {
     use super::*;
     use factory::{Factory, FactoryClient};
-    use soroban_sdk::{testutils::Address as _, Address, BytesN};
+    use soroban_sdk::{
+        testutils::{Address as _, Events as _},
+        token::StellarAssetClient,
+        Address, BytesN, IntoVal, Symbol,
+    };
 
     #[test]
     fn test_no_route_when_uninitialized() {
@@ -744,5 +869,295 @@ mod tests {
 
         assert!(found_a);
         assert!(found_b);
+    }
+
+    // -------------------------------------------------------------------------
+    // #685: versioned routing events
+    // -------------------------------------------------------------------------
+
+    struct Venues {
+        env: Env,
+        agg: Address,
+        admin: Address,
+        trader: Address,
+        token_a: Address,
+        token_b: Address,
+        pool_ab: Address,
+        factory: Address,
+    }
+
+    /// Aggregator wired to a real factory with a funded `token_a <-> token_b`
+    /// AMM pool, plus a trader holding both tokens.
+    fn setup_venues() -> Venues {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.budget().reset_unlimited();
+
+        let admin = Address::generate(&env);
+        let amm_wasm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let lp_wasm_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_wasm_hash, &lp_wasm_hash);
+
+        let agg_addr = env.register_contract(None, DexAggregator);
+        DexAggregatorClient::new(&env, &agg_addr).initialize(&admin, &factory_addr);
+
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        // fee_tier 2 = 30 bps (Medium); governance_wasm_hash = None
+        factory.create_pool(&admin, &token_a, &token_b, &2_i128, &None);
+        let pool_ab = factory.get_pool(&token_a, &token_b).unwrap();
+
+        let lp = Address::generate(&env);
+        let trader = Address::generate(&env);
+        for t in [&token_a, &token_b] {
+            StellarAssetClient::new(&env, t).mint(&lp, &10_000_000_i128);
+            StellarAssetClient::new(&env, t).mint(&trader, &1_000_000_i128);
+        }
+        amm::AmmPoolClient::new(&env, &pool_ab).add_liquidity(
+            &lp,
+            &1_000_000,
+            &1_000_000,
+            &0,
+            &u64::MAX,
+        );
+
+        Venues {
+            env,
+            agg: agg_addr,
+            admin,
+            trader,
+            token_a,
+            token_b,
+            pool_ab,
+            factory: factory_addr,
+        }
+    }
+
+    /// Payload of the last event this contract emitted under `topic`, with the
+    /// schema-version prefix asserted and stripped.
+    fn last_payload<T: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>(
+        env: &Env,
+        contract: &Address,
+        topic: Symbol,
+    ) -> T {
+        let event = env
+            .events()
+            .all()
+            .iter()
+            .rfind(|e| e.0 == *contract && e.1 == (topic.clone(),).into_val(env))
+            .unwrap_or_else(|| panic!("no event emitted for the requested topic"));
+        let (version, payload): (u32, T) = event.2.into_val(env);
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        payload
+    }
+
+    fn count_events(env: &Env, contract: &Address, topic: Symbol) -> usize {
+        env.events()
+            .all()
+            .iter()
+            .filter(|e| e.0 == *contract && e.1 == (topic.clone(),).into_val(env))
+            .count()
+    }
+
+    #[test]
+    fn test_register_cl_pool_emits_cl_reg() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+        let cl_pool = Address::generate(&v.env);
+
+        agg.register_cl_pool(&cl_pool, &v.token_a, &v.token_b, &30_i128);
+
+        let (token_a, token_b, fee_bps, pool): (Address, Address, i128, Address) =
+            last_payload(&v.env, &v.agg, symbol_short!("cl_reg"));
+        assert_eq!(token_a, v.token_a);
+        assert_eq!(token_b, v.token_b);
+        assert_eq!(fee_bps, 30);
+        assert_eq!(pool, cl_pool);
+    }
+
+    #[test]
+    fn test_register_cl_pool_does_not_re_emit_for_a_known_pool() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+        let cl_pool = Address::generate(&v.env);
+
+        agg.register_cl_pool(&cl_pool, &v.token_a, &v.token_b, &30_i128);
+        agg.register_cl_pool(&cl_pool, &v.token_a, &v.token_b, &30_i128);
+
+        assert_eq!(count_events(&v.env, &v.agg, symbol_short!("cl_reg")), 1);
+    }
+
+    #[test]
+    fn test_find_best_route_emits_route_sel_with_the_chosen_venue() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        let quote = agg.find_best_route(&v.token_a, &v.token_b, &10_000_i128, &2u32);
+
+        let (venue, venue_kind, amount_in, amount_out): (Address, PoolKind, i128, i128) =
+            last_payload(&v.env, &v.agg, symbol_short!("route_sel"));
+        assert_eq!(venue, v.pool_ab);
+        assert_eq!(venue_kind, PoolKind::Amm);
+        assert_eq!(amount_in, 10_000);
+        assert_eq!(amount_out, quote.amount_out);
+    }
+
+    #[test]
+    fn test_route_alt_is_not_emitted_when_only_one_venue_quoted() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        agg.find_best_route(&v.token_a, &v.token_b, &10_000_i128, &2u32);
+
+        assert_eq!(count_events(&v.env, &v.agg, symbol_short!("route_sel")), 1);
+        assert_eq!(count_events(&v.env, &v.agg, symbol_short!("route_alt")), 0);
+    }
+
+    #[test]
+    fn test_route_alt_reports_the_runner_up_when_a_second_venue_quotes() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+        let factory = FactoryClient::new(&v.env, &v.factory);
+
+        // A second, deliberately shallower A->C->B route through a third token,
+        // so two distinct entry venues complete a route to token_b.
+        let token_c = env_token(&v.env, &v.admin);
+        factory.create_pool(&v.admin, &v.token_a, &token_c, &2_i128, &None);
+        factory.create_pool(&v.admin, &token_c, &v.token_b, &2_i128, &None);
+
+        let lp = Address::generate(&v.env);
+        for t in [&v.token_a, &token_c, &v.token_b] {
+            StellarAssetClient::new(&v.env, t).mint(&lp, &10_000_000_i128);
+        }
+        for (x, y) in [(&v.token_a, &token_c), (&token_c, &v.token_b)] {
+            let pool = factory.get_pool(x, y).unwrap();
+            amm::AmmPoolClient::new(&v.env, &pool).add_liquidity(
+                &lp,
+                &500_000,
+                &500_000,
+                &0,
+                &u64::MAX,
+            );
+        }
+        agg.set_routing_tokens(&soroban_sdk::vec![
+            &v.env,
+            v.token_a.clone(),
+            token_c.clone(),
+            v.token_b.clone()
+        ]);
+
+        let quote = agg.find_best_route(&v.token_a, &v.token_b, &10_000_i128, &3u32);
+
+        let (venue, amount_out, alt_venue, _alt_kind, alt_amount_out): (
+            Address,
+            i128,
+            Address,
+            PoolKind,
+            i128,
+        ) = last_payload(&v.env, &v.agg, symbol_short!("route_alt"));
+        assert_eq!(venue, quote.hops.get(0).unwrap().pool);
+        assert_eq!(amount_out, quote.amount_out);
+        // The alternative is a different entry venue and never beats the winner.
+        assert_ne!(alt_venue, venue);
+        assert!(alt_amount_out <= amount_out);
+    }
+
+    #[test]
+    fn test_execute_route_emits_route_exe_with_the_settled_amount() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        let quote = agg.find_best_route(&v.token_a, &v.token_b, &10_000_i128, &2u32);
+        let out = agg.execute_route(&quote, &v.trader, &10_000_i128, &0_i128, &u64::MAX);
+
+        let (trader, token_in, token_out, amount_in, amount_out, pool): (
+            Address,
+            Address,
+            Address,
+            i128,
+            i128,
+            Address,
+        ) = last_payload(&v.env, &v.agg, symbol_short!("route_exe"));
+        assert_eq!(trader, v.trader);
+        assert_eq!(token_in, v.token_a);
+        assert_eq!(token_out, v.token_b);
+        assert_eq!(amount_in, 10_000);
+        assert_eq!(pool, v.pool_ab);
+        // The pool's actual output, which is what execute_route returned.
+        assert_eq!(amount_out, out);
+    }
+
+    #[test]
+    fn test_swap_best_emits_both_route_sel_and_route_exe() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        let out = agg.swap_best(&v.trader, &v.token_a, &v.token_b, &10_000_i128, &0_i128);
+
+        assert_eq!(count_events(&v.env, &v.agg, symbol_short!("route_sel")), 1);
+        let (_, _, _, quoted): (Address, PoolKind, i128, i128) =
+            last_payload(&v.env, &v.agg, symbol_short!("route_sel"));
+        let (_, _, _, _, settled, _): (Address, Address, Address, i128, i128, Address) =
+            last_payload(&v.env, &v.agg, symbol_short!("route_exe"));
+        assert_eq!(settled, out);
+        assert_eq!(quoted, out);
+    }
+
+    #[test]
+    fn test_tolerance_failure_emits_tol_fail() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        // Quote far outside the 10 bps tolerance.
+        assert!(!agg.is_price_within_tolerance(&v.token_a, &v.token_b, &10_000_i128, &1_i128));
+
+        let (pool, observed_bps, tolerance_bps): (Address, i128, i128) =
+            last_payload(&v.env, &v.agg, symbol_short!("tol_fail"));
+        assert_eq!(pool, v.pool_ab);
+        assert_eq!(tolerance_bps, DexAggregator::PRICE_TOLERANCE_BPS);
+        assert!(observed_bps > tolerance_bps);
+    }
+
+    #[test]
+    fn test_tolerance_success_emits_nothing() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        let quote = agg.find_best_route(&v.token_a, &v.token_b, &10_000_i128, &2u32);
+        assert!(agg.is_price_within_tolerance(
+            &v.token_a,
+            &v.token_b,
+            &10_000_i128,
+            &quote.amount_out
+        ));
+
+        assert_eq!(count_events(&v.env, &v.agg, symbol_short!("tol_fail")), 0);
+    }
+
+    #[test]
+    fn test_no_routing_events_when_no_route_exists() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+        let orphan = env_token(&v.env, &v.admin);
+
+        assert!(agg
+            .try_find_best_route(&v.token_a, &orphan, &10_000_i128, &2u32)
+            .is_err());
+
+        assert_eq!(count_events(&v.env, &v.agg, symbol_short!("route_sel")), 0);
+        assert_eq!(count_events(&v.env, &v.agg, symbol_short!("route_alt")), 0);
+    }
+
+    fn env_token(env: &Env, admin: &Address) -> Address {
+        env.register_stellar_asset_contract_v2(admin.clone())
+            .address()
     }
 }

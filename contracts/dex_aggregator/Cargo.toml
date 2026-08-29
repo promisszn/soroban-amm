@@ -11,6 +11,7 @@ testutils = ["soroban-sdk/testutils"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
+soroban-amm-sdk = { path = "../amm-sdk" }
 pool-interfaces = { path = "../pool_interfaces" }
 
 [dev-dependencies]
