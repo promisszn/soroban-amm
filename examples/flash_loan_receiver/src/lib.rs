@@ -154,8 +154,8 @@ impl FlashLoanReceiver {
     ) -> bool {
         // Retrieve pool address from storage
         let pool: Address = match env.storage().instance().get(&DataKey::Pool) {
-            Ok(addr) => addr,
-            Err(_) => return false, // Pool not initialized
+            Some(addr) => addr,
+            None => return false, // Pool not initialized
         };
 
         // Get pool info to discover token addresses

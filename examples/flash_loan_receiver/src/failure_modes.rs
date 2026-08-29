@@ -1,7 +1,8 @@
-//! Demonstrations of flash loan failure modes.
+//! Educational guide to flash loan failure modes.
 //!
-//! This module contains examples of what NOT to do with flash loans. Each
-//! demonstrates a way to lose all borrowed funds or trigger a revert.
+//! This module documents common mistakes that lead to lost funds or reverted
+//! transactions when working with flash loans. These are pseudo-code examples
+//! showing the PATTERN to avoid, not compilable contracts.
 //!
 //! ## Failure modes covered
 //!
@@ -9,25 +10,43 @@
 //!    to cover the fee. The receiver detects this and returns `false`, causing
 //!    the entire transaction to revert. The pool is unharmed.
 //!
+//!    ```ignore
+//!    // Borrower: Okay, I borrowed 100 XLM, fee is 5 XLM.
+//!    // I traded for 102 XLM elsewhere but costs 5 XLM to do.
+//!    // Net = 102 - 105 = -3 XLM loss, so return false.
+//!    if profit < fee {
+//!        return false; // Revert entire flash loan
+//!    }
+//!    ```
+//!
 //! 2. **Reentrancy attempt**: Try to call the pool during the flash loan callback.
 //!    The pool's reentrancy guard rejects this immediately with `Reentrant` error.
+//!
+//!    ```ignore
+//!    // During callback, attempting to call pool again:
+//!    let price = pool.get_price();  // ❌ ERROR: Reentrant!
+//!    ```
 //!
 //! 3. **Incomplete repayment**: Repay the principal but not the fee. The pool's
 //!    balance check fails before the callback returns, reverting the transaction.
 //!
+//!    ```ignore
+//!    // Borrowed 100, fee 5, but only repay 100:
+//!    token.transfer(&pool, 100);  // ❌ Pool expects 105
+//!    ```
+//!
 //! 4. **Wrong recipient**: Repay to an address other than the pool. The pool does
 //!    not receive the funds and reverts.
-
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, Env};
-
-/// A contract demonstrating what happens when profit doesn't cover the fee.
-#[contract]
-pub struct InsufficientProfitReceiver;
-
-#[contractimpl]
-impl InsufficientProfitReceiver {
-    /// Initialize with pool address.
-    pub fn initialize(_env: Env, _pool: Address) {
+//!
+//!    ```ignore
+//!    // Repay to wrong address:
+//!    token.transfer(&wrong_addr, 105);  // ❌ Pool not paid
+//!    ```
+//!
+//! ## Common patterns that lead to each failure
+//!
+//! **Failure mode 1 explanation**:
+pub mod insufficient_profit {
         // Initialization would go here
     }
 
