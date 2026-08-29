@@ -1,0 +1,25 @@
+[package]
+name = "flash-loan-receiver"
+version = "0.1.0"
+edition = "2021"
+description = "Reference implementation of a Soroban AMM flash loan receiver with real-world use cases"
+license = "MIT"
+repository = "https://github.com/promisszn/soroban-amm"
+keywords = ["soroban", "stellar", "flash-loan", "amm", "defi"]
+categories = ["cryptography::cryptocurrencies"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+testutils = ["soroban-sdk/testutils"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+soroban-amm-sdk = { path = "../../contracts/amm-sdk" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+amm = { path = "../../contracts/amm", features = ["testutils"] }
+token = { path = "../../contracts/token", features = ["testutils"] }

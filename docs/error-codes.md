@@ -377,6 +377,7 @@ Defined in [contracts/reserve_manager/src/lib.rs](../contracts/reserve_manager/s
 | 2 | `Unauthorized` | Action invoked by non-governance account. | Call from authorized governance account. |
 | 3 | `AlreadyInitialized` | Reserve manager initialized twice. | Initialize once upon deployment. |
 | 4 | `NegativeReserveAmount` | `min_reserve` specified as negative value. | Pass non-negative reserve amount. |
+| 5 | `BatchTooLarge` | `check_reserves_batch` called with more than `MAX_PAGE` (50) pools. | Split the pool list into batches of at most 50. |
 
 ---
 
@@ -388,10 +389,11 @@ Uses runtime `panic!` and `assert!` preconditions (defined in [contracts/router/
 |-----------------------|-------|--------|
 | `already initialized` | `initialize` called twice (`DataKey::Factory` exists). | Initialize router contract once. |
 | `path must have at least 2 tokens` | `path.len() < 2` in swap/quote functions. | Pass path array containing ≥ 2 token addresses. |
-| `amount_in must be positive` | `amount_in <= 0` in `swap_exact_in` or `get_amount_out_path`. | Pass strictly positive input amount. |
-| `amount_out must be positive` | `amount_out <= 0` in `swap_exact_out`. | Pass strictly positive output amount. |
+| `amount_in must be positive` | `amount_in <= 0` in `swap_exact_in`, `get_amount_out_path` or `get_amounts_out_path`. | Pass strictly positive input amount. |
+| `amount_out must be positive` | `amount_out <= 0` in `swap_exact_out`, `get_amount_in_path` or `get_amounts_in_path`. | Pass strictly positive output amount. |
+| `DuplicateAdjacentToken at hop {i}` | `path[i] == path[i + 1]`, which resolves to a pool that cannot exist. | Remove the repeated token from the path. |
 | `DeadlineExpired` | `env.ledger().timestamp() > deadline`. | Re-submit swap with future deadline. |
-| `no pool for hop {i}` | Factory returned no pool for token pair at hop `i`. | Ensure liquidity pool exists for every adjacent pair in path. |
+| `no pool for hop {i}` | Factory returned no pool for token pair at hop `i`. | Ensure liquidity pool exists for every adjacent pair in path; call `is_path_routable` to check before quoting. |
 | `Slippage exceeded` | Output `< min_amount_out` or input `> max_in`. | Widen slippage bounds or recalculate path quote. |
 
 ---

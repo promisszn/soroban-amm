@@ -15,6 +15,16 @@
 //! | `admin_changed` | `("admin_changed",)`          | `(1, (new_admin,))`                    |
 //! | `upgraded`      | `("upgraded",)`               | `(1, (new_wasm_hash,))`                |
 //! | `circuit_break` | `("circuit_break",)`          | `(1, (price_before, price_after, deviation_bps, threshold_bps))` |
+//!
+//! The DEX aggregator (`contracts/dex_aggregator`) adds:
+//!
+//! | Event symbol | Topics          | Data                                    |
+//! |--------------|-----------------|-----------------------------------------|
+//! | `cl_reg`     | `("cl_reg",)`   | `(1, (token_a, token_b, fee_bps, pool))`|
+//! | `route_sel`  | `("route_sel",)`| `(1, (venue, venue_kind, amount_in, amount_out))` |
+//! | `route_alt`  | `("route_alt",)`| `(1, (venue, amount_out, alt_venue, alt_venue_kind, alt_amount_out))` |
+//! | `route_exe`  | `("route_exe",)`| `(1, (trader, token_in, token_out, amount_in, amount_out, pool))` |
+//! | `tol_fail`   | `("tol_fail",)` | `(1, (pool, observed_bps, tolerance_bps))` |
 
 use soroban_sdk::{contracttype, Address, BytesN};
 
@@ -125,6 +135,73 @@ pub struct CircuitBreakerEvent {
     pub threshold_bps: i128,
 }
 
+/// Venue family behind a route hop. Mirrors `dex_aggregator::PoolKind`.
+#[contracttype]
+#[derive(Debug, Clone, PartialEq)]
+pub enum RouteVenueKind {
+    /// Constant-product (V2-style) AMM pool.
+    Amm,
+    /// Concentrated-liquidity pool.
+    Cl,
+}
+
+/// Emitted when the aggregator registers a concentrated-liquidity pool.
+#[contracttype]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClPoolRegisteredEvent {
+    pub token_a: Address,
+    pub token_b: Address,
+    pub fee_bps: i128,
+    pub pool: Address,
+}
+
+/// Emitted when the aggregator picks a route.
+///
+/// `venue` is the pool the route is entered through -- the venue that won the
+/// first-hop decision.
+#[contracttype]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteSelectedEvent {
+    pub venue: Address,
+    pub venue_kind: RouteVenueKind,
+    pub amount_in: i128,
+    pub amount_out: i128,
+}
+
+/// Emitted alongside `RouteSelectedEvent` when a second venue also quoted the
+/// trade, so the improvement the aggregator delivered is measurable.
+#[contracttype]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteAlternativeEvent {
+    pub venue: Address,
+    pub amount_out: i128,
+    pub alt_venue: Address,
+    pub alt_venue_kind: RouteVenueKind,
+    pub alt_amount_out: i128,
+}
+
+/// Emitted after an aggregator route settles. `amount_out` is what the pools
+/// actually returned, not the quote the route was planned against.
+#[contracttype]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteExecutedEvent {
+    pub trader: Address,
+    pub token_in: Address,
+    pub token_out: Address,
+    pub amount_in: i128,
+    pub amount_out: i128,
+    pub pool: Address,
+}
+
+/// Emitted when an aggregator price-tolerance check fails.
+#[contracttype]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToleranceFailedEvent {
+    pub pool: Address,
+    pub observed_bps: i128,
+    pub tolerance_bps: i128,
+}
+
 // ── Event symbol constants ────────────────────────────────────────────────────
 
 /// Symbol strings matching the on-chain event topics.
@@ -140,6 +217,13 @@ pub mod symbols {
     pub const ADMIN_CHANGED: &str = "admin_changed";
     pub const UPGRADED: &str = "upgraded";
     pub const CIRCUIT_BREAKER: &str = "circuit_break";
+
+    // ── DEX aggregator (#685) ────────────────────────────────────────────────
+    pub const CL_POOL_REGISTERED: &str = "cl_reg";
+    pub const ROUTE_SELECTED: &str = "route_sel";
+    pub const ROUTE_ALTERNATIVE: &str = "route_alt";
+    pub const ROUTE_EXECUTED: &str = "route_exe";
+    pub const TOLERANCE_FAILED: &str = "tol_fail";
 }
 
 // ── Decoder helpers ───────────────────────────────────────────────────────────
@@ -157,6 +241,11 @@ pub enum AmmEvent {
     AdminChanged(AdminChangedEvent),
     Upgraded(UpgradedEvent),
     CircuitBreaker(CircuitBreakerEvent),
+    ClPoolRegistered(ClPoolRegisteredEvent),
+    RouteSelected(RouteSelectedEvent),
+    RouteAlternative(RouteAlternativeEvent),
+    RouteExecuted(RouteExecutedEvent),
+    ToleranceFailed(ToleranceFailedEvent),
 }
 
 /// Decode a raw Soroban event `data` field given its `topics` array and `data` field.
@@ -281,6 +370,64 @@ pub fn decode_amm_event(
     } else if symbol == Symbol::new(env, symbols::UPGRADED) {
         let (new_wasm_hash,): (BytesN<32>,) = TryFromVal::try_from_val(env, &payload_val).ok()?;
         Some(AmmEvent::Upgraded(UpgradedEvent { new_wasm_hash }))
+    } else if symbol == Symbol::new(env, symbols::CL_POOL_REGISTERED) {
+        let (token_a, token_b, fee_bps, pool): (Address, Address, i128, Address) =
+            TryFromVal::try_from_val(env, &payload_val).ok()?;
+        Some(AmmEvent::ClPoolRegistered(ClPoolRegisteredEvent {
+            token_a,
+            token_b,
+            fee_bps,
+            pool,
+        }))
+    } else if symbol == Symbol::new(env, symbols::ROUTE_SELECTED) {
+        let (venue, venue_kind, amount_in, amount_out): (Address, RouteVenueKind, i128, i128) =
+            TryFromVal::try_from_val(env, &payload_val).ok()?;
+        Some(AmmEvent::RouteSelected(RouteSelectedEvent {
+            venue,
+            venue_kind,
+            amount_in,
+            amount_out,
+        }))
+    } else if symbol == Symbol::new(env, symbols::ROUTE_ALTERNATIVE) {
+        let (venue, amount_out, alt_venue, alt_venue_kind, alt_amount_out): (
+            Address,
+            i128,
+            Address,
+            RouteVenueKind,
+            i128,
+        ) = TryFromVal::try_from_val(env, &payload_val).ok()?;
+        Some(AmmEvent::RouteAlternative(RouteAlternativeEvent {
+            venue,
+            amount_out,
+            alt_venue,
+            alt_venue_kind,
+            alt_amount_out,
+        }))
+    } else if symbol == Symbol::new(env, symbols::ROUTE_EXECUTED) {
+        let (trader, token_in, token_out, amount_in, amount_out, pool): (
+            Address,
+            Address,
+            Address,
+            i128,
+            i128,
+            Address,
+        ) = TryFromVal::try_from_val(env, &payload_val).ok()?;
+        Some(AmmEvent::RouteExecuted(RouteExecutedEvent {
+            trader,
+            token_in,
+            token_out,
+            amount_in,
+            amount_out,
+            pool,
+        }))
+    } else if symbol == Symbol::new(env, symbols::TOLERANCE_FAILED) {
+        let (pool, observed_bps, tolerance_bps): (Address, i128, i128) =
+            TryFromVal::try_from_val(env, &payload_val).ok()?;
+        Some(AmmEvent::ToleranceFailed(ToleranceFailedEvent {
+            pool,
+            observed_bps,
+            tolerance_bps,
+        }))
     } else if symbol == Symbol::new(env, symbols::CIRCUIT_BREAKER) {
         let (price_before, price_after, deviation_bps, threshold_bps): (i128, i128, i128, i128) =
             TryFromVal::try_from_val(env, &payload_val).ok()?;

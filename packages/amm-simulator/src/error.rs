@@ -20,6 +20,16 @@ pub enum SimulationError {
     InvalidInput(String),
     #[error("invalid fee bps {fee_bps}")]
     InvalidFeeBps { fee_bps: i128 },
+    #[error("tick {tick} outside valid range [-887272, 887272]")]
+    TickOutOfRange { tick: i32 },
+    #[error("invalid tick spacing {tick_spacing}")]
+    InvalidTickSpacing { tick_spacing: i32 },
+    #[error("invalid price")]
+    InvalidPrice,
+    #[error("invalid amount")]
+    InvalidAmount,
+    #[error("price overflow")]
+    PriceOverflow,
     #[error("arithmetic overflow")]
     Overflow,
     #[error("failed to parse {path}: {source}")]

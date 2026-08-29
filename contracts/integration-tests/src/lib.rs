@@ -2,15 +2,24 @@
 //! amm, token, factory, twap_consumer, and concentrated_liquidity.
 //!
 //! Issue #166: Integration test matrix covering all five contracts.
+//! Issue #728: Real cross-contract suite with 45+ tests across 7 areas.
 //!
 //! All tests run fully in-process using the Soroban test environment —
 //! no external network calls are made.
+
+pub mod fixture;
+
+#[cfg(test)]
+mod factory_test;
 
 #[cfg(test)]
 mod upgrade_integration_test;
 
 #[cfg(test)]
 mod multisig_emergency_withdraw_test;
+
+#[cfg(test)]
+mod flash_loan_integration_test;
 
 #[cfg(all(test, feature = "legacy-integration-matrix"))]
 mod tests {
@@ -40,7 +49,7 @@ mod tests {
     fn set_ledger_ts(env: &Env, ts: u64) {
         env.ledger().set(LedgerInfo {
             timestamp: ts,
-            protocol_version: 22,
+            protocol_version: 21,
             sequence_number: env.ledger().sequence(),
             network_id: Default::default(),
             base_reserve: 10,

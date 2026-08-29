@@ -519,6 +519,7 @@ dependencies = [
  "amm",
  "factory",
  "pool-interfaces",
+ "soroban-amm-sdk",
  "soroban-sdk",
  "token",
 ]
@@ -670,6 +671,16 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "flash-loan-receiver"
+version = "0.1.0"
+dependencies = [
+ "amm",
+ "soroban-amm-sdk",
+ "soroban-sdk",
+ "token",
+]
 
 [[package]]
 name = "fnv"
@@ -891,12 +902,14 @@ name = "integration-tests"
 version = "0.1.0"
 dependencies = [
  "amm",
+ "cl_position_nft",
  "concentrated_liquidity",
  "dex-aggregator",
  "factory",
  "governance",
  "incentive-campaigns",
  "soroban-sdk",
+ "staking",
  "token",
  "twal-consumer",
  "twap-consumer",
@@ -1920,6 +1933,7 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 name = "v2-to-v3-migration"
 version = "0.1.0"
 dependencies = [
+ "amm",
  "soroban-amm-sdk",
  "soroban-sdk",
  "token",
