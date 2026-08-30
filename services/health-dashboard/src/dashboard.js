@@ -89,9 +89,11 @@ function renderHealth(health) {
   renderFiredAlerts(health.alertsFired || []);
 }
 
-function renderFiredAlerts(alerts) {
-  const list = $("alert-list");
-  if (!list || !alerts.length) return;
+export function renderFiredAlerts(alerts) {
+  const list = $("fired-alert-list");
+  if (!list) return;
+  list.replaceChildren();
+  if (!alerts.length) { list.innerHTML = '<div class="empty-state">No alerts have fired for this pool</div>'; return; }
   for (const alert of alerts) {
     const item = document.createElement("div");
     item.className = "alert-item alert-fired";
@@ -141,7 +143,7 @@ function renderHeatmap(events) {
   buckets.forEach((amount, index) => { const bar = document.createElement("div"); bar.className = "heatmap-bar"; bar.style.height = `${Math.max(4, amount / max * 56)}px`; bar.title = `${23 - index}h ago: ${formatMetric(amount)}`; heatmap.appendChild(bar); });
 }
 
-function renderAlertConfigs(configs, onRemove) {
+export function renderAlertConfigs(configs, onRemove) {
   const list = $("alert-list");
   if (!list) return;
   list.replaceChildren();

@@ -99,7 +99,12 @@
 
     <!-- Alert configuration -->
     <div class="alerts-panel">
-      <h2>Configurable Alerts</h2>
+      <h2 id="fired-alerts-heading">Fired Alerts</h2>
+      <div class="alert-list" id="fired-alert-list" aria-label="Fired alerts">
+        <div class="empty-state">No alerts have fired for this pool</div>
+      </div>
+
+      <h2 id="configured-alerts-heading">Configured Alerts</h2>
       <div class="alert-form">
         <select id="alert-metric" aria-label="Alert metric">
           <option value="price_deviation">Price Deviation (bps)</option>
@@ -109,7 +114,7 @@
         <input id="alert-threshold" type="number" placeholder="Threshold" min="0" style="width:120px" aria-label="Alert threshold" />
         <button id="btn-add-alert">Add Alert</button>
       </div>
-      <div class="alert-list" id="alert-list">
+      <div class="alert-list" id="alert-list" aria-label="Configured alerts">
         <div class="empty-state">No alerts configured for this pool</div>
       </div>
     </div>
