@@ -69,10 +69,34 @@ export interface PoolHealth {
   alertsFired: HealthAlert[];
 }
 
+export const VALID_ALERT_METRICS = ["price_deviation", "tvl", "volume24h"] as const;
+export type AlertMetric = (typeof VALID_ALERT_METRICS)[number];
+
+export class InvalidMetricError extends Error {
+  constructor(metric: string) {
+    super(`Invalid alert metric "${metric}". Must be one of: ${VALID_ALERT_METRICS.join(", ")}`);
+    this.name = "InvalidMetricError";
+  }
+}
+
+export class InvalidThresholdError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "InvalidThresholdError";
+  }
+}
+
+function isValidMetric(metric: string): metric is AlertMetric {
+  return (VALID_ALERT_METRICS as readonly string[]).includes(metric);
+}
+
 export interface AlertConfig {
   poolId: string;
-  metric: string;
-  thresholdBps: number;
+  metric: AlertMetric;
+  /** Basis-points threshold. Required (and only meaningful) for "price_deviation". */
+  thresholdBps?: number;
+  /** Raw-value threshold in the metric's native units. Required for "tvl" and "volume24h". */
+  thresholdValue?: number;
 }
 
 export class PoolIndexer {
@@ -235,6 +259,21 @@ export class PoolIndexer {
   // ── Alert configuration ─────────────────────────────────────────────────────
 
   setAlertConfig(config: AlertConfig): AlertConfig {
+    if (!isValidMetric(config.metric)) {
+      throw new InvalidMetricError(config.metric);
+    }
+    const threshold = config.metric === "price_deviation" ? config.thresholdBps : config.thresholdValue;
+    if (threshold === undefined || !Number.isFinite(threshold)) {
+      throw new InvalidThresholdError(
+        config.metric === "price_deviation"
+          ? "thresholdBps is required for metric \"price_deviation\""
+          : `thresholdValue is required for metric "${config.metric}"`,
+      );
+    }
+    if (threshold < 0) {
+      throw new InvalidThresholdError("Threshold must be >= 0");
+    }
+
     const key = `${config.poolId}:${config.metric}`;
     this.alertConfigs.set(key, config);
     return config;
@@ -264,20 +303,26 @@ export class PoolIndexer {
   private checkAlerts(poolId: string, stats: PoolStats): void {
     const configs = this.getAlertConfigs(poolId);
     for (const cfg of configs) {
-      let currentValue = 0;
+      // Metrics are validated (allow-listed) at write time in setAlertConfig,
+      // so every branch here is reachable and there is no silent fallthrough.
+      let currentValue: number;
+      let threshold: number;
       if (cfg.metric === "price_deviation") {
         currentValue = stats.priceDeviationBps;
+        threshold = cfg.thresholdBps!;
       } else if (cfg.metric === "tvl") {
         currentValue = stats.tvl;
-      } else if (cfg.metric === "volume24h") {
+        threshold = cfg.thresholdValue!;
+      } else {
         currentValue = stats.volume24h;
+        threshold = cfg.thresholdValue!;
       }
 
-      if (currentValue > cfg.thresholdBps) {
+      if (currentValue > threshold) {
         const alert: HealthAlert = {
           poolId,
           metric: cfg.metric,
-          threshold: cfg.thresholdBps,
+          threshold,
           currentValue,
           firedAt: Date.now(),
         };

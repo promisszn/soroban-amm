@@ -3,7 +3,13 @@ import { GraphQLError } from "graphql";
 import { startStandaloneServer } from "@apollo/server/standalone";
 import { PubSub } from "graphql-subscriptions";
 import { typeDefs } from "./schema.js";
-import { defaultIndexer, type AlertConfig } from "./indexer.js";
+import {
+  defaultIndexer,
+  InvalidMetricError,
+  InvalidThresholdError,
+  type AlertConfig,
+  type AlertMetric,
+} from "./indexer.js";
 
 const pubsub = new PubSub();
 
@@ -44,9 +50,30 @@ const resolvers = {
         poolId,
         metric,
         thresholdBps,
-      }: { poolId: string; metric: string; thresholdBps: number },
-    ): AlertConfig =>
-      defaultIndexer.setAlertConfig({ poolId, metric, thresholdBps }),
+        thresholdValue,
+      }: {
+        poolId: string;
+        metric: string;
+        thresholdBps?: number;
+        thresholdValue?: number;
+      },
+    ): AlertConfig => {
+      try {
+        return defaultIndexer.setAlertConfig({
+          poolId,
+          metric: metric as AlertMetric,
+          thresholdBps,
+          thresholdValue,
+        });
+      } catch (error) {
+        if (error instanceof InvalidMetricError || error instanceof InvalidThresholdError) {
+          throw new GraphQLError(error.message, {
+            extensions: { code: "BAD_USER_INPUT" },
+          });
+        }
+        throw error;
+      }
+    },
     removeAlertConfig: (
       _: unknown,
       { poolId, metric }: { poolId: string; metric: string },

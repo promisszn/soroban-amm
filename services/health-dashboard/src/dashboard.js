@@ -47,7 +47,7 @@ export async function gql(apiUrl, query, variables = {}) {
 const QUERY = {
   stats: `query Stats($poolId: ID) { poolStats(poolId: $poolId) { poolId tokenA tokenB tvl volume24h fees24h swapCount priceDeviationBps } }`,
   health: `query Health($poolId: ID!) { poolHealth(poolId: $poolId) { poolId healthScore tvlScore volumeScore feeEfficiencyScore priceDeviationBps status alertsFired { poolId metric threshold currentValue firedAt } } }`,
-  alerts: `query Alerts($poolId: ID) { alertConfigs(poolId: $poolId) { poolId metric thresholdBps } }`,
+  alerts: `query Alerts($poolId: ID) { alertConfigs(poolId: $poolId) { poolId metric thresholdBps thresholdValue } }`,
   history: `query History($poolId: ID!) { priceHistory(poolId: $poolId, from: 0) { poolId timestamp price feeBps } }`,
   events: `query Events($poolId: ID) { poolEvents(poolId: $poolId, limit: 200) { id poolId type timestamp payload } }`,
 };
@@ -148,7 +148,7 @@ export function renderAlertConfigs(configs, onRemove) {
   if (!list) return;
   list.replaceChildren();
   if (!configs.length) { list.innerHTML = '<div class="empty-state">No alerts configured for this pool</div>'; return; }
-  configs.forEach((alert) => { const item = document.createElement("div"); item.className = "alert-item"; item.textContent = `${alert.metric} > ${alert.thresholdBps} bps `; const button = document.createElement("button"); button.className = "remove"; button.type = "button"; button.textContent = "×"; button.setAttribute("aria-label", `Remove ${alert.metric} alert`); button.addEventListener("click", () => onRemove(alert)); item.appendChild(button); list.appendChild(item); });
+  configs.forEach((alert) => { const item = document.createElement("div"); item.className = "alert-item"; const label = alert.metric === "price_deviation" ? `${alert.metric} > ${alert.thresholdBps} bps` : `${alert.metric} > ${alert.thresholdValue}`; item.textContent = `${label} `; const button = document.createElement("button"); button.className = "remove"; button.type = "button"; button.textContent = "×"; button.setAttribute("aria-label", `Remove ${alert.metric} alert`); button.addEventListener("click", () => onRemove(alert)); item.appendChild(button); list.appendChild(item); });
 }
 
 function addDashboardMessages() {
@@ -188,11 +188,14 @@ export function createDashboardController({ apiUrl, poolId, pollIntervalMs = DEF
 
   async function mutate(query, variables) { return gql(url, query, variables); }
   async function addAlert() {
-    const metric = $("alert-metric").value; const thresholdBps = Number($("alert-threshold").value); if (!metric || !Number.isFinite(thresholdBps) || thresholdBps < 0) return;
+    const metric = $("alert-metric").value; const threshold = Number($("alert-threshold").value); if (!metric || !Number.isFinite(threshold) || threshold < 0) return;
+    // "price_deviation" is basis points; "tvl" and "volume24h" are raw values in the metric's native units.
+    const thresholdBps = metric === "price_deviation" ? threshold : undefined;
+    const thresholdValue = metric === "price_deviation" ? undefined : threshold;
     const currentPool = $("pool-id")?.value.trim() || pool;
-    const previous = configs; const next = [...configs.filter((item) => item.metric !== metric), { poolId: currentPool, metric, thresholdBps }]; configs = next; renderAlertConfigs(configs, removeAlert); $("alert-threshold").value = "";
+    const previous = configs; const next = [...configs.filter((item) => item.metric !== metric), { poolId: currentPool, metric, thresholdBps, thresholdValue }]; configs = next; renderAlertConfigs(configs, removeAlert); $("alert-threshold").value = "";
     const currentUrl = $("api-url")?.value.trim() || url;
-    try { await gql(currentUrl, `mutation SetAlert($poolId: ID!, $metric: String!, $thresholdBps: Int!) { setAlertConfig(poolId: $poolId, metric: $metric, thresholdBps: $thresholdBps) { poolId metric thresholdBps } }`, { poolId: currentPool, metric, thresholdBps }); } catch (error) { configs = previous; renderAlertConfigs(configs, removeAlert); setSectionState(`Alert was not saved: ${formatError(error)}`); }
+    try { await gql(currentUrl, `mutation SetAlert($poolId: ID!, $metric: String!, $thresholdBps: Int, $thresholdValue: Float) { setAlertConfig(poolId: $poolId, metric: $metric, thresholdBps: $thresholdBps, thresholdValue: $thresholdValue) { poolId metric thresholdBps thresholdValue } }`, { poolId: currentPool, metric, thresholdBps, thresholdValue }); } catch (error) { configs = previous; renderAlertConfigs(configs, removeAlert); setSectionState(`Alert was not saved: ${formatError(error)}`); }
   }
   async function removeAlert(alert) {
     const previous = configs; configs = configs.filter((item) => !(item.metric === alert.metric && item.poolId === alert.poolId)); renderAlertConfigs(configs, removeAlert);
