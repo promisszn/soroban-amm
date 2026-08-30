@@ -871,7 +871,11 @@ impl Factory {
             .get(&DataKey::ClPoolCount)
             .unwrap_or(0);
         for i in 0..count {
-            if let Some(p) = env.storage().persistent().get::<_, Address>(&DataKey::ClPoolByIndex(i)) {
+            if let Some(p) = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::ClPoolByIndex(i))
+            {
                 if p == pool {
                     return true;
                 }

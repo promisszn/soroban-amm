@@ -430,9 +430,10 @@ impl MigrationContract {
 mod tests {
     use super::*;
     use amm::{AmmPool, AmmPoolClient};
-    use soroban_sdk::testutils::{Address as _, Ledger as _, MockAuth, MockAuthInvoke};
+    extern crate std;
+    use soroban_sdk::testutils::{Address as _, Events, Ledger as _, MockAuth, MockAuthInvoke};
     use soroban_sdk::token::{StellarAssetClient, TokenClient};
-    use soroban_sdk::{IntoVal, String};
+    use soroban_sdk::{IntoVal, String, Symbol, TryFromVal};
     use token::{LpToken, LpTokenClient};
 
     /// Minimal V3 pool stub: `get_current_tick` is needed to exercise
@@ -1552,7 +1553,7 @@ mod tests {
         env.mock_all_auths();
         let f = build_fixture(&env, 1_000_000_i128, 1_000_000_i128, false, 1000);
 
-        let result = f.migration.migrate(
+        let _result = f.migration.migrate(
             &f.lp,
             &500_000_i128,
             &0_i128,
@@ -1564,15 +1565,13 @@ mod tests {
             &DEADLINE,
         );
 
-        assert!(result.is_ok(), "migration must succeed");
-
         // Read all events and find the migrated event
         let events = env.events().all();
-        let migrated_events: Vec<_> = events
+        let migrated_events: std::vec::Vec<_> = events
             .iter()
             .filter(|event| {
-                if let Ok((topic, _)) = <(Symbol, Address)>::try_from_val(&env, &event.topics) {
-                    topic == Symbol::new(&env, "migrated")
+                if let Some(topic_val) = event.1.get(0) {
+                    Symbol::try_from_val(&env, &topic_val) == Ok(Symbol::new(&env, "migrated"))
                 } else {
                     false
                 }
@@ -1585,8 +1584,8 @@ mod tests {
         );
 
         let event = migrated_events.last().unwrap();
-        let (version, _v2_shares, _deposited_a, _deposited_b, _position_id, _refund_a, _refund_b): (u32, i128, i128, i128, i128, i128, i128) =
-            event.data.try_into_val(&env).expect("must decode event with version prefix");
+        let (version, (_v2_shares, _deposited_a, _deposited_b, _position_id, _refund_a, _refund_b)): (u32, (i128, i128, i128, i128, i128, i128)) =
+            <(u32, (i128, i128, i128, i128, i128, i128))>::try_from_val(&env, &event.2).expect("must decode event with version prefix");
         assert_eq!(
             version,
             soroban_amm_sdk::EVENT_SCHEMA_VERSION,

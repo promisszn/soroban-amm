@@ -569,11 +569,7 @@ impl BatchAuction {
             .set(&DataKey::PendingOrders, &remaining);
         env.storage().instance().set(&DataKey::BatchOpenedAt, &now);
 
-        emit_versioned_event!(
-            env,
-            (symbol_short!("settled"),),
-            (process_count,)
-        );
+        emit_versioned_event!(env, (symbol_short!("settled"),), (process_count,));
 
         Ok(results)
     }
@@ -801,11 +797,7 @@ impl BatchAuction {
         }
 
         env.storage().instance().set(&DataKey::MaxOrders, &n);
-        emit_versioned_event!(
-            env,
-            (Symbol::new(&env, "max_orders_updated"),),
-            (n,)
-        );
+        emit_versioned_event!(env, (Symbol::new(&env, "max_orders_updated"),), (n,));
         Ok(())
     }
 
@@ -853,11 +845,7 @@ impl BatchAuction {
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &Option::<Address>::None);
-        emit_versioned_event!(
-            env,
-            (Symbol::new(&env, "admin_changed"),),
-            (new_admin,)
-        );
+        emit_versioned_event!(env, (Symbol::new(&env, "admin_changed"),), (new_admin,));
         Ok(())
     }
 
@@ -879,13 +867,14 @@ impl BatchAuction {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use amm::{AmmPool, AmmPoolClient};
     use concentrated_liquidity::{ConcentratedLiquidity, ConcentratedLiquidityClient};
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
+        testutils::{Address as _, Events, Ledger},
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
-        Env, String,
+        Env, String, TryFromVal,
     };
     use token::{LpToken, LpTokenClient};
 
@@ -1916,15 +1905,17 @@ mod tests {
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
-        let _order_id = client.submit_order(&trader, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        let _order_id =
+            client.submit_order(&trader, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
 
         // Find order_submitted event in all events
         let events = env.events().all();
-        let order_submitted_events: Vec<_> = events
+        let order_submitted_events: std::vec::Vec<_> = events
             .iter()
             .filter(|event| {
-                if let Ok((topic, _)) = <(Symbol, Address)>::try_from_val(&env, &event.topics) {
-                    topic == Symbol::new(&env, "order_submitted")
+                if let Some(topic_val) = event.1.get(0) {
+                    Symbol::try_from_val(&env, &topic_val)
+                        == Ok(Symbol::new(&env, "order_submitted"))
                 } else {
                     false
                 }
@@ -1936,8 +1927,9 @@ mod tests {
             "order_submitted event must be emitted"
         );
         let event = order_submitted_events.last().unwrap();
-        let (version, _order_id, _amount_in): (u32, u64, i128) =
-            event.data.try_into_val(&env).expect("must decode as (u32, u64, i128)");
+        let (version, (_order_id, _amount_in)): (u32, (u64, i128)) =
+            <(u32, (u64, i128))>::try_from_val(&env, &event.2)
+                .expect("must decode as (u32, (u64, i128))");
         assert_eq!(
             version,
             soroban_amm_sdk::EVENT_SCHEMA_VERSION,
@@ -1959,7 +1951,8 @@ mod tests {
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
-        let _order_id = client.submit_order(&trader, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        let _order_id =
+            client.submit_order(&trader, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
 
         // Advance time past the batch window
         env.ledger().set_timestamp(1031);
@@ -1968,11 +1961,11 @@ mod tests {
 
         // Find order_settled event
         let events = env.events().all();
-        let order_settled_events: Vec<_> = events
+        let order_settled_events: std::vec::Vec<_> = events
             .iter()
             .filter(|event| {
-                if let Ok((topic, _)) = <(Symbol, Address)>::try_from_val(&env, &event.topics) {
-                    topic == Symbol::new(&env, "order_settled")
+                if let Some(topic_val) = event.1.get(0) {
+                    Symbol::try_from_val(&env, &topic_val) == Ok(Symbol::new(&env, "order_settled"))
                 } else {
                     false
                 }
@@ -1984,8 +1977,9 @@ mod tests {
             "order_settled event must be emitted"
         );
         let event = order_settled_events.last().unwrap();
-        let (version, _order_id, _amount_out): (u32, u64, i128) =
-            event.data.try_into_val(&env).expect("must decode as (u32, u64, i128)");
+        let (version, (_order_id, _amount_out)): (u32, (u64, i128)) =
+            <(u32, (u64, i128))>::try_from_val(&env, &event.2)
+                .expect("must decode as (u32, (u64, i128))");
         assert_eq!(
             version,
             soroban_amm_sdk::EVENT_SCHEMA_VERSION,
@@ -2007,17 +2001,19 @@ mod tests {
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
-        let order_id = client.submit_order(&trader, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        let order_id =
+            client.submit_order(&trader, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
 
         client.cancel_order(&trader, &order_id);
 
         // Find order_cancelled event
         let events = env.events().all();
-        let order_cancelled_events: Vec<_> = events
+        let order_cancelled_events: std::vec::Vec<_> = events
             .iter()
             .filter(|event| {
-                if let Ok((topic, _)) = <(Symbol, Address)>::try_from_val(&env, &event.topics) {
-                    topic == Symbol::new(&env, "order_cancelled")
+                if let Some(topic_val) = event.1.get(0) {
+                    Symbol::try_from_val(&env, &topic_val)
+                        == Ok(Symbol::new(&env, "order_cancelled"))
                 } else {
                     false
                 }
@@ -2029,8 +2025,8 @@ mod tests {
             "order_cancelled event must be emitted"
         );
         let event = order_cancelled_events.last().unwrap();
-        let (version, _order_id): (u32, u64) =
-            event.data.try_into_val(&env).expect("must decode as (u32, u64)");
+        let (version, (_order_id,)): (u32, (u64,)) =
+            <(u32, (u64,))>::try_from_val(&env, &event.2).expect("must decode as (u32, (u64,))");
         assert_eq!(
             version,
             soroban_amm_sdk::EVENT_SCHEMA_VERSION,
@@ -2044,7 +2040,7 @@ mod tests {
         env.mock_all_auths_allowing_non_root_auth();
         env.ledger().set_timestamp(1000);
 
-        let (ta, tb, pool, admin) = setup(&env);
+        let (_ta, _tb, _pool, admin) = setup(&env);
 
         let auction_addr = env.register_contract(None, BatchAuction);
         let client = BatchAuctionClient::new(&env, &auction_addr);
@@ -2056,11 +2052,11 @@ mod tests {
 
         // Find admin_changed event
         let events = env.events().all();
-        let admin_changed_events: Vec<_> = events
+        let admin_changed_events: std::vec::Vec<_> = events
             .iter()
             .filter(|event| {
-                if let Ok((topic,)) = <(Symbol,)>::try_from_val(&env, &event.topics) {
-                    topic == Symbol::new(&env, "admin_changed")
+                if let Some(topic_val) = event.1.get(0) {
+                    Symbol::try_from_val(&env, &topic_val) == Ok(Symbol::new(&env, "admin_changed"))
                 } else {
                     false
                 }
@@ -2072,8 +2068,9 @@ mod tests {
             "admin_changed event must be emitted"
         );
         let event = admin_changed_events.last().unwrap();
-        let (version, _new_admin): (u32, Address) =
-            event.data.try_into_val(&env).expect("must decode as (u32, Address)");
+        let (version, (_new_admin,)): (u32, (Address,)) =
+            <(u32, (Address,))>::try_from_val(&env, &event.2)
+                .expect("must decode as (u32, (Address,))");
         assert_eq!(
             version,
             soroban_amm_sdk::EVENT_SCHEMA_VERSION,
@@ -2095,7 +2092,8 @@ mod tests {
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
-        let _order_id = client.submit_order(&trader, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        let _order_id =
+            client.submit_order(&trader, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
 
         // Advance time past the batch window
         env.ledger().set_timestamp(1031);
@@ -2104,24 +2102,21 @@ mod tests {
 
         // Find settled event
         let events = env.events().all();
-        let settled_events: Vec<_> = events
+        let settled_events: std::vec::Vec<_> = events
             .iter()
             .filter(|event| {
-                if let Ok((topic,)) = <(Symbol,)>::try_from_val(&env, &event.topics) {
-                    topic.short_str() == "settled"
+                if let Some(topic_val) = event.1.get(0) {
+                    Symbol::try_from_val(&env, &topic_val) == Ok(Symbol::new(&env, "settled"))
                 } else {
                     false
                 }
             })
             .collect();
 
-        assert!(
-            !settled_events.is_empty(),
-            "settled event must be emitted"
-        );
+        assert!(!settled_events.is_empty(), "settled event must be emitted");
         let event = settled_events.last().unwrap();
-        let (version, _process_count): (u32, u32) =
-            event.data.try_into_val(&env).expect("must decode as (u32, u32)");
+        let (version, (_process_count,)): (u32, (u32,)) =
+            <(u32, (u32,))>::try_from_val(&env, &event.2).expect("must decode as (u32, (u32,))");
         assert_eq!(
             version,
             soroban_amm_sdk::EVENT_SCHEMA_VERSION,

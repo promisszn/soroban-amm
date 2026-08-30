@@ -915,7 +915,7 @@ fn test_swap_exact_out_round_trip_consistent_with_get_amount_in() {
     AddLiquidity::new(&amm, &provider, 10_000_000, 10_000_000).execute();
 
     let want_out = 500_000_i128;
-    let quoted_in = amm.get_amount_in(&ts.tb_addr, &want_out).unwrap();
+    let quoted_in = amm.get_amount_in(&ts.tb_addr, &want_out);
 
     let trader = Address::generate(env);
     ta_sac.mint(&trader, &quoted_in);
@@ -1110,7 +1110,7 @@ fn test_get_amount_in_round_trip() {
     assert!(amount_out > 0);
 
     // Reverse: how much A is needed to get exactly amount_out of B?
-    let amount_in_reverse = amm.get_amount_in(&ts.tb_addr, &amount_out).unwrap();
+    let amount_in_reverse = amm.get_amount_in(&ts.tb_addr, &amount_out);
 
     // Due to integer rounding (+1 in get_amount_in), the reverse quote
     // should be >= the original input and at most 1 unit more.
@@ -1354,7 +1354,7 @@ fn test_get_amount_in_max_fee_does_not_panic() {
     tb_sac.mint(&provider, &1_000_000_i128);
     AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
 
-    let quoted_in = amm.get_amount_in(&ts.tb_addr, &1_000).unwrap();
+    let quoted_in = amm.get_amount_in(&ts.tb_addr, &1_000);
     assert_eq!(quoted_in, 0);
 }
 
@@ -1598,7 +1598,7 @@ fn test_large_reserves_get_amount_in_round_trip() {
     assert!(amount_out > 0);
 
     // Reverse: A needed for B
-    let amount_in_reverse = amm.get_amount_in(&ts.tb_addr, &amount_out).unwrap();
+    let amount_in_reverse = amm.get_amount_in(&ts.tb_addr, &amount_out);
 
     assert!(
         amount_in_reverse >= amount_in,
@@ -1653,8 +1653,11 @@ fn test_get_amount_in_rejects_amount_out_equals_reserve() {
 
     // Try to get exactly reserve_b amount — should fail with InsufficientLiquidity
     let result = amm.try_get_amount_in(&ts.tb_addr, &reserve_b);
-    assert!(result.is_err(), "get_amount_in must reject amount_out >= reserve_out");
-    
+    assert!(
+        result.is_err(),
+        "get_amount_in must reject amount_out >= reserve_out"
+    );
+
     if let Err(Ok(err)) = result {
         assert_eq!(err, AmmError::InsufficientLiquidity);
     }
@@ -1679,7 +1682,7 @@ fn test_get_amount_in_rejects_unknown_token() {
 
     let result = amm.try_get_amount_in(&unknown_token, &100_000_i128);
     assert!(result.is_err(), "get_amount_in must reject unknown token");
-    
+
     if let Err(Ok(err)) = result {
         assert_eq!(err, AmmError::InvalidToken);
     }
@@ -1696,7 +1699,7 @@ fn test_get_amount_in_rejects_empty_pool() {
 
     let result = amm.try_get_amount_in(&ts.tb_addr, &100_000_i128);
     assert!(result.is_err(), "get_amount_in must reject empty pool");
-    
+
     if let Err(Ok(err)) = result {
         assert_eq!(err, AmmError::EmptyPool);
     }
@@ -1721,8 +1724,11 @@ fn test_get_amount_in_succeeds_one_below_reserve() {
 
     // amount_out = reserve_b - 1 should succeed
     let result = amm.try_get_amount_in(&ts.tb_addr, &(reserve_b - 1));
-    assert!(result.is_ok(), "get_amount_in must succeed when amount_out < reserve_out");
-    
+    assert!(
+        result.is_ok(),
+        "get_amount_in must succeed when amount_out < reserve_out"
+    );
+
     if let Ok(Ok(amount_in)) = result {
         assert!(amount_in > 0, "amount_in must be positive");
     }
@@ -1749,9 +1755,12 @@ fn test_swap_exact_out_rejects_insufficient_liquidity() {
     let reserve_b = pool_info.reserve_b;
 
     // Try to get exactly reserve_b of token_b — should fail
-    let result = amm.try_swap_exact_out(&trader, &ts.tb_addr, &reserve_b, &u64::MAX, &u64::MAX);
-    assert!(result.is_err(), "swap_exact_out must reject when amount_out >= reserve_out");
-    
+    let result = amm.try_swap_exact_out(&trader, &ts.tb_addr, &reserve_b, &i128::MAX, &u64::MAX);
+    assert!(
+        result.is_err(),
+        "swap_exact_out must reject when amount_out >= reserve_out"
+    );
+
     if let Err(Ok(err)) = result {
         assert_eq!(err, AmmError::InsufficientLiquidity);
     }
@@ -1777,9 +1786,12 @@ fn test_swap_exact_out_success_unchanged() {
     let want_out = 500_000_i128;
     // Execute swap_exact_out and verify it returns the expected amount_in
     let actual_in = SwapExactOut::new(&amm, &trader, &ts.tb_addr, want_out, 10_000_000).execute();
-    
+
     // Verify we got the input amount (no error, value unchanged)
-    assert!(actual_in > 0, "swap_exact_out must return positive amount_in");
+    assert!(
+        actual_in > 0,
+        "swap_exact_out must return positive amount_in"
+    );
 }
 
 /// Test 7: get_amount_in with high fee (fee_bps >= 10_000) returns Ok(0).
@@ -1799,7 +1811,7 @@ fn test_get_amount_in_high_fee_returns_ok_zero() {
     // With fee_bps = 10_000, get_amount_in must return Ok(0), not panic
     let result = amm.try_get_amount_in(&ts.tb_addr, &500_i128);
     assert!(result.is_ok(), "get_amount_in with high fee must not panic");
-    
+
     if let Ok(Ok(amount_in)) = result {
         assert_eq!(amount_in, 0, "high fee should return 0");
     }
@@ -1828,7 +1840,7 @@ fn test_get_amount_in_property_no_panic() {
     for amount_out in [1_i128, 100_i128, 1000_i128, reserve_b - 1].iter() {
         // get_amount_in must return Ok or Err, never panic
         let result = amm.try_get_amount_in(&ts.tb_addr, amount_out);
-        
+
         // Result should be well-formed (either Ok(Ok(...)) or Err(...))
         match result {
             Ok(inner) => {

@@ -117,6 +117,7 @@ dependencies = [
  "amm",
  "concentrated_liquidity",
  "pool-interfaces",
+ "soroban-amm-sdk",
  "soroban-sdk",
  "token",
 ]
@@ -126,6 +127,7 @@ name = "batch_router"
 version = "0.1.0"
 dependencies = [
  "amm",
+ "concentrated_liquidity",
  "factory",
  "pool-interfaces",
  "soroban-amm-sdk",
@@ -139,8 +141,15 @@ version = "0.1.0"
 dependencies = [
  "amm",
  "batch_auction",
+ "cl_position_nft",
  "concentrated_liquidity",
+ "factory",
+ "governance",
+ "router",
+ "serde",
+ "serde_json",
  "soroban-sdk",
+ "staking",
  "token",
 ]
 
