@@ -323,6 +323,25 @@ impl DexAggregator {
         Ok(amount_out)
     }
 
+    /// Execute a best-execution swap with caller-supplied deadline.
+    ///
+    /// Finds the best available route and executes it atomically. The deadline
+    /// parameter specifies the latest allowed block timestamp (ledger time) for
+    /// the swap to be processed. If the current timestamp >= deadline, the swap
+    /// is rejected with SlippageExceeded.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `trader` - Address that initiates and receives funds from the swap
+    /// * `token_in` - Input token address
+    /// * `token_out` - Output token address
+    /// * `amount_in` - Exact amount to trade in
+    /// * `min_out` - Minimum acceptable output (slippage protection)
+    /// * `deadline` - Latest allowed block timestamp for execution (u64, seconds since epoch)
+    ///
+    /// # Returns
+    /// The actual amount of `token_out` received, or an error if routing fails,
+    /// the deadline expired, or slippage constraints are violated.
     pub fn swap_best(
         env: Env,
         trader: Address,
@@ -330,6 +349,7 @@ impl DexAggregator {
         token_out: Address,
         amount_in: i128,
         min_out: i128,
+        deadline: u64,
     ) -> Result<i128, AggregatorError> {
         Self::extend_ttl(&env);
         let max_hops: u32 = env
@@ -338,7 +358,6 @@ impl DexAggregator {
             .get(&DataKey::MaxHops)
             .unwrap_or(Self::DEFAULT_MAX_HOPS);
         let quote = Self::find_best_route(env.clone(), token_in, token_out, amount_in, max_hops)?;
-        let deadline = env.ledger().timestamp() + 3600;
         Self::execute_route(env, quote, trader, amount_in, min_out, deadline)
     }
 
@@ -1176,7 +1195,7 @@ mod tests {
         let v = setup_venues();
         let agg = DexAggregatorClient::new(&v.env, &v.agg);
 
-        let out = agg.swap_best(&v.trader, &v.token_a, &v.token_b, &10_000_i128, &0_i128);
+        let out = agg.swap_best(&v.trader, &v.token_a, &v.token_b, &10_000_i128, &0_i128, &u64::MAX);
 
         assert_eq!(count_events(&v.env, &v.agg, symbol_short!("route_sel")), 1);
         let (_, _, _, quoted): (Address, PoolKind, i128, i128) =
@@ -1358,7 +1377,7 @@ mod tests {
         let v = setup_venues();
         let agg = DexAggregatorClient::new(&v.env, &v.agg);
 
-        let out = agg.swap_best(&v.trader, &v.token_a, &v.token_b, &10_000_i128, &0_i128);
+        let out = agg.swap_best(&v.trader, &v.token_a, &v.token_b, &10_000_i128, &0_i128, &u64::MAX);
 
         assert!(out > 0, "swap_best must produce positive output with validation");
     }
@@ -1476,6 +1495,141 @@ mod tests {
             pool_info_before.reserve_b, pool_info_after.reserve_b,
             "pool reserve_b must be unchanged"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // #814: Deadline parameter tests
+    // -------------------------------------------------------------------------
+
+    /// Test 1: Regression test - swap_best rejects expired deadline.
+    /// A deadline one second in the past must fail without attempting the swap.
+    #[test]
+    fn test_swap_best_rejects_expired_deadline() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        // Get current timestamp and use one second in the past as deadline
+        let now = v.env.ledger().timestamp();
+        let expired_deadline = now.saturating_sub(1);
+
+        // swap_best with expired deadline should fail with SlippageExceeded
+        let result = agg.try_swap_best(
+            &v.trader,
+            &v.token_a,
+            &v.token_b,
+            &10_000_i128,
+            &0_i128,
+            &expired_deadline,
+        );
+
+        assert!(
+            result.is_err(),
+            "swap_best must reject expired deadline (in the past)"
+        );
+        if let Err(Ok(err)) = result {
+            assert_eq!(
+                err, AggregatorError::SlippageExceeded,
+                "expired deadline must return SlippageExceeded"
+            );
+        } else {
+            panic!("expected AggregatorError::SlippageExceeded");
+        }
+    }
+
+    /// Test 2: Positive test - swap_best succeeds with deadline 10 seconds in future.
+    #[test]
+    fn test_swap_best_succeeds_with_future_deadline() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        // Use a deadline 10 seconds in the future
+        let now = v.env.ledger().timestamp();
+        let future_deadline = now + 10;
+
+        let result = agg.try_swap_best(
+            &v.trader,
+            &v.token_a,
+            &v.token_b,
+            &10_000_i128,
+            &0_i128,
+            &future_deadline,
+        );
+
+        assert!(result.is_ok(), "swap_best must succeed with future deadline");
+        let out = result.unwrap();
+        assert!(out > 0, "swap_best must produce positive output");
+    }
+
+    /// Test 3: Boundary test - swap_best succeeds when deadline equals current timestamp.
+    /// The execute_route check is `deadline < timestamp`, so equal should succeed.
+    #[test]
+    fn test_swap_best_succeeds_at_deadline_boundary() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        // Use current timestamp as deadline (execute_route checks deadline < timestamp, not <=)
+        let now = v.env.ledger().timestamp();
+        let deadline_equals_now = now;
+
+        let result = agg.try_swap_best(
+            &v.trader,
+            &v.token_a,
+            &v.token_b,
+            &10_000_i128,
+            &0_i128,
+            &deadline_equals_now,
+        );
+
+        assert!(
+            result.is_ok(),
+            "swap_best must succeed when deadline == current timestamp (strict < comparison)"
+        );
+        let out = result.unwrap();
+        assert!(out > 0, "swap_best must produce positive output");
+    }
+
+    /// Test 4: Economics invariance - deadline does not affect swap output.
+    /// Two swaps against the same route with different deadlines should produce identical output.
+    #[test]
+    fn test_swap_best_deadline_does_not_affect_economics() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        let now = v.env.ledger().timestamp();
+        let short_deadline = now + 5;
+        let long_deadline = now + 3600;
+
+        // First swap with short deadline
+        let out1 = agg.swap_best(
+            &v.trader,
+            &v.token_a,
+            &v.token_b,
+            &10_000_i128,
+            &0_i128,
+            &short_deadline,
+        );
+
+        // Reset trader funds for second swap
+        // Need to create a new venue setup for a clean second trade
+        let v2 = setup_venues();
+        let agg2 = DexAggregatorClient::new(&v2.env, &v2.agg);
+
+        // Second swap with long deadline against same input
+        let out2 = agg2.swap_best(
+            &v2.trader,
+            &v2.token_a,
+            &v2.token_b,
+            &10_000_i128,
+            &0_i128,
+            &long_deadline,
+        );
+
+        // Both should produce identical output (deadline only affects expiry, not economics)
+        assert_eq!(
+            out1, out2,
+            "swap_best must produce identical output regardless of deadline"
+        );
+        assert!(out1 > 0, "both swaps must produce positive output");
     }
 
     fn env_token(env: &Env, admin: &Address) -> Address {
