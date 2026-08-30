@@ -1290,6 +1290,20 @@ impl ConcentratedLiquidity {
         env.storage().instance().get(&DataKey::CurrentTick).unwrap()
     }
 
+    /// Returns the pool's token pair as `(token_a, token_b)`.
+    ///
+    /// Unlike the constant-product AMM, this pool exposes no `get_info`, so
+    /// external contracts that need the pair — such as `reserve_manager`'s
+    /// `check_reserves`, which reads the pool's SEP-41 token balances — use
+    /// this accessor.
+    ///
+    /// Panics if the pool has not been initialized.
+    pub fn get_tokens(env: Env) -> (Address, Address) {
+        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
+        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        (token_a, token_b)
+    }
+
     pub fn active_liquidity(env: Env) -> i128 {
         env.storage()
             .instance()
