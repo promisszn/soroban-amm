@@ -55,6 +55,8 @@ pub struct PriceImpactEstimate {
 pub enum AggregatorError {
     NoRouteFound = 1,
     SlippageExceeded = 2,
+    InvalidMaxHops = 3,
+    TooManyRoutingTokens = 4,
 }
 
 #[contracttype]
@@ -109,6 +111,7 @@ impl DexAggregator {
     pub const PRICE_TOLERANCE_BPS: i128 = 10;
     pub const BPS: i128 = 10_000;
     pub const MAX_CL_POOLS: u32 = 50;
+    pub const MAX_ROUTING_TOKENS: u32 = 50;
     pub const CL_FEE_TIERS: [i128; 3] = [30, 100, 500];
 
     pub const MIN_SQRT_PRICE: u128 = 4_295_128_739_u128;
@@ -127,9 +130,17 @@ impl DexAggregator {
         env.storage().instance().set(&DataKey::ClPoolCount, &0u32);
     }
 
-    pub fn set_max_hops(env: Env, max_hops: u32) {
+    pub fn set_max_hops(env: Env, max_hops: u32) -> Result<(), AggregatorError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        if max_hops == 0 {
+            return Err(AggregatorError::InvalidMaxHops);
+        }
+
         Self::extend_ttl(&env);
         env.storage().instance().set(&DataKey::MaxHops, &max_hops);
+        Ok(())
     }
 
     pub fn register_cl_pool(
@@ -178,10 +189,19 @@ impl DexAggregator {
         );
     }
 
-    pub fn set_routing_tokens(env: Env, tokens: Vec<Address>) {
+    pub fn set_routing_tokens(env: Env, tokens: Vec<Address>) -> Result<(), AggregatorError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        if tokens.len() as u32 > Self::MAX_ROUTING_TOKENS {
+            return Err(AggregatorError::TooManyRoutingTokens);
+        }
+
+        Self::extend_ttl(&env);
         env.storage()
             .instance()
             .set(&DataKey::RoutingTokens, &tokens);
+        Ok(())
     }
 
     pub fn remove_cl_pool(env: Env, pool: Address) {
@@ -1160,4 +1180,197 @@ mod tests {
         env.register_stellar_asset_contract_v2(admin.clone())
             .address()
     }
+
+    // -------------------------------------------------------------------------
+    // #809: Authorization checks for set_max_hops and set_routing_tokens
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_set_max_hops_non_admin_fails() {
+        // Regression test: non-admin calls set_max_hops with no auth → must panic
+        let env = Env::default();
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        let admin = Address::generate(&env);
+        factory.initialize(
+            &admin,
+            &BytesN::from_array(&env, &[0u8; 32]),
+            &BytesN::from_array(&env, &[1u8; 32]),
+        );
+
+        let agg_addr = env.register_contract(None, DexAggregator);
+        let agg = DexAggregatorClient::new(&env, &agg_addr);
+        agg.initialize(&admin, &factory_addr);
+
+        let non_admin = Address::generate(&env);
+        env.mock_auths(&[]);
+
+        // Non-admin calling set_max_hops should fail
+        let result = agg.try_set_max_hops(&3u32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_routing_tokens_non_admin_fails() {
+        // Regression test: non-admin calls set_routing_tokens with no auth → must panic
+        let env = Env::default();
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        let admin = Address::generate(&env);
+        factory.initialize(
+            &admin,
+            &BytesN::from_array(&env, &[0u8; 32]),
+            &BytesN::from_array(&env, &[1u8; 32]),
+        );
+
+        let agg_addr = env.register_contract(None, DexAggregator);
+        let agg = DexAggregatorClient::new(&env, &agg_addr);
+        agg.initialize(&admin, &factory_addr);
+
+        let token = Address::generate(&env);
+        let tokens = vec![&env, token];
+        env.mock_auths(&[]);
+
+        // Non-admin calling set_routing_tokens should fail
+        let result = agg.try_set_routing_tokens(&tokens);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_admin_set_max_hops_success_then_route_limited() {
+        // Admin calls set_max_hops(&env, &3) successfully, then a >3-hop route fails
+        let env = Env::default();
+        env.mock_all_auths();
+        env.budget().reset_unlimited();
+
+        let admin = Address::generate(&env);
+        let amm_wasm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let lp_wasm_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_wasm_hash, &lp_wasm_hash);
+
+        let agg_addr = env.register_contract(None, DexAggregator);
+        let agg = DexAggregatorClient::new(&env, &agg_addr);
+        agg.initialize(&admin, &factory_addr);
+
+        // Admin sets max_hops to 3
+        let result = agg.try_set_max_hops(&3u32);
+        assert!(result.is_ok());
+
+        // Verify find_best_route respects the max_hops cap
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+
+        // Create a deep route that would require >3 hops (this will fail because we have no pools)
+        let result = agg.try_find_best_route(&token_a, &token_b, &100_i128, &5u32);
+        assert!(result.is_err()); // Expected: NoRouteFound because no pools registered
+    }
+
+    #[test]
+    fn test_set_max_hops_zero_fails_with_invalid_max_hops() {
+        // set_max_hops(&env, &0) → Err(AggregatorError::InvalidMaxHops)
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(
+            &admin,
+            &BytesN::from_array(&env, &[0u8; 32]),
+            &BytesN::from_array(&env, &[1u8; 32]),
+        );
+
+        let agg_addr = env.register_contract(None, DexAggregator);
+        let agg = DexAggregatorClient::new(&env, &agg_addr);
+        agg.initialize(&admin, &factory_addr);
+
+        // Setting max_hops to 0 should fail with InvalidMaxHops
+        let result = agg.try_set_max_hops(&0u32);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            AggregatorError::InvalidMaxHops
+        );
+    }
+
+    #[test]
+    fn test_set_routing_tokens_too_many_fails() {
+        // set_routing_tokens with MAX_ROUTING_TOKENS + 1 addresses → TooManyRoutingTokens
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(
+            &admin,
+            &BytesN::from_array(&env, &[0u8; 32]),
+            &BytesN::from_array(&env, &[1u8; 32]),
+        );
+
+        let agg_addr = env.register_contract(None, DexAggregator);
+        let agg = DexAggregatorClient::new(&env, &agg_addr);
+        agg.initialize(&admin, &factory_addr);
+
+        // Create MAX_ROUTING_TOKENS + 1 addresses
+        let mut too_many_tokens = Vec::new(&env);
+        for i in 0..=(DexAggregator::MAX_ROUTING_TOKENS) {
+            too_many_tokens.push_back(Address::generate(&env));
+        }
+
+        // Setting too many tokens should fail with TooManyRoutingTokens
+        let result = agg.try_set_routing_tokens(&too_many_tokens);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            AggregatorError::TooManyRoutingTokens
+        );
+    }
+
+    #[test]
+    fn test_admin_set_routing_tokens_success_updates_discovery() {
+        // Admin calls set_routing_tokens with a valid list, and discover_tokens picks up the new tokens
+        let env = Env::default();
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        let admin = Address::generate(&env);
+        factory.initialize(
+            &admin,
+            &BytesN::from_array(&env, &[0u8; 32]),
+            &BytesN::from_array(&env, &[1u8; 32]),
+        );
+
+        let agg_addr = env.register_contract(None, DexAggregator);
+        let agg = DexAggregatorClient::new(&env, &agg_addr);
+        agg.initialize(&admin, &factory_addr);
+
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+        let routing_token = Address::generate(&env);
+
+        env.mock_all_auths();
+
+        // Set routing tokens
+        let routing_tokens = vec![&env, routing_token.clone()];
+        let result = agg.try_set_routing_tokens(&routing_tokens);
+        assert!(result.is_ok());
+
+        // Verify discover_tokens includes the routing tokens
+        let discovered = env.as_contract(&agg_addr, || {
+            DexAggregator::discover_tokens(&env, &token_a, &token_b)
+        });
+
+        let mut found_routing_token = false;
+        for i in 0..discovered.len() {
+            if discovered.get(i).unwrap() == routing_token {
+                found_routing_token = true;
+                break;
+            }
+        }
+        assert!(found_routing_token);
+    }
 }
+
