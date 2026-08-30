@@ -2068,11 +2068,7 @@ impl ConcentratedLiquidity {
                 }
             };
 
-            let next_price_x96 = {
-                let price = Self::tick_to_price(next_tick);
-                let sqrt_p = Self::sqrt(price);
-                (sqrt_p as u128) * (1u128 << 96) / 1000u128
-            };
+            let next_price_x96 = Self::tick_to_sqrt_price_x96(next_tick);
 
             let mut target_price_x96 = next_price_x96;
             let mut hit_limit = false;
@@ -2284,7 +2280,23 @@ impl ConcentratedLiquidity {
                     } else {
                         sqrt_price_x96 = new_price_x96;
                     }
+                    // This branch only runs when the step's own math already
+                    // determined the trade does *not* need to reach `next_tick`
+                    // (the `if` arm above handles the case where it does). The
+                    // step math works in a deliberately low-precision (~3
+                    // significant digit) price representation, though, and its
+                    // pool-favorable rounding can — right at a boundary —
+                    // compute a price indistinguishable from (or past) the
+                    // tick it was told not to reach. Reconstructing that price
+                    // via the full-precision `sqrt_price_x96_to_tick` can then
+                    // resolve to `next_tick` or beyond even though this step
+                    // never crossed it. Clamp back to the known-correct side.
                     current_tick = Self::sqrt_price_x96_to_tick(sqrt_price_x96);
+                    current_tick = if zero_for_one {
+                        current_tick.max(next_tick)
+                    } else {
+                        current_tick.min(next_tick)
+                    };
                 } else {
                     sqrt_price_x96 = target_price_x96;
                     current_tick = Self::sqrt_price_x96_to_tick(sqrt_price_x96);
@@ -2550,11 +2562,7 @@ impl ConcentratedLiquidity {
                 }
             };
 
-            let next_price_x96 = {
-                let price = Self::tick_to_price(next_tick);
-                let sqrt_p = Self::sqrt(price);
-                (sqrt_p as u128) * (1u128 << 96) / 1000u128
-            };
+            let next_price_x96 = Self::tick_to_sqrt_price_x96(next_tick);
 
             let mut target_price_x96 = next_price_x96;
             let mut hit_limit = false;
@@ -2673,7 +2681,19 @@ impl ConcentratedLiquidity {
                     } else {
                         sqrt_price_x96 = new_price_x96;
                     }
+                    // See the equivalent clamp in `swap`'s partial-step branch:
+                    // this branch only runs when the step math already decided
+                    // the trade does not need to reach `next_tick`, but its
+                    // deliberately low-precision, pool-favorable-rounded price
+                    // can — right at a boundary — round-trip through the
+                    // full-precision `sqrt_price_x96_to_tick` to `next_tick` or
+                    // beyond. Clamp back to the known-correct side.
                     current_tick = Self::sqrt_price_x96_to_tick(sqrt_price_x96);
+                    current_tick = if zero_for_one {
+                        current_tick.max(next_tick)
+                    } else {
+                        current_tick.min(next_tick)
+                    };
                 } else {
                     sqrt_price_x96 = target_price_x96;
                     current_tick = Self::sqrt_price_x96_to_tick(sqrt_price_x96);
@@ -3618,11 +3638,7 @@ impl ConcentratedLiquidity {
                 }
             };
 
-            let next_price_x96 = {
-                let price = Self::tick_to_price(next_tick);
-                let sqrt_p = Self::sqrt(price);
-                (sqrt_p as u128) * (1u128 << 96) / 1000u128
-            };
+            let next_price_x96 = Self::tick_to_sqrt_price_x96(next_tick);
 
             let mut target_price_x96 = next_price_x96;
             let mut hit_limit = false;
@@ -3714,7 +3730,23 @@ impl ConcentratedLiquidity {
                     } else {
                         sqrt_price_x96 = new_price_x96;
                     }
+                    // This branch only runs when the step's own math already
+                    // determined the trade does *not* need to reach `next_tick`
+                    // (the `if` arm above handles the case where it does). The
+                    // step math works in a deliberately low-precision (~3
+                    // significant digit) price representation, though, and its
+                    // pool-favorable rounding can — right at a boundary —
+                    // compute a price indistinguishable from (or past) the
+                    // tick it was told not to reach. Reconstructing that price
+                    // via the full-precision `sqrt_price_x96_to_tick` can then
+                    // resolve to `next_tick` or beyond even though this step
+                    // never crossed it. Clamp back to the known-correct side.
                     current_tick = Self::sqrt_price_x96_to_tick(sqrt_price_x96);
+                    current_tick = if zero_for_one {
+                        current_tick.max(next_tick)
+                    } else {
+                        current_tick.min(next_tick)
+                    };
                 } else {
                     sqrt_price_x96 = target_price_x96;
                     current_tick = Self::sqrt_price_x96_to_tick(sqrt_price_x96);
@@ -4110,8 +4142,13 @@ mod tests {
         te.client
             .mint_position(&provider2, &50, &150, &100_000, &100_000, &0, &0);
 
+        // 200_000 in (180_000 after the 10% fee) is large enough to cross
+        // down through both the 100->50 and 50->0 boundaries, so both
+        // positions actually trade against the swap and must retain their
+        // own fee share rather than losing it to whichever range the price
+        // ends up in.
         te.client
-            .swap(&te.provider, &true, &20_000, &0, &0, &10_000);
+            .swap(&te.provider, &true, &200_000, &0, &0, &10_000);
 
         let (f1_a, f1_b) = te.client.collect_fees(&provider1, &0, &50);
         let (f2_a, f2_b) = te.client.collect_fees(&provider2, &50, &150);
@@ -7814,30 +7851,24 @@ mod test_swap_exact_out {
         let env = Env::default();
         let f = setup_exact_out(&env, 0, 0); // 0% fee for a clean hand computation
 
-        // Mirror image of the ranges above: one wide range far below, the
-        // range straddling the initial tick, then two adjacent tight ranges
-        // above it, so a large exact-out swap moving price *up* must cross
-        // at least the 100 and 200 boundaries.
-        f.client
-            .mint_position(&f.provider, &-10_000, &-100, &2_000_000, &2_000_000, &0, &0);
+        // Mirror image of the ranges above: the range straddling the initial
+        // tick, two adjacent tight ranges above it, then one wide range far
+        // above (the swap's direction, so it has enough liquidity to absorb
+        // a large exact-out request) so the swap moving price *up* must
+        // cross at least the 100 and 200 boundaries.
         f.client
             .mint_position(&f.provider, &-100, &100, &2_000_000, &2_000_000, &0, &0);
         f.client
             .mint_position(&f.provider, &100, &200, &2_000_000, &2_000_000, &0, &0);
         f.client
             .mint_position(&f.provider, &200, &300, &2_000_000, &2_000_000, &0, &0);
+        f.client
+            .mint_position(&f.provider, &300, &10_000, &2_000_000, &2_000_000, &0, &0);
 
         let ranges = [
             (
-                -10_000i32,
                 -100i32,
-                f.client
-                    .get_position(&f.provider, &-10_000, &-100)
-                    .liquidity,
-            ),
-            (
-                -100,
-                100,
+                100i32,
                 f.client.get_position(&f.provider, &-100, &100).liquidity,
             ),
             (
@@ -7850,14 +7881,21 @@ mod test_swap_exact_out {
                 300,
                 f.client.get_position(&f.provider, &200, &300).liquidity,
             ),
+            (
+                300,
+                10_000,
+                f.client.get_position(&f.provider, &300, &10_000).liquidity,
+            ),
         ];
 
         let amount_out = 2_000_000_i128; // token A out, large enough to cross several ticks
+        // `u128::MAX`, not `0`, is this crate's "no limit" sentinel for
+        // `zero_for_one = false` (see `swap_exact_out_normal_path_one_for_zero`).
         let amount_in = f.client.swap_exact_out(
             &f.provider,
             &false,
             &amount_out,
-            &0_u128,
+            &u128::MAX,
             &i128::MAX,
             &10_000,
         );
