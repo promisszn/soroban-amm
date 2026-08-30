@@ -16,6 +16,7 @@ const BUMP_TO: u32 = 518_400;
 #[contracttype]
 pub enum DataKey {
     Factory,
+    Admin,
 }
 
 #[contract]
@@ -24,11 +25,13 @@ pub struct Router;
 #[contractimpl]
 impl Router {
     /// Initialize the router with the factory that tracks all deployed pools.
-    pub fn initialize(env: Env, factory: Address) {
+    pub fn initialize(env: Env, admin: Address, factory: Address) {
         assert!(
             !env.storage().instance().has(&DataKey::Factory),
             "already initialized"
         );
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Factory, &factory);
     }
 
@@ -378,7 +381,7 @@ mod tests {
 
         let router_addr = env.register_contract(None, Router);
         let router = RouterClient::new(&env, &router_addr);
-        router.initialize(&factory_addr);
+        router.initialize(&admin, &factory_addr);
 
         let token1 = env
             .register_stellar_asset_contract_v2(admin.clone())
@@ -503,7 +506,7 @@ mod tests {
         factory.initialize(&admin, &amm_wasm_hash, &lp_wasm_hash);
 
         let router_addr = env.register_contract(None, Router);
-        RouterClient::new(&env, &router_addr).initialize(&factory_addr);
+        RouterClient::new(&env, &router_addr).initialize(&admin, &factory_addr);
 
         let mut tokens: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
         for _ in 0..4 {

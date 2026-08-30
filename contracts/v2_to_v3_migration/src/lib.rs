@@ -44,6 +44,9 @@ pub enum DataKey {
     V3Pool,
 }
 
+const MIN_TTL: u32 = 172_800;
+const BUMP_TO: u32 = 518_400;
+
 // ── External interfaces ───────────────────────────────────────────────────────
 
 /// Minimal V2 AMM interface needed for migration.
@@ -127,6 +130,10 @@ pub struct MigrationResult {
 #[contract]
 pub struct MigrationContract;
 
+fn extend_ttl(env: &Env) {
+    env.storage().instance().extend_ttl(MIN_TTL, BUMP_TO);
+}
+
 #[contractimpl]
 impl MigrationContract {
     // ── Setup ─────────────────────────────────────────────────────────────────
@@ -143,6 +150,7 @@ impl MigrationContract {
         v2_pool: Address,
         v3_pool: Address,
     ) -> Result<(), MigrationError> {
+        extend_ttl(&env);
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(MigrationError::AlreadyInitialized);
         }
@@ -203,6 +211,7 @@ impl MigrationContract {
         min_v3_shares: i128,
         deadline: u64,
     ) -> Result<MigrationResult, MigrationError> {
+        extend_ttl(&env);
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(MigrationError::NotInitialized);
         }

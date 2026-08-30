@@ -25,6 +25,9 @@ use soroban_sdk::{
 const DEFAULT_MAX_ORDERS: u32 = 50;
 const MAX_ORDERS_CEILING: u32 = 200;
 
+const MIN_TTL: u32 = 172_800;
+const BUMP_TO: u32 = 518_400;
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -115,6 +118,10 @@ fn max_orders(env: &Env) -> u32 {
         .unwrap_or(DEFAULT_MAX_ORDERS)
 }
 
+fn extend_ttl(env: &Env) {
+    env.storage().instance().extend_ttl(MIN_TTL, BUMP_TO);
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -131,6 +138,7 @@ impl BatchAuction {
         admin: Address,
         batch_window_secs: u64,
     ) -> Result<(), AuctionError> {
+        extend_ttl(&env);
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(AuctionError::AlreadyInitialized);
         }
@@ -173,6 +181,7 @@ impl BatchAuction {
         min_out: i128,
         deadline: u64,
     ) -> Result<u64, AuctionError> {
+        extend_ttl(&env);
         Self::record_order(
             env,
             trader,
@@ -216,6 +225,7 @@ impl BatchAuction {
         alt_amm_pool: Option<Address>,
         deadline: u64,
     ) -> Result<u64, AuctionError> {
+        extend_ttl(&env);
         Self::record_order(
             env,
             trader,
@@ -342,6 +352,7 @@ impl BatchAuction {
     ///
     /// Only the original trader may cancel their own order.
     pub fn cancel_order(env: Env, trader: Address, order_id: u64) -> Result<(), AuctionError> {
+        extend_ttl(&env);
         trader.require_auth();
 
         let order: Order = env
@@ -414,6 +425,7 @@ impl BatchAuction {
     /// callers should compare against `get_pending_orders` before and after
     /// to see which orders failed, and use `order_failed` events to react.
     pub fn settle_batch(env: Env) -> Result<Vec<i128>, AuctionError> {
+        extend_ttl(&env);
         let opened_at: u64 = env
             .storage()
             .instance()
@@ -758,6 +770,7 @@ impl BatchAuction {
 
     /// Update the batch window duration. Admin-only.
     pub fn set_batch_window(env: Env, batch_window_secs: u64) -> Result<(), AuctionError> {
+        extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage()
@@ -777,6 +790,7 @@ impl BatchAuction {
     /// keeps settlement cost bounded even if governance/admin configuration is
     /// changed under production load.
     pub fn set_max_orders(env: Env, admin: Address, n: u32) -> Result<(), AuctionError> {
+        extend_ttl(&env);
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if stored_admin != admin {
             return Err(AuctionError::Unauthorized);
@@ -805,6 +819,7 @@ impl BatchAuction {
         current_admin: Address,
         new_admin: Address,
     ) -> Result<(), AuctionError> {
+        extend_ttl(&env);
         let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if current_admin != stored {
             return Err(AuctionError::Unauthorized);
@@ -823,6 +838,7 @@ impl BatchAuction {
 
     /// Accept the pending admin nomination. Caller becomes the new admin.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), AuctionError> {
+        extend_ttl(&env);
         let pending: Option<Address> = env
             .storage()
             .instance()
