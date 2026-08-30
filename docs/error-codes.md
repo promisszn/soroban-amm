@@ -526,6 +526,28 @@ Contains integration and upgrade test suites for multi-contract interactions. Ex
 
 ---
 
+## TwapConsumer (`contracts/twap_consumer`)
+
+Defined in [contracts/twap_consumer/src/lib.rs](../contracts/twap_consumer/src/lib.rs) as `TwapError`.
+
+| Code | Symbol | Cause | Remedy |
+|------|--------|-------|--------|
+| 1 | `AlreadyInitialized` | `initialize` was called on a consumer contract that has already been set up. | Do not re-initialize the contract. |
+| 2 | `NotInitialized` | Contract function called before `initialize` was performed. | Call `initialize` with keeper address first. |
+| 3 | `ZeroWindow` | `window_seconds` argument was zero. | Provide a strictly positive window duration in seconds. |
+| 4 | `InsufficientHistory` | Not enough snapshot history exists to cover the requested TWAP window. | Wait for more snapshots to accumulate or reduce the TWAP window size. |
+| 5 | `NoSnapshotFound` | Snapshot not found for the specified timestamp or pool key. | Verify the snapshot timestamp exists or wait for the keeper to save a snapshot. |
+| 6 | `ElapsedZero` | Elapsed time between snapshots is zero or negative. | Ensure oracle price cumulative timestamps advance. |
+| 7 | `InvalidSpotPrice` | Spot price provided for validation is non-positive. | Provide a strictly positive spot price. |
+| 8 | `InvalidTwapPrice` | Computed TWAP price is non-positive. | Ensure pool reserves and cumulative prices are positive. |
+| 9 | `InvalidDeviationBps` | Deviation threshold is outside `[0, 10 000]` bps. | Provide a deviation threshold between 0 and 10 000 bps. |
+| 10 | `NegativeCollateral` | Collateral amount provided is negative. | Provide a non-negative collateral amount. |
+| 11 | `PriceManipulated` | Spot price deviates from TWAP beyond allowed threshold. | Reject the trade/valuation or retry with current market prices. |
+| 12 | `InvalidRetentionPolicy` | `max_age_seconds` is shorter than the minimum supported TWAP window (`LONGEST_TWAP_WINDOW`). | Set `max_age_seconds` to at least `LONGEST_TWAP_WINDOW` or 0 (disabled). |
+| 13 | `Unauthorized` | Non-keeper/admin address attempted an administrative action. | Submit the transaction authenticated by the configured keeper/admin. |
+
+---
+
 ## Decoding errors from RPC responses
 
 When `stellar-sdk-rs` (or the Soroban RPC) returns a failed invocation, the
