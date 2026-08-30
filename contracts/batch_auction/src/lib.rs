@@ -15,7 +15,7 @@
 
 #![no_std]
 
-use pool_interfaces::{AmmPoolClient, ConcentratedLiquidityClient};
+use pool_interfaces::{AmmPoolClient, ConcentratedLiquidityClient, FactoryClient};
 use soroban_amm_sdk::emit_versioned_event;
 use soroban_sdk::token::Client as SepTokenClient;
 use soroban_sdk::{
@@ -24,6 +24,11 @@ use soroban_sdk::{
 
 const DEFAULT_MAX_ORDERS: u32 = 50;
 const MAX_ORDERS_CEILING: u32 = 200;
+/// Ceiling on how far in the future a trader-supplied `deadline` may be
+/// (issue #700): otherwise a trader could pin their escrow open indefinitely
+/// with a far-future deadline, since only the trader's own `cancel_order` (or
+/// this ceiling) can release it before then.
+const MAX_ORDER_LIFETIME_SECS: u64 = 7 * 24 * 60 * 60;
 
 const MIN_TTL: u32 = 172_800;
 const BUMP_TO: u32 = 518_400;
@@ -50,6 +55,21 @@ pub enum AuctionError {
     NoPendingAdmin = 12,
     /// `accept_admin` caller is not the pending nominee (issue #553).
     WrongAdmin = 13,
+    /// `pool`/`alt_pool` is neither on the admin allowlist nor attested to by
+    /// the configured factory (issue #700).
+    UnknownVenue = 14,
+    /// An order's venue was allow-listed at submission but has since been
+    /// removed; the order is refunded at settlement instead of executed
+    /// against it (issue #700).
+    VenueRemoved = 15,
+    /// `deadline` is further out than `MAX_ORDER_LIFETIME_SECS` (issue #700).
+    DeadlineTooFar = 16,
+    /// `expire_order` called on an order whose deadline has not passed yet
+    /// (issue #700).
+    OrderNotExpired = 17,
+    /// `claim_refund` called for an order with no claimable balance on
+    /// record (issue #700).
+    NothingToClaim = 18,
 }
 
 // ── Storage types ─────────────────────────────────────────────────────────────
@@ -109,6 +129,17 @@ pub enum DataKey {
     NextOrderId,
     Order(u64),
     PendingOrders,
+    /// The factory that attests to protocol-deployed pools (issue #700).
+    Factory,
+    /// Admin-managed allowlist entry for a venue the factory doesn't know
+    /// about (issue #700).
+    Venue(Address),
+    /// Enumeration index for `list_venues` (issue #700).
+    VenueList,
+    /// A stranded `(trader, token, amount)` from a refund/payout transfer
+    /// that failed during `settle_batch`/`expire_order`, claimable later via
+    /// `claim_refund` (issue #700).
+    Claimable(u64),
 }
 
 fn max_orders(env: &Env) -> u32 {
@@ -259,34 +290,34 @@ impl BatchAuction {
         sqrt_price_limit: u128,
         alt_pool: Option<Address>,
     ) -> Result<u64, AuctionError> {
-        if deadline < env.ledger().timestamp() {
+        let now = env.ledger().timestamp();
+        if deadline < now {
             return Err(AuctionError::DeadlineExceeded);
+        }
+        if deadline > now + MAX_ORDER_LIFETIME_SECS {
+            return Err(AuctionError::DeadlineTooFar);
         }
         if amount_in <= 0 {
             return Err(AuctionError::ZeroAmount);
         }
 
-        // Validate the order's tokens against the primary pool's actual pair up
-        // front. If a mismatched pair slipped through, settle_batch would call
-        // swap with the wrong tokens and panic; since settlement is atomic, that
-        // panic reverts the whole batch and locks every other trader's escrow
-        // until each order is cancelled individually (issue #361). AMM and CL
-        // pools expose their token pair through different interfaces, so the
-        // lookup must branch on pool_type (issue #470).
-        if !Self::pool_matches_pair(&env, &pool, pool_type, &token_in, &token_out) {
-            return Err(AuctionError::InvalidPoolTokenPair);
-        }
-        // An alternate venue must trade the same pair as the primary venue.
-        // Otherwise best-venue routing could quote and select a real pool over
-        // `token_in -> token_x`, causing settlement to receive the wrong asset.
+        // Validate `pool` is a venue this protocol actually deployed (attested
+        // to by the factory) or one the admin has explicitly vetted, and that
+        // it trades the order's exact token pair. Trusting the pool's own
+        // self-reported token pair alone (the previous check) let an attacker
+        // name their own contract as the venue and drain the shared escrow
+        // once settle_batch called into it (issue #700).
+        Self::check_venue(&env, &pool, pool_type, &token_in, &token_out)?;
+        // An alternate venue must be equally legitimate and trade the same
+        // pair as the primary venue. Otherwise best-venue routing could quote
+        // and select a real pool over `token_in -> token_x`, causing
+        // settlement to receive the wrong asset — or a malicious venue.
         if let Some(ref alt) = alt_pool {
             let alt_type = match pool_type {
                 PoolType::Amm => PoolType::Cl,
                 PoolType::Cl => PoolType::Amm,
             };
-            if !Self::pool_matches_pair(&env, alt, alt_type, &token_in, &token_out) {
-                return Err(AuctionError::InvalidPoolTokenPair);
-            }
+            Self::check_venue(&env, alt, alt_type, &token_in, &token_out)?;
         }
 
         let mut pending: Vec<u64> = env
@@ -471,24 +502,43 @@ impl BatchAuction {
             // settlement time, expire the order and refund its escrow rather
             // than silently substituting a freshly-computed deadline.
             if now > order.deadline {
-                let refund_ok = SepTokenClient::new(&env, &order.token_in)
-                    .try_transfer(&auction_addr, &order.trader, &order.amount_in)
-                    .ok()
-                    .and_then(|r| r.ok());
-                if refund_ok.is_none() {
-                    emit_versioned_event!(
-                        env,
-                        (Symbol::new(&env, "order_failed"), order.trader.clone()),
-                        (order_id,)
-                    );
-                } else {
+                if Self::pay_or_claim(
+                    &env,
+                    order_id,
+                    &order.trader,
+                    &order.token_in,
+                    order.amount_in,
+                ) {
                     results.push_back(0);
-                    emit_versioned_event!(
-                        env,
-                        (Symbol::new(&env, "order_expired"), order.trader.clone()),
-                        (order_id,)
-                    );
                 }
+                emit_versioned_event!(
+                    env,
+                    (Symbol::new(&env, "order_expired"), order.trader.clone()),
+                    (order_id,)
+                );
+                env.storage().instance().remove(&DataKey::Order(order_id));
+                continue;
+            }
+
+            // Re-validate the venue at settlement time too: an order's pool
+            // may have been admin-removed from the allowlist (or the factory
+            // reconfigured) since submission. Refund rather than executing
+            // against a venue that is no longer trusted (issue #700).
+            if !Self::venue_is_registered(&env, &order.pool, order.pool_type) {
+                Self::pay_or_claim(
+                    &env,
+                    order_id,
+                    &order.trader,
+                    &order.token_in,
+                    order.amount_in,
+                );
+                env.events().publish(
+                    (
+                        Symbol::new(&env, "order_venue_removed"),
+                        order.trader.clone(),
+                    ),
+                    (order_id,),
+                );
                 env.storage().instance().remove(&DataKey::Order(order_id));
                 continue;
             }
@@ -504,26 +554,29 @@ impl BatchAuction {
             match Self::execute_op(&env, &order, &auction_addr, order.deadline) {
                 Ok(amount_out) => {
                     // Forward output tokens to the original trader.
-                    let payout_ok = SepTokenClient::new(&env, &order.token_out)
-                        .try_transfer(&auction_addr, &order.trader, &amount_out)
-                        .ok()
-                        .and_then(|r| r.ok());
-                    if payout_ok.is_none() {
-                        // Swap succeeded but payout to the trader failed (no
-                        // trustline, frozen/revoked auth, clawback, etc.).
-                        // Tokens are stranded in the auction contract — the
-                        // order is still dropped so the batch can continue.
-                        emit_versioned_event!(
-                            env,
-                            (Symbol::new(&env, "order_failed"), order.trader.clone()),
-                            (order_id,)
-                        );
-                    } else {
+                    if Self::pay_or_claim(
+                        &env,
+                        order_id,
+                        &order.trader,
+                        &order.token_out,
+                        amount_out,
+                    ) {
                         results.push_back(amount_out);
                         emit_versioned_event!(
                             env,
                             (Symbol::new(&env, "order_settled"), order.trader.clone()),
                             (order_id, amount_out)
+                        );
+                    } else {
+                        // Swap succeeded but payout to the trader failed (no
+                        // trustline, frozen/revoked auth, clawback, etc.). The
+                        // amount is now claimable via `claim_refund` instead
+                        // of being stranded; the order is still dropped so
+                        // the batch can continue.
+                        emit_versioned_event!(
+                            env,
+                            (Symbol::new(&env, "order_failed"), order.trader.clone()),
+                            (order_id,)
                         );
                     }
                 }
@@ -532,23 +585,13 @@ impl BatchAuction {
                     // by the runtime, so the full escrow is still held by the
                     // auction contract. Refund it and drop the order instead of
                     // letting it block every other trader's settlement.
-                    let refund_ok = SepTokenClient::new(&env, &order.token_in)
-                        .try_transfer(&auction_addr, &order.trader, &order.amount_in)
-                        .ok()
-                        .and_then(|r| r.ok());
-                    if refund_ok.is_none() {
-                        // Refund transfer itself failed — escrow is stranded
-                        // but the order is still dropped so other traders are
-                        // not blocked.
-                        emit_versioned_event!(
-                            env,
-                            (
-                                Symbol::new(&env, "order_refund_failed"),
-                                order.trader.clone(),
-                            ),
-                            (order_id,)
-                        );
-                    }
+                    Self::pay_or_claim(
+                        &env,
+                        order_id,
+                        &order.trader,
+                        &order.token_in,
+                        order.amount_in,
+                    );
                     emit_versioned_event!(
                         env,
                         (Symbol::new(&env, "order_failed"), order.trader.clone()),
@@ -572,6 +615,133 @@ impl BatchAuction {
         emit_versioned_event!(env, (symbol_short!("settled"),), (process_count,));
 
         Ok(results)
+    }
+
+    /// Attempt to pay `amount` of `token` to `trader`. On success, returns
+    /// `true`. On failure (no trustline, frozen/revoked auth, clawback,
+    /// etc.), records the amount as claimable via `claim_refund` instead of
+    /// stranding it in the contract forever, emits `order_refund_failed`, and
+    /// returns `false` (issue #700).
+    fn pay_or_claim(
+        env: &Env,
+        order_id: u64,
+        trader: &Address,
+        token: &Address,
+        amount: i128,
+    ) -> bool {
+        let auction_addr = env.current_contract_address();
+        let ok = SepTokenClient::new(env, token)
+            .try_transfer(&auction_addr, trader, &amount)
+            .ok()
+            .and_then(|r| r.ok())
+            .is_some();
+        if !ok {
+            env.storage().instance().set(
+                &DataKey::Claimable(order_id),
+                &(trader.clone(), token.clone(), amount),
+            );
+            env.events().publish(
+                (Symbol::new(env, "order_refund_failed"), trader.clone()),
+                (order_id,),
+            );
+        }
+        ok
+    }
+
+    /// Refund a single order's escrow immediately once its deadline has
+    /// passed, without waiting for the batch window to elapse (issue #700).
+    /// Permissionless — anyone (e.g. a keeper) may call this on the trader's
+    /// behalf. Idempotent: once refunded, the order no longer exists, so a
+    /// second call returns `OrderNotFound` rather than double-refunding.
+    pub fn expire_order(env: Env, order_id: u64) -> Result<(), AuctionError> {
+        let order: Order = env
+            .storage()
+            .instance()
+            .get(&DataKey::Order(order_id))
+            .ok_or(AuctionError::OrderNotFound)?;
+        let now = env.ledger().timestamp();
+        if now <= order.deadline {
+            return Err(AuctionError::OrderNotExpired);
+        }
+        Self::pay_or_claim(
+            &env,
+            order_id,
+            &order.trader,
+            &order.token_in,
+            order.amount_in,
+        );
+        env.storage().instance().remove(&DataKey::Order(order_id));
+        let pending: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingOrders)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut updated = Vec::<u64>::new(&env);
+        for oid in pending.iter() {
+            if oid != order_id {
+                updated.push_back(oid);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingOrders, &updated);
+        env.events().publish(
+            (Symbol::new(&env, "order_expired"), order.trader),
+            (order_id,),
+        );
+        Ok(())
+    }
+
+    /// Return the IDs of pending orders whose deadline has already passed,
+    /// for keepers to drive `expire_order` (issue #700).
+    pub fn get_expired_orders(env: Env) -> Vec<u64> {
+        let now = env.ledger().timestamp();
+        let pending: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingOrders)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut expired = Vec::new(&env);
+        for oid in pending.iter() {
+            if let Some(order) = env
+                .storage()
+                .instance()
+                .get::<_, Order>(&DataKey::Order(oid))
+            {
+                if now > order.deadline {
+                    expired.push_back(oid);
+                }
+            }
+        }
+        expired
+    }
+
+    /// Claim a stranded refund/payout left behind by a failed transfer during
+    /// `settle_batch`/`expire_order` (issue #700). `trader` must be the same
+    /// address the claimable amount was recorded for.
+    pub fn claim_refund(env: Env, trader: Address, order_id: u64) -> Result<i128, AuctionError> {
+        trader.require_auth();
+        let (owner, token, amount): (Address, Address, i128) = env
+            .storage()
+            .instance()
+            .get(&DataKey::Claimable(order_id))
+            .ok_or(AuctionError::NothingToClaim)?;
+        if owner != trader {
+            return Err(AuctionError::Unauthorized);
+        }
+        env.storage()
+            .instance()
+            .remove(&DataKey::Claimable(order_id));
+        SepTokenClient::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &trader,
+            &amount,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "refund_claimed"), trader),
+            (order_id, amount),
+        );
+        Ok(amount)
     }
 
     /// Quote the output an order would receive on each candidate venue and
@@ -667,10 +837,11 @@ impl BatchAuction {
                 PoolType::Amm => PoolType::Cl,
                 PoolType::Cl => PoolType::Amm,
             };
-            // Re-check the alternate venue's token pair at routing time so a
-            // malformed order written before validation was added can never be
-            // routed into the wrong output asset.
-            if Self::pool_matches_pair(env, &alt, alt_type, &order.token_in, &order.token_out) {
+            // Re-check the alternate venue at routing time (pair *and*
+            // legitimacy) so a malformed order written before validation was
+            // added, or a venue removed since submission, can never be routed
+            // into the wrong output asset or an untrusted contract.
+            if Self::check_venue(env, &alt, alt_type, &order.token_in, &order.token_out).is_ok() {
                 if let Some(alt_q) = Self::try_quote(env, &alt, alt_type, order) {
                     if alt_q > primary_q {
                         return (alt_q, alt, alt_type);
@@ -699,6 +870,121 @@ impl BatchAuction {
         };
         (token_in == &pool_token_a && token_out == &pool_token_b)
             || (token_in == &pool_token_b && token_out == &pool_token_a)
+    }
+
+    /// Validate `pool` as a legitimate settlement venue trading exactly the
+    /// unordered `(token_in, token_out)` pair (issue #700).
+    ///
+    /// The pair check is always performed first, against the venue's own
+    /// reported tokens — cheap, and it gives a precise `InvalidPoolTokenPair`
+    /// for a real, legitimate pool simply named with the wrong pair. It is
+    /// never, by itself, a security boundary: an attacker's contract can
+    /// self-report any pair it likes, so legitimacy is established
+    /// separately below and failing *that* is reported as `UnknownVenue`.
+    ///
+    /// A venue is legitimate if either:
+    /// - it is on the admin allowlist (`add_venue`); or
+    /// - the configured factory attests to it: for an AMM venue, the
+    ///   factory's own `(token_a, token_b)` record for `pool` must match;
+    ///   for a CL venue, the factory must resolve `(token_in, token_out,
+    ///   pool's own fee_bps)` back to exactly `pool`.
+    ///
+    /// Either path anchors legitimacy in a registry this protocol controls,
+    /// rather than trusting metadata self-reported by an arbitrary address.
+    fn check_venue(
+        env: &Env,
+        pool: &Address,
+        pool_type: PoolType,
+        token_in: &Address,
+        token_out: &Address,
+    ) -> Result<(), AuctionError> {
+        if !Self::pool_matches_pair(env, pool, pool_type, token_in, token_out) {
+            return Err(AuctionError::InvalidPoolTokenPair);
+        }
+        if Self::is_venue_allowed(env.clone(), pool.clone()) {
+            return Ok(());
+        }
+        let factory: Option<Address> = env.storage().instance().get(&DataKey::Factory);
+        let Some(factory) = factory else {
+            return Err(AuctionError::UnknownVenue);
+        };
+        let factory_client = FactoryClient::new(env, &factory);
+        let attested = match pool_type {
+            PoolType::Amm => matches!(
+                factory_client
+                    .try_get_pool_tokens(pool)
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .flatten(),
+                Some((a, b)) if (token_in == &a && token_out == &b) || (token_in == &b && token_out == &a)
+            ),
+            PoolType::Cl => {
+                let fee_bps = match ConcentratedLiquidityClient::new(env, pool).try_fee_bps() {
+                    Ok(Ok(v)) => v,
+                    _ => return Err(AuctionError::UnknownVenue),
+                };
+                matches!(
+                    factory_client
+                        .try_get_cl_pool(token_in, token_out, &fee_bps)
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .flatten(),
+                    Some(resolved) if &resolved == pool
+                )
+            }
+        };
+        if attested {
+            Ok(())
+        } else {
+            Err(AuctionError::UnknownVenue)
+        }
+    }
+
+    /// Return whether `pool` is still a registered venue — on the admin
+    /// allowlist, or attested to by the factory for *its own* reported
+    /// tokens (issue #700).
+    ///
+    /// Unlike `check_venue`, this does not check `pool` against any specific
+    /// `(token_in, token_out)` pair: it is used only to re-validate that a
+    /// venue named in an already-submitted order hasn't since been removed
+    /// (e.g. via `remove_venue`), which is orthogonal to whatever tokens that
+    /// order recorded at submission time.
+    fn venue_is_registered(env: &Env, pool: &Address, pool_type: PoolType) -> bool {
+        if Self::is_venue_allowed(env.clone(), pool.clone()) {
+            return true;
+        }
+        let factory: Option<Address> = env.storage().instance().get(&DataKey::Factory);
+        let Some(factory) = factory else {
+            return false;
+        };
+        let factory_client = FactoryClient::new(env, &factory);
+        match pool_type {
+            PoolType::Amm => factory_client
+                .try_get_pool_tokens(pool)
+                .ok()
+                .and_then(|r| r.ok())
+                .flatten()
+                .is_some(),
+            PoolType::Cl => {
+                let cl_client = ConcentratedLiquidityClient::new(env, pool);
+                let fee_bps = match cl_client.try_fee_bps() {
+                    Ok(Ok(v)) => v,
+                    _ => return false,
+                };
+                let (a, b) = match cl_client.try_get_tokens() {
+                    Ok(Ok(v)) => v,
+                    _ => return false,
+                };
+                matches!(
+                    factory_client
+                        .try_get_cl_pool(&a, &b, &fee_bps)
+                        .ok()
+                        .and_then(|r| r.ok())
+                        .flatten(),
+                    Some(resolved) if &resolved == pool
+                )
+            }
+        }
     }
 
     /// Read-only output quote for `order` on `pool` interpreted as `pool_type`.
@@ -801,6 +1087,105 @@ impl BatchAuction {
         Ok(())
     }
 
+    /// Configure the factory that attests to protocol-deployed pools
+    /// (issue #700). Admin-only; may be updated to rotate the factory.
+    pub fn set_factory(env: Env, admin: Address, factory: Address) -> Result<(), AuctionError> {
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if stored_admin != admin {
+            return Err(AuctionError::Unauthorized);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Factory, &factory);
+        env.events()
+            .publish((Symbol::new(&env, "factory_updated"),), (factory,));
+        Ok(())
+    }
+
+    /// Admin-managed allowlist entry for a venue the factory doesn't (or
+    /// can't yet) attest to (issue #700).
+    pub fn add_venue(
+        env: Env,
+        admin: Address,
+        pool: Address,
+        pool_type: PoolType,
+    ) -> Result<(), AuctionError> {
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if stored_admin != admin {
+            return Err(AuctionError::Unauthorized);
+        }
+        admin.require_auth();
+        if !env.storage().instance().has(&DataKey::Venue(pool.clone())) {
+            let mut list: Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::VenueList)
+                .unwrap_or_else(|| Vec::new(&env));
+            list.push_back(pool.clone());
+            env.storage().instance().set(&DataKey::VenueList, &list);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::Venue(pool.clone()), &pool_type);
+        env.events()
+            .publish((Symbol::new(&env, "venue_added"), pool), (pool_type,));
+        Ok(())
+    }
+
+    /// Remove a venue from the admin allowlist (issue #700). A venue removed
+    /// after an order was submitted against it causes that order to be
+    /// refunded at settlement rather than executed (see `settle_batch`).
+    pub fn remove_venue(env: Env, admin: Address, pool: Address) -> Result<(), AuctionError> {
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if stored_admin != admin {
+            return Err(AuctionError::Unauthorized);
+        }
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .remove(&DataKey::Venue(pool.clone()));
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::VenueList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut updated = Vec::<Address>::new(&env);
+        for addr in list.iter() {
+            if addr != pool {
+                updated.push_back(addr);
+            }
+        }
+        env.storage().instance().set(&DataKey::VenueList, &updated);
+        env.events()
+            .publish((Symbol::new(&env, "venue_removed"), pool), ());
+        Ok(())
+    }
+
+    /// Return whether `pool` is on the admin allowlist.
+    pub fn is_venue_allowed(env: Env, pool: Address) -> bool {
+        env.storage().instance().has(&DataKey::Venue(pool))
+    }
+
+    /// Return admin-allowlisted venues, `(pool, pool_type)`, paginated.
+    pub fn list_venues(env: Env, offset: u32, limit: u32) -> Vec<(Address, PoolType)> {
+        let list: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::VenueList)
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut out = Vec::new(&env);
+        let end = (offset as u64 + limit as u64).min(list.len() as u64) as u32;
+        for i in offset..end {
+            let pool = list.get(i).unwrap();
+            let pool_type: PoolType = env
+                .storage()
+                .instance()
+                .get(&DataKey::Venue(pool.clone()))
+                .unwrap();
+            out.push_back((pool, pool_type));
+        }
+        out
+    }
+
     /// Nominate a new admin. The nominee must call `accept_admin` to complete
     /// the transfer (two-step rotation, matching `pol_vesting` / AMM).
     ///
@@ -871,12 +1256,78 @@ mod tests {
     use super::*;
     use amm::{AmmPool, AmmPoolClient};
     use concentrated_liquidity::{ConcentratedLiquidity, ConcentratedLiquidityClient};
+    use factory::{Factory, FactoryClient};
+    use pool_interfaces::{AmmError, PoolInfo};
     use soroban_sdk::{
         testutils::{Address as _, Events, Ledger},
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
         Env, String, TryFromVal,
     };
     use token::{LpToken, LpTokenClient};
+
+    /// Test-only hostile settlement venue (issue #700): reports whatever
+    /// token pair it's initialized with via `get_info` (self-reported, like
+    /// any real pool) and, if ever actually reached, drains its caller's
+    /// input while fabricating a large output. Used to prove the venue
+    /// registry rejects it at submission — before it can ever be dispatched
+    /// to from `settle_batch`.
+    #[contract]
+    struct HostileVenue;
+
+    #[contractimpl]
+    impl HostileVenue {
+        pub fn initialize(env: Env, token_a: Address, token_b: Address) {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("toks"), &(token_a, token_b));
+        }
+
+        pub fn get_info(env: Env) -> PoolInfo {
+            let (token_a, token_b): (Address, Address) = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("toks"))
+                .unwrap();
+            PoolInfo {
+                token_a: token_a.clone(),
+                token_b,
+                reserve_a: 0,
+                reserve_b: 0,
+                total_shares: 0,
+                fee_bps: 0,
+                flash_loan_fee_bps: 0,
+                admin: token_a.clone(),
+                fee_recipient: token_a,
+                protocol_fee_bps: 0,
+                lp_rebate_bps: 0,
+            }
+        }
+
+        pub fn swap(
+            env: Env,
+            trader: Address,
+            token_in: Address,
+            amount_in: i128,
+            _min_out: i128,
+            _deadline: u64,
+        ) -> Result<i128, AmmError> {
+            // If ever reached, this is exactly the attack the venue registry
+            // must block: drain the caller's input and fabricate a payout.
+            SepTokenClient::new(&env, &token_in).transfer(
+                &trader,
+                &env.current_contract_address(),
+                &amount_in,
+            );
+            Ok(amount_in.saturating_mul(1_000))
+        }
+    }
+
+    /// A deadline safely within `MAX_ORDER_LIFETIME_SECS` of `env`'s current
+    /// ledger time, for tests that don't care about deadline expiry and
+    /// previously used `u64::MAX` before the ceiling existed (issue #700).
+    fn far_future_deadline(env: &Env) -> u64 {
+        env.ledger().timestamp() + MAX_ORDER_LIFETIME_SECS - 1
+    }
 
     /// Deploy a concentrated-liquidity pool over `(token_a, token_b)`, seed a
     /// wide in-range position, and return the pool address. The pool starts at
@@ -934,7 +1385,7 @@ mod tests {
             &1_000_000_i128,
             &1_000_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(env),
         );
         (ta, tb, pool, admin)
     }
@@ -949,6 +1400,7 @@ mod tests {
 
         let auction_addr = env.register_contract(None, BatchAuction);
         BatchAuctionClient::new(&env, &auction_addr).initialize(&admin, &30_u64);
+        BatchAuctionClient::new(&env, &auction_addr).add_venue(&admin, &pool, &PoolType::Amm);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
@@ -960,7 +1412,7 @@ mod tests {
             &tb,
             &10_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         // Advance past the batch window.
@@ -1005,7 +1457,7 @@ mod tests {
             &foreign,
             &10_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
         assert_eq!(result, Err(Ok(AuctionError::InvalidPoolTokenPair)));
 
@@ -1028,6 +1480,7 @@ mod tests {
 
         let auction_addr = env.register_contract(None, BatchAuction);
         BatchAuctionClient::new(&env, &auction_addr).initialize(&admin, &30_u64);
+        BatchAuctionClient::new(&env, &auction_addr).add_venue(&admin, &pool, &PoolType::Amm);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
@@ -1039,7 +1492,7 @@ mod tests {
             &tb,
             &10_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         // Tokens were escrowed — trader's balance decreased.
@@ -1066,6 +1519,7 @@ mod tests {
 
         let auction_addr = env.register_contract(None, BatchAuction);
         BatchAuctionClient::new(&env, &auction_addr).initialize(&admin, &30_u64);
+        BatchAuctionClient::new(&env, &auction_addr).add_venue(&admin, &pool, &PoolType::Amm);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
@@ -1076,7 +1530,7 @@ mod tests {
             &tb,
             &10_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         // Window has not elapsed — should return BatchWindowOpen error.
@@ -1095,6 +1549,7 @@ mod tests {
         let auction_addr = env.register_contract(None, BatchAuction);
         let client = BatchAuctionClient::new(&env, &auction_addr);
         client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
@@ -1137,6 +1592,7 @@ mod tests {
         let auction_addr = env.register_contract(None, BatchAuction);
         let client = BatchAuctionClient::new(&env, &auction_addr);
         client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
@@ -1162,6 +1618,7 @@ mod tests {
 
         let auction_addr = env.register_contract(None, BatchAuction);
         BatchAuctionClient::new(&env, &auction_addr).initialize(&admin, &60_u64);
+        BatchAuctionClient::new(&env, &auction_addr).add_venue(&admin, &pool, &PoolType::Amm);
 
         let trader1 = Address::generate(&env);
         let trader2 = Address::generate(&env);
@@ -1175,7 +1632,7 @@ mod tests {
             &tb,
             &5_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
         BatchAuctionClient::new(&env, &auction_addr).submit_order(
             &trader2,
@@ -1184,7 +1641,7 @@ mod tests {
             &tb,
             &5_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         env.ledger().set_timestamp(1061);
@@ -1213,6 +1670,7 @@ mod tests {
         let auction_addr = env.register_contract(None, BatchAuction);
         let client = BatchAuctionClient::new(&env, &auction_addr);
         client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
 
         let good_trader = Address::generate(&env);
         let bad_trader = Address::generate(&env);
@@ -1228,7 +1686,7 @@ mod tests {
             &tb,
             &5_000_i128,
             &1_000_000_000_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
         client.submit_order(
             &good_trader,
@@ -1237,7 +1695,7 @@ mod tests {
             &tb,
             &5_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         env.ledger().set_timestamp(1031);
@@ -1276,15 +1734,39 @@ mod tests {
         let client = BatchAuctionClient::new(&env, &auction_addr);
         client.initialize(&admin, &60_u64);
         client.set_max_orders(&admin, &2_u32);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &10_000_i128);
 
-        client.submit_order(&trader, &pool, &ta, &tb, &1_000_i128, &0_i128, &u64::MAX);
-        client.submit_order(&trader, &pool, &ta, &tb, &1_000_i128, &0_i128, &u64::MAX);
+        client.submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &1_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+        client.submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &1_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
 
-        let result =
-            client.try_submit_order(&trader, &pool, &ta, &tb, &1_000_i128, &0_i128, &u64::MAX);
+        let result = client.try_submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &1_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
         assert_eq!(result, Err(Ok(AuctionError::BatchFull)));
 
         let (pending_count, max_orders, opened_at, window_secs) = client.get_batch_info();
@@ -1309,12 +1791,21 @@ mod tests {
         let client = BatchAuctionClient::new(&env, &auction_addr);
         client.initialize(&admin, &30_u64);
         client.set_max_orders(&admin, &3_u32);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &10_000_i128);
 
         for _ in 0..3 {
-            client.submit_order(&trader, &pool, &ta, &tb, &1_000_i128, &0_i128, &u64::MAX);
+            client.submit_order(
+                &trader,
+                &pool,
+                &ta,
+                &tb,
+                &1_000_i128,
+                &0_i128,
+                &far_future_deadline(&env),
+            );
         }
 
         env.ledger().set_timestamp(1031);
@@ -1354,6 +1845,7 @@ mod tests {
         let auction_addr = env.register_contract(None, BatchAuction);
         let client = BatchAuctionClient::new(&env, &auction_addr);
         client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &cl_pool, &PoolType::Cl);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
@@ -1370,7 +1862,7 @@ mod tests {
             &true,
             &0_u128,
             &None,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         env.ledger().set_timestamp(1031);
@@ -1412,13 +1904,15 @@ mod tests {
             &1_000_000_i128,
             &1_000_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
         let cl_pool = deploy_cl_pool(&env, &admin, &ta, &tb);
 
         let auction_addr = env.register_contract(None, BatchAuction);
         let client = BatchAuctionClient::new(&env, &auction_addr);
         client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &cl_pool, &PoolType::Cl);
+        client.add_venue(&admin, &amm_pool, &PoolType::Amm);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
@@ -1434,7 +1928,7 @@ mod tests {
             &true,
             &0_u128,
             &Some(amm_pool.clone()),
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         // Independently quote both venues; the best of the two must match the
@@ -1484,6 +1978,7 @@ mod tests {
         let auction_addr = env.register_contract(None, BatchAuction);
         let client = BatchAuctionClient::new(&env, &auction_addr);
         client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &cl_pool, &PoolType::Cl);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
@@ -1498,7 +1993,7 @@ mod tests {
             &true,
             &0_u128,
             &Some(wrong_amm_pool),
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
         assert_eq!(result, Err(Ok(AuctionError::InvalidPoolTokenPair)));
         assert_eq!(
@@ -1574,10 +2069,19 @@ mod tests {
         let auction_addr = env.register_contract(None, BatchAuction);
         let client = BatchAuctionClient::new(&env, &auction_addr);
         client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
-        let id = client.submit_order(&trader, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        let id = client.submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
 
         let order = client.get_pending_orders().get(0).unwrap();
         assert_eq!(order.pool_type, PoolType::Amm);
@@ -1602,14 +2106,31 @@ mod tests {
         let client = BatchAuctionClient::new(&env, &auction_addr);
         client.initialize(&admin, &30_u64);
         client.set_max_orders(&admin, &2_u32);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
 
         let trader1 = Address::generate(&env);
         let trader2 = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader1, &100_000_i128);
         StellarAssetClient::new(&env, &ta).mint(&trader2, &100_000_i128);
 
-        client.submit_order(&trader1, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
-        client.submit_order(&trader2, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        client.submit_order(
+            &trader1,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+        client.submit_order(
+            &trader2,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
 
         // Increase max_orders so we can submit a 3rd order, but set max_orders to 1 before settlement
         client.set_max_orders(&admin, &1_u32);
@@ -1632,7 +2153,15 @@ mod tests {
         client.set_max_orders(&admin, &5_u32);
         let trader3 = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader3, &100_000_i128);
-        client.submit_order(&trader3, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        client.submit_order(
+            &trader3,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
 
         // Attempting settle_batch at t=1035 must fail because opened_at is 1030 and window is 30s
         let err = client.try_settle_batch().err().unwrap().unwrap();
@@ -1656,6 +2185,7 @@ mod tests {
         let auction_addr = env.register_contract(None, BatchAuction);
         let client = BatchAuctionClient::new(&env, &auction_addr);
         client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
 
         let bad_trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&bad_trader, &10_000_i128);
@@ -1667,7 +2197,7 @@ mod tests {
             &tb,
             &5_000_i128,
             &1_000_000_000_i128, // impossible min_out
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         env.ledger().set_timestamp(1031);
@@ -1703,6 +2233,7 @@ mod tests {
         let client = BatchAuctionClient::new(&env, &auction_addr);
         client.initialize(&admin, &30_u64);
         client.set_max_orders(&admin, &2_u32);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
 
         let bad_trader = Address::generate(&env);
         let good_trader = Address::generate(&env);
@@ -1717,7 +2248,7 @@ mod tests {
             &tb,
             &10_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
         client.submit_order(
             &good_trader,
@@ -1726,7 +2257,7 @@ mod tests {
             &tb,
             &10_000_i128,
             &0_i128,
-            &u64::MAX,
+            &far_future_deadline(&env),
         );
 
         // Mutate the bad order's token_out to a non-existent contract
@@ -1734,7 +2265,7 @@ mod tests {
         let fake_token_out = Address::generate(&env);
         env.as_contract(&auction_addr, || {
             let mut bad_order: Order = env.storage().instance().get(&DataKey::Order(0)).unwrap();
-            bad_order.token_out = fake_token_out;
+            bad_order.token_out = fake_token_out.clone();
             env.storage().instance().set(&DataKey::Order(0), &bad_order);
         });
 
@@ -1749,6 +2280,18 @@ mod tests {
 
         // Both orders are cleared from the batch.
         assert_eq!(client.get_pending_orders().len(), 0);
+
+        // The stranded payout is recorded as claimable (issue #700) rather
+        // than lost outright.
+        let claimable: (Address, Address, i128) = env.as_contract(&auction_addr, || {
+            env.storage()
+                .instance()
+                .get(&DataKey::Claimable(0))
+                .unwrap()
+        });
+        assert_eq!(claimable.0, bad_trader);
+        assert_eq!(claimable.1, fake_token_out);
+        assert!(claimable.2 > 0);
     }
 
     /// Issue #546: deadline-expiry refund transfer failure isolation.
@@ -1769,6 +2312,7 @@ mod tests {
         let auction_addr = env.register_contract(None, BatchAuction);
         let client = BatchAuctionClient::new(&env, &auction_addr);
         client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
@@ -1781,7 +2325,7 @@ mod tests {
         let fake_token_in = Address::generate(&env);
         env.as_contract(&auction_addr, || {
             let mut order: Order = env.storage().instance().get(&DataKey::Order(0)).unwrap();
-            order.token_in = fake_token_in;
+            order.token_in = fake_token_in.clone();
             env.storage().instance().set(&DataKey::Order(0), &order);
         });
 
@@ -1793,6 +2337,16 @@ mod tests {
         let results = client.settle_batch();
         assert_eq!(results.len(), 0);
         assert_eq!(client.get_pending_orders().len(), 0);
+
+        // The stranded refund is recorded as claimable (issue #700) rather
+        // than lost outright.
+        let claimable: (Address, Address, i128) = env.as_contract(&auction_addr, || {
+            env.storage()
+                .instance()
+                .get(&DataKey::Claimable(0))
+                .unwrap()
+        });
+        assert_eq!(claimable, (trader, fake_token_in, 10_000_i128));
     }
 
     // ── Issue #553: two-step admin rotation ─────────────────────────────────────
@@ -1891,6 +2445,552 @@ mod tests {
         assert_eq!(window, 60);
     }
 
+    // ── Issue #700: venue registry ──────────────────────────────────────────────
+
+    #[test]
+    fn test_hostile_venue_rejected_before_escrow() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let admin = Address::generate(&env);
+        let ta = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let tb = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let hostile_addr = env.register_contract(None, HostileVenue);
+        HostileVenueClient::new(&env, &hostile_addr).initialize(&ta, &tb);
+
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+        // Deliberately no add_venue / set_factory — hostile_addr is unregistered.
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader, &10_000_i128);
+
+        let result = client.try_submit_order(
+            &trader,
+            &hostile_addr,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+        assert_eq!(result, Err(Ok(AuctionError::UnknownVenue)));
+
+        // No escrow happened — the trader keeps every token, and the
+        // hostile contract's own fabricated swap was never reachable.
+        assert_eq!(
+            StellarTokenClient::new(&env, &ta).balance(&trader),
+            10_000_i128
+        );
+        assert_eq!(client.get_pending_orders().len(), 0);
+    }
+
+    #[test]
+    fn test_hostile_alt_pool_rejected_as_strictly_as_primary() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let admin = Address::generate(&env);
+        let ta = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let tb = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let cl_pool = deploy_cl_pool(&env, &admin, &ta, &tb);
+
+        let hostile_addr = env.register_contract(None, HostileVenue);
+        HostileVenueClient::new(&env, &hostile_addr).initialize(&ta, &tb);
+
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+        // Only the primary CL venue is legitimate; the alt (Amm-typed)
+        // venue is the unregistered hostile contract.
+        client.add_venue(&admin, &cl_pool, &PoolType::Cl);
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader, &10_000_i128);
+
+        let result = client.try_submit_order_cl(
+            &trader,
+            &cl_pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &true,
+            &0_u128,
+            &Some(hostile_addr),
+            &far_future_deadline(&env),
+        );
+        assert_eq!(result, Err(Ok(AuctionError::UnknownVenue)));
+        assert_eq!(
+            StellarTokenClient::new(&env, &ta).balance(&trader),
+            10_000_i128
+        );
+        assert_eq!(client.get_pending_orders().len(), 0);
+    }
+
+    #[test]
+    fn test_removed_venue_refunds_order_others_still_settle() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let (ta, tb, pool, admin) = setup(&env);
+
+        // A second, independent AMM venue for the same pair.
+        let pool2 = deploy_pool(&env, &ta, &tb);
+        let lp2 = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&lp2, &2_000_000_i128);
+        StellarAssetClient::new(&env, &tb).mint(&lp2, &2_000_000_i128);
+        AmmPoolClient::new(&env, &pool2).add_liquidity(
+            &lp2,
+            &1_000_000_i128,
+            &1_000_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
+        client.add_venue(&admin, &pool2, &PoolType::Amm);
+
+        let trader1 = Address::generate(&env);
+        let trader2 = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader1, &10_000_i128);
+        StellarAssetClient::new(&env, &ta).mint(&trader2, &10_000_i128);
+
+        client.submit_order(
+            &trader1,
+            &pool,
+            &ta,
+            &tb,
+            &5_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+        client.submit_order(
+            &trader2,
+            &pool2,
+            &ta,
+            &tb,
+            &5_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+
+        // Admin removes trader1's venue before settlement.
+        client.remove_venue(&admin, &pool);
+
+        env.ledger().set_timestamp(1031);
+        let results = client.settle_batch();
+
+        // Only trader2's order (pool2, still valid) settled.
+        assert_eq!(results.len(), 1);
+        assert!(results.get(0).unwrap() > 0);
+
+        // trader1's escrow was refunded, not swapped against the removed venue.
+        assert_eq!(
+            StellarTokenClient::new(&env, &ta).balance(&trader1),
+            10_000_i128
+        );
+        assert_eq!(StellarTokenClient::new(&env, &tb).balance(&trader1), 0);
+        assert!(StellarTokenClient::new(&env, &tb).balance(&trader2) > 0);
+        assert_eq!(client.get_pending_orders().len(), 0);
+    }
+
+    #[test]
+    fn test_venue_allowlist_management_and_pagination() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let admin = Address::generate(&env);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+
+        let p1 = Address::generate(&env);
+        let p2 = Address::generate(&env);
+        let p3 = Address::generate(&env);
+
+        assert!(!client.is_venue_allowed(&p1));
+        client.add_venue(&admin, &p1, &PoolType::Amm);
+        client.add_venue(&admin, &p2, &PoolType::Cl);
+        client.add_venue(&admin, &p3, &PoolType::Amm);
+        assert!(client.is_venue_allowed(&p1));
+
+        assert_eq!(client.list_venues(&0_u32, &10_u32).len(), 3);
+        assert_eq!(client.list_venues(&0_u32, &2_u32).len(), 2);
+        assert_eq!(client.list_venues(&2_u32, &2_u32).len(), 1);
+
+        client.remove_venue(&admin, &p2);
+        assert!(!client.is_venue_allowed(&p2));
+        assert_eq!(client.list_venues(&0_u32, &10_u32).len(), 2);
+
+        // Non-admin cannot add or remove venues.
+        let rando = Address::generate(&env);
+        let err = client
+            .try_add_venue(&rando, &p1, &PoolType::Amm)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, AuctionError::Unauthorized);
+        let err = client.try_remove_venue(&rando, &p1).err().unwrap().unwrap();
+        assert_eq!(err, AuctionError::Unauthorized);
+    }
+
+    #[test]
+    fn test_set_factory_is_admin_gated_and_attests_cl_venue_without_allowlist() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+        let cl_hash = env
+            .deployer()
+            .upload_contract_wasm(concentrated_liquidity::WASM);
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+        factory.set_cl_wasm_hash(&cl_hash);
+
+        let ta = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let tb = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let cl_pool = factory.create_cl_pool(&admin, &ta, &tb, &30_i128, &0_i32);
+
+        // Seed liquidity directly on the deployed pool.
+        let lp = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&lp, &100_000_000_i128);
+        StellarAssetClient::new(&env, &tb).mint(&lp, &100_000_000_i128);
+        ConcentratedLiquidityClient::new(&env, &cl_pool).mint_position(
+            &lp,
+            &-1_000_i32,
+            &1_000_i32,
+            &50_000_000_i128,
+            &50_000_000_i128,
+            &0_i128,
+            &0_i128,
+        );
+
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+
+        // set_factory is admin-gated.
+        let rando = Address::generate(&env);
+        let err = client
+            .try_set_factory(&rando, &factory_addr)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, AuctionError::Unauthorized);
+
+        client.set_factory(&admin, &factory_addr);
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
+
+        // Succeeds purely via factory attestation — no admin allowlist entry.
+        assert!(!client.is_venue_allowed(&cl_pool));
+        client.submit_order_cl(
+            &trader,
+            &cl_pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &true,
+            &0_u128,
+            &None,
+            &far_future_deadline(&env),
+        );
+        assert_eq!(client.get_pending_orders().len(), 1);
+    }
+
+    #[test]
+    fn test_submit_order_rejects_deadline_too_far() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let (ta, tb, pool, admin) = setup(&env);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader, &20_000_i128);
+
+        let too_far = 1_000_u64 + 7 * 24 * 60 * 60 + 1;
+        let result =
+            client.try_submit_order(&trader, &pool, &ta, &tb, &5_000_i128, &0_i128, &too_far);
+        assert_eq!(result, Err(Ok(AuctionError::DeadlineTooFar)));
+        assert_eq!(
+            StellarTokenClient::new(&env, &ta).balance(&trader),
+            20_000_i128
+        );
+
+        // Right at the boundary must still succeed.
+        let ok_deadline = 1_000_u64 + 7 * 24 * 60 * 60;
+        client.submit_order(&trader, &pool, &ta, &tb, &5_000_i128, &0_i128, &ok_deadline);
+        assert_eq!(client.get_pending_orders().len(), 1);
+    }
+
+    #[test]
+    fn test_expire_order_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let (ta, tb, pool, admin) = setup(&env);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        // Long batch window so settle_batch itself would never fire in this test.
+        client.initialize(&admin, &1_000_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader, &10_000_i128);
+        let order_id =
+            client.submit_order(&trader, &pool, &ta, &tb, &5_000_i128, &0_i128, &1_010_u64);
+
+        // Not yet expired.
+        let err = client.try_expire_order(&order_id).err().unwrap().unwrap();
+        assert_eq!(err, AuctionError::OrderNotExpired);
+
+        env.ledger().set_timestamp(1_020);
+        client.expire_order(&order_id);
+        assert_eq!(
+            StellarTokenClient::new(&env, &ta).balance(&trader),
+            10_000_i128
+        );
+        assert_eq!(client.get_pending_orders().len(), 0);
+
+        // Idempotent: a second call errors rather than double-refunding.
+        let err = client.try_expire_order(&order_id).err().unwrap().unwrap();
+        assert_eq!(err, AuctionError::OrderNotFound);
+        assert_eq!(
+            StellarTokenClient::new(&env, &ta).balance(&trader),
+            10_000_i128
+        );
+    }
+
+    #[test]
+    fn test_get_expired_orders_returns_only_expired() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let (ta, tb, pool, admin) = setup(&env);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &1_000_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
+
+        let t1 = Address::generate(&env);
+        let t2 = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&t1, &10_000_i128);
+        StellarAssetClient::new(&env, &ta).mint(&t2, &10_000_i128);
+
+        let id1 = client.submit_order(&t1, &pool, &ta, &tb, &1_000_i128, &0_i128, &1_010_u64);
+        let id2 = client.submit_order(
+            &t2,
+            &pool,
+            &ta,
+            &tb,
+            &1_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+
+        env.ledger().set_timestamp(1_020);
+
+        let expired = client.get_expired_orders();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired.get(0).unwrap(), id1);
+        let _ = id2;
+    }
+
+    #[test]
+    fn test_claim_refund_pays_out_and_clears_claimable() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let admin = Address::generate(&env);
+        let ta = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+
+        let trader = Address::generate(&env);
+        // Seed the contract with real balance and a claimable record
+        // directly, simulating what settle_batch/expire_order leave behind
+        // after a failed transfer (that failure path itself is covered by
+        // test_failed_payout_does_not_revert_batch /
+        // test_failed_deadline_refund_does_not_revert_batch below); this
+        // isolates claim_refund's own payout/authorization/clearing logic.
+        StellarAssetClient::new(&env, &ta).mint(&auction_addr, &5_000_i128);
+        env.as_contract(&auction_addr, || {
+            env.storage().instance().set(
+                &DataKey::Claimable(42_u64),
+                &(trader.clone(), ta.clone(), 5_000_i128),
+            );
+        });
+
+        // Wrong caller cannot claim.
+        let rando = Address::generate(&env);
+        let err = client
+            .try_claim_refund(&rando, &42_u64)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, AuctionError::Unauthorized);
+
+        let claimed = client.claim_refund(&trader, &42_u64);
+        assert_eq!(claimed, 5_000_i128);
+        assert_eq!(
+            StellarTokenClient::new(&env, &ta).balance(&trader),
+            5_000_i128
+        );
+
+        // Already claimed — nothing left.
+        let err = client
+            .try_claim_refund(&trader, &42_u64)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, AuctionError::NothingToClaim);
+    }
+
+    #[test]
+    fn test_escrow_conservation_across_mixed_batch_outcomes() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let (ta, tb, pool, admin) = setup(&env);
+
+        let pool2 = deploy_pool(&env, &ta, &tb);
+        let lp2 = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&lp2, &2_000_000_i128);
+        StellarAssetClient::new(&env, &tb).mint(&lp2, &2_000_000_i128);
+        AmmPoolClient::new(&env, &pool2).add_liquidity(
+            &lp2,
+            &1_000_000_i128,
+            &1_000_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
+        client.add_venue(&admin, &pool2, &PoolType::Amm);
+
+        // Order A: settles normally against `pool`.
+        let trader_a = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader_a, &10_000_i128);
+        client.submit_order(
+            &trader_a,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+
+        // Order B: expires before settlement.
+        let trader_b = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader_b, &10_000_i128);
+        client.submit_order(
+            &trader_b,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &1_010_u64,
+        );
+
+        // Order C: its venue (`pool2`) is removed before settlement.
+        let trader_c = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader_c, &10_000_i128);
+        client.submit_order(
+            &trader_c,
+            &pool2,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+        client.remove_venue(&admin, &pool2);
+
+        // Order D: left pending — the batch cap is lowered below the pending
+        // count right before settlement so it is not processed this round.
+        let trader_d = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader_d, &10_000_i128);
+        client.submit_order(
+            &trader_d,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+
+        env.ledger().set_timestamp(1031);
+        client.set_max_orders(&admin, &3_u32);
+        let results = client.settle_batch();
+        // A actually settles (real output); B's expiry also successfully
+        // refunds and is recorded as a `0` output (pre-existing behavior);
+        // C (venue removed) and D (left pending) contribute nothing here.
+        assert_eq!(results.len(), 2);
+        assert!(results.get(0).unwrap() > 0);
+        assert_eq!(results.get(1).unwrap(), 0);
+        assert_eq!(client.get_pending_orders().len(), 1); // D remains
+
+        // The contract's real balances equal exactly D's still-escrowed
+        // amount for token_a, and zero for token_b — nothing over-paid or
+        // retained as dust.
+        assert_eq!(
+            StellarTokenClient::new(&env, &ta).balance(&auction_addr),
+            10_000_i128
+        );
+        assert_eq!(
+            StellarTokenClient::new(&env, &tb).balance(&auction_addr),
+            0_i128
+        );
+    }
+
     #[test]
     fn test_order_submitted_emits_versioned_event() {
         let env = Env::default();
@@ -1902,11 +3002,19 @@ mod tests {
         let auction_addr = env.register_contract(None, BatchAuction);
         let client = BatchAuctionClient::new(&env, &auction_addr);
         client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
-        let _order_id =
-            client.submit_order(&trader, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        let _order_id = client.submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
 
         // Find order_submitted event in all events
         let events = env.events().all();
@@ -1948,11 +3056,19 @@ mod tests {
         let auction_addr = env.register_contract(None, BatchAuction);
         let client = BatchAuctionClient::new(&env, &auction_addr);
         client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
-        let _order_id =
-            client.submit_order(&trader, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        let _order_id = client.submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
 
         // Advance time past the batch window
         env.ledger().set_timestamp(1031);
@@ -1998,11 +3114,19 @@ mod tests {
         let auction_addr = env.register_contract(None, BatchAuction);
         let client = BatchAuctionClient::new(&env, &auction_addr);
         client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
-        let order_id =
-            client.submit_order(&trader, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        let order_id = client.submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
 
         client.cancel_order(&trader, &order_id);
 
@@ -2089,11 +3213,19 @@ mod tests {
         let auction_addr = env.register_contract(None, BatchAuction);
         let client = BatchAuctionClient::new(&env, &auction_addr);
         client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
 
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
-        let _order_id =
-            client.submit_order(&trader, &pool, &ta, &tb, &10_000_i128, &0_i128, &u64::MAX);
+        let _order_id = client.submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
 
         // Advance time past the batch window
         env.ledger().set_timestamp(1031);

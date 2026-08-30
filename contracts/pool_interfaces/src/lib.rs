@@ -183,6 +183,8 @@ pub trait ConcentratedLiquidityInterface {
 
     fn get_tokens(env: Env) -> (Address, Address);
 
+    fn fee_bps(env: Env) -> i128;
+
     fn estimate_price_impact(
         env: Env,
         zero_for_one: bool,

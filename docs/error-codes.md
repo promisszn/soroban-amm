@@ -128,6 +128,11 @@ Defined in [contracts/batch_auction/src/lib.rs](../contracts/batch_auction/src/l
 | 11 | `TransferFailed` | Token transfer to/from trader failed during deposit or payout. | Verify token balance and allowance before placing order. |
 | 12 | `NoPendingAdmin` | `accept_admin` called without a prior `propose_admin`. | Call `propose_admin` first to set nominee. |
 | 13 | `WrongAdmin` | `accept_admin` called by address other than the nominated pending admin. | Invoke `accept_admin` from the nominee address. |
+| 14 | `UnknownVenue` | `pool`/`alt_pool` is neither on the admin allowlist (`add_venue`) nor attested to by the configured factory. | Deploy through the factory, or ask the admin to `add_venue` it. |
+| 15 | `VenueRemoved` | Internal: an order's venue was removed from the registry between submission and settlement. | No action — the order is refunded automatically at settlement. |
+| 16 | `DeadlineTooFar` | `deadline` is further in the future than `MAX_ORDER_LIFETIME_SECS` (7 days). | Submit with a nearer deadline. |
+| 17 | `OrderNotExpired` | `expire_order` called on an order whose deadline has not passed yet. | Wait until the order's deadline, or use `cancel_order` instead. |
+| 18 | `NothingToClaim` | `claim_refund` called for an order with no claimable balance on record. | No action — nothing was stranded for this order. |
 
 ---
 
