@@ -4,8 +4,17 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-soroban-sdk = { workspace = true, features = ["testutils"] }
+sorban-sdk = { workspace = true, features = ["testutils"] }
 amm = { path = "../contracts/amm", features = ["testutils"] }
 batch_auction = { path = "../contracts/batch_auction", features = ["testutils"] }
 concentrated_liquidity = { path = "../contracts/concentrated_liquidity", features = ["testutils"] }
 token = { path = "../contracts/token", features = ["testutils"] }
+governance = { path = "../contracts/governance", features = ["testutils"] }
+staking = { path = "../contracts/staking", features = ["testutils"] }
+cl_position_nft = { path = "../contracts/cl_position_nft", features = ["testutils"] }
+factory = { path = "../contracts/factory", features = ["testutils"] }
+router = { path = "../contracts/router", features = ["testutils"] }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
