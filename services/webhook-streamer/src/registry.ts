@@ -5,6 +5,7 @@
  */
 
 import type { WebhookSubscription } from "./types.js";
+import { validateWebhookUrl } from "./url-validation.js";
 
 let _nextId = 1;
 
@@ -16,6 +17,7 @@ export class WebhookRegistry {
     url: string,
     opts: { contractId?: string; eventType?: string; secret?: string } = {},
   ): WebhookSubscription {
+    validateWebhookUrl(url);
     const id = String(_nextId++);
     const sub: WebhookSubscription = {
       id,

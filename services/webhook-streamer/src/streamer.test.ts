@@ -16,6 +16,7 @@ import {
 } from "./dispatcher.js";
 import { DeadLetterQueue } from "./dead-letter.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
+import { InvalidWebhookUrlError, validateWebhookUrl } from "./url-validation.js";
 import type { PoolEvent } from "./types.js";
 
 describe("WebhookRegistry", () => {
@@ -64,6 +65,68 @@ describe("WebhookRegistry", () => {
     reg.register("https://other.com", { contractId: "OTHER" });
     const matches = reg.matching("MY_CONTRACT", "swap");
     assert.equal(matches.length, 0);
+  });
+
+  it("rejects an SSRF-prone URL and does not register it", () => {
+    const reg = new WebhookRegistry();
+    assert.throws(
+      () => reg.register("http://169.254.169.254/latest/meta-data/"),
+      InvalidWebhookUrlError,
+    );
+    assert.equal(reg.size, 0);
+  });
+});
+
+describe("validateWebhookUrl (SSRF protection)", () => {
+  const original = process.env["WEBHOOK_ALLOW_PRIVATE_TARGETS"];
+  function resetEnv() {
+    if (original === undefined) delete process.env["WEBHOOK_ALLOW_PRIVATE_TARGETS"];
+    else process.env["WEBHOOK_ALLOW_PRIVATE_TARGETS"] = original;
+  }
+
+  it("accepts a normal public https URL", () => {
+    assert.doesNotThrow(() => validateWebhookUrl("https://example.com/hook"));
+  });
+
+  it("rejects the cloud metadata link-local address", () => {
+    assert.throws(
+      () => validateWebhookUrl("http://169.254.169.254/latest/meta-data/"),
+      InvalidWebhookUrlError,
+    );
+  });
+
+  it("rejects loopback addresses", () => {
+    assert.throws(() => validateWebhookUrl("http://127.0.0.1:9999/x"), InvalidWebhookUrlError);
+    assert.throws(() => validateWebhookUrl("http://localhost:9999/x"), InvalidWebhookUrlError);
+    assert.throws(() => validateWebhookUrl("http://[::1]:9999/x"), InvalidWebhookUrlError);
+  });
+
+  it("rejects RFC1918 private ranges", () => {
+    assert.throws(() => validateWebhookUrl("http://10.0.0.5/x"), InvalidWebhookUrlError);
+    assert.throws(() => validateWebhookUrl("http://172.16.0.5/x"), InvalidWebhookUrlError);
+    assert.throws(() => validateWebhookUrl("http://192.168.1.5/x"), InvalidWebhookUrlError);
+  });
+
+  it("rejects the bare 0.0.0.0 IP literal", () => {
+    assert.throws(() => validateWebhookUrl("http://0.0.0.0/x"), InvalidWebhookUrlError);
+  });
+
+  it("rejects non-http(s) schemes", () => {
+    assert.throws(() => validateWebhookUrl("javascript:alert(1)"), InvalidWebhookUrlError);
+    assert.throws(() => validateWebhookUrl("file:///etc/passwd"), InvalidWebhookUrlError);
+  });
+
+  it("rejects unparseable URLs", () => {
+    assert.throws(() => validateWebhookUrl("not a url"), InvalidWebhookUrlError);
+  });
+
+  it("allows a private-range URL when WEBHOOK_ALLOW_PRIVATE_TARGETS=true", () => {
+    process.env["WEBHOOK_ALLOW_PRIVATE_TARGETS"] = "true";
+    try {
+      assert.doesNotThrow(() => validateWebhookUrl("http://127.0.0.1:9999/x"));
+    } finally {
+      resetEnv();
+    }
   });
 });
 

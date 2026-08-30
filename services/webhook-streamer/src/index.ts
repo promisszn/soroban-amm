@@ -19,6 +19,7 @@
 
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { defaultRegistry } from "./registry.js";
+import { InvalidWebhookUrlError } from "./url-validation.js";
 import { WebhookDispatcher } from "./dispatcher.js";
 import { DeadLetterQueue } from "./dead-letter.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
@@ -150,11 +151,19 @@ const server = createServer(async (req, res) => {
       if (!body.url) {
         return json(res, 400, { error: "url is required" });
       }
-      const sub = defaultRegistry.register(body.url, {
-        contractId: body.contractId,
-        eventType: body.eventType,
-        secret: body.secret,
-      });
+      let sub;
+      try {
+        sub = defaultRegistry.register(body.url, {
+          contractId: body.contractId,
+          eventType: body.eventType,
+          secret: body.secret,
+        });
+      } catch (err) {
+        if (err instanceof InvalidWebhookUrlError) {
+          return json(res, 400, { error: err.message });
+        }
+        throw err;
+      }
       return json(res, 201, sub);
     } catch {
       return json(res, 400, { error: "invalid JSON" });
