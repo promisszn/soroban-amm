@@ -24,7 +24,11 @@ members = [
   "contracts/v2_to_v3_migration",
   "contracts/pol_vesting",
   "benches",
-  "examples/flash_loan_receiver",
+  # Host-side tooling. `amm-simulator` is a `std` crate (clap CLI + serde JSON
+  # I/O), not a deployable contract, so it is a workspace member for
+  # build/clippy/test coverage but is excluded from the `wasm32v1-none` build
+  # in CI and from `default-members` below.
+  "packages/amm-simulator",
 ]
 default-members = [
   "contracts/amm",

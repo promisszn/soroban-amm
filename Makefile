@@ -6,7 +6,7 @@ WASM_DIR := target/wasm32v1-none/release
 
 SHELL := bash
 
-.PHONY: all help build optimize test test-all fmt lint check check-docs \
+.PHONY: all help build optimize test test-all sim-test fmt lint check check-docs \
         size size-check doc audit bench deploy e2e clean
 
 # Bare `make` explains itself instead of building.
@@ -39,6 +39,9 @@ test: build ## Build, then run the default-members test suite
 
 test-all: ## Run tests for the whole workspace, bypassing default-members
 	cargo test --workspace
+
+sim-test: ## Build and run the off-chain amm-simulator parity suite
+	cargo test -p soroban-amm-simulator
 
 fmt: ## cargo fmt --all
 	cargo fmt --all

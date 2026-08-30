@@ -36,9 +36,11 @@ jobs:
       # tests), so there is nothing left to collide with at link time.
       # `amm-fuzz`, `integration-tests`, and `benches` are not deployable
       # contracts, so they never produce wasm to build or size-check here.
-      # `examples/flash_loan_receiver` IS deployable and IS included in the build.
+      # `packages/amm-simulator` is a host-side `std` tool (clap CLI + serde
+      # JSON I/O), not a deployable contract, so it is excluded from the WASM
+      # build. It is exercised by its own `simulator` job below.
       - name: Build WASM artifacts
-        run: cargo build --release --target wasm32v1-none --workspace --exclude amm-fuzz --exclude integration-tests --exclude benches
+        run: cargo build --release --target wasm32v1-none --workspace --exclude amm-fuzz --exclude integration-tests --exclude benches --exclude packages/amm-simulator
       - name: Check WASM binary sizes
         run: bash scripts/size_report.sh --fail-on-limit
       # All six crates that were previously excluded here
@@ -58,6 +60,14 @@ jobs:
         run: cargo run -p benches -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --exclude amm-fuzz -- -D warnings
+
+      # Off-chain simulator: builds, lints and runs the parity suite that
+      # compares its math against the real `amm` contract in a Soroban test Env.
+      - name: Build and test amm-simulator
+        run: cargo test -p soroban-amm-simulator
+
+      - name: Clippy amm-simulator
+        run: cargo clippy -p soroban-amm-simulator --all-targets -- -D warnings
       - name: Format check
         run: cargo fmt --all -- --check
       - name: Check docs

@@ -23,3 +23,12 @@ rand = { version = "0.8", features = ["small_rng"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
+
+# `tests/parity.rs` runs the *real* `amm` contract inside a Soroban test `Env`
+# next to the simulator and asserts the two agree exactly, so the contract
+# crates are dev-dependencies here. They are dev-only: nothing in `src/` links
+# against a contract, which keeps this crate a plain host-side `std` tool.
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+amm = { path = "../../contracts/amm", features = ["testutils"] }
+proptest = "1"

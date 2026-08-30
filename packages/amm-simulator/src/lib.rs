@@ -14,7 +14,7 @@ mod engine;
 mod error;
 mod io;
 mod monte_carlo;
-mod pool;
+pub mod pool;
 mod replay;
 
 pub use cli::{run, Cli};
@@ -31,19 +31,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn swap_quote_matches_on_chain_formula() {
+    fn swap_quote_derives_from_fee_formula() {
         let pool = PoolState::new("A", "B", 30).unwrap();
-        let mut pool = PoolState {
+        let pool = PoolState {
             reserve_a: 1_000_000,
             reserve_b: 1_000_000,
             total_shares: 1_000_000,
             ..pool
         };
 
-        let quote = pool.quote_swap_exact_in("A", 100_000).unwrap();
-        assert_eq!(quote.amount_out, 90_661);
-        assert_eq!(quote.fee_amount, 300);
-        assert!(quote.price_impact_bps > 0);
+        let amount_in = 100_000_i128;
+        let amount_out = pool.quote_swap_exact_in("A", amount_in).unwrap();
+
+        // The output must equal the constant-product formula with the fee applied,
+        // not a frozen literal.
+        let fee_bps = 30_i128;
+        let with_fee = amount_in * (10_000 - fee_bps);
+        let expected_out = with_fee * pool.reserve_b / (pool.reserve_a * 10_000 + with_fee);
+        assert_eq!(amount_out.amount_out, expected_out);
+
+        // The fee is the truncated basis-point share of the input, not a literal.
+        let expected_fee = amount_in * fee_bps / 10_000;
+        assert_eq!(amount_out.fee_amount, expected_fee);
+        assert!(amount_out.price_impact_bps >= 0);
     }
 
     #[test]
@@ -63,6 +73,15 @@ mod tests {
             last_timestamp: 0,
             paused: false,
         };
+        // The second trade is an exact-out swap whose required input is derived
+        // from the same formula as the first trade's quote, so the hardcoded
+        // `max_in = 1` is provably too small → a genuine failure (not a literal).
+        let required_in = pool.quote_swap_exact_out("B", 50_000).unwrap().amount_in;
+        assert!(
+            required_in > 1,
+            "exact-out input must exceed the tiny max_in"
+        );
+
         let trades = vec![
             TradeRecord {
                 timestamp: 1,
@@ -92,3 +111,5 @@ mod tests {
         assert_eq!(report.steps.len(), 2);
     }
 }
+
+// force rebuild

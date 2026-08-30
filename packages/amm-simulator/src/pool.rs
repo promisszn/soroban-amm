@@ -1,6 +1,5 @@
 use crate::error::{Result, SimulationError};
 use serde::{Deserialize, Serialize};
-use std::convert::TryFrom;
 
 const BPS_DENOMINATOR: i128 = 10_000;
 const PRICE_SCALE: i128 = 1_000_000;
@@ -103,7 +102,7 @@ impl PoolState {
         if !self.is_empty() {
             let spot_a = self.spot_price_a();
             let spot_b = self.spot_price_b();
-            let delta_i128 = i128::try_from(delta).map_err(|_| SimulationError::Overflow)?;
+            let delta_i128 = delta as i128;
             self.price_cumulative_a = self
                 .price_cumulative_a
                 .checked_add(spot_a.checked_mul(delta_i128).ok_or(SimulationError::Overflow)?)
@@ -271,12 +270,12 @@ impl PoolState {
 
         if token_in == self.token_a {
             self.reserve_a = self.reserve_a + amount_in - protocol_fee;
-            self.reserve_b = self.reserve_b - quote.amount_out;
-            self.accrued_fee_a = self.accrued_fee_a + protocol_fee;
+            self.reserve_b -= quote.amount_out;
+            self.accrued_fee_a += protocol_fee;
         } else {
             self.reserve_b = self.reserve_b + amount_in - protocol_fee;
-            self.reserve_a = self.reserve_a - quote.amount_out;
-            self.accrued_fee_b = self.accrued_fee_b + protocol_fee;
+            self.reserve_a -= quote.amount_out;
+            self.accrued_fee_b += protocol_fee;
         }
         Ok(quote)
     }
@@ -299,12 +298,12 @@ impl PoolState {
 
         if token_out == self.token_a {
             self.reserve_b = self.reserve_b + quote.amount_in - protocol_fee;
-            self.reserve_a = self.reserve_a - amount_out;
-            self.accrued_fee_b = self.accrued_fee_b + protocol_fee;
+            self.reserve_a -= amount_out;
+            self.accrued_fee_b += protocol_fee;
         } else {
             self.reserve_a = self.reserve_a + quote.amount_in - protocol_fee;
-            self.reserve_b = self.reserve_b - amount_out;
-            self.accrued_fee_a = self.accrued_fee_a + protocol_fee;
+            self.reserve_b -= amount_out;
+            self.accrued_fee_a += protocol_fee;
         }
         Ok(quote)
     }
@@ -323,9 +322,9 @@ impl PoolState {
             return Err(SimulationError::SlippageExceeded);
         }
         self.apply_checkpoint()?;
-        self.reserve_a = self.reserve_a + amount_a;
-        self.reserve_b = self.reserve_b + amount_b;
-        self.total_shares = self.total_shares + quote.shares;
+        self.reserve_a += amount_a;
+        self.reserve_b += amount_b;
+        self.total_shares += quote.shares;
         Ok(quote)
     }
 
@@ -343,9 +342,9 @@ impl PoolState {
             return Err(SimulationError::SlippageExceeded);
         }
         self.apply_checkpoint()?;
-        self.reserve_a = self.reserve_a - quote.amount_a;
-        self.reserve_b = self.reserve_b - quote.amount_b;
-        self.total_shares = self.total_shares - shares;
+        self.reserve_a -= quote.amount_a;
+        self.reserve_b -= quote.amount_b;
+        self.total_shares -= shares;
         Ok(quote)
     }
 
