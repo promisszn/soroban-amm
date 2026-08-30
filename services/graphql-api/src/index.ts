@@ -1,8 +1,15 @@
 import { ApolloServer } from "@apollo/server";
+import { GraphQLError } from "graphql";
 import { startStandaloneServer } from "@apollo/server/standalone";
 import { PubSub } from "graphql-subscriptions";
 import { typeDefs } from "./schema.js";
-import { defaultIndexer, type AlertConfig } from "./indexer.js";
+import {
+  defaultIndexer,
+  InvalidMetricError,
+  InvalidThresholdError,
+  type AlertConfig,
+  type AlertMetric,
+} from "./indexer.js";
 
 const pubsub = new PubSub();
 
@@ -20,7 +27,17 @@ const resolvers = {
       _: unknown,
       { poolId, from, to }: { poolId: string; from?: number; to?: number },
     ) => defaultIndexer.getPriceHistory(poolId, from, to),
-    twal: () => null,
+    twal: (
+      _: unknown,
+      { poolId, windowSeconds }: { poolId: string; windowSeconds: number },
+    ) => {
+      if (windowSeconds <= 0) {
+        throw new GraphQLError("windowSeconds must be greater than 0", {
+          extensions: { code: "BAD_USER_INPUT" },
+        });
+      }
+      return defaultIndexer.getTwal(poolId, windowSeconds);
+    },
     poolHealth: (_: unknown, { poolId }: { poolId: string }) =>
       defaultIndexer.getPoolHealth(poolId),
     alertConfigs: (_: unknown, { poolId }: { poolId?: string }) =>
@@ -33,9 +50,30 @@ const resolvers = {
         poolId,
         metric,
         thresholdBps,
-      }: { poolId: string; metric: string; thresholdBps: number },
-    ): AlertConfig =>
-      defaultIndexer.setAlertConfig({ poolId, metric, thresholdBps }),
+        thresholdValue,
+      }: {
+        poolId: string;
+        metric: string;
+        thresholdBps?: number;
+        thresholdValue?: number;
+      },
+    ): AlertConfig => {
+      try {
+        return defaultIndexer.setAlertConfig({
+          poolId,
+          metric: metric as AlertMetric,
+          thresholdBps,
+          thresholdValue,
+        });
+      } catch (error) {
+        if (error instanceof InvalidMetricError || error instanceof InvalidThresholdError) {
+          throw new GraphQLError(error.message, {
+            extensions: { code: "BAD_USER_INPUT" },
+          });
+        }
+        throw error;
+      }
+    },
     removeAlertConfig: (
       _: unknown,
       { poolId, metric }: { poolId: string; metric: string },

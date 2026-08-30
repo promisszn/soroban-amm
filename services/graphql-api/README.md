@@ -55,6 +55,18 @@ query PriceHistory {
 }
 ```
 
+### Time-weighted average liquidity (TWAL)
+
+```graphql
+query PoolTwal {
+  twal(poolId: "pool-demo", windowSeconds: 3600)
+}
+```
+
+Returns a time-weighted average price over the trailing `windowSeconds`, or
+`null` if no price points were recorded for the pool in that window. Throws
+a GraphQL error if `windowSeconds` is not greater than zero.
+
 ### Complex nested query
 
 ```graphql

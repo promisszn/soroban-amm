@@ -47,7 +47,7 @@ export async function gql(apiUrl, query, variables = {}) {
 const QUERY = {
   stats: `query Stats($poolId: ID) { poolStats(poolId: $poolId) { poolId tokenA tokenB tvl volume24h fees24h swapCount priceDeviationBps } }`,
   health: `query Health($poolId: ID!) { poolHealth(poolId: $poolId) { poolId healthScore tvlScore volumeScore feeEfficiencyScore priceDeviationBps status alertsFired { poolId metric threshold currentValue firedAt } } }`,
-  alerts: `query Alerts($poolId: ID) { alertConfigs(poolId: $poolId) { poolId metric thresholdBps } }`,
+  alerts: `query Alerts($poolId: ID) { alertConfigs(poolId: $poolId) { poolId metric thresholdBps thresholdValue } }`,
   history: `query History($poolId: ID!) { priceHistory(poolId: $poolId, from: 0) { poolId timestamp price feeBps } }`,
   events: `query Events($poolId: ID) { poolEvents(poolId: $poolId, limit: 200) { id poolId type timestamp payload } }`,
 };
@@ -89,9 +89,11 @@ function renderHealth(health) {
   renderFiredAlerts(health.alertsFired || []);
 }
 
-function renderFiredAlerts(alerts) {
-  const list = $("alert-list");
-  if (!list || !alerts.length) return;
+export function renderFiredAlerts(alerts) {
+  const list = $("fired-alert-list");
+  if (!list) return;
+  list.replaceChildren();
+  if (!alerts.length) { list.innerHTML = '<div class="empty-state">No alerts have fired for this pool</div>'; return; }
   for (const alert of alerts) {
     const item = document.createElement("div");
     item.className = "alert-item alert-fired";
@@ -141,12 +143,12 @@ function renderHeatmap(events) {
   buckets.forEach((amount, index) => { const bar = document.createElement("div"); bar.className = "heatmap-bar"; bar.style.height = `${Math.max(4, amount / max * 56)}px`; bar.title = `${23 - index}h ago: ${formatMetric(amount)}`; heatmap.appendChild(bar); });
 }
 
-function renderAlertConfigs(configs, onRemove) {
+export function renderAlertConfigs(configs, onRemove) {
   const list = $("alert-list");
   if (!list) return;
   list.replaceChildren();
   if (!configs.length) { list.innerHTML = '<div class="empty-state">No alerts configured for this pool</div>'; return; }
-  configs.forEach((alert) => { const item = document.createElement("div"); item.className = "alert-item"; item.textContent = `${alert.metric} > ${alert.thresholdBps} bps `; const button = document.createElement("button"); button.className = "remove"; button.type = "button"; button.textContent = "×"; button.setAttribute("aria-label", `Remove ${alert.metric} alert`); button.addEventListener("click", () => onRemove(alert)); item.appendChild(button); list.appendChild(item); });
+  configs.forEach((alert) => { const item = document.createElement("div"); item.className = "alert-item"; const label = alert.metric === "price_deviation" ? `${alert.metric} > ${alert.thresholdBps} bps` : `${alert.metric} > ${alert.thresholdValue}`; item.textContent = `${label} `; const button = document.createElement("button"); button.className = "remove"; button.type = "button"; button.textContent = "×"; button.setAttribute("aria-label", `Remove ${alert.metric} alert`); button.addEventListener("click", () => onRemove(alert)); item.appendChild(button); list.appendChild(item); });
 }
 
 function addDashboardMessages() {
@@ -180,17 +182,23 @@ export function createDashboardController({ apiUrl, poolId, pollIntervalMs = DEF
     results.forEach((result, index) => { const key = Object.keys(QUERY)[index]; if (result.status === "fulfilled") data[key] = result.value; else failures.push(`${key}: ${formatError(result.reason)}`); });
     renderStats(data.stats?.poolStats); renderHealth(data.health?.poolHealth); renderEvents(data.events?.poolEvents); renderHistory(data.history?.priceHistory); renderHeatmap(data.events?.poolEvents); if (data.alerts?.alertConfigs) { configs = data.alerts.alertConfigs; renderAlertConfigs(configs, removeAlert); }
     if (failures.length === Object.keys(QUERY).length) { setStatus("Error", "error", failures.join("; ")); setSectionState(`Unable to load dashboard data. ${failures[0]}`); $("btn-retry").hidden = false; }
-    else { setStatus(failures.length ? "Degraded" : "Connected", failures.length ? "error" : "connected", failures.join("; ")); setSectionState(failures.length ? `Degraded: ${failures.join("; ")}` : data.stats?.poolStats?.length ? "" : "No pools indexed yet"); $("btn-retry").hidden = false; setText("last-updated", `Last updated ${new Date().toLocaleTimeString()}`); }
+    // Retry is only useful when something failed; hide it on a fully successful refresh.
+    else { setStatus(failures.length ? "Degraded" : "Connected", failures.length ? "error" : "connected", failures.join("; ")); setSectionState(failures.length ? `Degraded: ${failures.join("; ")}` : data.stats?.poolStats?.length ? "" : "No pools indexed yet"); $("btn-retry").hidden = !failures.length; setText("last-updated", `Last updated ${new Date().toLocaleTimeString()}`); }
     refreshing = false;
   }
 
   async function mutate(query, variables) { return gql(url, query, variables); }
   async function addAlert() {
-    const metric = $("alert-metric").value; const thresholdBps = Number($("alert-threshold").value); if (!metric || !Number.isFinite(thresholdBps) || thresholdBps < 0) return;
+    const metric = $("alert-metric").value; const threshold = Number($("alert-threshold").value); if (!metric || !Number.isFinite(threshold) || threshold < 0) return;
+    // "price_deviation" is basis points; "tvl" and "volume24h" are raw values in the metric's native units.
+    const thresholdBps = metric === "price_deviation" ? threshold : undefined;
+    const thresholdValue = metric === "price_deviation" ? undefined : threshold;
     const currentPool = $("pool-id")?.value.trim() || pool;
-    const previous = configs; const next = [...configs.filter((item) => item.metric !== metric), { poolId: currentPool, metric, thresholdBps }]; configs = next; renderAlertConfigs(configs, removeAlert); $("alert-threshold").value = "";
+    // Dedup by metric AND poolId — filtering by metric alone would drop other pools' alerts
+    // for the same metric when the Pool ID field is blank (alertConfigs(poolId: undefined) spans all pools).
+    const previous = configs; const next = [...configs.filter((item) => !(item.metric === metric && item.poolId === currentPool)), { poolId: currentPool, metric, thresholdBps, thresholdValue }]; configs = next; renderAlertConfigs(configs, removeAlert); $("alert-threshold").value = "";
     const currentUrl = $("api-url")?.value.trim() || url;
-    try { await gql(currentUrl, `mutation SetAlert($poolId: ID!, $metric: String!, $thresholdBps: Int!) { setAlertConfig(poolId: $poolId, metric: $metric, thresholdBps: $thresholdBps) { poolId metric thresholdBps } }`, { poolId: currentPool, metric, thresholdBps }); } catch (error) { configs = previous; renderAlertConfigs(configs, removeAlert); setSectionState(`Alert was not saved: ${formatError(error)}`); }
+    try { await gql(currentUrl, `mutation SetAlert($poolId: ID!, $metric: String!, $thresholdBps: Int, $thresholdValue: Float) { setAlertConfig(poolId: $poolId, metric: $metric, thresholdBps: $thresholdBps, thresholdValue: $thresholdValue) { poolId metric thresholdBps thresholdValue } }`, { poolId: currentPool, metric, thresholdBps, thresholdValue }); } catch (error) { configs = previous; renderAlertConfigs(configs, removeAlert); setSectionState(`Alert was not saved: ${formatError(error)}`); }
   }
   async function removeAlert(alert) {
     const previous = configs; configs = configs.filter((item) => !(item.metric === alert.metric && item.poolId === alert.poolId)); renderAlertConfigs(configs, removeAlert);
