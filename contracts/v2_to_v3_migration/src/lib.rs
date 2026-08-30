@@ -14,6 +14,7 @@
 
 #![no_std]
 
+use soroban_amm_sdk::emit_versioned_event;
 use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, Address, Env,
@@ -313,7 +314,8 @@ impl MigrationContract {
         let deposited_a = received_a - refund_a;
         let deposited_b = received_b - refund_b;
 
-        env.events().publish(
+        emit_versioned_event!(
+            env,
             (soroban_sdk::Symbol::new(&env, "migrated"), provider.clone()),
             (
                 v2_shares,
@@ -322,7 +324,7 @@ impl MigrationContract {
                 position_id,
                 refund_a,
                 refund_b,
-            ),
+            )
         );
 
         Ok(MigrationResult {
@@ -1542,5 +1544,53 @@ mod tests {
         // by 1_000_000.
         assert_eq!(f.tb.balance(&f.v3_pool), 1_142_857_i128);
         assert_eq!(f.ta.balance(&f.v3_pool), 1_000_000_i128);
+    }
+
+    #[test]
+    fn test_migrated_event_emits_versioned_schema() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let f = build_fixture(&env, 1_000_000_i128, 1_000_000_i128, false, 1000);
+
+        let result = f.migration.migrate(
+            &f.lp,
+            &500_000_i128,
+            &0_i128,
+            &0_i128,
+            &i32::MIN,
+            &i32::MAX,
+            &50_i32,
+            &0_i128,
+            &DEADLINE,
+        );
+
+        assert!(result.is_ok(), "migration must succeed");
+
+        // Read all events and find the migrated event
+        let events = env.events().all();
+        let migrated_events: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                if let Ok((topic, _)) = <(Symbol, Address)>::try_from_val(&env, &event.topics) {
+                    topic == Symbol::new(&env, "migrated")
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert!(
+            !migrated_events.is_empty(),
+            "migrated event must be emitted"
+        );
+
+        let event = migrated_events.last().unwrap();
+        let (version, _v2_shares, _deposited_a, _deposited_b, _position_id, _refund_a, _refund_b): (u32, i128, i128, i128, i128, i128, i128) =
+            event.data.try_into_val(&env).expect("must decode event with version prefix");
+        assert_eq!(
+            version,
+            soroban_amm_sdk::EVENT_SCHEMA_VERSION,
+            "event must have correct schema version prefix"
+        );
     }
 }
