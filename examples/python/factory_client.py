@@ -3,7 +3,7 @@ import argparse
 
 import os
 import sys
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from stellar_sdk import Keypair, Network, scval
 from stellar_sdk.address import Address
@@ -44,8 +44,14 @@ def main() -> int:
     if not pool_address:
         print(f"\n2. Creating pool for pair with fee_bps={fee_bps}...")
         try:
-            pool_address = create_pool(client, source_keypair, token_a_contract_id, token_b_contract_id, fee_bps)
+            pool_address, governance_address = create_pool(
+                client, source_keypair, source_keypair.public_key, token_a_contract_id, token_b_contract_id, fee_bps
+            )
             print(f"Pool created successfully at: {pool_address}")
+            if governance_address:
+                print(f"Governance contract deployed at: {governance_address}")
+            else:
+                print("No governance contract was deployed (governance_wasm_hash not supplied).")
         except Exception as e:
             print(f"Failed to create pool (might already exist): {e}")
     else:
@@ -60,18 +66,36 @@ def main() -> int:
     return 0
 
 
-def create_pool(client: ContractClient, source_kp: Keypair, token_a: str, token_b: str, fee_bps: int) -> str:
+def create_pool(
+    client: ContractClient,
+    source_kp: Keypair,
+    caller: str,
+    token_a: str,
+    token_b: str,
+    fee_bps: int,
+    governance_wasm_hash: Optional[bytes] = None,
+) -> Tuple[str, Optional[str]]:
     result = submit_contract_call(
         client,
         source_kp,
         "create_pool",
+        scval.to_address(caller),
         scval.to_address(token_a),
         scval.to_address(token_b),
         scval.to_int128(fee_bps),
+        scval.to_bytes(governance_wasm_hash) if governance_wasm_hash is not None else scval.to_void(),
     )
-    if isinstance(result, Address):
-        return result.address
-    return str(result)
+
+    pool_result, governance_result = result
+
+    pool_address = pool_result.address if isinstance(pool_result, Address) else str(pool_result)
+    governance_address: Optional[str] = None
+    if isinstance(governance_result, Address):
+        governance_address = governance_result.address
+    elif governance_result is not None:
+        governance_address = str(governance_result)
+
+    return pool_address, governance_address
 
 
 def get_pool(client: ContractClient, token_a: str, token_b: str) -> Optional[str]:

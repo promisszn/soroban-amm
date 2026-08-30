@@ -48,6 +48,13 @@ python client.py
 
 Demonstrates deploying and querying pools registry via the pool factory.
 
+`create_pool` calls the factory's `create_pool(caller, token_a, token_b,
+fee_tier, governance_wasm_hash)` with the deploying address as `caller` and,
+optionally, a `governance_wasm_hash` (32-byte WASM hash) that deploys a
+per-pool governance contract alongside the pool. It returns both the pool
+address and the optional governance contract address; when no governance
+WASM hash is supplied, the governance address is `None`.
+
 ### Configure
 
 Set the environment variables before running the script:
