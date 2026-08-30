@@ -9,3 +9,6 @@ amm = { path = "../contracts/amm", features = ["testutils"] }
 batch_auction = { path = "../contracts/batch_auction", features = ["testutils"] }
 concentrated_liquidity = { path = "../contracts/concentrated_liquidity", features = ["testutils"] }
 token = { path = "../contracts/token", features = ["testutils"] }
+governance = { path = "../contracts/governance", features = ["testutils"] }
+staking = { path = "../contracts/staking", features = ["testutils"] }
+incentive_campaigns = { package = "incentive-campaigns", path = "../contracts/incentive_campaigns", features = ["testutils"] }
