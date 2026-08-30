@@ -862,6 +862,23 @@ impl Factory {
         page
     }
 
+    /// Check if an address is a registered CL pool in this factory.
+    pub fn is_cl_pool(env: Env, pool: Address) -> bool {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ClPoolCount)
+            .unwrap_or(0);
+        for i in 0..count {
+            if let Some(p) = env.storage().persistent().get::<_, Address>(&DataKey::ClPoolByIndex(i)) {
+                if p == pool {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     // ── Treasury & protocol fee sweep ────────────────────────────────────────
 
     /// Configure the protocol treasury address and the global protocol fee rate.

@@ -113,6 +113,8 @@ pub trait FactoryInterface {
     fn get_cl_pool(env: Env, token_a: Address, token_b: Address, fee_bps: i128) -> Option<Address>;
 
     fn get_pool_tokens(env: Env, pool: Address) -> Option<(Address, Address)>;
+
+    fn is_cl_pool(env: Env, pool: Address) -> bool;
 }
 
 // ── concentrated_liquidity ───────────────────────────────────────────────────
