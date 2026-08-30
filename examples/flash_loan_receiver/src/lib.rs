@@ -92,13 +92,17 @@ pub mod arbitrage;
 pub mod collateral_swap;
 pub mod failure_modes;
 
-use soroban_amm_sdk::types::PoolInfo;
-use soroban_sdk::{contract, contractimpl, contracttype, token::Client as TokenClient, Address, Bytes, Env};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, token::Client as TokenClient, Address, Bytes, Env,
+};
 
-/// Storage key for the pool address.
+/// Storage keys for the pool address and its token pair, cached at
+/// `initialize` time.
 #[contracttype]
 enum DataKey {
     Pool,
+    TokenA,
+    TokenB,
 }
 
 /// The main flash loan receiver contract.
@@ -113,7 +117,11 @@ impl FlashLoanReceiver {
     /// Initialize the receiver with the pool address.
     ///
     /// This must be called before any flash loan callback. It stores the pool
-    /// address in contract storage.
+    /// address and looks up its token pair once, up front, since `get_info`
+    /// cannot be called on the pool from inside `on_flash_loan` — the pool is
+    /// still on the call stack there, and Soroban's host rejects any call
+    /// back into a contract that is already executing, regardless of whether
+    /// the call is a plain read.
     ///
     /// # Arguments
     /// - `pool`: The address of the AMM pool contract
@@ -121,7 +129,14 @@ impl FlashLoanReceiver {
     /// # Panics
     /// None; initialization is idempotent.
     pub fn initialize(env: Env, pool: Address) {
+        let info = soroban_amm_sdk::client::AmmPoolClient::new(&env, &pool).get_info();
         env.storage().instance().set(&DataKey::Pool, &pool);
+        env.storage()
+            .instance()
+            .set(&DataKey::TokenA, &info.token_a);
+        env.storage()
+            .instance()
+            .set(&DataKey::TokenB, &info.token_b);
     }
 
     /// Handle an incoming flash loan.
@@ -152,15 +167,15 @@ impl FlashLoanReceiver {
         fee_b: i128,
         _data: Bytes,
     ) -> bool {
-        // Retrieve pool address from storage
+        // Retrieve the pool address and its cached token pair from storage.
+        // These were captured at `initialize` time — the pool cannot be
+        // queried here, since it is still on the call stack.
         let pool: Address = match env.storage().instance().get(&DataKey::Pool) {
             Some(addr) => addr,
             None => return false, // Pool not initialized
         };
-
-        // Get pool info to discover token addresses
-        let pool_client = soroban_amm_sdk::client::AmmPoolClient::new(&env, &pool);
-        let info: PoolInfo = pool_client.get_info();
+        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
+        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
         let receiver = env.current_contract_address();
 
         // ═══════════════════════════════════════════════════════════════════════
@@ -169,20 +184,12 @@ impl FlashLoanReceiver {
 
         // Repay token A if borrowed
         if token_a_amount > 0 || fee_a > 0 {
-            TokenClient::new(&env, &info.token_a).transfer(
-                &receiver,
-                &pool,
-                &(token_a_amount + fee_a),
-            );
+            TokenClient::new(&env, &token_a).transfer(&receiver, &pool, &(token_a_amount + fee_a));
         }
 
         // Repay token B if borrowed
         if token_b_amount > 0 || fee_b > 0 {
-            TokenClient::new(&env, &info.token_b).transfer(
-                &receiver,
-                &pool,
-                &(token_b_amount + fee_b),
-            );
+            TokenClient::new(&env, &token_b).transfer(&receiver, &pool, &(token_b_amount + fee_b));
         }
 
         true

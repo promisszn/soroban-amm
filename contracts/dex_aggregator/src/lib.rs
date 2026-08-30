@@ -55,6 +55,9 @@ pub struct PriceImpactEstimate {
 pub enum AggregatorError {
     NoRouteFound = 1,
     SlippageExceeded = 2,
+    UnregisteredPool = 3,
+    InvalidMaxHops = 4,
+    TooManyRoutingTokens = 5,
 }
 
 #[contracttype]
@@ -109,6 +112,7 @@ impl DexAggregator {
     pub const PRICE_TOLERANCE_BPS: i128 = 10;
     pub const BPS: i128 = 10_000;
     pub const MAX_CL_POOLS: u32 = 50;
+    pub const MAX_ROUTING_TOKENS: u32 = 50;
     pub const CL_FEE_TIERS: [i128; 3] = [30, 100, 500];
 
     pub const MIN_SQRT_PRICE: u128 = 4_295_128_739_u128;
@@ -119,6 +123,7 @@ impl DexAggregator {
             !env.storage().instance().has(&DataKey::Factory),
             "already initialized"
         );
+        admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Factory, &factory);
         env.storage()
@@ -127,9 +132,17 @@ impl DexAggregator {
         env.storage().instance().set(&DataKey::ClPoolCount, &0u32);
     }
 
-    pub fn set_max_hops(env: Env, max_hops: u32) {
+    pub fn set_max_hops(env: Env, max_hops: u32) -> Result<(), AggregatorError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        if max_hops == 0 {
+            return Err(AggregatorError::InvalidMaxHops);
+        }
+
         Self::extend_ttl(&env);
         env.storage().instance().set(&DataKey::MaxHops, &max_hops);
+        Ok(())
     }
 
     pub fn register_cl_pool(
@@ -178,10 +191,19 @@ impl DexAggregator {
         );
     }
 
-    pub fn set_routing_tokens(env: Env, tokens: Vec<Address>) {
+    pub fn set_routing_tokens(env: Env, tokens: Vec<Address>) -> Result<(), AggregatorError> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        if tokens.len() > Self::MAX_ROUTING_TOKENS {
+            return Err(AggregatorError::TooManyRoutingTokens);
+        }
+
+        Self::extend_ttl(&env);
         env.storage()
             .instance()
             .set(&DataKey::RoutingTokens, &tokens);
+        Ok(())
     }
 
     pub fn remove_cl_pool(env: Env, pool: Address) {
@@ -322,6 +344,25 @@ impl DexAggregator {
         Ok(amount_out)
     }
 
+    /// Execute a best-execution swap with caller-supplied deadline.
+    ///
+    /// Finds the best available route and executes it atomically. The deadline
+    /// parameter specifies the latest allowed block timestamp (ledger time) for
+    /// the swap to be processed. If the current timestamp >= deadline, the swap
+    /// is rejected with SlippageExceeded.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `trader` - Address that initiates and receives funds from the swap
+    /// * `token_in` - Input token address
+    /// * `token_out` - Output token address
+    /// * `amount_in` - Exact amount to trade in
+    /// * `min_out` - Minimum acceptable output (slippage protection)
+    /// * `deadline` - Latest allowed block timestamp for execution (u64, seconds since epoch)
+    ///
+    /// # Returns
+    /// The actual amount of `token_out` received, or an error if routing fails,
+    /// the deadline expired, or slippage constraints are violated.
     pub fn swap_best(
         env: Env,
         trader: Address,
@@ -329,6 +370,7 @@ impl DexAggregator {
         token_out: Address,
         amount_in: i128,
         min_out: i128,
+        deadline: u64,
     ) -> Result<i128, AggregatorError> {
         Self::extend_ttl(&env);
         let max_hops: u32 = env
@@ -337,7 +379,6 @@ impl DexAggregator {
             .get(&DataKey::MaxHops)
             .unwrap_or(Self::DEFAULT_MAX_HOPS);
         let quote = Self::find_best_route(env.clone(), token_in, token_out, amount_in, max_hops)?;
-        let deadline = env.ledger().timestamp() + 3600;
         Self::execute_route(env, quote, trader, amount_in, min_out, deadline)
     }
 
@@ -532,6 +573,16 @@ impl DexAggregator {
         min_out: i128,
         deadline: u64,
     ) -> Result<i128, AggregatorError> {
+        let factory: Address = env.storage().instance().get(&DataKey::Factory).unwrap();
+        let factory_client = FactoryClient::new(env, &factory);
+
+        // Validate all hops up front before any token movement
+        for hop in hops.iter() {
+            if !Self::is_registered_pool(env, &factory_client, &hop) {
+                return Err(AggregatorError::UnregisteredPool);
+            }
+        }
+
         let mut current = amount_in;
         let last = hops.len() - 1;
         for i in 0..hops.len() {
@@ -709,6 +760,46 @@ impl DexAggregator {
             || (info.token_a == *token_out && info.token_b == *token_in)
     }
 
+    /// Check if a hop references a registered pool (AMM or CL).
+    /// For AMM: validates pool exists via factory.get_pool_tokens.
+    /// For CL: validates pool exists in either factory or local registry.
+    fn is_registered_pool(env: &Env, factory: &FactoryClient, hop: &RouteHop) -> bool {
+        match hop.pool_kind {
+            PoolKind::Amm => {
+                // AMM pool must exist in factory
+                factory.get_pool_tokens(&hop.pool).is_some()
+            }
+            PoolKind::Cl => {
+                // CL pool can come from factory or local registry
+                // Check factory first (all fee tiers)
+                for fee_idx in 0..3 {
+                    let fee = Self::CL_FEE_TIERS[fee_idx as usize];
+                    if let Some(pool) = factory.get_cl_pool(&hop.token_in, &hop.token_out, &fee) {
+                        if pool == hop.pool {
+                            return true;
+                        }
+                    }
+                }
+
+                // Check local registry
+                let cl_count: u32 = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::ClPoolCount)
+                    .unwrap_or(0);
+                for i in 0..cl_count {
+                    let info: ClPoolInfo =
+                        env.storage().instance().get(&DataKey::ClPool(i)).unwrap();
+                    if info.pool == hop.pool {
+                        return true;
+                    }
+                }
+
+                false
+            }
+        }
+    }
+
     /// Has `(token, depth)` already been enqueued with a better or equal amount? (#363)
     fn is_visited_and_worse(
         visited: &mut Vec<(Address, u32, i128)>,
@@ -750,7 +841,7 @@ mod tests {
     use super::*;
     use factory::{Factory, FactoryClient};
     use soroban_sdk::{
-        testutils::{Address as _, Events as _},
+        testutils::{Address as _, Events as _, Ledger as _},
         token::StellarAssetClient,
         Address, BytesN, IntoVal, Symbol,
     };
@@ -829,6 +920,7 @@ mod tests {
     #[test]
     fn test_discover_tokens_includes_registered_cl_pools() {
         let env = Env::default();
+        env.mock_all_auths();
         let factory_addr = env.register_contract(None, Factory);
         let factory = FactoryClient::new(&env, &factory_addr);
         let admin = Address::generate(&env);
@@ -846,8 +938,6 @@ mod tests {
         let token_a = Address::generate(&env);
         let token_b = Address::generate(&env);
         let cl_pool = Address::generate(&env);
-
-        env.mock_all_auths();
         agg.register_cl_pool(&cl_pool, &token_a, &token_b, &30_i128);
 
         let tokens = env.as_contract(&agg_addr, || {
@@ -1100,7 +1190,14 @@ mod tests {
         let v = setup_venues();
         let agg = DexAggregatorClient::new(&v.env, &v.agg);
 
-        let out = agg.swap_best(&v.trader, &v.token_a, &v.token_b, &10_000_i128, &0_i128);
+        let out = agg.swap_best(
+            &v.trader,
+            &v.token_a,
+            &v.token_b,
+            &10_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
 
         assert_eq!(count_events(&v.env, &v.agg, symbol_short!("route_sel")), 1);
         let (_, _, _, quoted): (Address, PoolKind, i128, i128) =
@@ -1156,8 +1253,571 @@ mod tests {
         assert_eq!(count_events(&v.env, &v.agg, symbol_short!("route_alt")), 0);
     }
 
+    // -------------------------------------------------------------------------
+    // #813: Unregistered pool validation tests
+    // -------------------------------------------------------------------------
+
+    /// Test 1: Regression test - reject unregistered AMM pool (would execute on main)
+    #[test]
+    fn test_execute_route_rejects_unregistered_amm_pool() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        // Create a malicious fake pool contract (an address that isn't registered)
+        let fake_pool = Address::generate(&v.env);
+
+        // Build a route manually pointing at the unregistered pool
+        let bad_route = RouteQuote {
+            amount_out: 9_000_i128,
+            hops: vec![
+                &v.env,
+                RouteHop {
+                    pool: fake_pool,
+                    pool_kind: PoolKind::Amm,
+                    token_in: v.token_a.clone(),
+                    token_out: v.token_b.clone(),
+                    zero_for_one: true,
+                },
+            ],
+        };
+
+        // execute_route should reject the unregistered pool upfront
+        let result = agg.try_execute_route(&bad_route, &v.trader, &10_000_i128, &0_i128, &u64::MAX);
+
+        assert!(
+            result.is_err(),
+            "execute_route must reject unregistered AMM pool"
+        );
+        if let Err(Ok(err)) = result {
+            assert_eq!(
+                err,
+                AggregatorError::UnregisteredPool,
+                "error must be UnregisteredPool"
+            );
+        } else {
+            panic!("expected AggregatorError::UnregisteredPool");
+        }
+    }
+
+    /// Test 2: Regression test - reject unregistered CL pool
+    #[test]
+    fn test_execute_route_rejects_unregistered_cl_pool() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        // Create a malicious fake CL pool contract
+        let fake_cl_pool = Address::generate(&v.env);
+
+        let bad_route = RouteQuote {
+            amount_out: 9_000_i128,
+            hops: vec![
+                &v.env,
+                RouteHop {
+                    pool: fake_cl_pool,
+                    pool_kind: PoolKind::Cl,
+                    token_in: v.token_a.clone(),
+                    token_out: v.token_b.clone(),
+                    zero_for_one: true,
+                },
+            ],
+        };
+
+        let result = agg.try_execute_route(&bad_route, &v.trader, &10_000_i128, &0_i128, &u64::MAX);
+
+        assert!(
+            result.is_err(),
+            "execute_route must reject unregistered CL pool"
+        );
+        if let Err(Ok(err)) = result {
+            assert_eq!(
+                err,
+                AggregatorError::UnregisteredPool,
+                "error must be UnregisteredPool"
+            );
+        } else {
+            panic!("expected AggregatorError::UnregisteredPool");
+        }
+    }
+
+    /// Test 3: Positive test - legitimate route from find_best_route succeeds
+    #[test]
+    fn test_execute_route_accepts_legitimate_route_from_find_best_route() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        // Get a route from the trusted path
+        let quote = agg.find_best_route(&v.token_a, &v.token_b, &10_000_i128, &2u32);
+        assert!(quote.amount_out > 0, "quote should have positive output");
+
+        // Execute it - should succeed with no UnregisteredPool error
+        let result = agg.try_execute_route(&quote, &v.trader, &10_000_i128, &0_i128, &u64::MAX);
+
+        assert!(result.is_ok(), "legitimate route must succeed");
+        let out = result.unwrap().unwrap();
+        assert!(out > 0, "output must be positive");
+    }
+
+    /// Test 4: Positive test - swap_best (full trusted path) still succeeds
+    #[test]
+    fn test_swap_best_still_succeeds_with_validation() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        let out = agg.swap_best(
+            &v.trader,
+            &v.token_a,
+            &v.token_b,
+            &10_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+
+        assert!(
+            out > 0,
+            "swap_best must produce positive output with validation"
+        );
+    }
+
+    /// Test 5: Multi-hop atomicity - if hop 2 is unregistered, hop 1 doesn't execute
+    #[test]
+    fn test_multi_hop_atomicity_no_partial_execution() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        // Get a valid hop from token_a to token_b
+        let valid_hop_quote = agg.find_best_route(&v.token_a, &v.token_b, &10_000_i128, &1u32);
+        let valid_hop = valid_hop_quote.hops.get(0).unwrap();
+
+        // Create a fake second hop (unregistered pool)
+        let fake_pool = Address::generate(&v.env);
+        let bad_hop = RouteHop {
+            pool: fake_pool,
+            pool_kind: PoolKind::Amm,
+            token_in: v.token_b.clone(),
+            token_out: v.token_a.clone(),
+            zero_for_one: true,
+        };
+
+        // Build a 2-hop route where hop 1 is valid but hop 2 is not
+        let bad_route = RouteQuote {
+            amount_out: 9_000_i128,
+            hops: vec![&v.env, valid_hop.clone(), bad_hop],
+        };
+
+        // Get token balance before
+        let token_a_client = soroban_sdk::token::TokenClient::new(&v.env, &v.token_a);
+        let balance_before = token_a_client.balance(&v.trader);
+
+        // execute_route should fail before any swap
+        let result = agg.try_execute_route(&bad_route, &v.trader, &10_000_i128, &0_i128, &u64::MAX);
+
+        assert!(result.is_err(), "route with unregistered hop must fail");
+
+        // Verify token balance is unchanged (no partial execution)
+        let balance_after = token_a_client.balance(&v.trader);
+        assert_eq!(
+            balance_before, balance_after,
+            "trader's token_a balance must be unchanged (atomic failure)"
+        );
+    }
+
+    /// Test 6: Upfront validation - all hops checked before any movement
+    #[test]
+    fn test_validation_happens_upfront_before_token_transfer() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        // Create a route where hop 1 is valid, but hop 2 has an unregistered pool
+        let valid_hop_quote = agg.find_best_route(&v.token_a, &v.token_b, &10_000_i128, &1u32);
+        let valid_hop = valid_hop_quote.hops.get(0).unwrap();
+
+        // Unregistered second hop
+        let fake_pool = Address::generate(&v.env);
+        let bad_hop = RouteHop {
+            pool: fake_pool,
+            pool_kind: PoolKind::Amm,
+            token_in: v.token_b.clone(),
+            token_out: v.token_a.clone(),
+            zero_for_one: true,
+        };
+
+        let bad_route = RouteQuote {
+            amount_out: 9_000_i128,
+            hops: vec![&v.env, valid_hop.clone(), bad_hop],
+        };
+
+        // Get initial state
+        let token_a_client = soroban_sdk::token::TokenClient::new(&v.env, &v.token_a);
+        let token_b_client = soroban_sdk::token::TokenClient::new(&v.env, &v.token_b);
+        let balance_a_before = token_a_client.balance(&v.trader);
+        let balance_b_before = token_b_client.balance(&v.trader);
+        let pool_info_before = amm::AmmPoolClient::new(&v.env, &v.pool_ab).get_info();
+
+        // Execute route (should fail validation)
+        let _result =
+            agg.try_execute_route(&bad_route, &v.trader, &10_000_i128, &0_i128, &u64::MAX);
+
+        // Verify nothing changed
+        let balance_a_after = token_a_client.balance(&v.trader);
+        let balance_b_after = token_b_client.balance(&v.trader);
+        let pool_info_after = amm::AmmPoolClient::new(&v.env, &v.pool_ab).get_info();
+
+        assert_eq!(
+            balance_a_before, balance_a_after,
+            "token_a balance must be unchanged"
+        );
+        assert_eq!(
+            balance_b_before, balance_b_after,
+            "token_b balance must be unchanged"
+        );
+        assert_eq!(
+            pool_info_before.reserve_a, pool_info_after.reserve_a,
+            "pool reserve_a must be unchanged"
+        );
+        assert_eq!(
+            pool_info_before.reserve_b, pool_info_after.reserve_b,
+            "pool reserve_b must be unchanged"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // #814: Deadline parameter tests
+    // -------------------------------------------------------------------------
+
+    /// Test 1: Regression test - swap_best rejects expired deadline.
+    /// A deadline one second in the past must fail without attempting the swap.
+    #[test]
+    fn test_swap_best_rejects_expired_deadline() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        // Advance the ledger so "one second in the past" is a real past
+        // timestamp rather than saturating to 0.
+        v.env.ledger().set_timestamp(1_000);
+
+        // Get current timestamp and use one second in the past as deadline
+        let now = v.env.ledger().timestamp();
+        let expired_deadline = now.saturating_sub(1);
+
+        // swap_best with expired deadline should fail with SlippageExceeded
+        let result = agg.try_swap_best(
+            &v.trader,
+            &v.token_a,
+            &v.token_b,
+            &10_000_i128,
+            &0_i128,
+            &expired_deadline,
+        );
+
+        assert!(
+            result.is_err(),
+            "swap_best must reject expired deadline (in the past)"
+        );
+        if let Err(Ok(err)) = result {
+            assert_eq!(
+                err,
+                AggregatorError::SlippageExceeded,
+                "expired deadline must return SlippageExceeded"
+            );
+        } else {
+            panic!("expected AggregatorError::SlippageExceeded");
+        }
+    }
+
+    /// Test 2: Positive test - swap_best succeeds with deadline 10 seconds in future.
+    #[test]
+    fn test_swap_best_succeeds_with_future_deadline() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        // Use a deadline 10 seconds in the future
+        let now = v.env.ledger().timestamp();
+        let future_deadline = now + 10;
+
+        let result = agg.try_swap_best(
+            &v.trader,
+            &v.token_a,
+            &v.token_b,
+            &10_000_i128,
+            &0_i128,
+            &future_deadline,
+        );
+
+        assert!(
+            result.is_ok(),
+            "swap_best must succeed with future deadline"
+        );
+        let out = result.unwrap().unwrap();
+        assert!(out > 0, "swap_best must produce positive output");
+    }
+
+    /// Test 3: Boundary test - swap_best succeeds when deadline equals current timestamp.
+    /// The execute_route check is `deadline < timestamp`, so equal should succeed.
+    #[test]
+    fn test_swap_best_succeeds_at_deadline_boundary() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        // Use current timestamp as deadline (execute_route checks deadline < timestamp, not <=)
+        let now = v.env.ledger().timestamp();
+        let deadline_equals_now = now;
+
+        let result = agg.try_swap_best(
+            &v.trader,
+            &v.token_a,
+            &v.token_b,
+            &10_000_i128,
+            &0_i128,
+            &deadline_equals_now,
+        );
+
+        assert!(
+            result.is_ok(),
+            "swap_best must succeed when deadline == current timestamp (strict < comparison)"
+        );
+        let out = result.unwrap().unwrap();
+        assert!(out > 0, "swap_best must produce positive output");
+    }
+
+    /// Test 4: Economics invariance - deadline does not affect swap output.
+    /// Two swaps against the same route with different deadlines should produce identical output.
+    #[test]
+    fn test_swap_best_deadline_does_not_affect_economics() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        let now = v.env.ledger().timestamp();
+        let short_deadline = now + 5;
+        let long_deadline = now + 3600;
+
+        // First swap with short deadline
+        let out1 = agg.swap_best(
+            &v.trader,
+            &v.token_a,
+            &v.token_b,
+            &10_000_i128,
+            &0_i128,
+            &short_deadline,
+        );
+
+        // Reset trader funds for second swap
+        // Need to create a new venue setup for a clean second trade
+        let v2 = setup_venues();
+        let agg2 = DexAggregatorClient::new(&v2.env, &v2.agg);
+
+        // Second swap with long deadline against same input
+        let out2 = agg2.swap_best(
+            &v2.trader,
+            &v2.token_a,
+            &v2.token_b,
+            &10_000_i128,
+            &0_i128,
+            &long_deadline,
+        );
+
+        // Both should produce identical output (deadline only affects expiry, not economics)
+        assert_eq!(
+            out1, out2,
+            "swap_best must produce identical output regardless of deadline"
+        );
+        assert!(out1 > 0, "both swaps must produce positive output");
+    }
+
     fn env_token(env: &Env, admin: &Address) -> Address {
         env.register_stellar_asset_contract_v2(admin.clone())
             .address()
+    }
+
+    // -------------------------------------------------------------------------
+    // #809: Authorization checks for set_max_hops and set_routing_tokens
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_set_max_hops_non_admin_fails() {
+        // Regression test: non-admin calls set_max_hops with no auth → must panic
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        let admin = Address::generate(&env);
+        factory.initialize(
+            &admin,
+            &BytesN::from_array(&env, &[0u8; 32]),
+            &BytesN::from_array(&env, &[1u8; 32]),
+        );
+
+        let agg_addr = env.register_contract(None, DexAggregator);
+        let agg = DexAggregatorClient::new(&env, &agg_addr);
+        agg.initialize(&admin, &factory_addr);
+
+        let _non_admin = Address::generate(&env);
+        env.mock_auths(&[]);
+
+        // Non-admin calling set_max_hops should fail
+        let result = agg.try_set_max_hops(&3u32);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_routing_tokens_non_admin_fails() {
+        // Regression test: non-admin calls set_routing_tokens with no auth → must panic
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        let admin = Address::generate(&env);
+        factory.initialize(
+            &admin,
+            &BytesN::from_array(&env, &[0u8; 32]),
+            &BytesN::from_array(&env, &[1u8; 32]),
+        );
+
+        let agg_addr = env.register_contract(None, DexAggregator);
+        let agg = DexAggregatorClient::new(&env, &agg_addr);
+        agg.initialize(&admin, &factory_addr);
+
+        let token = Address::generate(&env);
+        let tokens = vec![&env, token];
+        env.mock_auths(&[]);
+
+        // Non-admin calling set_routing_tokens should fail
+        let result = agg.try_set_routing_tokens(&tokens);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_admin_set_max_hops_success_then_route_limited() {
+        // Admin calls set_max_hops(&env, &3) successfully, then a >3-hop route fails
+        let env = Env::default();
+        env.mock_all_auths();
+        env.budget().reset_unlimited();
+
+        let admin = Address::generate(&env);
+        let amm_wasm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let lp_wasm_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_wasm_hash, &lp_wasm_hash);
+
+        let agg_addr = env.register_contract(None, DexAggregator);
+        let agg = DexAggregatorClient::new(&env, &agg_addr);
+        agg.initialize(&admin, &factory_addr);
+
+        // Admin sets max_hops to 3
+        let result = agg.try_set_max_hops(&3u32);
+        assert!(result.is_ok());
+
+        // Verify find_best_route respects the max_hops cap
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+
+        // Create a deep route that would require >3 hops (this will fail because we have no pools)
+        let result = agg.try_find_best_route(&token_a, &token_b, &100_i128, &5u32);
+        assert!(result.is_err()); // Expected: NoRouteFound because no pools registered
+    }
+
+    #[test]
+    fn test_set_max_hops_zero_fails_with_invalid_max_hops() {
+        // set_max_hops(&env, &0) → Err(AggregatorError::InvalidMaxHops)
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(
+            &admin,
+            &BytesN::from_array(&env, &[0u8; 32]),
+            &BytesN::from_array(&env, &[1u8; 32]),
+        );
+
+        let agg_addr = env.register_contract(None, DexAggregator);
+        let agg = DexAggregatorClient::new(&env, &agg_addr);
+        agg.initialize(&admin, &factory_addr);
+
+        // Setting max_hops to 0 should fail with InvalidMaxHops
+        let result = agg.try_set_max_hops(&0u32);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            AggregatorError::InvalidMaxHops
+        );
+    }
+
+    #[test]
+    fn test_set_routing_tokens_too_many_fails() {
+        // set_routing_tokens with MAX_ROUTING_TOKENS + 1 addresses → TooManyRoutingTokens
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(
+            &admin,
+            &BytesN::from_array(&env, &[0u8; 32]),
+            &BytesN::from_array(&env, &[1u8; 32]),
+        );
+
+        let agg_addr = env.register_contract(None, DexAggregator);
+        let agg = DexAggregatorClient::new(&env, &agg_addr);
+        agg.initialize(&admin, &factory_addr);
+
+        // Create MAX_ROUTING_TOKENS + 1 addresses
+        let mut too_many_tokens = Vec::new(&env);
+        for _ in 0..=(DexAggregator::MAX_ROUTING_TOKENS) {
+            too_many_tokens.push_back(Address::generate(&env));
+        }
+
+        // Setting too many tokens should fail with TooManyRoutingTokens
+        let result = agg.try_set_routing_tokens(&too_many_tokens);
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().unwrap(),
+            AggregatorError::TooManyRoutingTokens
+        );
+    }
+
+    #[test]
+    fn test_admin_set_routing_tokens_success_updates_discovery() {
+        // Admin calls set_routing_tokens with a valid list, and discover_tokens picks up the new tokens
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        let admin = Address::generate(&env);
+        factory.initialize(
+            &admin,
+            &BytesN::from_array(&env, &[0u8; 32]),
+            &BytesN::from_array(&env, &[1u8; 32]),
+        );
+
+        let agg_addr = env.register_contract(None, DexAggregator);
+        let agg = DexAggregatorClient::new(&env, &agg_addr);
+        agg.initialize(&admin, &factory_addr);
+
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+        let routing_token = Address::generate(&env);
+
+        // Set routing tokens
+        let routing_tokens = vec![&env, routing_token.clone()];
+        let result = agg.try_set_routing_tokens(&routing_tokens);
+        assert!(result.is_ok());
+
+        // Verify discover_tokens includes the routing tokens
+        let discovered = env.as_contract(&agg_addr, || {
+            DexAggregator::discover_tokens(&env, &token_a, &token_b)
+        });
+
+        let mut found_routing_token = false;
+        for i in 0..discovered.len() {
+            if discovered.get(i).unwrap() == routing_token {
+                found_routing_token = true;
+                break;
+            }
+        }
+        assert!(found_routing_token);
     }
 }

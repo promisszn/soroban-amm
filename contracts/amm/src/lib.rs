@@ -2159,7 +2159,7 @@ impl AmmPool {
             return Err(AmmError::InvalidToken);
         };
 
-        let amount_in = Self::get_amount_in(env.clone(), token_out.clone(), amount_out);
+        let amount_in = Self::get_amount_in(env.clone(), token_out.clone(), amount_out)?;
         if amount_in > max_in {
             return Err(AmmError::SlippageExceeded);
         }
@@ -2533,7 +2533,13 @@ impl AmmPool {
     }
 
     /// Quote how much `token_in` is required to receive exactly `amount_out` of `token_out`.
-    pub fn get_amount_in(env: Env, token_out: Address, amount_out: i128) -> i128 {
+    ///
+    /// # Returns
+    /// The amount of input token needed, or an error if:
+    /// - `token_out` does not match either pool token (InvalidToken)
+    /// - Either reserve is zero (EmptyPool)
+    /// - `amount_out` is >= the output reserve (InsufficientLiquidity)
+    pub fn get_amount_in(env: Env, token_out: Address, amount_out: i128) -> Result<i128, AmmError> {
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
@@ -2548,17 +2554,24 @@ impl AmmPool {
                 Self::get_reserve_b(env.clone()),
             )
         } else {
-            panic!("unknown token");
+            return Err(AmmError::InvalidToken);
         };
-        assert!(reserve_in > 0 && reserve_out > 0, "zero reserve");
-        assert!(amount_out < reserve_out, "amount_out >= reserve_out");
+        if reserve_in <= 0 || reserve_out <= 0 {
+            return Err(AmmError::EmptyPool);
+        }
+        if amount_out >= reserve_out {
+            return Err(AmmError::InsufficientLiquidity);
+        }
         // Defensive guard for any pool created before the tightened fee bound:
         // a 100% fee makes the `(10_000 - fee_bps)` divisor zero. A swap can
         // never return any output in that case, so the input is unquotable.
         if fee_bps >= 10_000 {
-            return 0;
+            return Ok(0);
         }
-        (reserve_in * amount_out * 10_000) / ((reserve_out - amount_out) * (10_000 - fee_bps)) + 1
+        Ok(
+            (reserve_in * amount_out * 10_000) / ((reserve_out - amount_out) * (10_000 - fee_bps))
+                + 1,
+        )
     }
 
     /// Return the current swap fee in basis points.

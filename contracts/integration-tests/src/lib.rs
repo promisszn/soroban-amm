@@ -49,7 +49,7 @@ mod tests {
     fn set_ledger_ts(env: &Env, ts: u64) {
         env.ledger().set(LedgerInfo {
             timestamp: ts,
-            protocol_version: 22,
+            protocol_version: 21,
             sequence_number: env.ledger().sequence(),
             network_id: Default::default(),
             base_reserve: 10,

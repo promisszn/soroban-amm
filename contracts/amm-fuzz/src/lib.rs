@@ -33,6 +33,8 @@
 
 extern crate std;
 
+pub mod cl;
+
 use proptest::prelude::*;
 use soroban_sdk::{
     testutils::Address as _,
@@ -185,6 +187,12 @@ struct Pool<'a> {
 }
 
 fn deploy_pool(env: &Env, fee_bps: i128) -> Pool<'_> {
+    // These fuzz properties check contract *correctness*, not gas cost — that's
+    // `benches`'s job. The default test budget models real network CPU limits,
+    // but `amm.wasm`/`token.wasm` here are unoptimized debug-adjacent builds
+    // (no `stellar contract optimize` pass), so just instantiating them for a
+    // property-test iteration can exceed it well before any contract logic runs.
+    env.budget().reset_unlimited();
     let amm_hash = env.deployer().upload_contract_wasm(amm_wasm::WASM);
     let token_hash = env.deployer().upload_contract_wasm(token_wasm::WASM);
 

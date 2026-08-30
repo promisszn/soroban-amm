@@ -7889,8 +7889,8 @@ mod test_swap_exact_out {
         ];
 
         let amount_out = 2_000_000_i128; // token A out, large enough to cross several ticks
-        // `u128::MAX`, not `0`, is this crate's "no limit" sentinel for
-        // `zero_for_one = false` (see `swap_exact_out_normal_path_one_for_zero`).
+                                         // `u128::MAX`, not `0`, is this crate's "no limit" sentinel for
+                                         // `zero_for_one = false` (see `swap_exact_out_normal_path_one_for_zero`).
         let amount_in = f.client.swap_exact_out(
             &f.provider,
             &false,

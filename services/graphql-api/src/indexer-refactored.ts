@@ -17,9 +17,10 @@ import type {
   AnalyticsStore,
   PoolEvent,
   PoolStats,
+  PricePoint,
   HealthAlert,
   AlertConfig,
-} from "../store/interface.js";
+} from "./store/interface.js";
 
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const VOLUME_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -214,7 +215,8 @@ export class PoolIndexer {
     if (history.length < 2) return 0;
 
     const twap =
-      history.reduce((sum, p) => sum + p.price, 0) / history.length;
+      history.reduce((sum: number, p: PricePoint) => sum + p.price, 0) /
+      history.length;
     if (twap === 0) return 0;
 
     return Math.round(

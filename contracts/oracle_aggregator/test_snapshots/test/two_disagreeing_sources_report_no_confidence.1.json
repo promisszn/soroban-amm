@@ -45,6 +45,9 @@
                 },
                 {
                   "u32": 0
+                },
+                {
+                  "u32": 10000
                 }
               ]
             }
@@ -70,6 +73,9 @@
                 },
                 {
                   "u32": 2
+                },
+                {
+                  "u32": 10000
                 }
               ]
             }
@@ -283,6 +289,14 @@
                                   "val": {
                                     "u32": 0
                                   }
+                                },
+                                {
+                                  "key": {
+                                    "symbol": "weight"
+                                  },
+                                  "val": {
+                                    "u32": 10000
+                                  }
                                 }
                               ]
                             },
@@ -310,6 +324,14 @@
                                   },
                                   "val": {
                                     "u32": 2
+                                  }
+                                },
+                                {
+                                  "key": {
+                                    "symbol": "weight"
+                                  },
+                                  "val": {
+                                    "u32": 10000
                                   }
                                 }
                               ]
@@ -621,6 +643,9 @@
                 },
                 {
                   "u32": 0
+                },
+                {
+                  "u32": 10000
                 }
               ]
             }
@@ -678,6 +703,9 @@
                 },
                 {
                   "u32": 2
+                },
+                {
+                  "u32": 10000
                 }
               ]
             }
@@ -864,6 +892,37 @@
                 },
                 {
                   "u64": 1000
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": false
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000002",
+        "type_": "contract",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "deviant"
+              }
+            ],
+            "data": {
+              "vec": [
+                {
+                  "vec": [
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                    },
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAMDR4"
+                    }
+                  ]
                 }
               ]
             }

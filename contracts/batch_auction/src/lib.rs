@@ -16,6 +16,7 @@
 #![no_std]
 
 use pool_interfaces::{AmmPoolClient, ConcentratedLiquidityClient, FactoryClient};
+use soroban_amm_sdk::emit_versioned_event;
 use soroban_sdk::token::Client as SepTokenClient;
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Symbol, Vec,
@@ -28,6 +29,9 @@ const MAX_ORDERS_CEILING: u32 = 200;
 /// with a far-future deadline, since only the trader's own `cancel_order` (or
 /// this ceiling) can release it before then.
 const MAX_ORDER_LIFETIME_SECS: u64 = 7 * 24 * 60 * 60;
+
+const MIN_TTL: u32 = 172_800;
+const BUMP_TO: u32 = 518_400;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -145,6 +149,10 @@ fn max_orders(env: &Env) -> u32 {
         .unwrap_or(DEFAULT_MAX_ORDERS)
 }
 
+fn extend_ttl(env: &Env) {
+    env.storage().instance().extend_ttl(MIN_TTL, BUMP_TO);
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -161,6 +169,7 @@ impl BatchAuction {
         admin: Address,
         batch_window_secs: u64,
     ) -> Result<(), AuctionError> {
+        extend_ttl(&env);
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(AuctionError::AlreadyInitialized);
         }
@@ -203,6 +212,7 @@ impl BatchAuction {
         min_out: i128,
         deadline: u64,
     ) -> Result<u64, AuctionError> {
+        extend_ttl(&env);
         Self::record_order(
             env,
             trader,
@@ -246,6 +256,7 @@ impl BatchAuction {
         alt_amm_pool: Option<Address>,
         deadline: u64,
     ) -> Result<u64, AuctionError> {
+        extend_ttl(&env);
         Self::record_order(
             env,
             trader,
@@ -359,9 +370,10 @@ impl BatchAuction {
             .instance()
             .set(&DataKey::NextOrderId, &(id + 1));
 
-        env.events().publish(
+        emit_versioned_event!(
+            env,
             (Symbol::new(&env, "order_submitted"), trader),
-            (id, amount_in),
+            (id, amount_in)
         );
 
         Ok(id)
@@ -371,6 +383,7 @@ impl BatchAuction {
     ///
     /// Only the original trader may cancel their own order.
     pub fn cancel_order(env: Env, trader: Address, order_id: u64) -> Result<(), AuctionError> {
+        extend_ttl(&env);
         trader.require_auth();
 
         let order: Order = env
@@ -408,8 +421,11 @@ impl BatchAuction {
             .instance()
             .set(&DataKey::PendingOrders, &updated);
 
-        env.events()
-            .publish((Symbol::new(&env, "order_cancelled"), trader), (order_id,));
+        emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "order_cancelled"), trader),
+            (order_id,)
+        );
 
         Ok(())
     }
@@ -440,6 +456,7 @@ impl BatchAuction {
     /// callers should compare against `get_pending_orders` before and after
     /// to see which orders failed, and use `order_failed` events to react.
     pub fn settle_batch(env: Env) -> Result<Vec<i128>, AuctionError> {
+        extend_ttl(&env);
         let opened_at: u64 = env
             .storage()
             .instance()
@@ -494,9 +511,10 @@ impl BatchAuction {
                 ) {
                     results.push_back(0);
                 }
-                env.events().publish(
+                emit_versioned_event!(
+                    env,
                     (Symbol::new(&env, "order_expired"), order.trader.clone()),
-                    (order_id,),
+                    (order_id,)
                 );
                 env.storage().instance().remove(&DataKey::Order(order_id));
                 continue;
@@ -544,9 +562,10 @@ impl BatchAuction {
                         amount_out,
                     ) {
                         results.push_back(amount_out);
-                        env.events().publish(
+                        emit_versioned_event!(
+                            env,
                             (Symbol::new(&env, "order_settled"), order.trader.clone()),
-                            (order_id, amount_out),
+                            (order_id, amount_out)
                         );
                     } else {
                         // Swap succeeded but payout to the trader failed (no
@@ -554,9 +573,10 @@ impl BatchAuction {
                         // amount is now claimable via `claim_refund` instead
                         // of being stranded; the order is still dropped so
                         // the batch can continue.
-                        env.events().publish(
+                        emit_versioned_event!(
+                            env,
                             (Symbol::new(&env, "order_failed"), order.trader.clone()),
-                            (order_id,),
+                            (order_id,)
                         );
                     }
                 }
@@ -572,9 +592,10 @@ impl BatchAuction {
                         &order.token_in,
                         order.amount_in,
                     );
-                    env.events().publish(
+                    emit_versioned_event!(
+                        env,
                         (Symbol::new(&env, "order_failed"), order.trader.clone()),
-                        (order_id,),
+                        (order_id,)
                     );
                 }
             }
@@ -591,8 +612,7 @@ impl BatchAuction {
             .set(&DataKey::PendingOrders, &remaining);
         env.storage().instance().set(&DataKey::BatchOpenedAt, &now);
 
-        env.events()
-            .publish((symbol_short!("settled"),), (process_count,));
+        emit_versioned_event!(env, (symbol_short!("settled"),), (process_count,));
 
         Ok(results)
     }
@@ -1032,13 +1052,17 @@ impl BatchAuction {
 
     /// Update the batch window duration. Admin-only.
     pub fn set_batch_window(env: Env, batch_window_secs: u64) -> Result<(), AuctionError> {
+        extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage()
             .instance()
             .set(&DataKey::BatchWindowSecs, &batch_window_secs);
-        env.events()
-            .publish((Symbol::new(&env, "window_updated"),), (batch_window_secs,));
+        emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "window_updated"),),
+            (batch_window_secs,)
+        );
         Ok(())
     }
 
@@ -1048,6 +1072,7 @@ impl BatchAuction {
     /// keeps settlement cost bounded even if governance/admin configuration is
     /// changed under production load.
     pub fn set_max_orders(env: Env, admin: Address, n: u32) -> Result<(), AuctionError> {
+        extend_ttl(&env);
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if stored_admin != admin {
             return Err(AuctionError::Unauthorized);
@@ -1058,8 +1083,7 @@ impl BatchAuction {
         }
 
         env.storage().instance().set(&DataKey::MaxOrders, &n);
-        env.events()
-            .publish((Symbol::new(&env, "max_orders_updated"),), (n,));
+        emit_versioned_event!(env, (Symbol::new(&env, "max_orders_updated"),), (n,));
         Ok(())
     }
 
@@ -1172,6 +1196,7 @@ impl BatchAuction {
         current_admin: Address,
         new_admin: Address,
     ) -> Result<(), AuctionError> {
+        extend_ttl(&env);
         let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if current_admin != stored {
             return Err(AuctionError::Unauthorized);
@@ -1180,15 +1205,17 @@ impl BatchAuction {
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &Some(new_admin.clone()));
-        env.events().publish(
+        emit_versioned_event!(
+            env,
             (Symbol::new(&env, "admin_nominated"),),
-            (current_admin, new_admin),
+            (current_admin, new_admin)
         );
         Ok(())
     }
 
     /// Accept the pending admin nomination. Caller becomes the new admin.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), AuctionError> {
+        extend_ttl(&env);
         let pending: Option<Address> = env
             .storage()
             .instance()
@@ -1203,8 +1230,7 @@ impl BatchAuction {
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &Option::<Address>::None);
-        env.events()
-            .publish((Symbol::new(&env, "admin_changed"),), (new_admin,));
+        emit_versioned_event!(env, (Symbol::new(&env, "admin_changed"),), (new_admin,));
         Ok(())
     }
 
@@ -1226,15 +1252,16 @@ impl BatchAuction {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use amm::{AmmPool, AmmPoolClient};
     use concentrated_liquidity::{ConcentratedLiquidity, ConcentratedLiquidityClient};
     use factory::{Factory, FactoryClient};
     use pool_interfaces::{AmmError, PoolInfo};
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
+        testutils::{Address as _, Events, Ledger},
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
-        Env, String,
+        Env, String, TryFromVal,
     };
     use token::{LpToken, LpTokenClient};
 
@@ -2961,6 +2988,271 @@ mod tests {
         assert_eq!(
             StellarTokenClient::new(&env, &tb).balance(&auction_addr),
             0_i128
+        );
+    }
+
+    #[test]
+    fn test_order_submitted_emits_versioned_event() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let (ta, tb, pool, admin) = setup(&env);
+
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
+        let _order_id = client.submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+
+        // Find order_submitted event in all events
+        let events = env.events().all();
+        let order_submitted_events: std::vec::Vec<_> = events
+            .iter()
+            .filter(|event| {
+                if let Some(topic_val) = event.1.get(0) {
+                    Symbol::try_from_val(&env, &topic_val)
+                        == Ok(Symbol::new(&env, "order_submitted"))
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert!(
+            !order_submitted_events.is_empty(),
+            "order_submitted event must be emitted"
+        );
+        let event = order_submitted_events.last().unwrap();
+        let (version, (_order_id, _amount_in)): (u32, (u64, i128)) =
+            <(u32, (u64, i128))>::try_from_val(&env, &event.2)
+                .expect("must decode as (u32, (u64, i128))");
+        assert_eq!(
+            version,
+            soroban_amm_sdk::EVENT_SCHEMA_VERSION,
+            "event must have correct schema version"
+        );
+    }
+
+    #[test]
+    fn test_order_settled_emits_versioned_event() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let (ta, tb, pool, admin) = setup(&env);
+
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
+        let _order_id = client.submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+
+        // Advance time past the batch window
+        env.ledger().set_timestamp(1031);
+
+        let _results = client.settle_batch();
+
+        // Find order_settled event
+        let events = env.events().all();
+        let order_settled_events: std::vec::Vec<_> = events
+            .iter()
+            .filter(|event| {
+                if let Some(topic_val) = event.1.get(0) {
+                    Symbol::try_from_val(&env, &topic_val) == Ok(Symbol::new(&env, "order_settled"))
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert!(
+            !order_settled_events.is_empty(),
+            "order_settled event must be emitted"
+        );
+        let event = order_settled_events.last().unwrap();
+        let (version, (_order_id, _amount_out)): (u32, (u64, i128)) =
+            <(u32, (u64, i128))>::try_from_val(&env, &event.2)
+                .expect("must decode as (u32, (u64, i128))");
+        assert_eq!(
+            version,
+            soroban_amm_sdk::EVENT_SCHEMA_VERSION,
+            "event must have correct schema version"
+        );
+    }
+
+    #[test]
+    fn test_order_cancelled_emits_versioned_event() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let (ta, tb, pool, admin) = setup(&env);
+
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
+        let order_id = client.submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+
+        client.cancel_order(&trader, &order_id);
+
+        // Find order_cancelled event
+        let events = env.events().all();
+        let order_cancelled_events: std::vec::Vec<_> = events
+            .iter()
+            .filter(|event| {
+                if let Some(topic_val) = event.1.get(0) {
+                    Symbol::try_from_val(&env, &topic_val)
+                        == Ok(Symbol::new(&env, "order_cancelled"))
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert!(
+            !order_cancelled_events.is_empty(),
+            "order_cancelled event must be emitted"
+        );
+        let event = order_cancelled_events.last().unwrap();
+        let (version, (_order_id,)): (u32, (u64,)) =
+            <(u32, (u64,))>::try_from_val(&env, &event.2).expect("must decode as (u32, (u64,))");
+        assert_eq!(
+            version,
+            soroban_amm_sdk::EVENT_SCHEMA_VERSION,
+            "event must have correct schema version"
+        );
+    }
+
+    #[test]
+    fn test_admin_changed_emits_versioned_event() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let (_ta, _tb, _pool, admin) = setup(&env);
+
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+        client.accept_admin(&new_admin);
+
+        // Find admin_changed event
+        let events = env.events().all();
+        let admin_changed_events: std::vec::Vec<_> = events
+            .iter()
+            .filter(|event| {
+                if let Some(topic_val) = event.1.get(0) {
+                    Symbol::try_from_val(&env, &topic_val) == Ok(Symbol::new(&env, "admin_changed"))
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert!(
+            !admin_changed_events.is_empty(),
+            "admin_changed event must be emitted"
+        );
+        let event = admin_changed_events.last().unwrap();
+        let (version, (_new_admin,)): (u32, (Address,)) =
+            <(u32, (Address,))>::try_from_val(&env, &event.2)
+                .expect("must decode as (u32, (Address,))");
+        assert_eq!(
+            version,
+            soroban_amm_sdk::EVENT_SCHEMA_VERSION,
+            "event must have correct schema version"
+        );
+    }
+
+    #[test]
+    fn test_settled_event_emits_versioned_event() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let (ta, tb, pool, admin) = setup(&env);
+
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
+        let _order_id = client.submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+
+        // Advance time past the batch window
+        env.ledger().set_timestamp(1031);
+
+        let _results = client.settle_batch();
+
+        // Find settled event
+        let events = env.events().all();
+        let settled_events: std::vec::Vec<_> = events
+            .iter()
+            .filter(|event| {
+                if let Some(topic_val) = event.1.get(0) {
+                    Symbol::try_from_val(&env, &topic_val) == Ok(Symbol::new(&env, "settled"))
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert!(!settled_events.is_empty(), "settled event must be emitted");
+        let event = settled_events.last().unwrap();
+        let (version, (_process_count,)): (u32, (u32,)) =
+            <(u32, (u32,))>::try_from_val(&env, &event.2).expect("must decode as (u32, (u32,))");
+        assert_eq!(
+            version,
+            soroban_amm_sdk::EVENT_SCHEMA_VERSION,
+            "event must have correct schema version"
         );
     }
 }

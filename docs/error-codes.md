@@ -28,6 +28,28 @@ Use the numeric code when parsing RPC responses or writing off-chain tooling.
 
 (TODO)
 
+## Oracle Aggregator (`contracts/oracle_aggregator`)
+
+Defined in [contracts/oracle_aggregator/src/lib.rs](../contracts/oracle_aggregator/src/lib.rs) as `OracleError`.
+
+| Code | Symbol | Cause | Remedy |
+|------|--------|-------|--------|
+| 1 | `AlreadyInitialized` | `initialize` was called on an already-initialized aggregator. | Deploy a new aggregator contract. |
+| 2 | `NotInitialized` | A function was called before `initialize`. | Call `initialize` first. |
+| 3 | `NotAdmin` | The caller did not match the stored admin address. | Use the correct admin keypair. |
+| 4 | `SourceAlreadyRegistered` | `register_source` was called with an address already in the registry. | Remove and re-register, or use a different address. |
+| 5 | `SourceNotFound` | `remove_source` or `set_source_weight` referenced an unknown address. | Check `list_sources()` for registered addresses. |
+| 6 | `InsufficientSources` | Fewer than `MIN_VALID_SOURCES` fresh, agreeing sources were available, or `get_price` was called with insufficient confidence. | Register more sources or widen the deviation band. |
+| 7 | `InvalidStaleness` | `max_staleness_seconds` was zero. | Use a positive value. |
+| 8 | `InvalidDeviation` | `max_deviation_bps` was zero or exceeded `BPS_DENOMINATOR` (10 000). | Use a value in `1..=10_000`. |
+| 9 | `InvalidWeight` | A source weight was zero or exceeded `MAX_SOURCE_WEIGHT` (100 000). | Use a value in `1..=100_000`. |
+| 10 | `WeightFloorNotMet` | The total agreeing weight was below `MIN_AGREEING_WEIGHT` (20 000). | Increase individual source weights or register more sources. |
+
+> **ABI change (#689):** `AggregatedPrice.confidence` is now the **summed weight**
+> of agreeing sources (not a raw count). A source with weight 10 000 contributes
+> 10 000 to confidence, not 1. This is a breaking change for off-chain consumers
+> that interpreted `confidence` as a source count.
+
 ## Governance
 
 
@@ -194,6 +216,9 @@ Defined in [contracts/dex_aggregator/src/lib.rs](../contracts/dex_aggregator/src
 |------|--------|-------|--------|
 | 1 | `NoRouteFound` | No valid liquidity route connects `token_in` and `token_out` across registered pools. | Provide connected intermediate pools or update route path. |
 | 2 | `SlippageExceeded` | Total output across aggregated swap steps fell below `min_amount_out`. | Widen slippage tolerance or update quote before submitting. |
+| 3 | `UnregisteredPool` | A route hop references a pool that is not registered with the factory. | Only route through pools registered via the factory. |
+| 4 | `InvalidMaxHops` | `set_max_hops` called with `0`. | Pass a positive hop count. |
+| 5 | `TooManyRoutingTokens` | `set_routing_tokens` called with more than `MAX_ROUTING_TOKENS` addresses. | Reduce the routing token list size. |
 
 ---
 
@@ -506,6 +531,28 @@ Contains property-based and fuzz testing suites for constant-product invariants 
 Test harness crate ([contracts/integration-tests/src/lib.rs](../contracts/integration-tests/src/lib.rs)).
 
 Contains integration and upgrade test suites for multi-contract interactions. Exposes no on-chain contract error codes or panics.
+
+---
+
+## TwapConsumer (`contracts/twap_consumer`)
+
+Defined in [contracts/twap_consumer/src/lib.rs](../contracts/twap_consumer/src/lib.rs) as `TwapError`.
+
+| Code | Symbol | Cause | Remedy |
+|------|--------|-------|--------|
+| 1 | `AlreadyInitialized` | `initialize` was called on a consumer contract that has already been set up. | Do not re-initialize the contract. |
+| 2 | `NotInitialized` | Contract function called before `initialize` was performed. | Call `initialize` with keeper address first. |
+| 3 | `ZeroWindow` | `window_seconds` argument was zero. | Provide a strictly positive window duration in seconds. |
+| 4 | `InsufficientHistory` | Not enough snapshot history exists to cover the requested TWAP window. | Wait for more snapshots to accumulate or reduce the TWAP window size. |
+| 5 | `NoSnapshotFound` | Snapshot not found for the specified timestamp or pool key. | Verify the snapshot timestamp exists or wait for the keeper to save a snapshot. |
+| 6 | `ElapsedZero` | Elapsed time between snapshots is zero or negative. | Ensure oracle price cumulative timestamps advance. |
+| 7 | `InvalidSpotPrice` | Spot price provided for validation is non-positive. | Provide a strictly positive spot price. |
+| 8 | `InvalidTwapPrice` | Computed TWAP price is non-positive. | Ensure pool reserves and cumulative prices are positive. |
+| 9 | `InvalidDeviationBps` | Deviation threshold is outside `[0, 10 000]` bps. | Provide a deviation threshold between 0 and 10 000 bps. |
+| 10 | `NegativeCollateral` | Collateral amount provided is negative. | Provide a non-negative collateral amount. |
+| 11 | `PriceManipulated` | Spot price deviates from TWAP beyond allowed threshold. | Reject the trade/valuation or retry with current market prices. |
+| 12 | `InvalidRetentionPolicy` | `max_age_seconds` is shorter than the minimum supported TWAP window (`LONGEST_TWAP_WINDOW`). | Set `max_age_seconds` to at least `LONGEST_TWAP_WINDOW` or 0 (disabled). |
+| 13 | `Unauthorized` | Non-keeper/admin address attempted an administrative action. | Submit the transaction authenticated by the configured keeper/admin. |
 
 ---
 

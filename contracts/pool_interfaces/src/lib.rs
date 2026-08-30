@@ -97,7 +97,7 @@ pub trait AmmPoolInterface {
 
     fn get_amount_out(env: Env, token_in: Address, amount_in: i128) -> Result<i128, AmmError>;
 
-    fn get_amount_in(env: Env, token_out: Address, amount_out: i128) -> i128;
+    fn get_amount_in(env: Env, token_out: Address, amount_out: i128) -> Result<i128, AmmError>;
 
     fn get_info(env: Env) -> PoolInfo;
 }
@@ -113,6 +113,8 @@ pub trait FactoryInterface {
     fn get_cl_pool(env: Env, token_a: Address, token_b: Address, fee_bps: i128) -> Option<Address>;
 
     fn get_pool_tokens(env: Env, pool: Address) -> Option<(Address, Address)>;
+
+    fn is_cl_pool(env: Env, pool: Address) -> bool;
 }
 
 // ── concentrated_liquidity ───────────────────────────────────────────────────
