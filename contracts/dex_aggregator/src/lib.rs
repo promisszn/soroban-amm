@@ -119,6 +119,7 @@ impl DexAggregator {
             !env.storage().instance().has(&DataKey::Factory),
             "already initialized"
         );
+        admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Factory, &factory);
         env.storage()
@@ -829,6 +830,7 @@ mod tests {
     #[test]
     fn test_discover_tokens_includes_registered_cl_pools() {
         let env = Env::default();
+        env.mock_all_auths();
         let factory_addr = env.register_contract(None, Factory);
         let factory = FactoryClient::new(&env, &factory_addr);
         let admin = Address::generate(&env);
@@ -846,8 +848,6 @@ mod tests {
         let token_a = Address::generate(&env);
         let token_b = Address::generate(&env);
         let cl_pool = Address::generate(&env);
-
-        env.mock_all_auths();
         agg.register_cl_pool(&cl_pool, &token_a, &token_b, &30_i128);
 
         let tokens = env.as_contract(&agg_addr, || {

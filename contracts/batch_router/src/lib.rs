@@ -14,6 +14,7 @@ const BUMP_TO: u32 = 518_400;
 #[contracttype]
 pub enum DataKey {
     Factory,
+    Admin,
 }
 
 /// Errors returned by [`BatchRouter`] entry points.
@@ -128,10 +129,12 @@ pub struct BatchRouter;
 #[contractimpl]
 impl BatchRouter {
     /// Initialize the router with the factory that tracks all deployed pools.
-    pub fn initialize(env: Env, factory: Address) -> Result<(), BatchRouterError> {
+    pub fn initialize(env: Env, admin: Address, factory: Address) -> Result<(), BatchRouterError> {
         if env.storage().instance().has(&DataKey::Factory) {
             return Err(BatchRouterError::AlreadyInitialized);
         }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Factory, &factory);
         Ok(())
     }
@@ -498,9 +501,10 @@ mod tests {
     }
 
     fn deploy_router<'a>(env: &'a Env, factory_addr: &Address) -> BatchRouterClient<'a> {
+        let admin = Address::generate(env);
         let batch_addr = env.register_contract(None, BatchRouter);
         let batch_client = BatchRouterClient::new(env, &batch_addr);
-        batch_client.initialize(factory_addr);
+        batch_client.initialize(&admin, factory_addr);
         batch_client
     }
 
@@ -735,6 +739,7 @@ mod tests {
     #[test]
     fn test_batch_call_savings_reports_cross_contract_honestly() {
         let env = Env::default();
+        env.mock_all_auths();
         let factory_addr = setup_env_and_factory(&env);
         let batch_client = deploy_router(&env, &factory_addr);
 
@@ -873,11 +878,12 @@ mod tests {
     #[test]
     fn test_batch_without_auth_fails() {
         let env = Env::default();
-        // No mock_all_auths(): the caller's signature is never provided.
-        let factory_addr = setup_env_and_factory(&env);
         env.mock_all_auths();
+        // Initialize factory first with auth mocked
+        let factory_addr = setup_env_and_factory(&env);
         let (ta, _tb, pool, _) = setup_pool(&env, &factory_addr);
         let batch_client = deploy_router(&env, &factory_addr);
+        // Then disable auth for the batch call test
         env.set_auths(&[]);
 
         let trader = Address::generate(&env);
@@ -1023,6 +1029,7 @@ mod tests {
     #[test]
     fn test_max_batch_ops_getter() {
         let env = Env::default();
+        env.mock_all_auths();
         let factory_addr = setup_env_and_factory(&env);
         let batch_client = deploy_router(&env, &factory_addr);
         assert_eq!(batch_client.max_batch_ops(), MAX_BATCH_OPS);
@@ -1032,11 +1039,12 @@ mod tests {
     fn test_initialize_twice_rejected() {
         let env = Env::default();
         env.mock_all_auths();
+        let admin = Address::generate(&env);
         let factory_addr = setup_env_and_factory(&env);
         let batch_addr = env.register_contract(None, BatchRouter);
         let batch_client = BatchRouterClient::new(&env, &batch_addr);
-        batch_client.initialize(&factory_addr);
-        let result = batch_client.try_initialize(&factory_addr);
+        batch_client.initialize(&admin, &factory_addr);
+        let result = batch_client.try_initialize(&admin, &factory_addr);
         assert_eq!(result, Err(Ok(BatchRouterError::AlreadyInitialized)));
     }
 

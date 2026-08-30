@@ -171,6 +171,7 @@ impl Factory {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(FactoryError::AlreadyInitialized);
         }
+        admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
