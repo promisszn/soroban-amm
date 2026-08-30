@@ -36,7 +36,6 @@ jobs:
       # tests), so there is nothing left to collide with at link time.
       # `amm-fuzz`, `integration-tests`, and `benches` are not deployable
       # contracts, so they never produce wasm to build or size-check here.
-      # `examples/flash_loan_receiver` IS deployable and IS included in the build.
       - name: Build WASM artifacts
         run: cargo build --release --target wasm32v1-none --workspace --exclude amm-fuzz --exclude integration-tests --exclude benches
       - name: Check WASM binary sizes
@@ -133,7 +132,10 @@ jobs:
           - dir: packages/sdk
             test_cmd: npm test -- --passWithNoTests
           - dir: packages/ui-components
-            test_cmd: npm test -- --passWithNoTests
+            # Run the real test suite (now that it exists) and enforce the
+            # configured coverage thresholds; a broken component or a drop
+            # below the line/function coverage floor fails the build.
+            test_cmd: npm test -- --coverage
           - dir: packages/ts-advanced-client
             test_cmd: npm test
           - dir: services/graphql-api
