@@ -13,6 +13,7 @@ import {
   Address,
 } from "@stellar/stellar-sdk";
 import type { NetworkConfig } from "./types.js";
+import { simulateRead } from "./internal/simulate.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -42,19 +43,7 @@ export class TokenClient {
   }
 
   private async simulate(method: string, ...args: xdr.ScVal[]): Promise<xdr.ScVal> {
-    const op = this.contract.call(method, ...args);
-    const tx = new (await import("@stellar/stellar-sdk")).TransactionBuilder(
-      await this.server.getAccount("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"),
-      { fee: "100", networkPassphrase: this.networkPassphrase }
-    )
-      .addOperation(op)
-      .setTimeout(30)
-      .build();
-    const result = await this.server.simulateTransaction(tx);
-    if (StellarRpc.Api.isSimulationError(result)) {
-      throw new Error(result.error);
-    }
-    return (result as StellarRpc.Api.SimulateTransactionSuccessResponse).result!.retval;
+    return simulateRead(this.server, this.contract, this.networkPassphrase, method, args);
   }
 
   // ── Read-only methods ──────────────────────────────────────────────────────
@@ -104,27 +93,56 @@ export class TokenClient {
   // are provided here to support typed integration layers; submitting the
   // transaction is the caller's responsibility using the Stellar SDK.
 
-  /** Parameters for `transfer(from, to, amount)`. */
+  /**
+   * Parameters for `transfer`.
+   *
+   * Mirrors `LpToken::transfer` — contracts/token/src/lib.rs:128
+   * `(from: Address, to: Address, amount: i128)`
+   */
   transferParams(from: string, to: string, amount: bigint): xdr.ScVal[] {
     return [addr(from), addr(to), i128(amount)];
   }
 
-  /** Parameters for `transfer_from(spender, from, to, amount)`. */
+  /**
+   * Parameters for `transfer_from`.
+   *
+   * Mirrors `LpToken::transfer_from` — contracts/token/src/lib.rs:138
+   * `(spender: Address, from: Address, to: Address, amount: i128)`
+   */
   transferFromParams(spender: string, from: string, to: string, amount: bigint): xdr.ScVal[] {
     return [addr(spender), addr(from), addr(to), i128(amount)];
   }
 
-  /** Parameters for `approve(from, spender, amount)`. */
+  /**
+   * Parameters for `approve`.
+   *
+   * Mirrors `LpToken::approve` — contracts/token/src/lib.rs:156
+   * `(from: Address, spender: Address, amount: i128)`
+   *
+   * This contract stores allowances without an expiry ledger, so — unlike the
+   * SEP-41 reference interface — it takes no `live_until_ledger` argument.
+   * Passing a 4th argument would be rejected for arity mismatch.
+   */
   approveParams(from: string, spender: string, amount: bigint): xdr.ScVal[] {
     return [addr(from), addr(spender), i128(amount)];
   }
 
-  /** Parameters for `mint(to, amount)` — admin only. */
+  /**
+   * Parameters for `mint` — admin only.
+   *
+   * Mirrors `LpToken::mint` — contracts/token/src/lib.rs:164
+   * `(to: Address, amount: i128)`
+   */
   mintParams(to: string, amount: bigint): xdr.ScVal[] {
     return [addr(to), i128(amount)];
   }
 
-  /** Parameters for `burn(from, amount)` — admin only. */
+  /**
+   * Parameters for `burn` — admin only.
+   *
+   * Mirrors `LpToken::burn` — contracts/token/src/lib.rs:179
+   * `(from: Address, amount: i128)`
+   */
   burnParams(from: string, amount: bigint): xdr.ScVal[] {
     return [addr(from), i128(amount)];
   }

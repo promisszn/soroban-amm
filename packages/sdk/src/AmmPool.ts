@@ -25,7 +25,9 @@ import type {
   LiquidityResult,
   FlashLoanParams,
 } from "./types.js";
-import { AmmErrors } from "./types.js";
+import { AmmErrors, AmmErrorNames } from "./types.js";
+import type { AmmErrorCode, AmmErrorKey } from "./types.js";
+import { simulateRead } from "./internal/simulate.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -37,12 +39,53 @@ function addr(address: string): xdr.ScVal {
   return nativeToScVal(Address.fromString(address));
 }
 
-function decodeError(err: unknown): Error {
+/**
+ * A contract-returned `AmmError`, decoded from the numeric discriminant Soroban
+ * reports. Carries the discriminant and its symbolic name so callers can branch
+ * on the specific failure rather than string-matching the message.
+ */
+export class AmmContractError extends Error {
+  /** Numeric discriminant, matching `AmmError` in contracts/amm/src/lib.rs. */
+  readonly code: AmmErrorCode;
+  /** Symbolic variant name, e.g. `"Paused"`. */
+  readonly name: AmmErrorKey;
+  /** Unmodified message reported by the RPC server. */
+  readonly rawMessage: string;
+
+  constructor(code: AmmErrorCode, rawMessage: string) {
+    super(`AMM error: ${AmmErrors[code]}`);
+    this.code = code;
+    this.name = AmmErrorNames[code];
+    this.rawMessage = rawMessage;
+  }
+}
+
+/**
+ * Matches the numeric-coded form Soroban RPC uses to report a contract-returned
+ * error, e.g. `Error(Contract, #6)`. Whitespace is tolerated because the exact
+ * spacing varies between RPC versions and SDK error wrappers.
+ */
+const CONTRACT_ERROR_PATTERN = /Error\s*\(\s*Contract\s*,\s*#(\d+)\s*\)/;
+
+/**
+ * Decode a simulation or RPC failure into a friendly, typed AMM error.
+ *
+ * Soroban reports contract errors as `Error(Contract, #N)` where `N` is the
+ * `AmmError` discriminant — never as descriptive English text, which is why the
+ * previous substring match against phrases like "contract is paused" could never
+ * fire. We parse the discriminant and look it up in {@link AmmErrors}, falling
+ * back to the raw message when no discriminant is present (host errors, network
+ * failures) or when the discriminant is one this SDK does not know.
+ */
+export function decodeError(err: unknown): Error {
   const msg = err instanceof Error ? err.message : String(err);
-  for (const [, text] of Object.entries(AmmErrors)) {
-    if (msg.toLowerCase().includes(text)) {
-      return new Error(`AMM error: ${text}`);
+  const match = CONTRACT_ERROR_PATTERN.exec(msg);
+  if (match) {
+    const code = Number(match[1]);
+    if (code in AmmErrors) {
+      return new AmmContractError(code as AmmErrorCode, msg);
     }
+    return new Error(`AMM error: unknown contract error #${code}: ${msg}`);
   }
   return new Error(`AMM error: ${msg}`);
 }
@@ -63,20 +106,14 @@ export class AmmPool {
   // ── Read-only helpers ──────────────────────────────────────────────────────
 
   private async simulate(method: string, ...args: xdr.ScVal[]): Promise<xdr.ScVal> {
-    const op = this.contract.call(method, ...args);
-    const tx = new (await import("@stellar/stellar-sdk")).TransactionBuilder(
-      await this.server.getAccount("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"),
-      { fee: "100", networkPassphrase: this.networkPassphrase }
-    )
-      .addOperation(op)
-      .setTimeout(30)
-      .build();
-    const result = await this.server.simulateTransaction(tx);
-    if (StellarRpc.Api.isSimulationError(result)) {
-      throw decodeError(new Error(result.error));
-    }
-    return (result as StellarRpc.Api.SimulateTransactionSuccessResponse)
-      .result!.retval;
+    return simulateRead(
+      this.server,
+      this.contract,
+      this.networkPassphrase,
+      method,
+      args,
+      decodeError
+    );
   }
 
   // ── Pool info ──────────────────────────────────────────────────────────────
