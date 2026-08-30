@@ -33,6 +33,8 @@
 
 extern crate std;
 
+pub mod cl;
+
 use proptest::prelude::*;
 use soroban_sdk::{
     testutils::Address as _,

@@ -10,3 +10,10 @@ crate-type = ["lib"]
 [dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 proptest = "1"
+
+[features]
+# Deployed-contract CL properties: `concentrated_liquidity.wasm` must exist
+# under target/wasm32v1-none/release (see the `fuzz-cl` Makefile target).
+# Without this feature `cargo test -p amm-fuzz` runs only the fast pure-math
+# and mirror properties, keeping the default runtime unchanged.
+cl = []

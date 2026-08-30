@@ -71,6 +71,25 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
         # Advisories can be ignored via .cargo/audit.toml.
 
+  fuzz:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+      - name: Add wasm target
+        run: rustup target add wasm32v1-none
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+      - name: Run the full amm-fuzz suite (incl. CL stateful properties)
+        run: make fuzz-cl
+
   go-sdk:
     runs-on: ubuntu-latest
     permissions:
