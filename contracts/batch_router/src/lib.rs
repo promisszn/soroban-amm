@@ -506,12 +506,13 @@ impl BatchRouter {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use factory::{Factory, FactoryClient};
     use soroban_sdk::{
-        testutils::{Address as _},
+        testutils::{Address as _, Events},
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
-        vec, Env,
+        vec, Env, TryFromVal,
     };
 
     fn setup_env_and_factory(env: &Env) -> Address {
@@ -562,18 +563,47 @@ mod tests {
     }
 
     fn deploy_cl_pool(
-        _env: &Env,
-        _factory_addr: &Address,
-        _admin: &Address,
-        _token_a: &Address,
-        _token_b: &Address,
+        env: &Env,
+        factory_addr: &Address,
+        admin: &Address,
+        token_a: &Address,
+        token_b: &Address,
     ) -> Address {
-        // For testing purposes, we use a mock CL pool address generated
-        // The actual tests would require deploying ConcentratedLiquidity contract
-        // which is complex. Instead, we rely on the factory's is_cl_pool validation.
-        Address::generate(_env)
-    }
+        let cl_addr = env.register_contract(None, concentrated_liquidity::ConcentratedLiquidity);
+        let cl = concentrated_liquidity::ConcentratedLiquidityClient::new(env, &cl_addr);
+        cl.initialize(admin, token_a, token_b, &30_i128, &0_i32, &10_i32);
 
+        let lp = Address::generate(env);
+        StellarAssetClient::new(env, token_a).mint(&lp, &100_000_000_i128);
+        StellarAssetClient::new(env, token_b).mint(&lp, &100_000_000_i128);
+        cl.mint_position(
+            &lp,
+            &-1_000_i32,
+            &1_000_i32,
+            &50_000_000_i128,
+            &50_000_000_i128,
+            &0_i128,
+            &0_i128,
+        );
+
+        // Register the pool with the factory so `is_cl_pool` finds it, without
+        // going through `create_cl_pool` (which requires a deployed wasm hash).
+        env.as_contract(factory_addr, || {
+            let count: u64 = env
+                .storage()
+                .instance()
+                .get(&factory::DataKey::ClPoolCount)
+                .unwrap_or(0);
+            env.storage()
+                .persistent()
+                .set(&factory::DataKey::ClPoolByIndex(count), &cl_addr);
+            env.storage()
+                .instance()
+                .set(&factory::DataKey::ClPoolCount, &(count + 1));
+        });
+
+        cl_addr
+    }
 
     #[test]
     fn test_batch_cl_swap_succeeds() {
@@ -946,12 +976,18 @@ mod tests {
                 token_in: ta.clone(),
                 amount_in: 10_000_i128,
                 min_out: 0_i128,
+                pool_kind: PoolType::Amm,
+                zero_for_one: false,
+                sqrt_price_limit_x96: 0_u128,
             }),
             BatchOp::Swap(SwapOp {
                 pool: pool.clone(),
                 token_in: tb.clone(),
                 amount_in: 5_000_i128,
                 min_out: 0_i128,
+                pool_kind: PoolType::Amm,
+                zero_for_one: false,
+                sqrt_price_limit_x96: 0_u128,
             }),
         ];
 
@@ -961,11 +997,15 @@ mod tests {
 
         // Read all events and find the batch_executed event
         let events = env.events().all();
-        let batch_executed_events: Vec<_> = events
+        let batch_executed_events: std::vec::Vec<_> = events
             .iter()
             .filter(|event| {
-                if let Ok((topic,)) = <(Symbol,)>::try_from_val(&env, &event.topics) {
-                    topic == Symbol::new(&env, "batch_executed")
+                if let Some(topic_val) = event.1.get(0) {
+                    if let Ok(topic) = Symbol::try_from_val(&env, &topic_val) {
+                        topic == Symbol::new(&env, "batch_executed")
+                    } else {
+                        false
+                    }
                 } else {
                     false
                 }
@@ -979,8 +1019,8 @@ mod tests {
 
         // Last event should be batch_executed with version prefix
         let event = batch_executed_events.last().unwrap();
-        let (version, ops_len): (u32, u32) =
-            event.data.try_into_val(&env).expect("must decode as (u32, u32)");
+        let (version, (ops_len,)): (u32, (u32,)) =
+            <(u32, (u32,))>::try_from_val(&env, &event.2).expect("must decode as (u32, (u32,))");
         assert_eq!(
             version,
             soroban_amm_sdk::EVENT_SCHEMA_VERSION,

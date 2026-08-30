@@ -211,6 +211,9 @@ Defined in [contracts/dex_aggregator/src/lib.rs](../contracts/dex_aggregator/src
 |------|--------|-------|--------|
 | 1 | `NoRouteFound` | No valid liquidity route connects `token_in` and `token_out` across registered pools. | Provide connected intermediate pools or update route path. |
 | 2 | `SlippageExceeded` | Total output across aggregated swap steps fell below `min_amount_out`. | Widen slippage tolerance or update quote before submitting. |
+| 3 | `UnregisteredPool` | A route hop references a pool that is not registered with the factory. | Only route through pools registered via the factory. |
+| 4 | `InvalidMaxHops` | `set_max_hops` called with `0`. | Pass a positive hop count. |
+| 5 | `TooManyRoutingTokens` | `set_routing_tokens` called with more than `MAX_ROUTING_TOKENS` addresses. | Reduce the routing token list size. |
 
 ---
 

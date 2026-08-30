@@ -159,12 +159,7 @@ impl TwapConsumer {
     }
 
     /// Returns a paginated slice of snapshot timestamps for `pool`.
-    pub fn list_snapshot_timestamps(
-        env: Env,
-        pool: Address,
-        offset: u32,
-        limit: u32,
-    ) -> Vec<u64> {
+    pub fn list_snapshot_timestamps(env: Env, pool: Address, offset: u32, limit: u32) -> Vec<u64> {
         let timestamps: Vec<u64> = env
             .storage()
             .persistent()
@@ -654,6 +649,7 @@ use mock_cl_pool::MockClPool;
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
 
     use amm::{AmmPool, AmmPoolClient};
@@ -673,6 +669,58 @@ mod tests {
             StellarTokenClient::new(env, &contract.address()),
             StellarAssetClient::new(env, &contract.address()),
         )
+    }
+
+    /// Deploys an `AmmPool`, seeds it with `reserve_a`/`reserve_b` liquidity,
+    /// deploys a `TwapConsumer`, and saves an initial snapshot. Returns the
+    /// pool address and a client for the consumer.
+    fn setup_pool_and_consumer<'a>(
+        env: &'a Env,
+        admin: &Address,
+        reserve_a: i128,
+        reserve_b: i128,
+    ) -> (Address, TwapConsumerClient<'a>) {
+        let amm_addr = env.register_contract(None, AmmPool);
+        let lp_addr = env.register_contract(None, LpToken);
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+
+        token::LpTokenClient::new(env, &lp_addr).initialize(
+            &amm_addr,
+            &soroban_sdk::String::from_str(env, "AMM LP Token"),
+            &soroban_sdk::String::from_str(env, "ALP"),
+            &7u32,
+        );
+
+        let (ta, ta_sac) = create_sac(env, admin);
+        let (tb, tb_sac) = create_sac(env, admin);
+
+        let amm = AmmPoolClient::new(env, &amm_addr);
+        amm.initialize(
+            admin,
+            &ta.address,
+            &tb.address,
+            &lp_addr,
+            &30_i128,
+            admin,
+            &0_i128,
+        );
+
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &reserve_a);
+        tb_sac.mint(&provider, &reserve_b);
+        amm.add_liquidity(
+            &provider,
+            &reserve_a,
+            &reserve_b,
+            &0_i128,
+            &(env.ledger().timestamp() + 10_000),
+        );
+
+        let consumer = TwapConsumerClient::new(env, &consumer_addr);
+        consumer.initialize(admin);
+        consumer.save_snapshot(&amm_addr);
+
+        (amm_addr, consumer)
     }
 
     #[test]
@@ -1356,7 +1404,10 @@ mod tests {
         let consumer = TwapConsumerClient::new(&env, &consumer_addr);
 
         let default_policy = consumer.get_retention_policy();
-        assert_eq!(default_policy.max_age_seconds, TwapConsumer::DEFAULT_MAX_AGE_SECONDS);
+        assert_eq!(
+            default_policy.max_age_seconds,
+            TwapConsumer::DEFAULT_MAX_AGE_SECONDS
+        );
         assert_eq!(default_policy.max_snapshots_per_pool, 0);
     }
 
@@ -1425,7 +1476,8 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
-        let (pool, consumer) = setup_pool_and_consumer(&env, &admin, 2_000_000_i128, 2_000_000_i128);
+        let (pool, consumer) =
+            setup_pool_and_consumer(&env, &admin, 2_000_000_i128, 2_000_000_i128);
 
         assert_eq!(consumer.get_snapshot_count(&pool), 1);
 
@@ -1461,7 +1513,8 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
-        let (pool, consumer) = setup_pool_and_consumer(&env, &admin, 2_000_000_i128, 2_000_000_i128);
+        let (pool, consumer) =
+            setup_pool_and_consumer(&env, &admin, 2_000_000_i128, 2_000_000_i128);
 
         env.ledger().set_timestamp(10_000);
         consumer.save_snapshot(&pool);
@@ -1529,11 +1582,18 @@ mod tests {
         env.ledger().set_timestamp(110_000);
 
         let removed = consumer.prune_snapshots(&pool, &10);
-        assert_eq!(removed, 1, "Exactly 1 snapshot on the boundary should be pruned");
+        assert_eq!(
+            removed, 1,
+            "Exactly 1 snapshot on the boundary should be pruned"
+        );
 
         let remaining = consumer.list_snapshot_timestamps(&pool, &0, &10);
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining.get(0).unwrap(), 10_001, "Snapshot inside retention window must remain");
+        assert_eq!(
+            remaining.get(0).unwrap(),
+            10_001,
+            "Snapshot inside retention window must remain"
+        );
     }
 
     #[test]
@@ -1657,14 +1717,14 @@ mod tests {
                 .persistent()
                 .set(&DataKey::TrackedPoolsPersistent, &tracked);
 
-            let mut ts1 = Vec::new(&env);
+            let mut ts1: Vec<u64> = Vec::new(&env);
             ts1.push_back(100);
             ts1.push_back(200);
             env.storage()
                 .persistent()
                 .set(&DataKey::SnapshotTimestamps(pool1.clone()), &ts1);
 
-            let mut ts2 = Vec::new(&env);
+            let mut ts2: Vec<u64> = Vec::new(&env);
             ts2.push_back(100);
             ts2.push_back(200);
             ts2.push_back(300);
@@ -1690,7 +1750,8 @@ mod tests {
         env.ledger().set_timestamp(10_000);
 
         let admin = Address::generate(&env);
-        let (pool, consumer) = setup_pool_and_consumer(&env, &admin, 2_000_000_i128, 2_000_000_i128);
+        let (pool, consumer) =
+            setup_pool_and_consumer(&env, &admin, 2_000_000_i128, 2_000_000_i128);
 
         // Retention policy: cap 2 snapshots per pool
         let policy = RetentionPolicy {
@@ -1739,7 +1800,8 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
-        let (pool, consumer) = setup_pool_and_consumer(&env, &admin, 2_000_000_i128, 2_000_000_i128);
+        let (pool, consumer) =
+            setup_pool_and_consumer(&env, &admin, 2_000_000_i128, 2_000_000_i128);
 
         let policy = RetentionPolicy {
             max_age_seconds: 100_000,
@@ -1758,15 +1820,20 @@ mod tests {
         // Snapshots: 0, 10_000 are pruned. 20_000 remains (age 95_000).
         assert_eq!(removed, 2);
 
-        // Interleave new write
-        env.ledger().set_timestamp(120_000);
+        // Interleave new write, just short of the 20_000 snapshot's age
+        // crossing the retention boundary so opportunistic amortized
+        // pruning inside save_snapshot does not also remove it here.
+        env.ledger().set_timestamp(119_999);
         consumer.save_snapshot(&pool);
 
         let timestamps = consumer.list_snapshot_timestamps(&pool, &0, &10);
         assert_eq!(timestamps.len(), 2);
         assert_eq!(timestamps.get(0).unwrap(), 20_000);
-        assert_eq!(timestamps.get(1).unwrap(), 120_000);
-        assert!(timestamps.get(0).unwrap() < timestamps.get(1).unwrap(), "Index must remain sorted");
+        assert_eq!(timestamps.get(1).unwrap(), 119_999);
+        assert!(
+            timestamps.get(0).unwrap() < timestamps.get(1).unwrap(),
+            "Index must remain sorted"
+        );
     }
 
     #[test]
@@ -1774,7 +1841,25 @@ mod tests {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
-        let (pool, consumer) = setup_pool_and_consumer(&env, &admin, 2_000_000_i128, 2_000_000_i128);
+        let (pool, consumer) =
+            setup_pool_and_consumer(&env, &admin, 2_000_000_i128, 2_000_000_i128);
+        let amm = AmmPoolClient::new(&env, &pool);
+
+        // Save a snapshot in the recent window at ts=110_000, before tightening
+        // the retention policy, so opportunistic amortized pruning inside this
+        // call (still under the generous default policy) doesn't already
+        // remove the ts=0 snapshot ahead of the explicit prune below.
+        //
+        // A tiny swap checkpoints the AMM's TWAP accumulator at this
+        // timestamp — without any reserve-mutating call, the pool's
+        // cumulative-price timestamp stays frozen at ts=0 and the later TWAP
+        // read below would see zero elapsed time.
+        env.ledger().set_timestamp(110_000);
+        let info = amm.get_info();
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &info.token_a).mint(&trader, &1_000_i128);
+        amm.swap(&trader, &info.token_a, &1_000_i128, &0_i128, &110_000_u64);
+        consumer.save_snapshot(&pool);
 
         let policy = RetentionPolicy {
             max_age_seconds: 100_000,
@@ -1782,22 +1867,39 @@ mod tests {
         };
         consumer.set_retention_policy(&admin, &policy);
 
-        // Save a snapshot in the recent window at ts=110_000
-        env.ledger().set_timestamp(110_000);
-        consumer.save_snapshot(&pool);
-
         // Advance to 110_060 and prune old snapshot at ts=0
         env.ledger().set_timestamp(110_060);
         let removed = consumer.prune_snapshots(&pool, &10);
         assert_eq!(removed, 1);
 
-        // TWAP read over recent window (60s) still succeeds against ts=110_000 snapshot
+        // Another tiny checkpointing swap so the AMM's live cumulative-price
+        // timestamp advances past the surviving ts=110_000 snapshot;
+        // otherwise the read below would see zero elapsed time between the
+        // floor snapshot and "now".
+        StellarAssetClient::new(&env, &info.token_a).mint(&trader, &1_000_i128);
+        amm.swap(&trader, &info.token_a, &1_000_i128, &0_i128, &110_060_u64);
+
+        // TWAP read over recent window (60s) still succeeds against the
+        // surviving ts=110_000 snapshot; the tiny swaps barely move the
+        // price off its initial 1:1 ratio.
         let twap = consumer.get_twap_price(&pool, &60_u64);
-        assert_eq!(twap, 1_000_000);
+        assert!(
+            (999_000..=1_001_000).contains(&twap),
+            "twap {} out of expected range",
+            twap
+        );
 
         let (twap_a, twap_b) = consumer.get_twap_both(&pool, &60_u64);
-        assert_eq!(twap_a, 1_000_000);
-        assert_eq!(twap_b, 1_000_000);
+        assert!(
+            (999_000..=1_001_000).contains(&twap_a),
+            "twap_a {} out of expected range",
+            twap_a
+        );
+        assert!(
+            (999_000..=1_001_000).contains(&twap_b),
+            "twap_b {} out of expected range",
+            twap_b
+        );
     }
 
     #[test]

@@ -40,8 +40,8 @@ test: build ## Build, then run the default-members test suite
 test-all: ## Run tests for the whole workspace, bypassing default-members
 	cargo test --workspace
 
-fuzz-cl: ## Build the CL wasm, then run the full amm-fuzz suite incl. CL stateful properties
-	cargo build --release --target wasm32v1-none -p concentrated_liquidity
+fuzz-cl: ## Build the wasm deps amm-fuzz imports, then run the full amm-fuzz suite incl. CL stateful properties
+	cargo build --release --target wasm32v1-none -p concentrated_liquidity -p amm -p token
 	cargo test -p amm-fuzz --features cl
 
 fmt: ## cargo fmt --all

@@ -2568,7 +2568,10 @@ impl AmmPool {
         if fee_bps >= 10_000 {
             return Ok(0);
         }
-        Ok((reserve_in * amount_out * 10_000) / ((reserve_out - amount_out) * (10_000 - fee_bps)) + 1)
+        Ok(
+            (reserve_in * amount_out * 10_000) / ((reserve_out - amount_out) * (10_000 - fee_bps))
+                + 1,
+        )
     }
 
     /// Return the current swap fee in basis points.
