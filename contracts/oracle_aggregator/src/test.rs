@@ -1,8 +1,8 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger, LedgerInfo},
-    Address, Env,
+    testutils::{Address as _, Events, Ledger, LedgerInfo},
+    Address, Env, IntoVal,
 };
 
 use super::*;
@@ -102,6 +102,8 @@ fn set_now(env: &Env, ts: u64) {
     });
 }
 
+// ── Existing tests (updated for weight parameter and summed confidence) ─────
+
 #[test]
 fn initialize_seeds_admin_and_staleness() {
     let env = Env::default();
@@ -126,13 +128,15 @@ fn register_source_appends_to_registry() {
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 110);
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap);
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::External);
+        .register_source(&h.admin, &s2, &OracleSourceType::External, &10_000);
     let sources = h.aggregator.list_sources();
     assert_eq!(sources.len(), 2);
     assert_eq!(sources.get_unchecked(0).source_contract, s1);
+    assert_eq!(sources.get_unchecked(0).weight, 10_000);
     assert_eq!(sources.get_unchecked(1).source_contract, s2);
+    assert_eq!(sources.get_unchecked(1).weight, 10_000);
 }
 
 #[test]
@@ -142,9 +146,9 @@ fn register_source_rejects_duplicates() {
     let h = deploy(&env, 600);
     let s1 = deploy_source(&env, 100);
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap);
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap);
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
 }
 
 #[test]
@@ -154,9 +158,9 @@ fn remove_source_drops_the_entry() {
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 110);
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap);
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::External);
+        .register_source(&h.admin, &s2, &OracleSourceType::External, &10_000);
     h.aggregator.remove_source(&h.admin, &s1);
     let sources = h.aggregator.list_sources();
     assert_eq!(sources.len(), 1);
@@ -180,18 +184,19 @@ fn get_price_returns_median_of_three_sources() {
     let s2 = deploy_source(&env, 110);
     let s3 = deploy_source(&env, 150);
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap);
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap);
+        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &s3, &OracleSourceType::External);
+        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
     // These prices span 50%; widen the band so this stays a pure median test.
     h.aggregator.set_max_deviation_bps(&h.admin, &5_000);
     set_now(&env, 1_000);
 
     let result = h.aggregator.get_price(&h.token_a, &h.token_b);
     assert_eq!(result.price, 110);
-    assert_eq!(result.confidence, 3);
+    // Confidence is summed weight: 3 × 10_000 = 30_000.
+    assert_eq!(result.confidence, 30_000);
 }
 
 #[test]
@@ -201,70 +206,61 @@ fn get_price_returns_two_way_median_average() {
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 200);
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap);
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::External);
+        .register_source(&h.admin, &s2, &OracleSourceType::External, &10_000);
     // 100 vs 200 straddle the median by 33%; widen the band so both count.
     h.aggregator.set_max_deviation_bps(&h.admin, &5_000);
     set_now(&env, 1_000);
     let result = h.aggregator.get_price(&h.token_a, &h.token_b);
     assert_eq!(result.price, 150);
-    assert_eq!(result.confidence, 2);
+    assert_eq!(result.confidence, 20_000);
 }
 
 #[test]
 fn get_price_two_way_median_does_not_overflow_on_large_prices() {
     let env = Env::default();
     let h = deploy(&env, 600);
-    // Two individually-valid prices whose sum exceeds i128::MAX. The old
-    // `(lo + hi) / 2` midpoint would overflow here (panic in debug, wrap in
-    // release); `lo + (hi - lo) / 2` stays in range.
     let hi = i128::MAX;
     let lo = i128::MAX - 2;
     let s1 = deploy_source(&env, hi);
     let s2 = deploy_source(&env, lo);
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap);
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::External);
+        .register_source(&h.admin, &s2, &OracleSourceType::External, &10_000);
     set_now(&env, 1_000);
     let result = h.aggregator.get_price(&h.token_a, &h.token_b);
     assert_eq!(result.price, i128::MAX - 1);
-    assert_eq!(result.confidence, 2);
+    assert_eq!(result.confidence, 20_000);
 }
 
 #[test]
 fn stale_source_excluded_after_window() {
     let env = Env::default();
-    // Use max_staleness=600 so the 200s advance doesn't expire s1 or s3.
     let h = deploy(&env, 600);
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 110);
     let s3 = deploy_source(&env, 150);
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap);
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap);
+        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &s3, &OracleSourceType::External);
-    // Prices span 50%; widen the band so this stays a pure staleness test.
+        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
     h.aggregator.set_max_deviation_bps(&h.admin, &5_000);
 
     set_now(&env, 1_000);
     h.aggregator.get_price(&h.token_a, &h.token_b);
 
-    // Source-2 stops reporting (price goes to 0 → not counted).
     let s2_client = MockAdapterClient::new(&env, &s2);
     s2_client.set_price(&0);
 
-    // Advance the clock; s1 and s3 last reported at t=1000, 200s ago, still within 600s window.
     set_now(&env, 1_000 + 200);
 
     let result = h.aggregator.get_price(&h.token_a, &h.token_b);
-    // s2 excluded (price=0 → not counted); s1 + s3 remain.
-    // Median of (100, 150) = 125.
     assert_eq!(result.price, 125);
-    assert_eq!(result.confidence, 2);
+    assert_eq!(result.confidence, 20_000);
 }
 
 #[test]
@@ -274,7 +270,7 @@ fn single_source_below_min_panics() {
     let h = deploy(&env, 600);
     let s1 = deploy_source(&env, 100);
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap);
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
     set_now(&env, 1_000);
     h.aggregator.get_price(&h.token_a, &h.token_b);
 }
@@ -312,31 +308,27 @@ fn register_source_rejects_non_admin() {
     let attacker = Address::generate(&env);
     let s1 = deploy_source(&env, 100);
     h.aggregator
-        .register_source(&attacker, &s1, &OracleSourceType::AmmTwap);
+        .register_source(&attacker, &s1, &OracleSourceType::AmmTwap, &10_000);
 }
 
 #[test]
 fn stale_src_event_emitted_when_sources_skipped() {
-    use soroban_sdk::testutils::Events as _;
-    use soroban_sdk::IntoVal;
-
     let env = Env::default();
     let h = deploy(&env, 60);
 
-    let s1 = deploy_source(&env, 100); // healthy
-    let s2 = deploy_source(&env, 0); // price=0 → skipped
-    let s3 = deploy_source(&env, 0); // price=0 → skipped
+    let s1 = deploy_source(&env, 100);
+    let s2 = deploy_source(&env, 0);
+    let s3 = deploy_source(&env, 0);
 
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap);
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap);
+        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &s3, &OracleSourceType::External);
+        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
 
     set_now(&env, 1_000);
 
-    // get_price_safe won't panic even though only 1 source is valid.
     h.aggregator.get_price_safe(&h.token_a, &h.token_b);
 
     let events = env.events().all();
@@ -349,7 +341,6 @@ fn stale_src_event_emitted_when_sources_skipped() {
         .find(|e| e.0 == agg_id && e.1 == expected_topics)
         .expect("stale_src event must be emitted when sources are skipped");
 
-    // Data is a tuple wrapping a Vec<Address> of the two skipped sources.
     let (stale_addrs,): (soroban_sdk::Vec<Address>,) = stale_event.2.into_val(&env);
     assert_eq!(stale_addrs.len(), 2);
     assert!(stale_addrs.contains(&s2));
@@ -401,32 +392,26 @@ fn set_max_deviation_bps_rejects_non_admin() {
     h.aggregator.set_max_deviation_bps(&attacker, &250);
 }
 
-/// A source deviating far outside the band is dropped: it does not count
-/// toward confidence and does not move the reported median.
 #[test]
 fn deviating_source_excluded_from_confidence_and_price() {
     let env = Env::default();
     let h = deploy(&env, 600);
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 102);
-    let s3 = deploy_source(&env, 300); // ~194% above the median → out of band
+    let s3 = deploy_source(&env, 300);
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap);
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap);
+        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &s3, &OracleSourceType::External);
+        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
     set_now(&env, 1_000);
 
     let result = h.aggregator.get_price(&h.token_a, &h.token_b);
-    // Only s1 and s2 agree: median(100, 102) = 101, confidence 2 (not 3).
     assert_eq!(result.price, 101);
-    assert_eq!(result.confidence, 2);
+    assert_eq!(result.confidence, 20_000);
 }
 
-/// The two-source manipulation from the issue: with exactly MIN_VALID_SOURCES
-/// sources that disagree, neither sits within the band of their (mean) median,
-/// so no confident price is produced.
 #[test]
 fn two_disagreeing_sources_report_no_confidence() {
     let env = Env::default();
@@ -434,12 +419,11 @@ fn two_disagreeing_sources_report_no_confidence() {
     let honest = deploy_source(&env, 100);
     let attacker = deploy_source(&env, 200);
     h.aggregator
-        .register_source(&h.admin, &honest, &OracleSourceType::AmmTwap);
+        .register_source(&h.admin, &honest, &OracleSourceType::AmmTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &attacker, &OracleSourceType::External);
+        .register_source(&h.admin, &attacker, &OracleSourceType::External, &10_000);
     set_now(&env, 1_000);
 
-    // Neither source is within 5% of the median (150) → zero confidence.
     let safe = h.aggregator.get_price_safe(&h.token_a, &h.token_b);
     assert_eq!(safe.confidence, 0);
     assert_eq!(safe.price, 0);
@@ -453,59 +437,51 @@ fn two_disagreeing_sources_panic_on_get_price() {
     let honest = deploy_source(&env, 100);
     let attacker = deploy_source(&env, 200);
     h.aggregator
-        .register_source(&h.admin, &honest, &OracleSourceType::AmmTwap);
+        .register_source(&h.admin, &honest, &OracleSourceType::AmmTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &attacker, &OracleSourceType::External);
+        .register_source(&h.admin, &attacker, &OracleSourceType::External, &10_000);
     set_now(&env, 1_000);
     h.aggregator.get_price(&h.token_a, &h.token_b);
 }
 
-/// Widening the band lets a previously-deviant source count again, confirming
-/// the band is genuinely configurable.
 #[test]
 fn widening_band_admits_previously_deviant_source() {
     let env = Env::default();
     let h = deploy(&env, 600);
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 102);
-    let s3 = deploy_source(&env, 150); // ~47% above the median → out of the 5% band
+    let s3 = deploy_source(&env, 150);
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap);
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap);
+        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &s3, &OracleSourceType::External);
+        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
 
-    // Under the default band, s3 is dropped: median(100, 102) = 101, conf 2.
     set_now(&env, 1_000);
     let tight = h.aggregator.get_price(&h.token_a, &h.token_b);
     assert_eq!(tight.price, 101);
-    assert_eq!(tight.confidence, 2);
+    assert_eq!(tight.confidence, 20_000);
 
-    // Widen the band to 50%; s3 now agrees: median(100, 102, 150) = 102, conf 3.
     h.aggregator.set_max_deviation_bps(&h.admin, &5_000);
     let wide = h.aggregator.get_price(&h.token_a, &h.token_b);
     assert_eq!(wide.price, 102);
-    assert_eq!(wide.confidence, 3);
+    assert_eq!(wide.confidence, 30_000);
 }
 
-/// A `deviant` event names each out-of-band source that was dropped.
 #[test]
 fn deviant_event_lists_out_of_band_sources() {
-    use soroban_sdk::testutils::Events as _;
-    use soroban_sdk::IntoVal;
-
     let env = Env::default();
     let h = deploy(&env, 600);
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 102);
-    let s3 = deploy_source(&env, 300); // out of band
+    let s3 = deploy_source(&env, 300);
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap);
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap);
+        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &s3, &OracleSourceType::External);
+        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
     set_now(&env, 1_000);
 
     h.aggregator.get_price_safe(&h.token_a, &h.token_b);
@@ -534,17 +510,310 @@ fn panicking_source_is_skipped_and_does_not_abort_aggregation() {
     let panicker = deploy_panicking_source(&env);
 
     h.aggregator
-        .register_source(&h.admin, &honest1, &OracleSourceType::AmmTwap);
+        .register_source(&h.admin, &honest1, &OracleSourceType::AmmTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &honest2, &OracleSourceType::ClTwap);
+        .register_source(&h.admin, &honest2, &OracleSourceType::ClTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &panicker, &OracleSourceType::External);
+        .register_source(&h.admin, &panicker, &OracleSourceType::External, &10_000);
 
     set_now(&env, 1_000);
 
-    // Panicking source shouldn't bring down the aggregation.
-    // Median of (100, 102) is 101, confidence is 2.
     let result = h.aggregator.get_price(&h.token_a, &h.token_b);
     assert_eq!(result.price, 101);
-    assert_eq!(result.confidence, 2);
+    assert_eq!(result.confidence, 20_000);
+}
+
+// ── Weighted-median tests (#689) ────────────────────────────────────────────
+
+/// With all weights equal, the weighted median must return the same price
+/// as the unweighted implementation.
+#[test]
+fn equal_weight_weighted_matches_unweighted() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let s1 = deploy_source(&env, 100);
+    let s2 = deploy_source(&env, 110);
+    let s3 = deploy_source(&env, 150);
+    h.aggregator
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
+    h.aggregator
+        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator
+        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
+    h.aggregator.set_max_deviation_bps(&h.admin, &5_000);
+    set_now(&env, 1_000);
+
+    let result = h.aggregator.get_price(&h.token_a, &h.token_b);
+    // Unweighted median of [100, 110, 150] = 110.
+    // Weighted median with all weights 10_000: sorted [(100,10k), (110,10k), (150,10k)].
+    // Total = 30k, half = 15k. 100 → acc=10k <=15k. 110 → acc=20k > 15k → 110. ✓
+    assert_eq!(result.price, 110);
+    assert_eq!(result.confidence, 30_000);
+}
+
+/// A source with 3× weight moves the weighted median toward its quote.
+/// Fixture: prices [100, 110, 120], weights [10_000, 10_000, 30_000].
+/// Equal-weight median = 110. Weighted median: total=50k, half=25k.
+/// 100→10k, 110→20k, 120→50k > 25k → 120.
+#[test]
+fn heavy_source_moves_result_toward_its_quote() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let s1 = deploy_source(&env, 100);
+    let s2 = deploy_source(&env, 110);
+    let s3 = deploy_source(&env, 120);
+    h.aggregator
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
+    h.aggregator
+        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator
+        .register_source(&h.admin, &s3, &OracleSourceType::External, &30_000);
+    h.aggregator.set_max_deviation_bps(&h.admin, &5_000);
+    set_now(&env, 1_000);
+
+    let result = h.aggregator.get_price(&h.token_a, &h.token_b);
+    // Weighted median = 120, pulled toward the heavy source.
+    assert_eq!(result.price, 120);
+    assert_eq!(result.confidence, 50_000);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn register_source_rejects_zero_weight() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let s1 = deploy_source(&env, 100);
+    h.aggregator
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn register_source_rejects_weight_above_ceiling() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let s1 = deploy_source(&env, 100);
+    h.aggregator.register_source(
+        &h.admin,
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &(MAX_SOURCE_WEIGHT + 1),
+    );
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn set_source_weight_rejects_zero() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let s1 = deploy_source(&env, 100);
+    h.aggregator
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
+    h.aggregator.set_source_weight(&h.admin, &s1, &0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #9)")]
+fn set_source_weight_rejects_above_ceiling() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let s1 = deploy_source(&env, 100);
+    h.aggregator
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
+    h.aggregator
+        .set_source_weight(&h.admin, &s1, &(MAX_SOURCE_WEIGHT + 1));
+}
+
+/// When agreeing sources sum to less than MIN_AGREEING_WEIGHT, return {0, 0}.
+#[test]
+fn insufficient_agreeing_weight_returns_zero() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let s1 = deploy_source(&env, 100);
+    let s2 = deploy_source(&env, 102);
+    // Each source has weight 5_000; total = 10_000 < MIN_AGREEING_WEIGHT (20_000).
+    h.aggregator
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &5_000);
+    h.aggregator
+        .register_source(&h.admin, &s2, &OracleSourceType::External, &5_000);
+    set_now(&env, 1_000);
+
+    let result = h.aggregator.get_price_safe(&h.token_a, &h.token_b);
+    assert_eq!(result.price, 0);
+    assert_eq!(result.confidence, 0);
+}
+
+/// A heavy outlier is still classified deviant because the reference median
+/// used for the deviation band remains unweighted.
+#[test]
+fn heavy_outlier_still_deviants_despite_weight() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let s1 = deploy_source(&env, 100);
+    let s2 = deploy_source(&env, 102);
+    // Heavy source at 300 — even with 5× weight, reference median is unweighted.
+    let s3 = deploy_source(&env, 300);
+    h.aggregator
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
+    h.aggregator
+        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator
+        .register_source(&h.admin, &s3, &OracleSourceType::External, &50_000);
+    set_now(&env, 1_000);
+
+    let result = h.aggregator.get_price(&h.token_a, &h.token_b);
+    // Unweighted reference median = 102. 300 is ~194% above → deviant.
+    // Agreeing: (100, 10_000) and (102, 10_000). Weighted median = 101.
+    assert_eq!(result.price, 101);
+    assert_eq!(result.confidence, 20_000);
+}
+
+/// get_price_detailed accounts for every registered source exactly once.
+#[test]
+fn get_price_detailed_accounts_all_sources() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let s1 = deploy_source(&env, 100);
+    let s2 = deploy_source(&env, 102);
+    let s3 = deploy_source(&env, 300);
+    h.aggregator
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
+    h.aggregator
+        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator
+        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
+    set_now(&env, 1_000);
+
+    let (price, source_quotes) = h.aggregator.get_price_detailed(&h.token_a, &h.token_b);
+
+    // All 3 sources accounted for.
+    assert_eq!(source_quotes.len(), 3);
+    assert_eq!(price.price, 101);
+    assert_eq!(price.confidence, 20_000);
+
+    // Exactly two Agreed, one Deviant.
+    let mut agreed_count: u32 = 0;
+    let mut deviant_count: u32 = 0;
+    for i in 0..source_quotes.len() {
+        let sq = source_quotes.get_unchecked(i);
+        match sq.status {
+            QuoteStatus::Agreed => agreed_count += 1,
+            QuoteStatus::Deviant => {
+                deviant_count += 1;
+                assert_eq!(sq.source, s3);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(agreed_count, 2);
+    assert_eq!(deviant_count, 1);
+}
+
+/// The Agreed subset of get_price_detailed reproduces get_price_safe.
+#[test]
+fn get_price_detailed_agreed_matches_get_price_safe() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let s1 = deploy_source(&env, 100);
+    let s2 = deploy_source(&env, 102);
+    let s3 = deploy_source(&env, 150);
+    h.aggregator
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
+    h.aggregator
+        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator
+        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
+    set_now(&env, 1_000);
+
+    let safe = h.aggregator.get_price_safe(&h.token_a, &h.token_b);
+    let (detailed_price, _) = h.aggregator.get_price_detailed(&h.token_a, &h.token_b);
+
+    assert_eq!(safe.price, detailed_price.price);
+    assert_eq!(safe.confidence, detailed_price.confidence);
+}
+
+/// get_price_spread_bps computes the spread between highest and lowest
+/// agreeing quote.
+#[test]
+fn get_price_spread_bps_computes_correctly() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let s1 = deploy_source(&env, 100);
+    let s2 = deploy_source(&env, 110);
+    let s3 = deploy_source(&env, 300); // deviant
+    h.aggregator
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
+    h.aggregator
+        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator
+        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
+    // Widen the band so 100 and 110 agree (100 is ~9% from the reference
+    // median 110, needs > 500 bps to pass the default band).
+    h.aggregator.set_max_deviation_bps(&h.admin, &5_000);
+    set_now(&env, 1_000);
+
+    let spread = h.aggregator.get_price_spread_bps(&h.token_a, &h.token_b);
+    // Agreeing: 100, 110. Spread = (110-100)*10_000/100 = 1_000 bps = 10%.
+    assert_eq!(spread, 1_000);
+}
+
+/// Pre-existing source records without a weight (weight == 0) are backfilled
+/// to DEFAULT_SOURCE_WEIGHT by migrate_sources.
+#[test]
+fn migration_backfills_default_weight() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let s1 = deploy_source(&env, 100);
+    let s2 = deploy_source(&env, 110);
+
+    // Register sources with explicit weight.
+    h.aggregator
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
+    h.aggregator
+        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &20_000);
+
+    // Simulate a pre-upgrade record with weight=0 by manually overwriting
+    // the stored sources vector via env.as_contract.
+    let mut sources = h.aggregator.list_sources();
+    let mut src1 = sources.get_unchecked(0);
+    src1.weight = 0;
+    sources.set(0, src1);
+    let agg_id = h.aggregator.address.clone();
+    env.as_contract(&agg_id, || {
+        env.storage().instance().set(&DataKey::Sources, &sources);
+    });
+
+    // migrate_sources should backfill weight=0 → DEFAULT_SOURCE_WEIGHT.
+    h.aggregator.migrate_sources(&h.admin);
+
+    let migrated = h.aggregator.list_sources();
+    assert_eq!(migrated.get_unchecked(0).weight, DEFAULT_SOURCE_WEIGHT);
+    // s2's weight should be unchanged.
+    assert_eq!(migrated.get_unchecked(1).weight, 20_000);
+}
+
+/// set_source_weight emits a src_wt event with old and new weight.
+#[test]
+fn set_source_weight_emits_event() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let s1 = deploy_source(&env, 100);
+    h.aggregator
+        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
+
+    h.aggregator.set_source_weight(&h.admin, &s1, &25_000);
+
+    let events = env.events().all();
+    let agg_id = h.aggregator.address.clone();
+    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
+        (symbol_short!("src_wt"),).into_val(&env);
+    let wt_event = events
+        .iter()
+        .find(|e| e.0 == agg_id && e.1 == expected_topics)
+        .expect("src_wt event must be emitted");
+
+    let (src_addr, old_w, new_w): (Address, u32, u32) = wt_event.2.into_val(&env);
+    assert_eq!(src_addr, s1);
+    assert_eq!(old_w, 10_000);
+    assert_eq!(new_w, 25_000);
 }

@@ -28,6 +28,28 @@ Use the numeric code when parsing RPC responses or writing off-chain tooling.
 
 (TODO)
 
+## Oracle Aggregator (`contracts/oracle_aggregator`)
+
+Defined in [contracts/oracle_aggregator/src/lib.rs](../contracts/oracle_aggregator/src/lib.rs) as `OracleError`.
+
+| Code | Symbol | Cause | Remedy |
+|------|--------|-------|--------|
+| 1 | `AlreadyInitialized` | `initialize` was called on an already-initialized aggregator. | Deploy a new aggregator contract. |
+| 2 | `NotInitialized` | A function was called before `initialize`. | Call `initialize` first. |
+| 3 | `NotAdmin` | The caller did not match the stored admin address. | Use the correct admin keypair. |
+| 4 | `SourceAlreadyRegistered` | `register_source` was called with an address already in the registry. | Remove and re-register, or use a different address. |
+| 5 | `SourceNotFound` | `remove_source` or `set_source_weight` referenced an unknown address. | Check `list_sources()` for registered addresses. |
+| 6 | `InsufficientSources` | Fewer than `MIN_VALID_SOURCES` fresh, agreeing sources were available, or `get_price` was called with insufficient confidence. | Register more sources or widen the deviation band. |
+| 7 | `InvalidStaleness` | `max_staleness_seconds` was zero. | Use a positive value. |
+| 8 | `InvalidDeviation` | `max_deviation_bps` was zero or exceeded `BPS_DENOMINATOR` (10 000). | Use a value in `1..=10_000`. |
+| 9 | `InvalidWeight` | A source weight was zero or exceeded `MAX_SOURCE_WEIGHT` (100 000). | Use a value in `1..=100_000`. |
+| 10 | `WeightFloorNotMet` | The total agreeing weight was below `MIN_AGREEING_WEIGHT` (20 000). | Increase individual source weights or register more sources. |
+
+> **ABI change (#689):** `AggregatedPrice.confidence` is now the **summed weight**
+> of agreeing sources (not a raw count). A source with weight 10 000 contributes
+> 10 000 to confidence, not 1. This is a breaking change for off-chain consumers
+> that interpreted `confidence` as a source count.
+
 ## Governance
 
 
