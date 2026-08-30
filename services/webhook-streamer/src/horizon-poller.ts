@@ -3,7 +3,8 @@
  * Horizon /events endpoint and emits normalised PoolEvents.
  *
  * Uses cursor-based pagination so no event is missed across restarts
- * (persist `lastCursor` to a durable store in production).
+ * (persist the per-contract cursors — see `cursors()` — to a durable store
+ * in production).
  */
 
 import fetch from "node-fetch";
@@ -37,7 +38,7 @@ export interface PollerOptions {
 
 export class HorizonPoller {
   private running = false;
-  private lastCursor: string;
+  private readonly _cursors: Map<string, string> = new Map();
   private readonly opts: Required<PollerOptions>;
 
   constructor(opts: PollerOptions, private readonly handler: EventHandler) {
@@ -46,7 +47,9 @@ export class HorizonPoller {
       startCursor: "now",
       ...opts,
     };
-    this.lastCursor = this.opts.startCursor;
+    for (const contractId of this.opts.contractIds) {
+      this._cursors.set(contractId, this.opts.startCursor);
+    }
   }
 
   start(): void {
@@ -57,6 +60,11 @@ export class HorizonPoller {
 
   stop(): void {
     this.running = false;
+  }
+
+  /** Current pagination cursor per contract, for observability/tests. */
+  cursors(): ReadonlyMap<string, string> {
+    return new Map(this._cursors);
   }
 
   private async _loop(): Promise<void> {
@@ -72,7 +80,8 @@ export class HorizonPoller {
 
   private async _poll(): Promise<void> {
     for (const contractId of this.opts.contractIds) {
-      const url = this._buildUrl(contractId);
+      const cursor = this._cursors.get(contractId) ?? this.opts.startCursor;
+      const url = this._buildUrl(contractId, cursor);
       const res = await fetch(url);
       if (!res.ok) {
         console.warn(`[HorizonPoller] ${contractId}: HTTP ${res.status}`);
@@ -89,15 +98,15 @@ export class HorizonPoller {
         if (event) {
           await this.handler(event);
         }
-        this.lastCursor = raw.pagingToken;
+        this._cursors.set(contractId, raw.pagingToken);
       }
     }
   }
 
-  private _buildUrl(contractId: string): string {
+  private _buildUrl(contractId: string, cursor: string): string {
     const params = new URLSearchParams({
       contract_id: contractId,
-      cursor: this.lastCursor,
+      cursor,
       limit: "200",
       order: "asc",
     });

@@ -28,6 +28,7 @@ npm run build && npm start
 | `CONTRACT_IDS`    | _(empty)_                                  | Comma-separated contract IDs to watch    |
 | `POLL_INTERVAL_MS`| `5000`                                     | Polling interval in milliseconds         |
 | `PORT`            | `3001`                                     | Management API HTTP port                 |
+| `WEBHOOK_ALLOW_PRIVATE_TARGETS` | `false`                       | Set to `true` to allow registering webhook URLs that point at loopback/link-local/private-range addresses. Only for local development against a same-host test receiver — leave unset in production, since it disables SSRF protection on `POST /webhooks`. |
 
 ## Management API
 
@@ -43,6 +44,11 @@ Content-Type: application/json
   "secret": "my-secret"      // optional — sent as X-Webhook-Secret header
 }
 ```
+
+`url` must be an `http`/`https` URL and must not target loopback, link-local
+(including the cloud metadata address `169.254.169.254`), or RFC1918
+private-range addresses — requests that fail this check return `400`. See
+`WEBHOOK_ALLOW_PRIVATE_TARGETS` above to relax this for local development.
 
 ### List webhooks
 ```
