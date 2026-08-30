@@ -7,6 +7,10 @@ WebSocket subscriber) read this field BEFORE decoding the rest of the
 payload so an unexpected version can be quarantined rather than
 silently misinterpreted.
 
+`contracts/twap_consumer/src/lib.rs` emits `snap_del` on snapshot deletion
+and `pruned` on bounded pruning sweeps (`(symbol_short!("pruned"), pool)` -> `(removed_count, oldest_remaining_ts)`).
+
+
 ## How it's emitted
 
 Every emit site uses the `soroban_amm_sdk::emit_versioned_event!` macro
