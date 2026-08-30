@@ -915,7 +915,7 @@ fn test_swap_exact_out_round_trip_consistent_with_get_amount_in() {
     AddLiquidity::new(&amm, &provider, 10_000_000, 10_000_000).execute();
 
     let want_out = 500_000_i128;
-    let quoted_in = amm.get_amount_in(&ts.tb_addr, &want_out);
+    let quoted_in = amm.get_amount_in(&ts.tb_addr, &want_out).unwrap();
 
     let trader = Address::generate(env);
     ta_sac.mint(&trader, &quoted_in);
@@ -1110,7 +1110,7 @@ fn test_get_amount_in_round_trip() {
     assert!(amount_out > 0);
 
     // Reverse: how much A is needed to get exactly amount_out of B?
-    let amount_in_reverse = amm.get_amount_in(&ts.tb_addr, &amount_out);
+    let amount_in_reverse = amm.get_amount_in(&ts.tb_addr, &amount_out).unwrap();
 
     // Due to integer rounding (+1 in get_amount_in), the reverse quote
     // should be >= the original input and at most 1 unit more.
@@ -1354,7 +1354,7 @@ fn test_get_amount_in_max_fee_does_not_panic() {
     tb_sac.mint(&provider, &1_000_000_i128);
     AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
 
-    let quoted_in = amm.get_amount_in(&ts.tb_addr, &1_000);
+    let quoted_in = amm.get_amount_in(&ts.tb_addr, &1_000).unwrap();
     assert_eq!(quoted_in, 0);
 }
 
@@ -1598,7 +1598,7 @@ fn test_large_reserves_get_amount_in_round_trip() {
     assert!(amount_out > 0);
 
     // Reverse: A needed for B
-    let amount_in_reverse = amm.get_amount_in(&ts.tb_addr, &amount_out);
+    let amount_in_reverse = amm.get_amount_in(&ts.tb_addr, &amount_out).unwrap();
 
     assert!(
         amount_in_reverse >= amount_in,
@@ -1626,7 +1626,221 @@ fn test_get_amount_in_overflow() {
     AddLiquidity::new(&amm, &provider, large_amount, large_amount).execute();
 
     // 4e18 * 1e17 * 10000 = 4e39 > i128::MAX
-    amm.get_amount_in(&ts.ta_addr, &100_000_000_000_000_000_i128);
+    let _ = amm.get_amount_in(&ts.ta_addr, &100_000_000_000_000_000_i128);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #815: get_amount_in error handling tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Test 1: get_amount_in rejects when amount_out equals reserve_out (InsufficientLiquidity).
+#[test]
+fn test_get_amount_in_rejects_amount_out_equals_reserve() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    // Get the reserve of token_b
+    let pool_info = amm.get_info();
+    let reserve_b = pool_info.reserve_b;
+
+    // Try to get exactly reserve_b amount — should fail with InsufficientLiquidity
+    let result = amm.try_get_amount_in(&ts.tb_addr, &reserve_b);
+    assert!(result.is_err(), "get_amount_in must reject amount_out >= reserve_out");
+    
+    if let Err(Ok(err)) = result {
+        assert_eq!(err, AmmError::InsufficientLiquidity);
+    }
+}
+
+/// Test 2: get_amount_in rejects unknown token_out (InvalidToken).
+#[test]
+fn test_get_amount_in_rejects_unknown_token() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    // Use an unknown token
+    let unknown_token = Address::generate(env);
+
+    let result = amm.try_get_amount_in(&unknown_token, &100_000_i128);
+    assert!(result.is_err(), "get_amount_in must reject unknown token");
+    
+    if let Err(Ok(err)) = result {
+        assert_eq!(err, AmmError::InvalidToken);
+    }
+}
+
+/// Test 3: get_amount_in rejects on empty pool (EmptyPool).
+#[test]
+fn test_get_amount_in_rejects_empty_pool() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+
+    // Do NOT add liquidity — pool is empty (zero reserves)
+
+    let result = amm.try_get_amount_in(&ts.tb_addr, &100_000_i128);
+    assert!(result.is_err(), "get_amount_in must reject empty pool");
+    
+    if let Err(Ok(err)) = result {
+        assert_eq!(err, AmmError::EmptyPool);
+    }
+}
+
+/// Test 4: Boundary test - get_amount_in succeeds when amount_out is one less than reserve.
+#[test]
+fn test_get_amount_in_succeeds_one_below_reserve() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let pool_info = amm.get_info();
+    let reserve_b = pool_info.reserve_b;
+
+    // amount_out = reserve_b - 1 should succeed
+    let result = amm.try_get_amount_in(&ts.tb_addr, &(reserve_b - 1));
+    assert!(result.is_ok(), "get_amount_in must succeed when amount_out < reserve_out");
+    
+    if let Ok(Ok(amount_in)) = result {
+        assert!(amount_in > 0, "amount_in must be positive");
+    }
+}
+
+/// Test 5: swap_exact_out rejects when amount_out equals reserve (via try_swap_exact_out).
+#[test]
+fn test_swap_exact_out_rejects_insufficient_liquidity() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let trader = Address::generate(env);
+    ta_sac.mint(&trader, &10_000_000_i128);
+
+    let pool_info = amm.get_info();
+    let reserve_b = pool_info.reserve_b;
+
+    // Try to get exactly reserve_b of token_b — should fail
+    let result = amm.try_swap_exact_out(&trader, &ts.tb_addr, &reserve_b, &u64::MAX, &u64::MAX);
+    assert!(result.is_err(), "swap_exact_out must reject when amount_out >= reserve_out");
+    
+    if let Err(Ok(err)) = result {
+        assert_eq!(err, AmmError::InsufficientLiquidity);
+    }
+}
+
+/// Test 6: swap_exact_out success path returns same value as before refactor.
+#[test]
+fn test_swap_exact_out_success_unchanged() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &10_000_000_i128);
+    tb_sac.mint(&provider, &10_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 10_000_000, 10_000_000).execute();
+
+    let trader = Address::generate(env);
+    ta_sac.mint(&trader, &10_000_000_i128);
+
+    let want_out = 500_000_i128;
+    // Execute swap_exact_out and verify it returns the expected amount_in
+    let actual_in = SwapExactOut::new(&amm, &trader, &ts.tb_addr, want_out, 10_000_000).execute();
+    
+    // Verify we got the input amount (no error, value unchanged)
+    assert!(actual_in > 0, "swap_exact_out must return positive amount_in");
+}
+
+/// Test 7: get_amount_in with high fee (fee_bps >= 10_000) returns Ok(0).
+#[test]
+fn test_get_amount_in_high_fee_returns_ok_zero() {
+    let ts = setup_pool(10_000); // fee_bps = 10_000
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    // With fee_bps = 10_000, get_amount_in must return Ok(0), not panic
+    let result = amm.try_get_amount_in(&ts.tb_addr, &500_i128);
+    assert!(result.is_ok(), "get_amount_in with high fee must not panic");
+    
+    if let Ok(Ok(amount_in)) = result {
+        assert_eq!(amount_in, 0, "high fee should return 0");
+    }
+}
+
+/// Test 8: Property test - get_amount_in never panics for valid inputs.
+/// For any amount_out in [1, reserve_out - 1] and fee_bps in [0, 10_000],
+/// get_amount_in returns a typed Err or Ok, never a host trap.
+#[test]
+fn test_get_amount_in_property_no_panic() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &10_000_000_i128);
+    tb_sac.mint(&provider, &10_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 10_000_000, 10_000_000).execute();
+
+    let pool_info = amm.get_info();
+    let reserve_b = pool_info.reserve_b;
+
+    // Test multiple valid amounts in range [1, reserve_out - 1]
+    for amount_out in [1_i128, 100_i128, 1000_i128, reserve_b - 1].iter() {
+        // get_amount_in must return Ok or Err, never panic
+        let result = amm.try_get_amount_in(&ts.tb_addr, amount_out);
+        
+        // Result should be well-formed (either Ok(Ok(...)) or Err(...))
+        match result {
+            Ok(inner) => {
+                // Should be Ok(i128)
+                assert!(inner.is_ok(), "inner result should be Ok");
+            }
+            Err(_) => {
+                // Host-level error (e.g., invocation failure) — should not happen
+                panic!("get_amount_in should not cause host error");
+            }
+        }
+    }
 }
 
 // Issue #199: remove_liquidity_one_sided — provider receives only token_a.

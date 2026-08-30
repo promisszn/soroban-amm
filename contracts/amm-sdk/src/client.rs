@@ -82,7 +82,7 @@ pub trait AmmPoolInterface {
 
     fn get_amount_out(env: Env, token_in: Address, amount_in: i128) -> Result<i128, SdkAmmError>;
 
-    fn get_amount_in(env: Env, token_out: Address, amount_out: i128) -> i128;
+    fn get_amount_in(env: Env, token_out: Address, amount_out: i128) -> Result<i128, SdkAmmError>;
 
     fn simulate_swap(
         env: Env,
