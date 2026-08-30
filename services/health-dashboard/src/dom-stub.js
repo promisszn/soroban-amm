@@ -20,6 +20,7 @@ class FakeElement {
     this.style = {};
     this.dataset = {};
     this.listeners = {};
+    this.value = "";
     this.classList = new FakeClassList(this);
   }
   set textContent(value) { this._textContent = value; this.children = []; }

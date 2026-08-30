@@ -182,7 +182,8 @@ export function createDashboardController({ apiUrl, poolId, pollIntervalMs = DEF
     results.forEach((result, index) => { const key = Object.keys(QUERY)[index]; if (result.status === "fulfilled") data[key] = result.value; else failures.push(`${key}: ${formatError(result.reason)}`); });
     renderStats(data.stats?.poolStats); renderHealth(data.health?.poolHealth); renderEvents(data.events?.poolEvents); renderHistory(data.history?.priceHistory); renderHeatmap(data.events?.poolEvents); if (data.alerts?.alertConfigs) { configs = data.alerts.alertConfigs; renderAlertConfigs(configs, removeAlert); }
     if (failures.length === Object.keys(QUERY).length) { setStatus("Error", "error", failures.join("; ")); setSectionState(`Unable to load dashboard data. ${failures[0]}`); $("btn-retry").hidden = false; }
-    else { setStatus(failures.length ? "Degraded" : "Connected", failures.length ? "error" : "connected", failures.join("; ")); setSectionState(failures.length ? `Degraded: ${failures.join("; ")}` : data.stats?.poolStats?.length ? "" : "No pools indexed yet"); $("btn-retry").hidden = false; setText("last-updated", `Last updated ${new Date().toLocaleTimeString()}`); }
+    // Retry is only useful when something failed; hide it on a fully successful refresh.
+    else { setStatus(failures.length ? "Degraded" : "Connected", failures.length ? "error" : "connected", failures.join("; ")); setSectionState(failures.length ? `Degraded: ${failures.join("; ")}` : data.stats?.poolStats?.length ? "" : "No pools indexed yet"); $("btn-retry").hidden = !failures.length; setText("last-updated", `Last updated ${new Date().toLocaleTimeString()}`); }
     refreshing = false;
   }
 
@@ -193,7 +194,9 @@ export function createDashboardController({ apiUrl, poolId, pollIntervalMs = DEF
     const thresholdBps = metric === "price_deviation" ? threshold : undefined;
     const thresholdValue = metric === "price_deviation" ? undefined : threshold;
     const currentPool = $("pool-id")?.value.trim() || pool;
-    const previous = configs; const next = [...configs.filter((item) => item.metric !== metric), { poolId: currentPool, metric, thresholdBps, thresholdValue }]; configs = next; renderAlertConfigs(configs, removeAlert); $("alert-threshold").value = "";
+    // Dedup by metric AND poolId — filtering by metric alone would drop other pools' alerts
+    // for the same metric when the Pool ID field is blank (alertConfigs(poolId: undefined) spans all pools).
+    const previous = configs; const next = [...configs.filter((item) => !(item.metric === metric && item.poolId === currentPool)), { poolId: currentPool, metric, thresholdBps, thresholdValue }]; configs = next; renderAlertConfigs(configs, removeAlert); $("alert-threshold").value = "";
     const currentUrl = $("api-url")?.value.trim() || url;
     try { await gql(currentUrl, `mutation SetAlert($poolId: ID!, $metric: String!, $thresholdBps: Int, $thresholdValue: Float) { setAlertConfig(poolId: $poolId, metric: $metric, thresholdBps: $thresholdBps, thresholdValue: $thresholdValue) { poolId metric thresholdBps thresholdValue } }`, { poolId: currentPool, metric, thresholdBps, thresholdValue }); } catch (error) { configs = previous; renderAlertConfigs(configs, removeAlert); setSectionState(`Alert was not saved: ${formatError(error)}`); }
   }
