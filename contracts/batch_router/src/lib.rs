@@ -1062,4 +1062,65 @@ mod tests {
         let result = batch_client.try_execute_batch(&trader, &ops, &deadline);
         assert_eq!(result, Err(Ok(BatchRouterError::InvalidAmount)));
     }
+
+    #[test]
+    fn test_batch_executed_emits_versioned_event_with_schema_version() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_addr = setup_env_and_factory(&env);
+        let (ta, tb, pool, _) = setup_pool(&env, &factory_addr);
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
+        StellarAssetClient::new(&env, &tb).mint(&trader, &100_000_i128);
+
+        let ops = vec![
+            &env,
+            BatchOp::Swap(SwapOp {
+                pool: pool.clone(),
+                token_in: ta.clone(),
+                amount_in: 10_000_i128,
+                min_out: 0_i128,
+            }),
+            BatchOp::Swap(SwapOp {
+                pool: pool.clone(),
+                token_in: tb.clone(),
+                amount_in: 5_000_i128,
+                min_out: 0_i128,
+            }),
+        ];
+
+        let batch_client = deploy_router(&env, &factory_addr);
+        let deadline = env.ledger().timestamp() + 1000;
+        let _results = batch_client.execute_batch(&trader, &ops, &deadline);
+
+        // Read all events and find the batch_executed event
+        let events = env.events().all();
+        let batch_executed_events: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                if let Ok((topic,)) = <(Symbol,)>::try_from_val(&env, &event.topics) {
+                    topic == Symbol::new(&env, "batch_executed")
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        assert!(
+            !batch_executed_events.is_empty(),
+            "batch_executed event must be emitted"
+        );
+
+        // Last event should be batch_executed with version prefix
+        let event = batch_executed_events.last().unwrap();
+        let (version, ops_len): (u32, u32) =
+            event.data.try_into_val(&env).expect("must decode as (u32, u32)");
+        assert_eq!(
+            version,
+            soroban_amm_sdk::EVENT_SCHEMA_VERSION,
+            "event must have correct schema version"
+        );
+        assert_eq!(ops_len, 2, "event must record correct operation count");
+    }
 }

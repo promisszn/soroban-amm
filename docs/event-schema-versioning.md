@@ -220,6 +220,35 @@ schema version together when selecting a decoder.
 | `batch_op` | `(op_index: u32, kind: Symbol, result: BatchOpResult)` — emitted once per operation, in order, before the batch-level event. |
 | `batch_executed` | `(ops_len: u32)` |
 
+### Batch Auction — `contracts/batch_auction/src/lib.rs`
+
+| Event | Topics | Payload |
+|---|---|---|
+| `order_submitted` | `trader` | `(order_id: u64, amount_in: i128)` |
+| `order_cancelled` | `trader` | `(order_id: u64)` |
+| `order_expired` | `trader` | `(order_id: u64)` |
+| `order_failed` | `trader` | `(order_id: u64)` |
+| `order_refund_failed` | `trader` | `(order_id: u64)` |
+| `order_settled` | `trader` | `(order_id: u64, amount_out: i128)` |
+| `settled` | — | `(process_count: u32)` |
+| `window_updated` | — | `(batch_window_secs: u64)` |
+| `max_orders_updated` | — | `(max_orders: u32)` |
+| `admin_nominated` | — | `(current_admin: Address, new_admin: Address)` |
+| `admin_changed` | — | `(new_admin: Address)` |
+
+### V2→V3 Migration — `contracts/v2_to_v3_migration/src/lib.rs`
+
+| Event | Topics | Payload |
+|---|---|---|
+| `migrated` | `provider` | `(v2_shares: i128, deposited_a: i128, deposited_b: i128, position_id: i128, refund_a: i128, refund_b: i128)` |
+
+### BatchRouter — `contracts/batch_router/src/lib.rs`
+
+| Event | Payload |
+|---|---|
+| `batch_op` | `(op_index: u32, kind: Symbol, result: BatchOpResult)` — emitted once per operation, in order, before the batch-level event. |
+| `batch_executed` | `(ops_len: u32)` |
+
 ### DEX aggregator — `contracts/dex_aggregator/src/lib.rs`
 
 `venue` is the pool a route is *entered* through: the venue that won the
@@ -320,3 +349,11 @@ The event is emitted via `env.events().publish(...)` directly.
 | `deviant` | — | `(deviant_sources: Vec<Address>)` |
 | `price` | — | `(token_a: Address, token_b: Address, price: i128, confidence: u32)` |
 | `src_wt` | — | `(source: Address, old_weight: u32, new_weight: u32)` |
+
+## Update (#812)
+
+`contracts/batch_router/src/lib.rs`, `contracts/batch_auction/src/lib.rs`,
+and `contracts/v2_to_v3_migration/src/lib.rs` have all migrated from raw
+`env.events().publish()` calls to `emit_versioned_event!`. All event rows for
+these three contracts are now listed in the event catalogue above under the
+BatchRouter, Batch Auction, and V2→V3 Migration sections respectively.
