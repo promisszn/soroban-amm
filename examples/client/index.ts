@@ -1,4 +1,5 @@
 import { AmmPool, FactoryClient, TokenClient } from "@soroban-amm/sdk";
+import { parseAmountIn, parseDeadlineSeconds, parseSlippageBps } from "./config.js";
 
 const rpcUrl = process.env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org";
 const networkPassphrase = process.env.STELLAR_NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015";
@@ -22,9 +23,21 @@ async function main(): Promise<void> {
   const token = new TokenClient(config(tokenInId));
   const factoryId = process.env.FACTORY_CONTRACT_ID;
   const factory = factoryId ? new FactoryClient(config(factoryId)) : undefined;
-  const amountIn = BigInt(process.env.SWAP_AMOUNT_IN ?? "100000");
-  const deadline = BigInt(Math.floor(Date.now() / 1000) + Number(process.env.DEADLINE_SECONDS ?? 300));
-  const slippageBps = BigInt(process.env.SLIPPAGE_BPS ?? "50");
+
+  let amountIn: bigint;
+  let deadlineSeconds: number;
+  let slippageBps: bigint;
+  try {
+    amountIn = parseAmountIn(process.env.SWAP_AMOUNT_IN);
+    deadlineSeconds = parseDeadlineSeconds(process.env.DEADLINE_SECONDS);
+    slippageBps = parseSlippageBps(process.env.SLIPPAGE_BPS);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`Invalid configuration: ${message}`);
+    process.exitCode = 1;
+    return;
+  }
+  const deadline = BigInt(Math.floor(Date.now() / 1000) + deadlineSeconds);
 
   // 1. Read pool info to confirm the pair and current reserves.
   const info = await pool.getInfo();
