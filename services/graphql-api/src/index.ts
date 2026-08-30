@@ -1,4 +1,5 @@
 import { ApolloServer } from "@apollo/server";
+import { GraphQLError } from "graphql";
 import { startStandaloneServer } from "@apollo/server/standalone";
 import { PubSub } from "graphql-subscriptions";
 import { typeDefs } from "./schema.js";
@@ -20,7 +21,17 @@ const resolvers = {
       _: unknown,
       { poolId, from, to }: { poolId: string; from?: number; to?: number },
     ) => defaultIndexer.getPriceHistory(poolId, from, to),
-    twal: () => null,
+    twal: (
+      _: unknown,
+      { poolId, windowSeconds }: { poolId: string; windowSeconds: number },
+    ) => {
+      if (windowSeconds <= 0) {
+        throw new GraphQLError("windowSeconds must be greater than 0", {
+          extensions: { code: "BAD_USER_INPUT" },
+        });
+      }
+      return defaultIndexer.getTwal(poolId, windowSeconds);
+    },
     poolHealth: (_: unknown, { poolId }: { poolId: string }) =>
       defaultIndexer.getPoolHealth(poolId),
     alertConfigs: (_: unknown, { poolId }: { poolId?: string }) =>

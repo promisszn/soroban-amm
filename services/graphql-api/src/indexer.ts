@@ -158,6 +158,33 @@ export class PoolIndexer {
     });
   }
 
+  /**
+   * Time-weighted average liquidity (price) over the trailing `windowSeconds`.
+   * Each price point is weighted by the duration it was in effect: the time
+   * until the next point, or until now for the most recent point.
+   */
+  getTwal(poolId: string, windowSeconds: number): number | null {
+    const now = Date.now();
+    const from = now - windowSeconds * 1000;
+    const points = this.getPriceHistory(poolId, from, now).sort(
+      (a, b) => a.timestamp - b.timestamp,
+    );
+    if (points.length === 0) return null;
+
+    let weightedSum = 0;
+    let totalWeight = 0;
+    for (let i = 0; i < points.length; i++) {
+      const point = points[i];
+      const nextTimestamp = i + 1 < points.length ? points[i + 1].timestamp : now;
+      const weight = Math.max(0, nextTimestamp - point.timestamp);
+      weightedSum += point.price * weight;
+      totalWeight += weight;
+    }
+
+    if (totalWeight === 0) return points[points.length - 1].price;
+    return weightedSum / totalWeight;
+  }
+
   // ── Health scoring ──────────────────────────────────────────────────────────
 
   getPoolHealth(poolId: string): PoolHealth | null {
