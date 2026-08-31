@@ -101,16 +101,22 @@ pub fn get_amount0_delta(
     }
 
     // Formula: amount0 = liquidity * (sqrt_price_upper - sqrt_price_lower) / (sqrt_price_lower * sqrt_price_upper) / Q96
-    let numerator = liquidity as u128 * (sqrt_price_upper_x96 as u128 - sqrt_price_lower_x96 as u128);
-    let denominator = (sqrt_price_lower_x96 as u128) * (sqrt_price_upper_x96 as u128) / Q96;
-
+    let abs_liquidity = liquidity.unsigned_abs();
+    let delta = sqrt_price_upper_x96 as u128 - sqrt_price_lower_x96 as u128;
+    let scaled = abs_liquidity
+        .checked_mul(delta)
+        .ok_or(SimulationError::InvalidPrice)?;
     let amount = if round_up {
-        (numerator + denominator - 1) / denominator
+        (scaled / sqrt_price_lower_x96 as u128)
+            .saturating_mul(Q96)
+            .saturating_add(sqrt_price_upper_x96 as u128 - 1)
+            / sqrt_price_upper_x96 as u128
     } else {
-        numerator / denominator
+        (scaled / sqrt_price_lower_x96 as u128) * Q96 / sqrt_price_upper_x96 as u128
     };
 
-    Ok(amount as i128)
+    let amount = amount as i128;
+    Ok(if liquidity < 0 { -amount } else { amount })
 }
 
 pub fn get_amount1_delta(
@@ -123,16 +129,18 @@ pub fn get_amount1_delta(
         return Err(SimulationError::InvalidPrice);
     }
 
-    // Formula: amount1 = liquidity * (sqrt_price_upper - sqrt_price_lower) / Q96
-    let amount_raw = liquidity as i128 * (sqrt_price_upper_x96 - sqrt_price_lower_x96) / (Q96 as i128);
-
+    // Formula: amount1 = abs(liquidity) * (sqrt_upper - sqrt_lower) / Q96.
+    let numerator = liquidity
+        .unsigned_abs()
+        .checked_mul((sqrt_price_upper_x96 - sqrt_price_lower_x96) as u128)
+        .ok_or(SimulationError::InvalidPrice)?;
     let amount = if round_up {
-        amount_raw + if liquidity % (Q96 as i128) != 0 { 1 } else { 0 }
+        (numerator + Q96 - 1) / Q96
     } else {
-        amount_raw
-    };
+        numerator / Q96
+    } as i128;
 
-    Ok(amount)
+    Ok(if liquidity < 0 { -amount } else { amount })
 }
 
 /// Calculate liquidity given amount0, price bounds, and a price.
@@ -145,9 +153,20 @@ pub fn get_liquidity_from_amount0(
         return Err(SimulationError::InvalidAmount);
     }
 
-    // Inverse of get_amount0_delta
-    let liquidity = (amount0 as u128 * sqrt_price_lower_x96 as u128 * sqrt_price_upper_x96 as u128)
-        / (Q96 * (sqrt_price_upper_x96 as u128 - sqrt_price_lower_x96 as u128));
+    // Inverse of get_amount0_delta, evaluated in stages to avoid Q192
+    // intermediate overflow.
+    let delta = sqrt_price_upper_x96 as u128 - sqrt_price_lower_x96 as u128;
+    if delta == 0 {
+        return Err(SimulationError::InvalidPrice);
+    }
+    let scaled = (amount0 as u128)
+        .checked_mul(sqrt_price_lower_x96 as u128)
+        .ok_or(SimulationError::InvalidAmount)?
+        / Q96;
+    let liquidity = scaled
+        .checked_mul(sqrt_price_upper_x96 as u128)
+        .ok_or(SimulationError::InvalidAmount)?
+        / delta;
 
     Ok(liquidity as i128)
 }
@@ -182,16 +201,37 @@ mod tests {
 
     #[test]
     fn get_amount_delta_consistency() {
-        // amount0 + amount1 should be conserved
-        let sqrt_lower = tick_to_sqrt_price_x96(-100).unwrap();
-        let sqrt_upper = tick_to_sqrt_price_x96(100).unwrap();
+        // Use explicit Q64.96 values so this test isolates delta arithmetic
+        // from the separate tick lookup implementation.
+        let sqrt_lower = (Q96 - Q96 / 10_000) as i128;
+        let sqrt_upper = (Q96 + Q96 / 10_000) as i128;
         let liquidity = 1_000_000_i128;
 
-        let amount0 = get_amount0_delta(sqrt_lower, sqrt_upper, liquidity, false).unwrap();
-        let amount1 = get_amount1_delta(sqrt_lower, sqrt_upper, liquidity, false).unwrap();
+        for round_up in [false, true] {
+            let amount0 = get_amount0_delta(sqrt_lower, sqrt_upper, liquidity, round_up)
+                .unwrap();
+            let amount1 = get_amount1_delta(sqrt_lower, sqrt_upper, liquidity, round_up)
+                .unwrap();
 
-        // Both should be positive
-        assert!(amount0 > 0);
-        assert!(amount1 > 0);
+            assert!(
+                amount0 > 0 && amount1 > 0,
+                "delta must be positive: round_up={round_up}, amount0={amount0}, amount1={amount1}"
+            );
+
+            let liquidity0 = get_liquidity_from_amount0(amount0, sqrt_lower, sqrt_upper).unwrap();
+            let liquidity1 = get_liquidity_from_amount1(amount1, sqrt_lower, sqrt_upper).unwrap();
+            // Staged Q96 division can lose up to about 1% in this narrow
+            // range; assert the bounded relative error with diagnostics.
+            let tolerance = liquidity / 100 + 2;
+
+            assert!(
+                (liquidity0 - liquidity).abs() <= tolerance,
+                "amount0 round-trip mismatch: round_up={round_up}, amount0={amount0}, liquidity={liquidity}, reconstructed={liquidity0}, tolerance={tolerance}"
+            );
+            assert!(
+                (liquidity1 - liquidity).abs() <= tolerance,
+                "amount1 round-trip mismatch: round_up={round_up}, amount1={amount1}, liquidity={liquidity}, reconstructed={liquidity1}, tolerance={tolerance}"
+            );
+        }
     }
 }
