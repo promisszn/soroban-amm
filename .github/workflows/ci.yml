@@ -139,9 +139,7 @@ jobs:
                     - dir: packages/ts-advanced-client
                       test_cmd: npm test
                     - dir: services/graphql-api
-                      # No runnable test suite yet (the "test" script points at a
-                      # dist file that isn't emitted) - build coverage only for now.
-                      test_cmd: echo "no test suite configured yet"
+                      test_cmd: npm test
                     - dir: services/webhook-streamer
                       test_cmd: npm test
                     - dir: services/health-dashboard
