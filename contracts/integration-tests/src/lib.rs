@@ -21,6 +21,9 @@ mod multisig_emergency_withdraw_test;
 #[cfg(test)]
 mod flash_loan_integration_test;
 
+#[cfg(test)]
+mod memory_leak_detection_test;
+
 #[cfg(all(test, feature = "legacy-integration-matrix"))]
 mod tests {
     use soroban_sdk::{
