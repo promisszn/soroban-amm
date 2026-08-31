@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, TypeVar
+from typing import Any
 
 from stellar_sdk import Network, scval
 from stellar_sdk.address import Address
@@ -11,7 +11,6 @@ from stellar_sdk.contract import ContractClient
 
 I128_MIN = -(1 << 127)
 I128_MAX = (1 << 127) - 1
-T = TypeVar("T")
 
 
 class ConfigError(ValueError):
@@ -73,10 +72,12 @@ def decode_scval(value: Any) -> Any:
 
 def build_client(contract_id: str) -> ContractClient:
     """Build a ContractClient from the common Stellar environment settings."""
+    rpc = optional_env("STELLAR_RPC_URL", "https://soroban-testnet.stellar.org") or "https://soroban-testnet.stellar.org"
+    net = optional_env("STELLAR_NETWORK_PASSPHRASE", Network.TESTNET_NETWORK_PASSPHRASE) or Network.TESTNET_NETWORK_PASSPHRASE
     return ContractClient(
         contract_id=contract_id,
-        rpc_url=optional_env("STELLAR_RPC_URL", "https://soroban-testnet.stellar.org"),
-        network_passphrase=optional_env("STELLAR_NETWORK_PASSPHRASE", Network.TESTNET_NETWORK_PASSPHRASE),
+        rpc_url=rpc,
+        network_passphrase=net,
     )
 
 
