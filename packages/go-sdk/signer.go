@@ -3,7 +3,6 @@ package gosdk
 import (
 	"context"
 	"errors"
-	"strings"
 )
 
 // Signer signs transaction envelopes. It is an interface so callers can back it
@@ -18,7 +17,7 @@ type Signer interface {
 }
 
 // ErrSignerAddress is returned when a Signer reports an address that is not a
-// plausible Stellar account.
+// valid Stellar account strkey.
 var ErrSignerAddress = errors.New("signer address is not a valid account address")
 
 // SignerFunc adapts a function to the Signer interface, pairing it with a fixed
@@ -41,7 +40,7 @@ func (s SignerFunc) SignEnvelope(ctx context.Context, envelopeXDR string, networ
 	return s.Sign(ctx, envelopeXDR, networkPassphrase)
 }
 
-// ValidateSigner checks that a Signer reports a well-formed account address.
+// ValidateSigner checks that a Signer reports a valid Stellar account address.
 func ValidateSigner(s Signer) error {
 	if s == nil {
 		return ErrNoSigner
@@ -52,26 +51,20 @@ func ValidateSigner(s Signer) error {
 	return nil
 }
 
-// IsAccountAddress reports whether addr looks like a Stellar account strkey:
-// 56 characters beginning with G.
+// IsAccountAddress reports whether addr is a valid Stellar account strkey.
+//
+// Validation is delegated to DecodeStrkey so the helper verifies the version
+// byte, base32 encoding, payload length, and CRC16-XModem checksum.
 func IsAccountAddress(addr string) bool {
-	return len(addr) == 56 && strings.HasPrefix(addr, "G") && isBase32Upper(addr)
+	_, kind, err := DecodeStrkey(addr)
+	return err == nil && kind == StrkeyAccount
 }
 
-// IsContractAddress reports whether addr looks like a Soroban contract strkey:
-// 56 characters beginning with C.
+// IsContractAddress reports whether addr is a valid Soroban contract strkey.
+//
+// Validation is delegated to DecodeStrkey so the helper verifies the version
+// byte, base32 encoding, payload length, and CRC16-XModem checksum.
 func IsContractAddress(addr string) bool {
-	return len(addr) == 56 && strings.HasPrefix(addr, "C") && isBase32Upper(addr)
-}
-
-func isBase32Upper(s string) bool {
-	for _, r := range s {
-		switch {
-		case r >= 'A' && r <= 'Z':
-		case r >= '2' && r <= '7':
-		default:
-			return false
-		}
-	}
-	return true
+	_, kind, err := DecodeStrkey(addr)
+	return err == nil && kind == StrkeyContract
 }
