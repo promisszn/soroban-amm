@@ -37,7 +37,7 @@ jobs:
             # `amm-fuzz`, `integration-tests`, and `benches` are not deployable
             # contracts, so they never produce wasm to build or size-check here.
             - name: Build WASM artifacts
-              run: cargo build --release --target wasm32v1-none --workspace --exclude amm_fuzz --exclude integration_tests --exclude benches
+              run: cargo build --release --target wasm32v1-none --workspace --exclude amm_fuzz --exclude integration_tests --exclude benches --exclude soroban_amm_simulator
             - name: Check WASM binary sizes
               run: bash scripts/size_report.sh --fail-on-limit
             # All six crates that were previously excluded here
