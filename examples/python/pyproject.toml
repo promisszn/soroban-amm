@@ -1,0 +1,5 @@
+# Minimal ruff configuration for the examples/python package
+[tool.ruff]
+# Target Python and line length chosen to match CI environment
+line-length = 88
+target-version = "py311"
