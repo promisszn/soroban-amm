@@ -229,6 +229,7 @@ pub mod symbols {
 // ── Decoder helpers ───────────────────────────────────────────────────────────
 
 /// Wraps all possible events that can originate from an AMM pool.
+#[derive(Debug, Clone, PartialEq)]
 pub enum AmmEvent {
     Swap(SwapEvent),
     AddLiquidity(AddLiquidityEvent),
@@ -439,5 +440,329 @@ pub fn decode_amm_event(
         }))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soroban_sdk::{
+        testutils::Address as _, vec, BytesN, Env, IntoVal, Symbol, Val, Vec,
+    };
+
+    fn address(env: &Env) -> Address {
+        Address::generate(env)
+    }
+
+    fn symbol(env: &Env, name: &'static str) -> Val {
+        Symbol::new(env, name).into_val(env)
+    }
+
+    fn make_data(env: &Env, payload: Val, version: u32) -> Val {
+        (version, payload).into_val(env)
+    }
+
+    #[test]
+    fn decodes_swap() {
+        let env = Env::default();
+        let trader = address(&env);
+        let token_in = address(&env);
+        let token_out = address(&env);
+        let referrer = address(&env);
+
+        let topics = vec![
+            &env,
+            symbol(&env, symbols::SWAP),
+            trader.clone().into_val(&env),
+        ];
+        let payload: Val = (
+            token_in.clone(),
+            1000i128,
+            token_out.clone(),
+            999i128,
+            Some(referrer.clone()),
+        )
+            .into_val(&env);
+        let data = make_data(&env, payload, crate::EVENT_SCHEMA_VERSION);
+
+        // Matches the `swap` event published in contracts/amm/src/lib.rs:
+        // topics `(Symbol::new(&env, "swap"), trader)`, data `(EVENT_SCHEMA_VERSION, (token_in, amount_in, token_out, amount_out, referrer))`.
+        assert_eq!(
+            decode_amm_event(&env, topics, data),
+            Some(AmmEvent::Swap(SwapEvent {
+                trader,
+                token_in,
+                amount_in: 1000,
+                token_out,
+                amount_out: 999,
+                referrer: Some(referrer),
+            }))
+        );
+    }
+
+    #[test]
+    fn decodes_add_liquidity() {
+        let env = Env::default();
+        let provider = address(&env);
+
+        let topics = vec![
+            &env,
+            symbol(&env, symbols::ADD_LIQUIDITY),
+            provider.clone().into_val(&env),
+        ];
+        let payload: Val = (100i128, 200i128, 300i128).into_val(&env);
+        let data = make_data(&env, payload, crate::EVENT_SCHEMA_VERSION);
+
+        assert_eq!(
+            decode_amm_event(&env, topics, data),
+            Some(AmmEvent::AddLiquidity(AddLiquidityEvent {
+                provider,
+                amount_a: 100,
+                amount_b: 200,
+                shares_minted: 300,
+            }))
+        );
+    }
+
+    #[test]
+    fn decodes_remove_liquidity() {
+        let env = Env::default();
+        let provider = address(&env);
+
+        let topics = vec![&env, symbol(&env, symbols::REMOVE_LIQUIDITY)];
+        let payload: Val = (provider.clone(), 10i128, 11i128, 12i128).into_val(&env);
+        let data = make_data(&env, payload, crate::EVENT_SCHEMA_VERSION);
+
+        assert_eq!(
+            decode_amm_event(&env, topics, data),
+            Some(AmmEvent::RemoveLiquidity(RemoveLiquidityEvent {
+                provider,
+                shares_burned: 10,
+                amount_a: 11,
+                amount_b: 12,
+            }))
+        );
+    }
+
+    #[test]
+    fn decodes_remove_liquidity_one_sided() {
+        let env = Env::default();
+        let provider = address(&env);
+        let token_out = address(&env);
+
+        let topics = vec![&env, symbol(&env, symbols::REMOVE_LIQUIDITY_ONE_SIDED)];
+        let payload: Val = (provider.clone(), 10i128, token_out.clone(), 120i128).into_val(&env);
+        let data = make_data(&env, payload, crate::EVENT_SCHEMA_VERSION);
+
+        assert_eq!(
+            decode_amm_event(&env, topics, data),
+            Some(AmmEvent::RemoveLiquidityOneSided(
+                RemoveLiquidityOneSidedEvent {
+                    provider,
+                    shares_burned: 10,
+                    token_out,
+                    total_out: 120,
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn decodes_flash_loan() {
+        let env = Env::default();
+        let receiver = address(&env);
+        let token = address(&env);
+
+        let topics = vec![
+            &env,
+            symbol(&env, symbols::FLASH_LOAN),
+            receiver.clone().into_val(&env),
+        ];
+        let payload: Val = (token.clone(), 10_000i128, 10i128).into_val(&env);
+        let data = make_data(&env, payload, crate::EVENT_SCHEMA_VERSION);
+
+        assert_eq!(
+            decode_amm_event(&env, topics, data),
+            Some(AmmEvent::FlashLoan(FlashLoanEvent {
+                receiver,
+                token,
+                amount: 10_000,
+                fee: 10,
+            }))
+        );
+    }
+
+    #[test]
+    fn decodes_fee_updated() {
+        let env = Env::default();
+        let admin = address(&env);
+
+        let topics = vec![
+            &env,
+            symbol(&env, symbols::FEE_UPDATED),
+            admin.clone().into_val(&env),
+        ];
+        let payload: Val = (25i128,).into_val(&env);
+        let data = make_data(&env, payload, crate::EVENT_SCHEMA_VERSION);
+
+        assert_eq!(
+            decode_amm_event(&env, topics, data),
+            Some(AmmEvent::FeeUpdated(FeeUpdatedEvent {
+                admin,
+                new_fee_bps: 25,
+            }))
+        );
+    }
+
+    #[test]
+    fn decodes_flash_fee_updated() {
+        let env = Env::default();
+        let admin = address(&env);
+
+        let topics = vec![
+            &env,
+            symbol(&env, symbols::FLASH_FEE_UPDATED),
+            admin.clone().into_val(&env),
+        ];
+        let payload: Val = (35i128,).into_val(&env);
+        let data = make_data(&env, payload, crate::EVENT_SCHEMA_VERSION);
+
+        assert_eq!(
+            decode_amm_event(&env, topics, data),
+            Some(AmmEvent::FlashFeeUpdated(FlashFeeUpdatedEvent {
+                admin,
+                new_fee_bps: 35,
+            }))
+        );
+    }
+
+    #[test]
+    fn decodes_admin_nominated() {
+        let env = Env::default();
+        let current_admin = address(&env);
+        let new_admin = address(&env);
+
+        let topics = vec![&env, symbol(&env, symbols::ADMIN_NOMINATED)];
+        let payload: Val = (current_admin.clone(), new_admin.clone()).into_val(&env);
+        let data = make_data(&env, payload, crate::EVENT_SCHEMA_VERSION);
+
+        assert_eq!(
+            decode_amm_event(&env, topics, data),
+            Some(AmmEvent::AdminNominated(AdminNominatedEvent {
+                current_admin,
+                new_admin,
+            }))
+        );
+    }
+
+    #[test]
+    fn decodes_admin_changed() {
+        let env = Env::default();
+        let new_admin = address(&env);
+
+        let topics = vec![&env, symbol(&env, symbols::ADMIN_CHANGED)];
+        let payload: Val = (new_admin.clone(),).into_val(&env);
+        let data = make_data(&env, payload, crate::EVENT_SCHEMA_VERSION);
+
+        assert_eq!(
+            decode_amm_event(&env, topics, data),
+            Some(AmmEvent::AdminChanged(AdminChangedEvent { new_admin }))
+        );
+    }
+
+    #[test]
+    fn decodes_upgraded() {
+        let env = Env::default();
+        let new_wasm_hash: BytesN<32> = BytesN::from_array(&env, &[7u8; 32]);
+
+        let topics = vec![&env, symbol(&env, symbols::UPGRADED)];
+        let payload: Val = (new_wasm_hash.clone(),).into_val(&env);
+        let data = make_data(&env, payload, crate::EVENT_SCHEMA_VERSION);
+
+        assert_eq!(
+            decode_amm_event(&env, topics, data),
+            Some(AmmEvent::Upgraded(UpgradedEvent { new_wasm_hash }))
+        );
+    }
+
+    #[test]
+    fn decodes_circuit_breaker() {
+        let env = Env::default();
+
+        let topics = vec![&env, symbol(&env, symbols::CIRCUIT_BREAKER)];
+        let payload: Val = (1_000_000i128, 1_500_000i128, 400i128, 300i128).into_val(&env);
+        let data = make_data(&env, payload, crate::EVENT_SCHEMA_VERSION);
+
+        // Matches the `circuit_break` event published in contracts/amm/src/lib.rs:
+        // data `(EVENT_SCHEMA_VERSION, (price_before, price_after, deviation_bps, threshold_bps))`.
+        assert_eq!(
+            decode_amm_event(&env, topics, data),
+            Some(AmmEvent::CircuitBreaker(CircuitBreakerEvent {
+                price_before: 1_000_000,
+                price_after: 1_500_000,
+                deviation_bps: 400,
+                threshold_bps: 300,
+            }))
+        );
+    }
+
+    #[test]
+    fn empty_topics_returns_none() {
+        let env = Env::default();
+        let topics: Vec<Val> = Vec::new(&env);
+        let payload: Val = symbol(&env, "unused");
+        let data = make_data(&env, payload, crate::EVENT_SCHEMA_VERSION);
+
+        assert!(decode_amm_event(&env, topics, data).is_none());
+    }
+
+    #[test]
+    fn wrong_schema_version_returns_none() {
+        let env = Env::default();
+        let trader = address(&env);
+
+        let topics = vec![
+            &env,
+            symbol(&env, symbols::SWAP),
+            trader.clone().into_val(&env),
+        ];
+        let payload: Val = (
+            trader.clone(),
+            100i128,
+            trader.clone(),
+            99i128,
+            None::<Address>,
+        )
+            .into_val(&env);
+        let data = make_data(&env, payload, crate::EVENT_SCHEMA_VERSION + 1);
+
+        assert!(decode_amm_event(&env, topics, data).is_none());
+    }
+
+    #[test]
+    fn unrecognized_symbol_returns_none() {
+        let env = Env::default();
+        let topics = vec![&env, symbol(&env, "not_an_amm_event")];
+        let payload: Val = symbol(&env, "unused");
+        let data = make_data(&env, payload, crate::EVENT_SCHEMA_VERSION);
+
+        assert!(decode_amm_event(&env, topics, data).is_none());
+    }
+
+    #[test]
+    fn swap_payload_arity_mismatch_returns_none() {
+        let env = Env::default();
+        let trader = address(&env);
+        let token_in = address(&env);
+
+        let topics = vec![
+            &env,
+            symbol(&env, symbols::SWAP),
+            trader.clone().into_val(&env),
+        ];
+        let payload: Val = (token_in.clone(), 100i128).into_val(&env);
+        let data = make_data(&env, payload, crate::EVENT_SCHEMA_VERSION);
+
+        assert!(decode_amm_event(&env, topics, data).is_none());
     }
 }
