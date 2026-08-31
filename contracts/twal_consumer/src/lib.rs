@@ -42,6 +42,11 @@ pub enum TwalError {
     /// either it returned a host-level invocation error, or the callee
     /// panicked (e.g. the address is not a contract, or has a bug).
     CrossContractCallFailed = 11,
+    /// A CL TWAL query found a stored `LiquiditySnapshot` for the pool but no
+    /// `ClAccumulator` entry, so there is no running liquidity-cumulative to
+    /// extrapolate to the current ledger time. Call `save_cl_snapshot` for the
+    /// pool (which writes both) before querying `get_cl_twal`.
+    MissingClAccumulator = 12,
 }
 
 #[contracttype]
@@ -334,11 +339,13 @@ impl TwalConsumer {
         out
     }
 
-    /// Panic-free mirror of `get_cl_twal`'s logic, for the fault-isolated
-    /// batch-read path (`compute_twal_entry`). Unlike the AMM path, a CL
-    /// pool's TWAL query never makes a cross-contract call — all the data it
-    /// needs was already captured by `save_cl_snapshot` — so the only
-    /// failure modes are the typed ones below, not a panicking callee.
+    /// Shared implementation behind both the public `get_cl_twal` and the
+    /// fault-isolated batch-read path (`compute_twal_entry`), so the two can
+    /// never drift apart on which condition maps to which `TwalError`. Unlike
+    /// the AMM path, a CL pool's TWAL query never makes a cross-contract call
+    /// — all the data it needs was already captured by `save_cl_snapshot` —
+    /// so the only failure modes are the typed ones below, not a panicking
+    /// callee.
     fn get_cl_twal_checked(
         env: &Env,
         pool: &Address,
@@ -355,8 +362,12 @@ impl TwalConsumer {
             return Err(TwalError::InsufficientHistory);
         }
         let then_ts = ledger_ts_now - window_seconds;
+        // No snapshot at or before the window start: the pool's recorded
+        // history does not reach back far enough, mirroring
+        // `get_twal_liquidity`'s treatment of the same condition.
         let floor_ts =
-            Self::floor_snapshot_ts(env, pool, then_ts).ok_or(TwalError::NoSnapshotFound)?;
+            Self::floor_snapshot_ts(env, pool, then_ts).ok_or(TwalError::InsufficientHistory)?;
+        // The timestamp index named a snapshot that is not in storage.
         let snapshot: LiquiditySnapshot = env
             .storage()
             .persistent()
@@ -366,7 +377,7 @@ impl TwalConsumer {
             .storage()
             .persistent()
             .get(&DataKey::ClAccumulator(pool.clone()))
-            .ok_or(TwalError::NoSnapshotFound)?;
+            .ok_or(TwalError::MissingClAccumulator)?;
 
         let elapsed_since_update = ledger_ts_now.saturating_sub(accumulator.last_ts) as i128;
         let cum_now = accumulator.cum_liquidity + accumulator.last_active * elapsed_since_update;
@@ -462,6 +473,7 @@ impl TwalConsumer {
             5 => TwalError::NoSnapshotFound,
             6 => TwalError::ElapsedZero,
             9 => TwalError::WindowTooLarge,
+            12 => TwalError::MissingClAccumulator,
             _ => TwalError::CrossContractCallFailed,
         }
     }
@@ -650,38 +662,25 @@ impl TwalConsumer {
     /// `L`; the previous implementation differenced two *instantaneous* readings
     /// and so reported a rate of change (0 for constant liquidity) with the
     /// wrong units (issue #462).
-    pub fn get_cl_twal(env: Env, pool: Address, window_seconds: u64) -> i128 {
-        assert!(window_seconds > 0, "window_seconds must be > 0");
-
-        let ledger_ts_now = env.ledger().timestamp();
-        assert!(
-            ledger_ts_now >= window_seconds,
-            "ledger timestamp is smaller than requested window"
-        );
-
-        let then_ts = ledger_ts_now - window_seconds;
-        let floor_ts = Self::floor_snapshot_ts(&env, &pool, then_ts)
-            .unwrap_or_else(|| panic!("no liquidity snapshot at or before {then_ts}"));
-        let snapshot: LiquiditySnapshot = env
-            .storage()
-            .persistent()
-            .get(&DataKey::LiquiditySnapshot(pool.clone(), floor_ts))
-            .unwrap_or_else(|| panic!("missing liquidity snapshot at {floor_ts}"));
-
-        let accumulator: ClLiquidityAccumulator = env
-            .storage()
-            .persistent()
-            .get(&DataKey::ClAccumulator(pool))
-            .unwrap_or_else(|| panic!("missing CL accumulator; call save_cl_snapshot first"));
-
-        // Extrapolate the cumulative to now using the last recorded active
-        // liquidity, mirroring how the AMM accumulator advances between checkpoints.
-        let elapsed_since_update = ledger_ts_now.saturating_sub(accumulator.last_ts) as i128;
-        let cum_now = accumulator.cum_liquidity + accumulator.last_active * elapsed_since_update;
-
-        let elapsed = (ledger_ts_now - snapshot.pool_ts) as i128;
-        assert!(elapsed > 0, "window too small (pool time did not advance)");
-        (cum_now - snapshot.cum_liquidity) / elapsed
+    /// Returns a typed `TwalError` rather than panicking, matching
+    /// `get_twal_liquidity`. A panic here would abort the whole calling
+    /// transaction — including a composing contract such as
+    /// `oracle_aggregator` — leaving it no way to tolerate a pool whose
+    /// snapshots are missing or whose window is out of range (issue #792):
+    ///
+    /// - [`TwalError::ZeroWindow`] — `window_seconds == 0`.
+    /// - [`TwalError::WindowTooLarge`] — `window_seconds` exceeds
+    ///   [`Self::MAX_WINDOW_SECONDS`].
+    /// - [`TwalError::InsufficientHistory`] — the ledger clock predates the
+    ///   window, or no snapshot exists at or before the window start.
+    /// - [`TwalError::NoSnapshotFound`] — the snapshot the timestamp index
+    ///   named is absent from storage.
+    /// - [`TwalError::MissingClAccumulator`] — no `ClAccumulator` for the
+    ///   pool; call `save_cl_snapshot` first.
+    /// - [`TwalError::ElapsedZero`] — pool time did not advance across the
+    ///   window.
+    pub fn get_cl_twal(env: Env, pool: Address, window_seconds: u64) -> Result<i128, TwalError> {
+        Self::get_cl_twal_checked(&env, &pool, window_seconds)
     }
 }
 
@@ -1489,5 +1488,205 @@ mod tests {
         // Window covers both segments: (1_000*300 + 3_000*300) / 600 = 2_000.
         let twal = consumer.get_cl_twal(&pool_addr, &600);
         assert_eq!(twal, 2_000);
+    }
+
+    // -- get_cl_twal typed errors (issue #792) --------------------------------
+
+    /// A CL pool plus a consumer with a baseline snapshot already saved at
+    /// `t = 10_000`, so tests only have to disturb the one condition they
+    /// mean to exercise.
+    fn setup_cl_pool(env: &Env) -> (Address, TwalConsumerClient<'_>) {
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+
+        let keeper = Address::generate(env);
+        let pool_addr = env.register_contract(None, MockClPool);
+        MockClPoolClient::new(env, &pool_addr).set_liquidity(&5_000_i128);
+        let consumer_addr = env.register_contract(None, TwalConsumer);
+        let consumer = TwalConsumerClient::new(env, &consumer_addr);
+        consumer.initialize(&keeper);
+        consumer.save_cl_snapshot(&pool_addr);
+        (pool_addr, consumer)
+    }
+
+    #[test]
+    fn test_cl_twal_zero_window_returns_typed_error() {
+        let env = Env::default();
+        let (pool_addr, consumer) = setup_cl_pool(&env);
+
+        assert_eq!(
+            consumer.try_get_cl_twal(&pool_addr, &0),
+            Err(Ok(TwalError::ZeroWindow))
+        );
+    }
+
+    #[test]
+    fn test_cl_twal_window_too_large_returns_typed_error() {
+        let env = Env::default();
+        let (pool_addr, consumer) = setup_cl_pool(&env);
+        // Push the clock past the window so the bound -- not the ledger age --
+        // is what rejects the call.
+        let too_big = TwalConsumer::MAX_WINDOW_SECONDS + 1;
+        env.ledger().with_mut(|l| l.timestamp = too_big + 10_000);
+
+        assert_eq!(
+            consumer.try_get_cl_twal(&pool_addr, &too_big),
+            Err(Ok(TwalError::WindowTooLarge))
+        );
+    }
+
+    #[test]
+    fn test_cl_twal_ledger_younger_than_window_returns_insufficient_history() {
+        let env = Env::default();
+        let (pool_addr, consumer) = setup_cl_pool(&env);
+        // Ledger clock is at 10_000; a 20_000s window reaches before genesis.
+        assert_eq!(
+            consumer.try_get_cl_twal(&pool_addr, &20_000),
+            Err(Ok(TwalError::InsufficientHistory))
+        );
+    }
+
+    #[test]
+    fn test_cl_twal_no_snapshot_before_window_returns_insufficient_history() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+
+        let keeper = Address::generate(&env);
+        let pool_addr = env.register_contract(None, MockClPool);
+        MockClPoolClient::new(&env, &pool_addr).set_liquidity(&5_000_i128);
+        let consumer_addr = env.register_contract(None, TwalConsumer);
+        let consumer = TwalConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&keeper);
+
+        // The only snapshot is taken at 9_900, which is *after* the window
+        // start of 10_000 - 600 = 9_400, so no floor snapshot exists.
+        env.ledger().with_mut(|l| l.timestamp = 9_900);
+        consumer.save_cl_snapshot(&pool_addr);
+        env.ledger().with_mut(|l| l.timestamp = 10_000);
+
+        assert_eq!(
+            consumer.try_get_cl_twal(&pool_addr, &600),
+            Err(Ok(TwalError::InsufficientHistory))
+        );
+    }
+
+    #[test]
+    fn test_cl_twal_missing_snapshot_entry_returns_no_snapshot_found() {
+        let env = Env::default();
+        let (pool_addr, consumer) = setup_cl_pool(&env);
+        let consumer_addr = consumer.address.clone();
+
+        env.ledger().with_mut(|l| l.timestamp = 10_600);
+
+        // Drop the snapshot entry itself while leaving the timestamp index
+        // pointing at it -- the index names a floor snapshot that storage no
+        // longer holds.
+        env.as_contract(&consumer_addr, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::LiquiditySnapshot(pool_addr.clone(), 10_000));
+        });
+
+        assert_eq!(
+            consumer.try_get_cl_twal(&pool_addr, &600),
+            Err(Ok(TwalError::NoSnapshotFound))
+        );
+    }
+
+    #[test]
+    fn test_cl_twal_missing_accumulator_returns_typed_error() {
+        let env = Env::default();
+        let (pool_addr, consumer) = setup_cl_pool(&env);
+        let consumer_addr = consumer.address.clone();
+
+        env.ledger().with_mut(|l| l.timestamp = 10_600);
+
+        // Snapshot and its index survive; only the running accumulator is gone.
+        env.as_contract(&consumer_addr, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ClAccumulator(pool_addr.clone()));
+        });
+
+        assert_eq!(
+            consumer.try_get_cl_twal(&pool_addr, &600),
+            Err(Ok(TwalError::MissingClAccumulator))
+        );
+    }
+
+    #[test]
+    fn test_cl_twal_elapsed_zero_returns_typed_error() {
+        let env = Env::default();
+        let (pool_addr, consumer) = setup_cl_pool(&env);
+        let consumer_addr = consumer.address.clone();
+
+        env.ledger().with_mut(|l| l.timestamp = 10_600);
+
+        // Backdate nothing but the floor snapshot pool_ts to *now*, so the
+        // averaging span collapses to zero.
+        env.as_contract(&consumer_addr, || {
+            let snapshot: LiquiditySnapshot = env
+                .storage()
+                .persistent()
+                .get(&DataKey::LiquiditySnapshot(pool_addr.clone(), 10_000))
+                .unwrap();
+            env.storage().persistent().set(
+                &DataKey::LiquiditySnapshot(pool_addr.clone(), 10_000),
+                &LiquiditySnapshot {
+                    cum_liquidity: snapshot.cum_liquidity,
+                    pool_ts: 10_600,
+                },
+            );
+        });
+
+        assert_eq!(
+            consumer.try_get_cl_twal(&pool_addr, &600),
+            Err(Ok(TwalError::ElapsedZero))
+        );
+    }
+
+    #[test]
+    fn test_cl_twal_success_path_still_returns_ok_value() {
+        let env = Env::default();
+        let (pool_addr, consumer) = setup_cl_pool(&env);
+
+        env.ledger().with_mut(|l| l.timestamp = 10_600);
+        consumer.save_cl_snapshot(&pool_addr);
+        env.ledger().with_mut(|l| l.timestamp = 11_200);
+
+        // Constant 5_000 liquidity: the Result wrapper does not change the
+        // computed value.
+        assert_eq!(
+            consumer.try_get_cl_twal(&pool_addr, &600),
+            Ok(Ok(5_000_i128))
+        );
+        assert_eq!(consumer.get_cl_twal(&pool_addr, &600), 5_000);
+    }
+
+    #[test]
+    fn test_cl_twal_batch_read_agrees_with_direct_typed_error() {
+        let env = Env::default();
+        let (pool_addr, consumer) = setup_cl_pool(&env);
+        let consumer_addr = consumer.address.clone();
+
+        env.ledger().with_mut(|l| l.timestamp = 10_600);
+        env.as_contract(&consumer_addr, || {
+            env.storage()
+                .persistent()
+                .remove(&DataKey::ClAccumulator(pool_addr.clone()));
+        });
+
+        // The fault-isolated batch path and the direct accessor share one
+        // implementation, so they must report the same code.
+        let entries = consumer.get_twal_all_safe(&600);
+        assert_eq!(entries.len(), 1);
+        let entry = entries.get(0).unwrap();
+        assert!(!entry.ok);
+        assert_eq!(entry.error_code, TwalError::MissingClAccumulator as u32);
+        assert_eq!(
+            consumer.try_get_cl_twal(&pool_addr, &600),
+            Err(Ok(TwalError::MissingClAccumulator))
+        );
     }
 }

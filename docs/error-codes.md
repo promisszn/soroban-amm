@@ -239,6 +239,7 @@ Defined in [contracts/twal_consumer/src/lib.rs](../contracts/twal_consumer/src/l
 | 9 | `WindowTooLarge` | `window_seconds` exceeded `MAX_WINDOW_SECONDS` (90 days). | Use a shorter window. |
 | 10 | `TooManyPools` | `get_twal_batch` was called with more pools than `MAX_TRACKED_POOLS`. | Split the request into smaller batches. |
 | 11 | `CrossContractCallFailed` | A pool's liquidity-oracle call failed at the host level or the callee panicked (non-contract address, buggy pool). Only ever appears as a `TwalEntry.error_code` from `get_twal_all_safe`/`get_twal_batch`, or as the `Err` from `get_twal_all` once any entry fails this way. | Investigate the specific pool with `get_twal_batch([pool], window)`; consider `remove_tracked_pool` if it is permanently dead. |
+| 12 | `MissingClAccumulator` | A CL TWAL query found a stored `LiquiditySnapshot` for the pool but no `ClAccumulator` entry, so there is no running liquidity-cumulative to extrapolate to now. | Call `save_cl_snapshot` for the pool (it writes both) before querying `get_cl_twal`. |
 
 `get_twal_all_safe` and `get_twal_batch` never return an `Err` for a single bad
 pool — they return a `TwalEntry` with `ok: false` and `error_code` set to one
