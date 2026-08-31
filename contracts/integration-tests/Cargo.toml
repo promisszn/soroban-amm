@@ -1,5 +1,5 @@
 [package]
-name = "integration-tests"
+name = "integration_tests"
 version = "0.1.0"
 edition = "2021"
 
@@ -28,11 +28,11 @@ staking          = { path = "../staking",          features = ["testutils"] }
 cl_position_nft  = { path = "../cl_position_nft",  features = ["testutils"] }
 
 [dev-dependencies]
-twap-consumer    = { path = "../twap_consumer",    features = ["testutils"] }
-twal-consumer    = { path = "../twal_consumer",    features = ["testutils"] }
-dex-aggregator   = { path = "../dex_aggregator",   features = ["testutils"] }
-incentive-campaigns = { path = "../incentive_campaigns", features = ["testutils"] }
-v2-to-v3-migration   = { path = "../v2_to_v3_migration",   features = ["testutils"] }
+twap_consumer    = { path = "../twap_consumer",    features = ["testutils"] }
+twal_consumer    = { path = "../twal_consumer",    features = ["testutils"] }
+dex_aggregator   = { path = "../dex_aggregator",   features = ["testutils"] }
+incentive_campaigns = { path = "../incentive_campaigns", features = ["testutils"] }
+v2_to_v3_migration   = { path = "../v2_to_v3_migration",   features = ["testutils"] }
 
 [[test]]
 name = "v2_to_v3_migration"

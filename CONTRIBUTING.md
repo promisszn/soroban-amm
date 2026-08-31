@@ -56,9 +56,9 @@ you'd like to work on and we'll help you find a starting point.
 - **Rust** (stable toolchain) — install via [rustup](https://rustup.rs/).
 - **wasm32v1-none** target:
 
-  ```bash
-  rustup target add wasm32v1-none
-  ```
+    ```bash
+    rustup target add wasm32v1-none
+    ```
 
 - **Stellar CLI** (for building optimized WASM and deploying) — see the
   [Stellar CLI install guide](https://developers.stellar.org/docs/tools/developer-tools/cli/install-cli).
@@ -70,19 +70,19 @@ you'd like to work on and we'll help you find a starting point.
 
 The repository is a Cargo workspace. Each contract lives under `contracts/`:
 
-| Crate | Purpose |
-|-------|---------|
-| `amm` | V2 constant-product AMM pool |
-| `token` | SEP-41 LP token |
-| `factory` | Pool factory and registry |
-| `governance` | On-chain LP-governed governance |
-| `twap_consumer` | TWAP oracle consumer |
-| `concentrated_liquidity` | V3-style tick-based AMM (in progress) |
-| `router`, `dex_aggregator`, `batch_router`, `batch_auction` | Routing & execution |
-| `staking`, `incentive_campaigns`, `pol_vesting`, `reserve_manager` | Protocol economics |
-| `amm-fuzz` | Property-based invariant fuzzing |
-| `integration-tests` | Cross-contract integration tests |
-| `amm-sdk` | Rust SDK for interacting with the contracts |
+| Crate                                                              | Purpose                                     |
+| ------------------------------------------------------------------ | ------------------------------------------- |
+| `amm`                                                              | V2 constant-product AMM pool                |
+| `token`                                                            | SEP-41 LP token                             |
+| `factory`                                                          | Pool factory and registry                   |
+| `governance`                                                       | On-chain LP-governed governance             |
+| `twap_consumer`                                                    | TWAP oracle consumer                        |
+| `concentrated_liquidity`                                           | V3-style tick-based AMM (in progress)       |
+| `router`, `dex_aggregator`, `batch_router`, `batch_auction`        | Routing & execution                         |
+| `staking`, `incentive_campaigns`, `pol_vesting`, `reserve_manager` | Protocol economics                          |
+| `amm-fuzz`                                                         | Property-based invariant fuzzing            |
+| `integration-tests`                                                | Cross-contract integration tests            |
+| `amm-sdk`                                                          | Rust SDK for interacting with the contracts |
 
 Supporting directories: `scripts/` (deploy & e2e), `benches/` (hot-path
 benchmarks), `examples/` (TypeScript & Python clients), and `docs/`.
@@ -97,8 +97,8 @@ Common tasks are wrapped in the `Makefile`:
 make help       # list every target with a one-line description (default goal)
 make build      # cargo build --release --target wasm32v1-none
 make optimize   # optimize every WASM artifact from `make build` via the Stellar CLI
-make test       # build, then run the default-members test suite
-make test-all   # run tests for the whole workspace, bypassing default-members
+make test       # build, then run the workspace test suite
+make test-all   # run tests for the whole workspace
 make fmt        # cargo fmt --all
 make lint       # cargo clippy --all -- -D warnings
 make check-docs # verify docs/error-codes.md matches #[contracterror] enums
@@ -170,8 +170,8 @@ checked. See [`AUDIT.md`](AUDIT.md) for the security properties we track.
 1. **Fork** the repository and create a branch from `main`
    (`fix/short-description` or `feat/short-description`).
 2. Make your change, add tests, and run `make check` locally.
-3. **Open a pull request** against `main` with a clear description of *what*
-   changed and *why*. Link any related issue.
+3. **Open a pull request** against `main` with a clear description of _what_
+   changed and _why_. Link any related issue.
 4. Ensure **CI passes** — build, WASM size checks, clippy, formatting, and the
    test suite all run automatically on every PR.
 5. A **maintainer reviews and approves** before merge. Direct pushes to `main`

@@ -34,15 +34,15 @@ optimize: build ## Optimize every WASM artifact produced by `make build`
 		stellar contract optimize --wasm "$$f"; \
 	done
 
-test: build ## Build, then run the default-members test suite
-	cargo test
-
-test-all: ## Run tests for the whole workspace, bypassing default-members
+test: build ## Build, then run the full workspace test suite
 	cargo test --workspace
 
-fuzz-cl: ## Build the wasm deps amm-fuzz imports, then run the full amm-fuzz suite incl. CL stateful properties
+test-all: ## Run tests for the whole workspace
+	cargo test --workspace
+
+fuzz-cl: ## Build the wasm deps amm_fuzz imports, then run the full amm_fuzz suite incl. CL stateful properties
 	cargo build --release --target wasm32v1-none -p concentrated_liquidity -p amm -p token
-	cargo test -p amm-fuzz --features cl
+	cargo test -p amm_fuzz --features cl
 
 fmt: ## cargo fmt --all
 	cargo fmt --all

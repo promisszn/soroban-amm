@@ -1,185 +1,185 @@
 name: CI
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+    push:
+        branches: [main]
+    pull_request:
+        branches: [main]
 jobs:
-  build-and-test:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      checks: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Setup Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          components: clippy, rustfmt
-      - name: Add wasm target
-        run: rustup target add wasm32v1-none
-      - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@v2
-      # `router`, `dex-aggregator`, `batch_router`, and `batch_auction` used to
-      # depend on more than one other contract crate (e.g. `amm` + `factory`,
-      # or `amm` + `concentrated_liquidity`) as a Rust library, which caused a
-      # duplicate wasm-export symbol collision at link time (every
-      # #[contractimpl] fn in a dependency is exported as a wasm symbol).
-      # Fixed by extracting the cross-contract call interfaces those four
-      # crates actually need into `contracts/pool_interfaces`, a shared crate
-      # with no `#[contract]`/`#[contractimpl]` block and therefore no wasm
-      # exports of its own. All four now depend on that instead of on the
-      # real contract crates (which remain dev-dependencies for their own
-      # tests), so there is nothing left to collide with at link time.
-      # `amm-fuzz`, `integration-tests`, and `benches` are not deployable
-      # contracts, so they never produce wasm to build or size-check here.
-      - name: Build WASM artifacts
-        run: cargo build --release --target wasm32v1-none --workspace --exclude amm-fuzz --exclude integration-tests --exclude benches
-      - name: Check WASM binary sizes
-        run: bash scripts/size_report.sh --fail-on-limit
-      # All six crates that were previously excluded here
-      # (`concentrated_liquidity`, `dex-aggregator`, `incentive-campaigns`,
-      # `oracle-aggregator`, `token`, `v2-to-v3-migration`) have had their
-      # pre-existing test failures root-caused and fixed. Three deep,
-      # non-trivial bugs found along the way in `concentrated_liquidity`
-      # (tick-crossing liquidity/fee-growth bookkeeping) are documented and
-      # left as `#[ignore]`d tests with a diagnosis in the test file itself,
-      # rather than excluding the whole crate — see that PR's description
-      # for details. Every crate in the workspace now runs on every PR.
-      - name: Run all tests
-        run: cargo test --workspace --exclude amm-fuzz
-      - name: Run upgrade integration tests
-        run: cargo test -p integration-tests upgrade
-      - name: Run hot-path benchmarks
-        run: cargo run -p benches -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --exclude amm-fuzz -- -D warnings
-      - name: Format check
-        run: cargo fmt --all -- --check
-      - name: Check docs
-        run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --exclude amm-fuzz
-      - name: Check error docs sync
-        run: make check-docs
+    build-and-test:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            checks: write
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v7
+            - name: Setup Rust
+              uses: actions-rs/toolchain@v1
+              with:
+                  profile: minimal
+                  toolchain: stable
+                  components: clippy, rustfmt
+            - name: Add wasm target
+              run: rustup target add wasm32v1-none
+            - name: Cache Cargo dependencies
+              uses: Swatinem/rust-cache@v2
+            # `router`, `dex-aggregator`, `batch_router`, and `batch_auction` used to
+            # depend on more than one other contract crate (e.g. `amm` + `factory`,
+            # or `amm` + `concentrated_liquidity`) as a Rust library, which caused a
+            # duplicate wasm-export symbol collision at link time (every
+            # #[contractimpl] fn in a dependency is exported as a wasm symbol).
+            # Fixed by extracting the cross-contract call interfaces those four
+            # crates actually need into `contracts/pool_interfaces`, a shared crate
+            # with no `#[contract]`/`#[contractimpl]` block and therefore no wasm
+            # exports of its own. All four now depend on that instead of on the
+            # real contract crates (which remain dev-dependencies for their own
+            # tests), so there is nothing left to collide with at link time.
+            # `amm-fuzz`, `integration-tests`, and `benches` are not deployable
+            # contracts, so they never produce wasm to build or size-check here.
+            - name: Build WASM artifacts
+              run: cargo build --release --target wasm32v1-none --workspace --exclude amm_fuzz --exclude integration_tests --exclude benches --exclude soroban_amm_simulator
+            - name: Check WASM binary sizes
+              run: bash scripts/size_report.sh --fail-on-limit
+            # All six crates that were previously excluded here
+            # (`concentrated_liquidity`, `dex-aggregator`, `incentive-campaigns`,
+            # `oracle-aggregator`, `token`, `v2-to-v3-migration`) have had their
+            # pre-existing test failures root-caused and fixed. Three deep,
+            # non-trivial bugs found along the way in `concentrated_liquidity`
+            # (tick-crossing liquidity/fee-growth bookkeeping) are documented and
+            # left as `#[ignore]`d tests with a diagnosis in the test file itself,
+            # rather than excluding the whole crate — see that PR's description
+            # for details. Every crate in the workspace now runs on every PR.
+            - name: Run all tests
+              run: cargo test --workspace --exclude amm_fuzz
+            - name: Run upgrade integration tests
+              run: cargo test -p integration_tests upgrade
+            - name: Run hot-path benchmarks
+              run: cargo run -p benches -- --check
+            - name: Clippy
+              run: cargo clippy --workspace --all-targets --exclude amm-fuzz -- -D warnings
+            - name: Format check
+              run: cargo fmt --all -- --check
+            - name: Check docs
+              run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --exclude amm-fuzz
+            - name: Check error docs sync
+              run: make check-docs
 
-      - name: Security audit
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-        # Advisories can be ignored via .cargo/audit.toml.
+            - name: Security audit
+              uses: rustsec/audit-check@v2
+              with:
+                  token: ${{ secrets.GITHUB_TOKEN }}
+              # Advisories can be ignored via .cargo/audit.toml.
 
-  fuzz:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Setup Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-      - name: Add wasm target
-        run: rustup target add wasm32v1-none
-      - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@v2
-      - name: Run the full amm-fuzz suite (incl. CL stateful properties)
-        run: make fuzz-cl
+    fuzz:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v7
+            - name: Setup Rust
+              uses: actions-rs/toolchain@v1
+              with:
+                  profile: minimal
+                  toolchain: stable
+            - name: Add wasm target
+              run: rustup target add wasm32v1-none
+            - name: Cache Cargo dependencies
+              uses: Swatinem/rust-cache@v2
+            - name: Run the full amm-fuzz suite (incl. CL stateful properties)
+              run: make fuzz-cl
 
-  go-sdk:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    defaults:
-      run:
-        working-directory: packages/go-sdk
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Setup Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: "1.21"
-          # The SDK has no third-party dependencies, so there is no go.sum to
-          # key a module cache on.
-          cache: false
-      - name: Format check
-        run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "FAIL: gofmt found unformatted files:"
-            echo "$unformatted"
-            exit 1
-          fi
-      - name: Build
-        run: go build ./...
-      - name: Vet
-        run: go vet ./...
-      - name: Test
-        run: go test ./... -count=1
+    go-sdk:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+        defaults:
+            run:
+                working-directory: packages/go-sdk
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v7
+            - name: Setup Go
+              uses: actions/setup-go@v7
+              with:
+                  go-version: "1.21"
+                  # The SDK has no third-party dependencies, so there is no go.sum to
+                  # key a module cache on.
+                  cache: false
+            - name: Format check
+              run: |
+                  unformatted=$(gofmt -l .)
+                  if [ -n "$unformatted" ]; then
+                    echo "FAIL: gofmt found unformatted files:"
+                    echo "$unformatted"
+                    exit 1
+                  fi
+            - name: Build
+              run: go build ./...
+            - name: Vet
+              run: go vet ./...
+            - name: Test
+              run: go test ./... -count=1
 
-  npm-packages:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - dir: packages/sdk
-            test_cmd: npm test -- --passWithNoTests
-          - dir: packages/ui-components
-            # Run the real test suite (now that it exists) and enforce the
-            # configured coverage thresholds; a broken component or a drop
-            # below the line/function coverage floor fails the build.
-            test_cmd: npm test -- --coverage
-          - dir: packages/ts-advanced-client
-            test_cmd: npm test
-          - dir: services/graphql-api
-            # No runnable test suite yet (the "test" script points at a
-            # dist file that isn't emitted) - build coverage only for now.
-            test_cmd: echo "no test suite configured yet"
-          - dir: services/webhook-streamer
-            test_cmd: npm test
-          - dir: services/health-dashboard
-            test_cmd: npm test
-          - dir: examples/client
-            test_cmd: npm test
-    defaults:
-      run:
-        working-directory: ${{ matrix.dir }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Setup Node
-        uses: actions/setup-node@v7
-        with:
-          node-version: 22
-      - name: Install dependencies
-        run: npm install
-      - name: Build
-        run: npm run build
-      - name: Test
-        run: ${{ matrix.test_cmd }}
+    npm-packages:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - dir: packages/sdk
+                      test_cmd: npm test -- --passWithNoTests
+                    - dir: packages/ui-components
+                      # Run the real test suite (now that it exists) and enforce the
+                      # configured coverage thresholds; a broken component or a drop
+                      # below the line/function coverage floor fails the build.
+                      test_cmd: npm test -- --coverage
+                    - dir: packages/ts-advanced-client
+                      test_cmd: npm test
+                    - dir: services/graphql-api
+                      # No runnable test suite yet (the "test" script points at a
+                      # dist file that isn't emitted) - build coverage only for now.
+                      test_cmd: echo "no test suite configured yet"
+                    - dir: services/webhook-streamer
+                      test_cmd: npm test
+                    - dir: services/health-dashboard
+                      test_cmd: npm test
+                    - dir: examples/client
+                      test_cmd: npm test
+        defaults:
+            run:
+                working-directory: ${{ matrix.dir }}
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v7
+            - name: Setup Node
+              uses: actions/setup-node@v7
+              with:
+                  node-version: 22
+            - name: Install dependencies
+              run: npm install
+            - name: Build
+              run: npm run build
+            - name: Test
+              run: ${{ matrix.test_cmd }}
 
-  python-examples:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    defaults:
-      run:
-        working-directory: examples/python
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Setup Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.11"
-      - name: Install dependencies
-        run: pip install -r requirements.txt -r requirements-dev.txt
-      - name: Run tests
-        run: pytest -q
+    python-examples:
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+        defaults:
+            run:
+                working-directory: examples/python
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v7
+            - name: Setup Python
+              uses: actions/setup-python@v7
+              with:
+                  python-version: "3.11"
+            - name: Install dependencies
+              run: pip install -r requirements.txt -r requirements-dev.txt
+            - name: Run tests
+              run: pytest -q

@@ -1,5 +1,5 @@
 [package]
-name = "flash-loan-receiver"
+name = "flash_loan_receiver"
 version = "0.1.0"
 edition = "2021"
 description = "Reference implementation of a Soroban AMM flash loan receiver with real-world use cases"
@@ -17,7 +17,7 @@ testutils = ["soroban-sdk/testutils"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
-soroban-amm-sdk = { path = "../../contracts/amm-sdk" }
+soroban_amm_sdk = { path = "../../contracts/amm-sdk" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
