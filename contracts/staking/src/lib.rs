@@ -138,6 +138,7 @@ pub struct Staking;
 impl Staking {
     /// Initialize the staking contract.
     pub fn initialize(env: Env, lp_token: Address, reward_token: Address, admin: Address) {
+        Self::extend_instance_ttl(&env);
         assert!(
             !env.storage().instance().has(&DataKey::LpToken),
             "already initialized"
@@ -178,6 +179,7 @@ impl Staking {
         min_lock_duration_secs: u64,
         max_lock_duration_secs: u64,
     ) {
+        Self::extend_instance_ttl(&env);
         assert!(
             !env.storage().instance().has(&DataKey::LpToken),
             "already initialized"
@@ -212,11 +214,13 @@ impl Staking {
 
     /// Escrow LP tokens for a fixed lock duration with a boosted reward rate (#317).
     pub fn lock(env: Env, staker: Address, amount: i128, lock_duration_seconds: u64) {
+        Self::extend_instance_ttl(&env);
         Self::stake_locked(env, staker, amount, lock_duration_seconds);
     }
 
     /// Withdraw all LP and accrued rewards after the lock expires (#317).
     pub fn unlock(env: Env, staker: Address) -> (i128, i128) {
+        Self::extend_instance_ttl(&env);
         let amount: i128 = env
             .storage()
             .persistent()
@@ -228,6 +232,7 @@ impl Staking {
 
     /// Extend an existing lock forward in time only (#317).
     pub fn extend_lock(env: Env, staker: Address, new_duration_seconds: u64) {
+        Self::extend_instance_ttl(&env);
         assert!(!Self::is_paused(env.clone()), "contract is paused");
         staker.require_auth();
         assert!(new_duration_seconds > 0, "duration must be positive");
@@ -309,6 +314,7 @@ impl Staking {
     /// passed this reads `MIN_BOOST` even if `settle_boost` hasn't physically
     /// corrected storage yet, matching `get_staker_info` and `current_boost`.
     pub fn get_locked_position(env: Env, staker: Address) -> LockedPosition {
+        Self::extend_instance_ttl(&env);
         let amount: i128 = env
             .storage()
             .persistent()
@@ -329,6 +335,7 @@ impl Staking {
 
     /// Add rewards to the pool. Admin only.
     pub fn add_rewards(env: Env, admin: Address, amount: i128) {
+        Self::extend_instance_ttl(&env);
         admin.require_auth();
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         assert!(admin == stored_admin, "not admin");
@@ -377,6 +384,7 @@ impl Staking {
     /// is being patched). Unstaking and emergency withdrawals remain available
     /// so stakers can always retrieve their LP tokens.
     pub fn pause(env: Env, admin: Address) {
+        Self::extend_instance_ttl(&env);
         admin.require_auth();
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         assert!(admin == stored_admin, "not admin");
@@ -387,6 +395,7 @@ impl Staking {
 
     /// Resume staking and claiming. Admin only (#360).
     pub fn unpause(env: Env, admin: Address) {
+        Self::extend_instance_ttl(&env);
         admin.require_auth();
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         assert!(admin == stored_admin, "not admin");
@@ -397,6 +406,7 @@ impl Staking {
 
     /// Whether the contract is currently paused (#360).
     pub fn is_paused(env: Env) -> bool {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::Paused)
@@ -405,6 +415,7 @@ impl Staking {
 
     /// Stake LP tokens without a lock (1Ãƒâ€” boost).
     pub fn stake(env: Env, staker: Address, amount: i128) {
+        Self::extend_instance_ttl(&env);
         Self::stake_locked(env, staker, amount, 0);
     }
 
@@ -417,6 +428,7 @@ impl Staking {
     /// If the staker already has a lock, the new lock must expire no earlier
     /// than the existing one (locks can only be extended, not shortened).
     pub fn stake_locked(env: Env, staker: Address, amount: i128, lock_duration_secs: u64) {
+        Self::extend_instance_ttl(&env);
         assert!(!Self::is_paused(env.clone()), "contract is paused");
         staker.require_auth();
         assert!(
@@ -534,6 +546,7 @@ impl Staking {
 
     /// Claim accrued rewards without unstaking.
     pub fn claim(env: Env, staker: Address) -> i128 {
+        Self::extend_instance_ttl(&env);
         assert!(!Self::is_paused(env.clone()), "contract is paused");
         staker.require_auth();
         Self::_claim_rewards(&env, &staker)
@@ -543,6 +556,7 @@ impl Staking {
     ///
     /// Panics if the staker's lock has not yet expired.
     pub fn unstake(env: Env, staker: Address, amount: i128) -> (i128, i128) {
+        Self::extend_instance_ttl(&env);
         staker.require_auth();
         assert!(amount > 0, "amount must be positive");
 
@@ -640,6 +654,7 @@ impl Staking {
     /// behind the admin so it cannot be used to skip rewards under normal
     /// conditions.
     pub fn set_emergency_mode(env: Env, admin: Address, enabled: bool) {
+        Self::extend_instance_ttl(&env);
         admin.require_auth();
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         assert!(admin == stored_admin, "not admin");
@@ -652,6 +667,7 @@ impl Staking {
 
     /// Set the optional maximum reward pool balance. Admin only.
     pub fn set_max_reward_pool_balance(env: Env, admin: Address, max_balance: i128) {
+        Self::extend_instance_ttl(&env);
         admin.require_auth();
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         assert!(admin == stored_admin, "not admin");
@@ -676,6 +692,7 @@ impl Staking {
 
     /// Whether emergency mode is currently active (#359).
     pub fn is_emergency_mode(env: Env) -> bool {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::EmergencyMode)
@@ -692,6 +709,7 @@ impl Staking {
     ///
     /// Returns the raw LP amount returned to the staker.
     pub fn emergency_withdraw(env: Env, staker: Address) -> i128 {
+        Self::extend_instance_ttl(&env);
         staker.require_auth();
         assert!(
             Self::is_emergency_mode(env.clone()),
@@ -753,6 +771,7 @@ impl Staking {
 
     /// View pending rewards for a staker.
     pub fn pending_rewards(env: Env, staker: Address) -> i128 {
+        Self::extend_instance_ttl(&env);
         let effective = Self::_staker_effective(&env, &staker);
         if effective == 0 {
             return 0;
@@ -772,6 +791,7 @@ impl Staking {
 
     /// Get pool information.
     pub fn get_pool_info(env: Env) -> PoolInfo {
+        Self::extend_instance_ttl(&env);
         PoolInfo {
             lp_token: env.storage().instance().get(&DataKey::LpToken).unwrap(),
             reward_token: env.storage().instance().get(&DataKey::RewardToken).unwrap(),
@@ -801,6 +821,7 @@ impl Staking {
     /// effective amount here even before `settle_boost` has run, so this
     /// view is never the thing that hides the bug this issue fixes.
     pub fn get_staker_info(env: Env, staker: Address) -> StakerInfo {
+        Self::extend_instance_ttl(&env);
         let staked_amount: i128 = env
             .storage()
             .persistent()
@@ -877,12 +898,14 @@ impl Staking {
     /// keeper (or UI) can check decay status without loading the full
     /// `StakerInfo` struct.
     pub fn current_boost(env: Env, staker: Address) -> i128 {
+        Self::extend_instance_ttl(&env);
         Self::_current_boost(&env, &staker)
     }
 
     /// `staker`'s effective (boosted) staked amount right now, decay applied.
     /// Equivalent to `get_staker_info(..).effective_amount`.
     pub fn effective_staked(env: Env, staker: Address) -> i128 {
+        Self::extend_instance_ttl(&env);
         Self::_staker_effective(&env, &staker)
     }
 
@@ -898,6 +921,7 @@ impl Staking {
     /// pre-#699 behaviour where nothing ever corrected it for an
     /// unsettled expiry.
     pub fn total_effective_staked(env: Env) -> i128 {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::TotalEffectiveStaked)
@@ -906,6 +930,7 @@ impl Staking {
 
     /// The lock-expiry timestamp for `staker` (0 if never locked).
     pub fn boost_expires_at(env: Env, staker: Address) -> u64 {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .persistent()
             .get(&DataKey::LockExpiry(staker))
@@ -921,6 +946,7 @@ impl Staking {
     /// subset of that page whose lock has genuinely expired and whose
     /// stored boost hasn't been settled down to `MIN_BOOST` yet.
     pub fn list_expired_boosts(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        Self::extend_instance_ttl(&env);
         let index = Self::_index_load(&env);
         let (min_boost, _) = Self::_boost_bounds(&env);
         let now = env.ledger().timestamp();
@@ -970,6 +996,7 @@ impl Staking {
     /// `stake_locked`/`extend_lock` already do before recomputing a
     /// position's effective amount, so no reward is silently reassigned.
     pub fn settle_boost(env: Env, staker: Address) {
+        Self::extend_instance_ttl(&env);
         let (min_boost, _) = Self::_boost_bounds(&env);
         let stored_boost: i128 = env
             .storage()
@@ -1062,6 +1089,7 @@ impl Staking {
     /// none can abort the others. Bounded to `MAX_BATCH_SIZE` so one
     /// invocation can't be made to exceed the transaction's resource budget.
     pub fn settle_boost_batch(env: Env, stakers: Vec<Address>) {
+        Self::extend_instance_ttl(&env);
         assert!(
             stakers.len() <= MAX_BATCH_SIZE,
             "batch too large: settle_boost_batch is capped at MAX_BATCH_SIZE entries per call"
@@ -1091,6 +1119,7 @@ impl Staking {
     /// double-register anyone, and it never claws back or reassigns any
     /// reward already accrued or paid.
     pub fn register_existing_stakers(env: Env, stakers: Vec<Address>) {
+        Self::extend_instance_ttl(&env);
         assert!(
             stakers.len() <= MAX_BATCH_SIZE,
             "batch too large: register_existing_stakers is capped at MAX_BATCH_SIZE entries per call"
@@ -1109,6 +1138,7 @@ impl Staking {
 
     /// Distribute new rewards across all stakers. Admin only.
     pub fn update_rewards(env: Env, admin: Address, new_rewards: i128) {
+        Self::extend_instance_ttl(&env);
         admin.require_auth();
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         assert!(admin == stored_admin, "not admin");
@@ -1161,10 +1191,9 @@ impl Staking {
         if distributable > 0 {
             let rewards_increase = distributable * SCALE_FACTOR / total_effective;
             acc_per_share = acc_per_share + rewards_increase;
-            env.storage().instance().set(
-                &DataKey::AccumulatedRewardsPerShare,
-                &acc_per_share,
-            );
+            env.storage()
+                .instance()
+                .set(&DataKey::AccumulatedRewardsPerShare, &acc_per_share);
 
             env.storage()
                 .instance()
@@ -1181,6 +1210,10 @@ impl Staking {
     }
 
     // Ã¢â€â‚¬Ã¢â€â‚¬ Internal helpers Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+
+    fn extend_instance_ttl(env: &Env) {
+        env.storage().instance().extend_ttl(MIN_TTL, BUMP_TO);
+    }
 
     fn _claim_rewards(env: &Env, staker: &Address) -> i128 {
         let pending = Self::pending_rewards(env.clone(), staker.clone());
@@ -1432,10 +1465,11 @@ mod cap_tests;
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
+        testutils::{storage::Instance as _, Address as _, Ledger},
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
         Address, Env,
     };
+    use token::DataKey as TokenDataKey;
 
     fn create_sac<'a>(
         env: &'a Env,
@@ -1460,6 +1494,128 @@ mod tests {
         let staker = Address::generate(env);
         lp_sac.mint(&staker, &5_000_i128);
         (admin, staker, staking)
+    }
+
+    fn instance_ttl(env: &Env, staking: &StakingClient<'_>) -> u32 {
+        env.as_contract(&staking.address, || env.storage().instance().get_ttl())
+    }
+
+    fn lower_instance_ttl_below_min(env: &Env, staking: &StakingClient<'_>) {
+        env.ledger()
+            .with_mut(|l| l.sequence_number += BUMP_TO - MIN_TTL + 1);
+        let ttl = instance_ttl(env, staking);
+        assert!(
+            ttl < MIN_TTL,
+            "test setup should lower instance TTL below MIN_TTL, got {ttl}"
+        );
+    }
+
+    fn refresh_token_instance_ttl(env: &Env, token: &Address) {
+        env.as_contract(token, || {
+            env.storage().instance().extend_ttl(BUMP_TO, BUMP_TO * 2);
+        });
+    }
+
+    fn refresh_token_balance_ttl(env: &Env, token: &Address, holder: &Address) {
+        env.as_contract(token, || {
+            env.storage().persistent().extend_ttl(
+                &TokenDataKey::Balance(holder.clone()),
+                BUMP_TO,
+                BUMP_TO * 2,
+            );
+        });
+    }
+
+    fn assert_instance_ttl_bumped(env: &Env, staking: &StakingClient<'_>) {
+        let ttl = instance_ttl(env, staking);
+        assert!(
+            ttl >= BUMP_TO - 1,
+            "instance TTL {ttl} should be bumped toward BUMP_TO"
+        );
+    }
+
+    #[test]
+    fn test_initialize_extends_instance_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let staking_addr = env.register_contract(None, Staking);
+        let (lp_token, _) = create_sac(&env, &admin);
+        let (reward_token, _) = create_sac(&env, &admin);
+        let staking = StakingClient::new(&env, &staking_addr);
+
+        staking.initialize(&lp_token.address, &reward_token.address, &admin);
+
+        assert_instance_ttl_bumped(&env, &staking);
+    }
+
+    #[test]
+    fn test_unstake_restores_lapsed_instance_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staker, staking) = setup(&env);
+        staking.stake(&staker, &1_000_i128);
+        staking.update_rewards(&admin, &100_i128);
+        let pool = staking.get_pool_info();
+        refresh_token_instance_ttl(&env, &pool.lp_token);
+        refresh_token_instance_ttl(&env, &pool.reward_token);
+        refresh_token_balance_ttl(&env, &pool.lp_token, &staking.address);
+        refresh_token_balance_ttl(&env, &pool.lp_token, &staker);
+        refresh_token_balance_ttl(&env, &pool.reward_token, &staking.address);
+        lower_instance_ttl_below_min(&env, &staking);
+        assert!(instance_ttl(&env, &staking) < MIN_TTL);
+
+        let (amount, rewards) = staking.unstake(&staker, &1_000_i128);
+
+        assert_eq!((amount, rewards), (1_000, 100));
+        assert_instance_ttl_bumped(&env, &staking);
+    }
+
+    #[test]
+    fn test_emergency_withdraw_restores_lapsed_instance_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staker, staking) = setup(&env);
+        staking.stake_locked(&staker, &1_000_i128, &MIN_LOCK_DURATION);
+        staking.set_emergency_mode(&admin, &true);
+        let pool = staking.get_pool_info();
+        refresh_token_instance_ttl(&env, &pool.lp_token);
+        refresh_token_balance_ttl(&env, &pool.lp_token, &staking.address);
+        refresh_token_balance_ttl(&env, &pool.lp_token, &staker);
+        lower_instance_ttl_below_min(&env, &staking);
+        assert!(instance_ttl(&env, &staking) < MIN_TTL);
+
+        let withdrawn = staking.emergency_withdraw(&staker);
+
+        assert_eq!(withdrawn, 1_000);
+        assert_instance_ttl_bumped(&env, &staking);
+    }
+
+    #[test]
+    fn test_stake_and_claim_extend_instance_ttl() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staker, staking) = setup(&env);
+        let pool = staking.get_pool_info();
+        refresh_token_instance_ttl(&env, &pool.lp_token);
+        refresh_token_instance_ttl(&env, &pool.reward_token);
+        refresh_token_balance_ttl(&env, &pool.lp_token, &staker);
+        refresh_token_balance_ttl(&env, &pool.reward_token, &staking.address);
+        lower_instance_ttl_below_min(&env, &staking);
+        assert!(instance_ttl(&env, &staking) < MIN_TTL);
+
+        staking.stake_locked(&staker, &1_000_i128, &MIN_LOCK_DURATION);
+
+        assert_instance_ttl_bumped(&env, &staking);
+        staking.update_rewards(&admin, &100_i128);
+        refresh_token_instance_ttl(&env, &pool.reward_token);
+        lower_instance_ttl_below_min(&env, &staking);
+        assert!(instance_ttl(&env, &staking) < MIN_TTL);
+
+        let claimed = staking.claim(&staker);
+
+        assert_eq!(claimed, 99);
+        assert_instance_ttl_bumped(&env, &staking);
     }
 
     #[test]
@@ -2698,7 +2854,7 @@ mod tests {
 
         let admin = Address::generate(&env);
         let staking_addr = env.register_contract(None, Staking);
-        let (lp_token, _lp_sac) = create_sac(&env, &admin);
+        let (lp_token, lp_sac) = create_sac(&env, &admin);
         let (reward_token, reward_sac) = create_sac(&env, &admin);
         let staking = StakingClient::new(&env, &staking_addr);
         staking.initialize(&lp_token.address, &reward_token.address, &admin);
@@ -2709,7 +2865,7 @@ mod tests {
 
         // Stake one staker so total_effective > 0.
         let staker = Address::generate(&env);
-        lp_token.mint(&staker, &1_000_i128);
+        lp_sac.mint(&staker, &1_000_i128);
         staking.stake(&staker, &1_000_i128);
 
         // Attempt to distribute more than the pool has: should be clamped

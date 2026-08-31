@@ -827,6 +827,22 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "StakerIndex"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "vec": [
+                            {
+                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "TotalEffectiveStaked"
                             }
                           ]
@@ -845,7 +861,7 @@
             },
             "ext": "v0"
           },
-          4095
+          3110400
         ]
       ],
       [
@@ -1415,7 +1431,7 @@
             },
             "ext": "v0"
           },
-          4095
+          3110400
         ]
       ]
     ]
@@ -2489,7 +2505,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'contract is paused' from contract function 'Symbol(obj#769)'"
+                  "string": "caught panic 'contract is paused' from contract function 'Symbol(obj#797)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
