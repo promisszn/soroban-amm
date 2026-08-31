@@ -238,12 +238,12 @@ fn setup_cl(env: &Env) -> (ConcentratedLiquidityClient<'_>, Address, Address, Ad
 fn bench_cl_mint_position(env: &Env) {
     let (client, provider, _, _) = setup_cl(env);
     env.budget().reset_default();
-    client.mint_position(&provider, &-100, &100, &100_000, &100_000, &0, &0);
+    client.mint_position(&provider, &-100, &100, &100_000, &100_000, &0, &0, &u64::MAX);
 }
 
 fn bench_cl_swap(env: &Env) {
     let (client, provider, token_a, _) = setup_cl(env);
-    client.mint_position(&provider, &-100, &100, &100_000, &100_000, &0, &0);
+    client.mint_position(&provider, &-100, &100, &100_000, &100_000, &0, &0, &u64::MAX);
     StellarAssetClient::new(env, &token_a).mint(&provider, &100);
     env.budget().reset_default();
     client.swap(&provider, &true, &100, &0, &0, &u64::MAX);

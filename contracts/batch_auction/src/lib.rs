@@ -1348,6 +1348,7 @@ mod tests {
             &50_000_000_i128,
             &0_i128,
             &0_i128,
+            &u64::MAX,
         );
         cl_addr
     }
@@ -2691,6 +2692,7 @@ mod tests {
             &50_000_000_i128,
             &0_i128,
             &0_i128,
+            &u64::MAX,
         );
 
         let auction_addr = env.register_contract(None, BatchAuction);

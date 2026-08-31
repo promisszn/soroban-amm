@@ -122,6 +122,7 @@ fn memory_leak_detect_orphaned_storage_after_position_burn() {
         &1_000_000_i128,
         &0_i128,
         &0_i128,
+        &u64::MAX,
     );
 
     // The mint registered both boundary ticks and the position row.
