@@ -1266,6 +1266,53 @@ impl Governance {
         proposal
     }
 
+    /// Total number of proposals ever created by this contract.
+    ///
+    /// This is the monotonic `ProposalCount` counter incremented by `propose`,
+    /// so it doubles as the exclusive upper bound of the assigned id range:
+    /// every proposal ever created has an id in `[0, get_proposal_count())`.
+    /// It never decreases — cancelled, vetoed and executed proposals are
+    /// status-transitioned in place, never removed from the count.
+    pub fn get_proposal_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ProposalCount)
+            .unwrap_or(0)
+    }
+
+    /// Return up to `limit` proposals by ascending id, starting at `offset`.
+    ///
+    /// Ids are assigned sequentially from 0 by `propose`, and no code path ever
+    /// removes a `DataKey::Proposal` entry — cancel, veto and execute only
+    /// mutate the stored struct's flags — so `[0, get_proposal_count())` is a
+    /// dense id range and proposals come back in creation order.
+    ///
+    /// The one way an id in that range can fail to resolve is a persistent
+    /// entry whose TTL lapsed before anyone bumped it. Such an id is skipped
+    /// rather than panicking, so an expired proposal can never make the whole
+    /// page unreadable. A returned page can therefore be shorter than
+    /// `min(limit, count - offset)`; callers paginating to the end should drive
+    /// the loop off `get_proposal_count()` and `offset`, not off page length.
+    ///
+    /// `offset >= count` returns an empty `Vec`, and `offset + limit` is
+    /// clamped to `count`, mirroring `factory::get_pools`.
+    pub fn get_proposals_paginated(env: Env, offset: u32, limit: u32) -> Vec<Proposal> {
+        let count = Self::get_proposal_count(env.clone());
+        let start = offset.min(count);
+        // Saturating: `start + limit` can overflow u32 for a large `limit`.
+        let end = start.saturating_add(limit).min(count);
+
+        let mut page = Vec::new(&env);
+        for id in start..end {
+            let key = DataKey::Proposal(id);
+            if let Some(proposal) = env.storage().persistent().get::<_, Proposal>(&key) {
+                Self::bump_key_ttl(&env, &key);
+                page.push_back(proposal);
+            }
+        }
+        page
+    }
+
     /// Derive the current status of a proposal.
     pub fn proposal_status(env: Env, proposal_id: u32) -> ProposalStatus {
         let proposal: Proposal = env
@@ -3085,6 +3132,163 @@ mod tests {
 
         gov.execute(&pid);
         assert_eq!(gov.proposal_status(&pid), ProposalStatus::Executed);
+    }
+
+    // ── Proposal enumeration (issue #793) ────────────────────────────────────
+
+    /// Five distinct `ProposalKind`s, so enumeration is exercised across
+    /// variants rather than repeats of a single kind.
+    fn enumeration_kinds(env: &Env) -> [ProposalKind; 5] {
+        [
+            ProposalKind::UpdateFee(50),
+            ProposalKind::UpdateFee(60),
+            ProposalKind::PausePool,
+            ProposalKind::UnpausePool,
+            ProposalKind::TransferAdmin(Address::generate(env)),
+        ]
+    }
+
+    #[test]
+    fn test_get_proposal_count_starts_at_zero() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        assert_eq!(gov.get_proposal_count(), 0);
+        assert_eq!(gov.get_proposals_paginated(&0, &10).len(), 0);
+    }
+
+    #[test]
+    fn test_get_proposal_count_tracks_created_proposals() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp1 = Address::generate(&s.env);
+        mint_lp(&s, &lp1, 1_000);
+
+        for (i, kind) in enumeration_kinds(&s.env).iter().take(3).enumerate() {
+            assert_eq!(gov.get_proposal_count(), i as u32);
+            assert_eq!(gov.propose(&lp1, kind), i as u32);
+        }
+
+        assert_eq!(gov.get_proposal_count(), 3);
+    }
+
+    #[test]
+    fn test_get_proposals_paginated_returns_creation_order_matching_get_proposal() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp1 = Address::generate(&s.env);
+        mint_lp(&s, &lp1, 1_000);
+
+        let kinds = enumeration_kinds(&s.env);
+        for kind in kinds.iter() {
+            gov.propose(&lp1, kind);
+        }
+        assert_eq!(gov.get_proposal_count(), 5);
+
+        let page = gov.get_proposals_paginated(&0, &5);
+        assert_eq!(page.len(), 5);
+        for id in 0..5u32 {
+            let from_page = page.get(id).unwrap();
+            // Ids ascend in creation order, and every field matches the
+            // single-id accessor exactly.
+            assert_eq!(from_page.id, id);
+            assert_eq!(from_page.kind, kinds[id as usize]);
+            assert_eq!(from_page, gov.get_proposal(&id));
+        }
+    }
+
+    #[test]
+    fn test_get_proposals_paginated_offset_and_limit_boundaries() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp1 = Address::generate(&s.env);
+        mint_lp(&s, &lp1, 1_000);
+
+        for kind in enumeration_kinds(&s.env).iter() {
+            gov.propose(&lp1, kind);
+        }
+
+        // Interior slice.
+        let mid = gov.get_proposals_paginated(&1, &2);
+        assert_eq!(mid.len(), 2);
+        assert_eq!(mid.get(0).unwrap().id, 1);
+        assert_eq!(mid.get(1).unwrap().id, 2);
+
+        // offset + limit > count returns only the remaining tail.
+        let tail = gov.get_proposals_paginated(&3, &100);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail.get(0).unwrap().id, 3);
+        assert_eq!(tail.get(1).unwrap().id, 4);
+
+        // offset == count and offset > count are both empty, not panics.
+        assert_eq!(gov.get_proposals_paginated(&5, &10).len(), 0);
+        assert_eq!(gov.get_proposals_paginated(&99, &10).len(), 0);
+
+        // A zero limit is empty even well inside the range.
+        assert_eq!(gov.get_proposals_paginated(&0, &0).len(), 0);
+
+        // `start + limit` must not overflow u32.
+        assert_eq!(gov.get_proposals_paginated(&1, &u32::MAX).len(), 4);
+    }
+
+    #[test]
+    fn test_get_proposals_paginated_walks_full_set_in_pages() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp1 = Address::generate(&s.env);
+        mint_lp(&s, &lp1, 1_000);
+
+        for kind in enumeration_kinds(&s.env).iter() {
+            gov.propose(&lp1, kind);
+        }
+
+        // Page size 2 over 5 proposals: 2 + 2 + 1, driven off the count.
+        let count = gov.get_proposal_count();
+        let mut seen: soroban_sdk::Vec<u32> = soroban_sdk::Vec::new(&s.env);
+        let mut offset = 0u32;
+        while offset < count {
+            let page = gov.get_proposals_paginated(&offset, &2);
+            for i in 0..page.len() {
+                seen.push_back(page.get(i).unwrap().id);
+            }
+            offset += 2;
+        }
+
+        assert_eq!(seen.len(), 5);
+        for id in 0..5u32 {
+            assert_eq!(seen.get(id).unwrap(), id);
+        }
+    }
+
+    #[test]
+    fn test_get_proposals_paginated_reflects_status_transitions_without_gaps() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp1 = Address::generate(&s.env);
+        let lp2 = Address::generate(&s.env);
+        mint_lp(&s, &lp1, 600);
+        mint_lp(&s, &lp2, 400);
+
+        let executed_id = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+        let cancelled_id = gov.propose(&lp1, &ProposalKind::UpdateFee(60));
+        let open_id = gov.propose(&lp1, &ProposalKind::PausePool);
+
+        gov.vote(&lp1, &executed_id, &Vote::For);
+        gov.vote(&lp2, &executed_id, &Vote::For);
+        gov.cancel_proposal(&cancelled_id, &lp1);
+
+        let proposal = gov.get_proposal(&executed_id);
+        s.env.ledger().set_timestamp(proposal.execute_after + 1);
+        gov.execute(&executed_id);
+
+        // Executing and cancelling mutate flags in place; neither shrinks the
+        // count nor punches a hole in the id range.
+        assert_eq!(gov.get_proposal_count(), 3);
+        let page = gov.get_proposals_paginated(&0, &3);
+        assert_eq!(page.len(), 3);
+        assert!(page.get(0).unwrap().executed);
+        assert!(page.get(1).unwrap().cancelled);
+        assert!(!page.get(2).unwrap().executed);
+        assert_eq!(page.get(2).unwrap().id, open_id);
     }
 }
 

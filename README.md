@@ -236,7 +236,7 @@ A single-entry-point contract for creating and discovering AMM pools. The factor
 | `create_pool(token_a, token_b, fee_bps) → Address` | Deploy a new AMM + LP token pair; panics on duplicate |
 | `get_pool(token_a, token_b) → Option<Address>` | Look up an existing pool (order-independent) |
 | `get_lp_token(pool) → Option<Address>` | Look up the LP token for a given pool address |
-| `all_pools() → Vec<Address>` | List every pool deployed by this factory |
+| `all_pools() → Vec<Address>` | List pool addresses, capped at `MAX_UNBOUNDED_PAGE` (200); use `get_pools` to page past it |
 | `get_pool_count() → u64` | Return the total number of deployed pools |
 | `get_pools(offset, limit) → Vec<Address>` | Return a paginated page of pool addresses starting at offset |
 | `update_wasm_hashes(amm_wasm_hash, token_wasm_hash)` | Update the WASM hashes used for future pool deployments |
@@ -268,6 +268,8 @@ Allows LP token holders to propose and vote on parameter changes to a pool on-ch
 | `cancel_proposal(proposal_id, proposer)` | Cancel a pending proposal before voting ends |
 | `unlock_vote(voter, proposal_id)` | Release vote-locked LP tokens after a proposal is resolved |
 | `get_proposal(proposal_id) → Proposal` | Read proposal details |
+| `get_proposal_count() → u32` | Total proposals ever created; ids run `[0, count)` |
+| `get_proposals_paginated(offset, limit) → Vec<Proposal>` | Read a page of proposals in creation order |
 | `proposal_status(proposal_id) → ProposalStatus` | Read the current status of a proposal |
 | `get_vote_info(proposal_id, voter) → VoteRecord` | Read a specific voter's record on a proposal |
 | `get_params() → GovernanceParams` | Read current governance configuration |
