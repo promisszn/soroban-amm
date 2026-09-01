@@ -467,13 +467,17 @@ impl Governance {
     }
 
     /// Effective quorum bps for a proposal (base + decay, capped at 10_000).
-    pub fn get_effective_quorum(env: Env, proposal_id: u32) -> i128 {
+    ///
+    /// Returns [`GovernanceError::ProposalNotFound`] for an unknown
+    /// `proposal_id` rather than trapping, so off-chain callers can handle a
+    /// missing proposal via `try_get_effective_quorum`.
+    pub fn get_effective_quorum(env: Env, proposal_id: u32) -> Result<i128, GovernanceError> {
         let proposal: Proposal = env
             .storage()
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
-            .expect("proposal not found");
-        Self::effective_quorum_bps(&env, &proposal)
+            .ok_or(GovernanceError::ProposalNotFound)?;
+        Ok(Self::effective_quorum_bps(&env, &proposal))
     }
 
     /// Admin-only governance parameter update.
@@ -1005,8 +1009,11 @@ impl Governance {
         env.storage().persistent().set(&proposal_key, &proposal);
         Self::bump_key_ttl(&env, &proposal_key);
 
-        env.events()
-            .publish((Symbol::new(&env, "cancelled"),), (proposal_id,));
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "cancelled"),),
+            (proposal_id,)
+        );
         Ok(())
     }
 
@@ -1047,7 +1054,7 @@ impl Governance {
     /// Unlock voting power for a concluded proposal.
     pub fn unlock_vote(env: Env, voter: Address, proposal_id: u32) -> Result<(), GovernanceError> {
         voter.require_auth();
-        let status = Self::proposal_status(env.clone(), proposal_id);
+        let status = Self::proposal_status(env.clone(), proposal_id)?;
         if status != ProposalStatus::Executed
             && status != ProposalStatus::Defeated
             && status != ProposalStatus::Expired
@@ -1107,8 +1114,7 @@ impl Governance {
         env.storage().persistent().set(&delegate_key, &to);
         Self::bump_key_ttl(&env, &delegate_key);
 
-        env.events()
-            .publish((Symbol::new(&env, "delegated"),), (from, to));
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "delegated"),), (from, to));
         Ok(())
     }
 
@@ -1127,8 +1133,7 @@ impl Governance {
             .persistent()
             .remove(&DataKey::Delegate(from.clone()));
 
-        env.events()
-            .publish((Symbol::new(&env, "undelegated"),), (from,));
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "undelegated"),), (from,));
     }
 
     /// Retrieve the current delegatee for an LP holder.
@@ -1150,8 +1155,11 @@ impl Governance {
         env.storage()
             .instance()
             .set(&DataKey::VetoMultisig, &multisig);
-        env.events()
-            .publish((Symbol::new(&env, "veto_multisig_set"),), (multisig,));
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "veto_multisig_set"),),
+            (multisig,)
+        );
         Ok(())
     }
 
@@ -1255,15 +1263,19 @@ impl Governance {
     }
 
     /// Read a proposal by id.
-    pub fn get_proposal(env: Env, proposal_id: u32) -> Proposal {
+    ///
+    /// Returns [`GovernanceError::ProposalNotFound`] for an unknown
+    /// `proposal_id` rather than trapping, so off-chain callers can handle a
+    /// missing proposal via `try_get_proposal`.
+    pub fn get_proposal(env: Env, proposal_id: u32) -> Result<Proposal, GovernanceError> {
         let key = DataKey::Proposal(proposal_id);
         let proposal: Proposal = env
             .storage()
             .persistent()
             .get(&key)
-            .expect("proposal not found");
+            .ok_or(GovernanceError::ProposalNotFound)?;
         Self::bump_key_ttl(&env, &key);
-        proposal
+        Ok(proposal)
     }
 
     /// Total number of proposals ever created by this contract.
@@ -1314,20 +1326,24 @@ impl Governance {
     }
 
     /// Derive the current status of a proposal.
-    pub fn proposal_status(env: Env, proposal_id: u32) -> ProposalStatus {
+    ///
+    /// Returns [`GovernanceError::ProposalNotFound`] for an unknown
+    /// `proposal_id` rather than trapping, so off-chain callers can handle a
+    /// missing proposal via `try_proposal_status`.
+    pub fn proposal_status(env: Env, proposal_id: u32) -> Result<ProposalStatus, GovernanceError> {
         let proposal: Proposal = env
             .storage()
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
-            .expect("proposal not found");
+            .ok_or(GovernanceError::ProposalNotFound)?;
         Self::bump_key_ttl(&env, &DataKey::Proposal(proposal_id));
 
         if proposal.cancelled {
-            return ProposalStatus::Cancelled;
+            return Ok(ProposalStatus::Cancelled);
         }
 
         if proposal.executed {
-            return ProposalStatus::Executed;
+            return Ok(ProposalStatus::Executed);
         }
 
         let now = env.ledger().timestamp();
@@ -1335,14 +1351,14 @@ impl Governance {
         if proposal.vetoed {
             if let Some(end) = proposal.discussion_end {
                 if now <= end {
-                    return ProposalStatus::InDiscussion;
+                    return Ok(ProposalStatus::InDiscussion);
                 }
             }
-            return ProposalStatus::Vetoed;
+            return Ok(ProposalStatus::Vetoed);
         }
 
         if now <= proposal.vote_end {
-            return ProposalStatus::Active;
+            return Ok(ProposalStatus::Active);
         }
 
         let effective_quorum = Self::effective_quorum_bps(&env, &proposal);
@@ -1351,17 +1367,17 @@ impl Governance {
         let passed = total_votes >= quorum_threshold && proposal.votes_for > proposal.votes_against;
 
         if !passed {
-            return ProposalStatus::Defeated;
+            return Ok(ProposalStatus::Defeated);
         }
 
         if now > proposal.expires_at {
-            return ProposalStatus::Expired;
+            return Ok(ProposalStatus::Expired);
         }
 
         if now >= proposal.execute_after {
-            ProposalStatus::Queued
+            Ok(ProposalStatus::Queued)
         } else {
-            ProposalStatus::Pending
+            Ok(ProposalStatus::Pending)
         }
     }
 
@@ -3263,6 +3279,7 @@ mod tests {
     fn test_get_proposals_paginated_reflects_status_transitions_without_gaps() {
         let s = setup_suite(30);
         let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
         let lp1 = Address::generate(&s.env);
         let lp2 = Address::generate(&s.env);
         mint_lp(&s, &lp1, 600);
@@ -3289,6 +3306,231 @@ mod tests {
         assert!(page.get(1).unwrap().cancelled);
         assert!(!page.get(2).unwrap().executed);
         assert_eq!(page.get(2).unwrap().id, open_id);
+    }
+
+    // ── Issue #825: every governance event carries EVENT_SCHEMA_VERSION ───────
+    //
+    // `cancel_proposal`, `delegate`, `undelegate` and `set_veto_multisig` used
+    // to call `env.events().publish(...)` directly, so their payloads were not
+    // version-stamped and an indexer reading `(version, ...rest)` would have
+    // decoded the first real field as the version number. These tests pin the
+    // stamp in place for all four.
+
+    /// Fetch the payload of the most recent event this contract published under
+    /// `topic`, decoded as a version-stamped `(u32, T)` pair.
+    fn last_versioned_event<T>(s: &Suite, gov: &GovernanceClient, topic: &str) -> (u32, T)
+    where
+        T: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>,
+    {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::IntoVal;
+
+        let wanted: soroban_sdk::Vec<soroban_sdk::Val> =
+            (Symbol::new(&s.env, topic),).into_val(&s.env);
+        let evt = s
+            .env
+            .events()
+            .all()
+            .iter()
+            .rfind(|e| e.0 == gov.address && e.1 == wanted)
+            .unwrap_or_else(|| panic!("no `{topic}` event found"));
+        evt.2.into_val(&s.env)
+    }
+
+    #[test]
+    fn test_cancel_proposal_emits_versioned_event() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        let lp1 = Address::generate(&s.env);
+        mint_lp(&s, &lp1, 1_000);
+
+        let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+        gov.cancel_proposal(&pid, &lp1);
+
+        let (version, data): (u32, (u32,)) = last_versioned_event(&s, &gov, "cancelled");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(version, 1);
+        assert_eq!(data, (pid,));
+    }
+
+    #[test]
+    fn test_delegate_emits_versioned_event() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        let from = Address::generate(&s.env);
+        let to = Address::generate(&s.env);
+        mint_lp(&s, &from, 500);
+        mint_lp(&s, &to, 500);
+
+        gov.delegate(&from, &to);
+
+        let (version, data): (u32, (Address, Address)) =
+            last_versioned_event(&s, &gov, "delegated");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(version, 1);
+        assert_eq!(data, (from, to));
+    }
+
+    #[test]
+    fn test_undelegate_emits_versioned_event() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        let from = Address::generate(&s.env);
+        let to = Address::generate(&s.env);
+        mint_lp(&s, &from, 500);
+        mint_lp(&s, &to, 500);
+
+        gov.delegate(&from, &to);
+        gov.undelegate(&from);
+
+        let (version, data): (u32, (Address,)) = last_versioned_event(&s, &gov, "undelegated");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(version, 1);
+        assert_eq!(data, (from,));
+    }
+
+    #[test]
+    fn test_set_veto_multisig_emits_versioned_event() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        let multisig = Address::generate(&s.env);
+        gov.set_veto_multisig(&multisig);
+
+        let (version, data): (u32, (Address,)) =
+            last_versioned_event(&s, &gov, "veto_multisig_set");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(version, 1);
+        assert_eq!(data, (multisig,));
+    }
+
+    // ── Issue #824: missing-proposal reads return a typed error, not a trap ───
+    //
+    // `get_proposal`, `proposal_status` and `get_effective_quorum` used to
+    // `.expect("proposal not found")`, trapping the whole invocation. They now
+    // return `GovernanceError::ProposalNotFound`, which off-chain callers can
+    // match on via the generated `try_*` client methods.
+
+    #[test]
+    fn test_get_proposal_nonexistent_returns_error() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        assert_eq!(
+            gov.try_get_proposal(&999),
+            Err(Ok(GovernanceError::ProposalNotFound))
+        );
+    }
+
+    #[test]
+    fn test_proposal_status_nonexistent_returns_error() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        assert_eq!(
+            gov.try_proposal_status(&999),
+            Err(Ok(GovernanceError::ProposalNotFound))
+        );
+    }
+
+    #[test]
+    fn test_get_effective_quorum_nonexistent_returns_error() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        assert_eq!(
+            gov.try_get_effective_quorum(&999),
+            Err(Ok(GovernanceError::ProposalNotFound))
+        );
+    }
+
+    #[test]
+    fn test_get_proposal_existing_still_works() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        let lp1 = Address::generate(&s.env);
+        mint_lp(&s, &lp1, 1_000);
+        let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+
+        // The plain (non-`try_`) client method still returns the bare value.
+        let proposal = gov.get_proposal(&pid);
+        assert_eq!(proposal.id, pid);
+        assert_eq!(proposal.proposer, lp1);
+        assert_eq!(proposal.kind, ProposalKind::UpdateFee(50));
+        assert!(!proposal.executed);
+
+        // And the `try_` variant returns it wrapped in `Ok`.
+        assert_eq!(gov.try_get_proposal(&pid), Ok(Ok(proposal)));
+
+        // `get_effective_quorum` for a real proposal is the configured base.
+        assert_eq!(gov.get_effective_quorum(&pid), 1_000_i128);
+    }
+
+    #[test]
+    fn test_proposal_status_existing_still_works() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        let lp1 = Address::generate(&s.env);
+        let lp2 = Address::generate(&s.env);
+        mint_lp(&s, &lp1, 600);
+        mint_lp(&s, &lp2, 400);
+
+        let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::Active);
+        assert_eq!(
+            gov.try_proposal_status(&pid),
+            Ok(Ok(ProposalStatus::Active))
+        );
+
+        gov.vote(&lp1, &pid, &Vote::For);
+        gov.vote(&lp2, &pid, &Vote::For);
+
+        let proposal = gov.get_proposal(&pid);
+        s.env.ledger().set_timestamp(proposal.execute_after + 1);
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::Queued);
+
+        gov.execute(&pid);
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::Executed);
+    }
+
+    /// `unlock_vote` now propagates `proposal_status`'s `Result` with `?`; the
+    /// full lifecycle must be unaffected for a real proposal, and unlocking
+    /// against an unknown id must surface `ProposalNotFound` rather than trap.
+    #[test]
+    fn test_unlock_vote_still_works_after_signature_change() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let lp_client = token::LpTokenClient::new(&s.env, &s.lp_addr);
+
+        let lp1 = Address::generate(&s.env);
+        let lp2 = Address::generate(&s.env);
+        mint_lp(&s, &lp1, 600);
+        mint_lp(&s, &lp2, 400);
+
+        let pid = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+        gov.vote(&lp1, &pid, &Vote::For);
+        gov.vote(&lp2, &pid, &Vote::For);
+        assert_eq!(lp_client.locked_balance(&lp1), 600);
+
+        let proposal = gov.get_proposal(&pid);
+        s.env.ledger().set_timestamp(proposal.execute_after + 1);
+        gov.execute(&pid);
+
+        gov.unlock_vote(&lp1, &pid);
+        gov.unlock_vote(&lp2, &pid);
+        assert_eq!(lp_client.locked_balance(&lp1), 0);
+        assert_eq!(lp_client.locked_balance(&lp2), 0);
+
+        // The propagated error reaches the caller as a typed error.
+        assert_eq!(
+            gov.try_unlock_vote(&lp1, &999),
+            Err(Ok(GovernanceError::ProposalNotFound))
+        );
     }
 }
 

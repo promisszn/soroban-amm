@@ -8,8 +8,8 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
-pool-interfaces = { path = "../pool_interfaces" }
-soroban-amm-sdk = { path = "../amm-sdk" }
+pool_interfaces = { path = "../pool_interfaces" }
+soroban_amm_sdk = { path = "../amm-sdk" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }

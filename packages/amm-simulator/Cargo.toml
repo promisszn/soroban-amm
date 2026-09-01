@@ -1,5 +1,5 @@
 [package]
-name = "soroban-amm-simulator"
+name = "soroban_amm_simulator"
 version = "0.1.0"
 edition = "2021"
 description = "Off-chain simulation engine and CLI for Soroban AMM strategies"
@@ -13,7 +13,7 @@ readme = "README.md"
 name = "soroban_amm_simulator"
 
 [[bin]]
-name = "amm-sim"
+name = "amm_sim"
 path = "src/bin/amm-sim.rs"
 
 [dependencies]

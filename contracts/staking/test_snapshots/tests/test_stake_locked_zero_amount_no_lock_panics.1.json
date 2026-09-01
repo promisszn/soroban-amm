@@ -760,6 +760,22 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "StakerIndex"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "vec": [
+                            {
+                              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "TotalEffectiveStaked"
                             }
                           ]
@@ -778,7 +794,7 @@
             },
             "ext": "v0"
           },
-          4095
+          3110400
         ]
       ],
       [
@@ -1348,7 +1364,7 @@
             },
             "ext": "v0"
           },
-          4095
+          3110400
         ]
       ]
     ]
@@ -2354,7 +2370,7 @@
             "data": {
               "vec": [
                 {
-                  "string": "caught panic 'nothing to do: amount or lock duration required' from contract function 'Symbol(obj#693)'"
+                  "string": "caught panic 'nothing to do: amount or lock duration required' from contract function 'Symbol(obj#713)'"
                 },
                 {
                   "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"

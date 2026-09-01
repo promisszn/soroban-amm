@@ -7,6 +7,7 @@ A production-ready reference implementation of a Soroban AMM flash loan receiver
 A flash loan is a loan that is borrowed and repaid within a single atomic transaction. The borrower receives funds, can use them for any purpose, but must return the principal plus a fee before the transaction completes.
 
 **Flow:**
+
 1. Caller invokes `pool.flash_loan(receiver, amount_a, amount_b, data)`
 2. Pool transfers tokens to the receiver contract
 3. Pool calls `receiver.on_flash_loan(amount_a, amount_b, fee_a, fee_b, data)`
@@ -28,8 +29,8 @@ Flash loans are powerful for arbitrage, liquidations, and collateral swaps — b
 ### What you must guarantee
 
 - **Before returning**, transfer back to the pool:
-  - `amount_a + fee_a` of token A
-  - `amount_b + fee_b` of token B
+    - `amount_a + fee_a` of token A
+    - `amount_b + fee_b` of token B
 - **Missing the repayment** → entire transaction reverts
 - **Partial repayment** → entire transaction reverts
 - **Attempting reentrancy** → transaction reverts with error code 14
@@ -45,6 +46,7 @@ Borrow 1000 X from pool A → Sell at pool B (better price) → Repay pool A + f
 ```
 
 **Requirements:**
+
 - Identify price differences between markets
 - Execute the counter-trade before the callback returns
 - Profit must exceed the flash loan fee, or the entire attempt fails
@@ -61,6 +63,7 @@ Borrow underlying tokens from pool B → Add liquidity to pool B
 ```
 
 **Requirements:**
+
 - Coordinate two or more pool operations atomically
 - Ensure repayment is possible from reclaimed collateral
 - Handle slippage correctly on both sides
@@ -153,12 +156,14 @@ test environment with actual contracts:
 ### Test categories
 
 **Happy path** (10+ tests):
+
 - Repay principal + fee exactly
 - Repay both tokens correctly
 - Fee accounting is exact across multiple loans
 - Token conservation
 
 **Failure modes** (4+ tests):
+
 - Insufficient profit aborts cleanly
 - Reentrancy is rejected
 - Incomplete repayment reverts
@@ -167,7 +172,7 @@ test environment with actual contracts:
 Run the full suite:
 
 ```bash
-cargo test -p flash-loan-receiver
+cargo test -p flash_loan_receiver
 ```
 
 ## Deployment guide
@@ -175,7 +180,7 @@ cargo test -p flash-loan-receiver
 ### Step 1: Compile to WASM
 
 ```bash
-cargo build --release --target wasm32v1-none -p flash-loan-receiver
+cargo build --release --target wasm32v1-none -p flash_loan_receiver
 ```
 
 Output: `target/wasm32v1-none/release/flash_loan_receiver.wasm`
@@ -230,6 +235,7 @@ The pool charges a flash loan fee as a percentage of the borrowed amount:
 - **Mainnet**: May vary by pool; check `pool.get_info().flash_loan_fee_bps`
 
 **Example:**
+
 - Borrow 1,000,000 tokens
 - Fee: 1,000,000 × 5 / 10,000 = 500 tokens
 - Repayment: 1,000,500 tokens

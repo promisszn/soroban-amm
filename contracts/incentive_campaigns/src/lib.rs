@@ -391,6 +391,12 @@ impl IncentiveCampaigns {
         let total_supply = LpTokenClient::new(&env, &campaign.lp_token).total_supply();
         campaign = advance_accumulator(campaign, accrual_until, total_supply);
 
+        // Checkpoint the audit trail *before* the rate changes too, for the same
+        // reason: `checkpoint_campaign_rewards` prices the whole interval since
+        // `CampaignLastAccrualTime` at `campaign.reward_rate`, so it must run
+        // while that field still holds the old rate.
+        Self::checkpoint_campaign_rewards(&env, campaign_id, &campaign, now);
+
         campaign.reward_rate = new_rate;
         env.storage().persistent().set(&campaign_key, &campaign);
         extend_persistent_ttl(&env, &campaign_key);
@@ -497,6 +503,14 @@ impl IncentiveCampaigns {
 
         // Update campaign accumulator based on time elapsed and total LP supply
         campaign = advance_accumulator(campaign, claim_time, total_supply);
+
+        // Keep the parallel audit trail (`CampaignAccruedRewards` /
+        // `CampaignLastAccrualTime`) in lockstep with the payout accumulator, so
+        // `get_campaign_accrual` is current after a claim rather than only after
+        // `set_campaign_rate` / `recover_leftover_funds`. Accrual is a pure
+        // function of `reward_rate` and elapsed time, so this is a checkpoint of
+        // the same interval the accumulator just advanced over.
+        Self::checkpoint_campaign_rewards(&env, campaign_id, &campaign, claim_time);
 
         let snapshot_key = DataKey::ProviderSnapshot(campaign_id, provider.clone());
         let snapshot: Option<ProviderSnapshot> = if env.storage().persistent().has(&snapshot_key) {
@@ -616,6 +630,53 @@ impl IncentiveCampaigns {
             .expect("campaign not found");
         extend_persistent_ttl(&env, &campaign_key);
         campaign
+    }
+
+    /// Return the campaign's accrual audit trail as
+    /// `(CampaignAccruedRewards, CampaignLastAccrualTime)`.
+    ///
+    /// `CampaignAccruedRewards` is the total pool rewards accrued up to
+    /// `CampaignLastAccrualTime`, priced at the reward rate in force over each
+    /// interval. It is checkpointed by `claim_rewards`, `set_campaign_rate` and
+    /// `recover_leftover_funds`, so it lags the wall clock by at most one such
+    /// call; it is not recomputed on read, which keeps this a genuine read
+    /// accessor.
+    ///
+    /// The value is a lower bound on the campaign's payouts: because the
+    /// accumulator can only ever pay out rewards that have accrued,
+    /// `get_campaign_accrual(id).0 >= get_campaign(id).total_distributed` holds
+    /// for any sequence of calls.
+    ///
+    /// Panics if the campaign does not exist, matching `get_campaign`.
+    pub fn get_campaign_accrual(env: Env, campaign_id: u64) -> (i128, u64) {
+        extend_instance_ttl(&env);
+        let campaign_key = DataKey::Campaign(campaign_id);
+        let campaign: Campaign = env
+            .storage()
+            .persistent()
+            .get(&campaign_key)
+            .expect("campaign not found");
+        extend_persistent_ttl(&env, &campaign_key);
+
+        let accrued_key = DataKey::CampaignAccruedRewards(campaign_id);
+        let last_accrual_key = DataKey::CampaignLastAccrualTime(campaign_id);
+        let accrued: i128 = env
+            .storage()
+            .persistent()
+            .get(&accrued_key)
+            .unwrap_or(0_i128);
+        let last_accrual: u64 = env
+            .storage()
+            .persistent()
+            .get(&last_accrual_key)
+            .unwrap_or(campaign.start_time);
+
+        // Reading extends the TTL of the entries read, consistent with every
+        // other read accessor in this contract.
+        extend_persistent_ttl(&env, &accrued_key);
+        extend_persistent_ttl(&env, &last_accrual_key);
+
+        (accrued, last_accrual)
     }
 
     /// Every campaign id ever created, oldest first.
@@ -1948,5 +2009,214 @@ mod tests {
         assert_eq!(client.get_campaigns_by_creator(&gov, &0, &10).len(), 0);
         assert_eq!(client.get_claim_history(&provider, &0, &10).len(), 0);
         assert_eq!(client.get_distribution_count(&1), 0);
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #826: the `CampaignAccruedRewards` / `CampaignLastAccrualTime` audit
+    // trail is exposed via `get_campaign_accrual` and kept in lockstep with the
+    // payout accumulator by `claim_rewards`.
+    // -------------------------------------------------------------------------
+
+    /// Right after `create_campaign` nothing has accrued and the accrual clock
+    /// sits at `start_time`.
+    #[test]
+    fn test_get_campaign_accrual_initial_state() {
+        let (env, incentives, pool, lp, reward, _provider, gov) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+
+        let start = 2_000_u64;
+        let id =
+            client.create_campaign(&gov, &pool, &lp, &reward, &start, &6_000, &100, &1_000_000);
+
+        assert_eq!(client.get_campaign_accrual(&id), (0_i128, start));
+    }
+
+    /// After a claim the audit trail is checkpointed to the claim time, and the
+    /// accrued total equals `reward_rate * elapsed` exactly.
+    #[test]
+    fn test_get_campaign_accrual_after_claim() {
+        let (env, incentives, pool, lp, reward, provider, gov) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+
+        let start = 1_000_u64;
+        let end = 11_000_u64;
+        let rate = 100_i128;
+        let id = client.create_campaign(
+            &gov,
+            &pool,
+            &lp,
+            &reward,
+            &start,
+            &end,
+            &rate,
+            &((end - start) as i128 * rate),
+        );
+
+        // The first claim only initialises the provider snapshot, but it still
+        // checkpoints the campaign-level accrual to that moment.
+        env.ledger().with_mut(|l| l.timestamp = 3_000);
+        assert_eq!(client.claim_rewards(&provider, &id), 0);
+        assert_eq!(
+            client.get_campaign_accrual(&id),
+            (rate * (3_000 - start) as i128, 3_000_u64)
+        );
+
+        // The second claim advances the trail by exactly the elapsed seconds.
+        env.ledger().with_mut(|l| l.timestamp = 5_500);
+        assert!(client.claim_rewards(&provider, &id) > 0);
+        assert_eq!(
+            client.get_campaign_accrual(&id),
+            (rate * (5_500 - start) as i128, 5_500_u64)
+        );
+    }
+
+    /// Accrual is capped at `end_time`: claiming long after the campaign closed
+    /// yields `reward_rate * duration`, not `reward_rate * (now - start)`.
+    #[test]
+    fn test_get_campaign_accrual_capped_at_end_time() {
+        let (env, incentives, pool, lp, reward, provider, gov) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+
+        let start = 1_000_u64;
+        let end = 4_000_u64;
+        let rate = 100_i128;
+        let funding = (end - start) as i128 * rate;
+        let id = client.create_campaign(&gov, &pool, &lp, &reward, &start, &end, &rate, &funding);
+
+        env.ledger().with_mut(|l| l.timestamp = 2_000);
+        client.claim_rewards(&provider, &id); // snapshot init
+
+        // Claim far past `end_time`.
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+        client.claim_rewards(&provider, &id);
+
+        let (accrued, last) = client.get_campaign_accrual(&id);
+        assert_eq!(accrued, rate * (end - start) as i128, "capped at end_time");
+        assert_eq!(accrued, funding);
+        assert_eq!(last, end, "accrual clock never advances past end_time");
+    }
+
+    /// The invariant `accrued >= total_distributed` holds across a multi-claim,
+    /// multi-provider sequence: the accumulator can only pay out what accrued.
+    #[test]
+    fn test_get_campaign_accrual_matches_total_distributed_lower_bound() {
+        let (env, incentives, amm, lp, reward, provider, gov) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+
+        // A second provider joins the pool, so rewards are split between two
+        // snapshots claimed at different times.
+        let second = Address::generate(&env);
+        let amm_client = AmmPoolClient::new(&env, &amm);
+        let info = amm_client.get_info();
+        StellarAssetClient::new(&env, &info.token_a).mint(&second, &1_000_000);
+        StellarAssetClient::new(&env, &info.token_b).mint(&second, &1_000_000);
+        amm_client.add_liquidity(&second, &1_000_000, &1_000_000, &0, &u64::MAX);
+
+        let start = 1_000_u64;
+        let end = 21_000_u64;
+        let rate = 100_i128;
+        let id = client.create_campaign(
+            &gov,
+            &amm,
+            &lp,
+            &reward,
+            &start,
+            &end,
+            &rate,
+            &((end - start) as i128 * rate),
+        );
+
+        for (t, who) in [
+            (2_000_u64, provider.clone()),
+            (4_000, second.clone()),
+            (7_500, provider.clone()),
+            (11_000, second.clone()),
+            (16_000, provider.clone()),
+            (30_000, second.clone()),
+        ] {
+            env.ledger().with_mut(|l| l.timestamp = t);
+            // Some of these are snapshot-initialising claims returning 0; either
+            // way the invariant must hold afterwards.
+            client.claim_rewards(&who, &id);
+            let (accrued, _) = client.get_campaign_accrual(&id);
+            let distributed = client.get_campaign(&id).total_distributed;
+            assert!(
+                accrued >= distributed,
+                "accrued must never fall below total_distributed"
+            );
+        }
+
+        // The campaign paid out something, so this is not a vacuous 0 >= 0.
+        assert!(client.get_campaign(&id).total_distributed > 0);
+    }
+
+    /// A rate change splits accrual into two segments priced at their own rate.
+    /// The trail must be checkpointed at the old rate before the new one lands.
+    #[test]
+    fn test_get_campaign_accrual_after_rate_change() {
+        let (env, incentives, pool, lp, reward, provider, gov) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+
+        let start = 1_000_u64;
+        let end = 11_000_u64;
+        let rate_a = 100_i128;
+        let rate_b = 250_i128;
+        let id = client.create_campaign(
+            &gov,
+            &pool,
+            &lp,
+            &reward,
+            &start,
+            &end,
+            &rate_a,
+            // Fund for the higher of the two rates so the raise stays covered.
+            &((end - start) as i128 * rate_b),
+        );
+
+        env.ledger().with_mut(|l| l.timestamp = 2_000);
+        client.claim_rewards(&provider, &id); // snapshot init
+
+        // Segment 1: t=1_000..4_000 at rate_a.
+        env.ledger().with_mut(|l| l.timestamp = 4_000);
+        client.set_campaign_rate(&gov, &id, &rate_b);
+        let seg1 = rate_a * (4_000 - start) as i128;
+        assert_eq!(client.get_campaign_accrual(&id), (seg1, 4_000_u64));
+
+        // Segment 2: t=4_000..9_000 at rate_b, checkpointed by the claim.
+        env.ledger().with_mut(|l| l.timestamp = 9_000);
+        client.claim_rewards(&provider, &id);
+        let seg2 = rate_b * (9_000 - 4_000) as i128;
+        assert_eq!(client.get_campaign_accrual(&id), (seg1 + seg2, 9_000_u64));
+    }
+
+    /// The accrual trail stays queryable and correct after the campaign has been
+    /// wound down and marked inactive by `recover_leftover_funds`.
+    #[test]
+    fn test_get_campaign_accrual_after_recover_leftover_funds() {
+        let (env, incentives, pool, lp, reward, provider, gov) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+
+        let start = 1_000_u64;
+        let end = 5_000_u64;
+        let rate = 100_i128;
+        // Overfund so there is a leftover to recover.
+        let funding = (end - start) as i128 * rate * 2;
+        let id = client.create_campaign(&gov, &pool, &lp, &reward, &start, &end, &rate, &funding);
+
+        env.ledger().with_mut(|l| l.timestamp = 2_000);
+        client.claim_rewards(&provider, &id); // snapshot init
+        env.ledger().with_mut(|l| l.timestamp = 4_000);
+        client.claim_rewards(&provider, &id);
+
+        let treasury = Address::generate(&env);
+        env.ledger().with_mut(|l| l.timestamp = 9_000);
+        assert!(client.recover_leftover_funds(&gov, &id, &treasury) > 0);
+
+        // Inactive campaign, but the audit trail is intact and capped at end.
+        assert!(!client.get_campaign(&id).active);
+        let (accrued, last) = client.get_campaign_accrual(&id);
+        assert_eq!(accrued, rate * (end - start) as i128);
+        assert_eq!(last, end);
+        assert!(accrued >= client.get_campaign(&id).total_distributed);
     }
 }
