@@ -6,8 +6,8 @@
   "description": "Off-chain pool health monitoring dashboard for the Soroban AMM",
   "scripts": {
     "dev": "npx serve . -p 3000",
-    "build": "node --check src/dashboard.js && test -f styles.css",
-    "lint": "node --check src/dashboard.js",
+    "build": "node --check src/dashboard.js && node --check src/dom-stub.js && test -f styles.css",
+    "lint": "node --check src/dashboard.js && node --check src/dom-stub.js",
     "test": "node --test src/dashboard.test.js"
   },
   "devDependencies": {

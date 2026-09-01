@@ -5,12 +5,15 @@
 //!   2. Call `initialize` with the admin address and pre-uploaded WASM hashes
 //!      for the AMM pool and LP token contracts.
 //!   3. Call `create_pool` for each token pair you want a pool for.
-//!   4. Use `get_pool` / `all_pools` to discover deployed AMM pools, or
-//!      `get_cl_pool` / `all_cl_pools` for concentrated-liquidity pools.
-//!      The two kinds are indexed separately (issue #493) — `all_pools()`
-//!      never returns a CL pool address, since CL pools don't implement the
-//!      AMM-only `get_info`/`withdraw_protocol_fees`/`set_protocol_fee`
-//!      interface that callers of `all_pools()` (e.g. `dex_aggregator`) rely on.
+//!   4. Use `get_pool` / `get_pools` to discover deployed AMM pools, or
+//!      `get_cl_pool` / `get_cl_pools` for concentrated-liquidity pools.
+//!      The two kinds are indexed separately (issue #493) — the AMM
+//!      accessors never return a CL pool address, since CL pools don't
+//!      implement the AMM-only `get_info`/`withdraw_protocol_fees`/
+//!      `set_protocol_fee` interface that AMM callers rely on.
+//!      `all_pools()` / `all_cl_pools()` are convenience wrappers capped at
+//!      `Factory::MAX_UNBOUNDED_PAGE` (issue #790); anything that must see
+//!      every pool should page with `get_pool_count()` + `get_pools()`.
 
 #![no_std]
 
@@ -156,6 +159,18 @@ pub struct Factory;
 
 #[contractimpl]
 impl Factory {
+    /// Hard cap on how many pool addresses a single `all_pools()` /
+    /// `all_cl_pools()` call will return (issue #790).
+    ///
+    /// Those accessors used to loop over every pool ever deployed, so their
+    /// CPU and read-entry cost grew without bound and would eventually exceed
+    /// Soroban's per-invocation resource budget, making the call permanently
+    /// unusable. Capping the result keeps them a cheap, predictable read for
+    /// the common small-factory case; callers that must see every pool past
+    /// the cap should page with `get_pool_count()` + `get_pools(offset, limit)`
+    /// (or the CL equivalents), which have always been bounded.
+    pub const MAX_UNBOUNDED_PAGE: u32 = 200;
+
     // ── Setup ─────────────────────────────────────────────────────────────────
 
     /// One-time factory setup.
@@ -561,10 +576,10 @@ impl Factory {
 
         // Issue #493: CL pools are indexed and counted separately from AMM
         // pools (`ClPoolCount`/`ClPoolByIndex`, not `PoolCount`/`PoolByIndex`),
-        // so `all_pools()` — which AMM-only callers like `dex_aggregator` rely
-        // on — never returns a CL pool address. The salt is still offset by
-        // `0x8000_0000_0000_0000` so a CL pool's deploy salt can never collide
-        // with an AMM pool's, even though the two now count independently.
+        // so the AMM accessors (`all_pools()`/`get_pools()`) never return a CL
+        // pool address. The salt is still offset by `0x8000_0000_0000_0000` so
+        // a CL pool's deploy salt can never collide with an AMM pool's, even
+        // though the two now count independently.
         let n: u64 = env
             .storage()
             .instance()
@@ -768,25 +783,22 @@ impl Factory {
             .get(&DataKey::ClPool(ta, tb, fee_bps))
     }
 
-    /// Return the addresses of every **AMM** pool deployed by this factory.
+    /// Return **AMM** pool addresses, oldest first, capped at
+    /// [`Self::MAX_UNBOUNDED_PAGE`].
     ///
     /// Never includes CL pools (issue #493) — callers that treat every entry
-    /// as an AMM pool (e.g. `dex_aggregator::discover_tokens`, which calls the
-    /// AMM-only `get_info()`) can rely on that. Use `all_cl_pools()` for CL
-    /// pool addresses.
+    /// as an AMM pool (e.g. anything calling the AMM-only `get_info()`) can
+    /// rely on that. Use `all_cl_pools()` for CL pool addresses.
+    ///
+    /// **Bounded since issue #790.** This is no longer a "return everything"
+    /// read: once the factory holds more than `MAX_UNBOUNDED_PAGE` pools, the
+    /// result is truncated to the first `MAX_UNBOUNDED_PAGE` by index and the
+    /// rest are simply not returned — silently, since the return type carries
+    /// no truncation flag. Compare `get_pool_count()` against the returned
+    /// length to detect truncation, and use `get_pools(offset, limit)` to page
+    /// through the full set. Prefer `get_pools` outright in new code.
     pub fn all_pools(env: Env) -> Vec<Address> {
-        let count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::PoolCount)
-            .unwrap_or(0);
-        let mut all = Vec::new(&env);
-        for i in 0..count {
-            if let Some(pool) = env.storage().persistent().get(&DataKey::PoolByIndex(i)) {
-                all.push_back(pool);
-            }
-        }
-        all
+        Self::get_pools(env, 0, Self::MAX_UNBOUNDED_PAGE)
     }
 
     /// Return the total number of **AMM** pools deployed by this factory.
@@ -818,22 +830,13 @@ impl Factory {
         page
     }
 
-    /// Return the addresses of every **CL** (concentrated-liquidity) pool
-    /// deployed by this factory. Mirrors `all_pools()` but for the separately
-    /// indexed CL pool sequence (issue #493).
+    /// Return **CL** (concentrated-liquidity) pool addresses, oldest first,
+    /// capped at [`Self::MAX_UNBOUNDED_PAGE`]. Mirrors `all_pools()` but for
+    /// the separately indexed CL pool sequence (issue #493), and is bounded
+    /// for the same reason (issue #790) — see `all_pools()` for how to detect
+    /// truncation and page past it with `get_cl_pools(offset, limit)`.
     pub fn all_cl_pools(env: Env) -> Vec<Address> {
-        let count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ClPoolCount)
-            .unwrap_or(0);
-        let mut all = Vec::new(&env);
-        for i in 0..count {
-            if let Some(pool) = env.storage().persistent().get(&DataKey::ClPoolByIndex(i)) {
-                all.push_back(pool);
-            }
-        }
-        all
+        Self::get_cl_pools(env, 0, Self::MAX_UNBOUNDED_PAGE)
     }
 
     /// Return the total number of CL pools deployed by this factory.
@@ -2791,5 +2794,166 @@ mod tests {
             result2.is_ok(),
             "rate limit must not be consumed by the rejected CL duplicate"
         );
+    }
+
+    // -- Bounded enumeration (issue #790) -------------------------------------
+
+    /// Registers `n` synthetic pool addresses straight into the factory's
+    /// index, bypassing `create_pool` so a cap-sized registry can be built
+    /// without deploying hundreds of real contracts. The stored addresses are
+    /// never invoked -- these tests only exercise the read/pagination path,
+    /// which reads `PoolByIndex` entries and never calls into them.
+    fn seed_pool_index(env: &Env, factory: &Address, n: u64, cl: bool) -> Vec<Address> {
+        let mut expected = Vec::new(env);
+        for _ in 0..n {
+            expected.push_back(Address::generate(env));
+        }
+        env.as_contract(factory, || {
+            for i in 0..n {
+                let addr = expected.get(i as u32).unwrap();
+                if cl {
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::ClPoolByIndex(i), &addr);
+                } else {
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::PoolByIndex(i), &addr);
+                }
+            }
+            let key = if cl {
+                DataKey::ClPoolCount
+            } else {
+                DataKey::PoolCount
+            };
+            env.storage().instance().set(&key, &n);
+        });
+        expected
+    }
+
+    fn bounded_factory(env: &Env) -> Address {
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+        let admin = Address::generate(env);
+        let factory_addr = env.register_contract(None, Factory);
+        FactoryClient::new(env, &factory_addr).initialize(&admin, &amm_hash, &token_hash);
+        factory_addr
+    }
+
+    #[test]
+    fn test_all_pools_is_capped_once_registry_exceeds_the_limit() {
+        let env = Env::default();
+        let factory_addr = bounded_factory(&env);
+        let factory = FactoryClient::new(&env, &factory_addr);
+
+        let cap = Factory::MAX_UNBOUNDED_PAGE as u64;
+        let total = cap + 25;
+        let expected = seed_pool_index(&env, &factory_addr, total, false);
+
+        // The count still reports the true total, so a caller can detect that
+        // `all_pools()` truncated.
+        assert_eq!(factory.get_pool_count(), total);
+
+        let all = factory.all_pools();
+        assert_eq!(all.len(), Factory::MAX_UNBOUNDED_PAGE);
+        // Truncation keeps the oldest pools, in index order.
+        for i in 0..Factory::MAX_UNBOUNDED_PAGE {
+            assert_eq!(all.get(i).unwrap(), expected.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_all_cl_pools_is_capped_once_registry_exceeds_the_limit() {
+        let env = Env::default();
+        let factory_addr = bounded_factory(&env);
+        let factory = FactoryClient::new(&env, &factory_addr);
+
+        let total = Factory::MAX_UNBOUNDED_PAGE as u64 + 7;
+        let expected = seed_pool_index(&env, &factory_addr, total, true);
+
+        assert_eq!(factory.get_cl_pool_count(), total);
+
+        let all = factory.all_cl_pools();
+        assert_eq!(all.len(), Factory::MAX_UNBOUNDED_PAGE);
+        for i in 0..Factory::MAX_UNBOUNDED_PAGE {
+            assert_eq!(all.get(i).unwrap(), expected.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_paginated_reads_reach_every_pool_past_the_cap() {
+        let env = Env::default();
+        let factory_addr = bounded_factory(&env);
+        let factory = FactoryClient::new(&env, &factory_addr);
+
+        let total = Factory::MAX_UNBOUNDED_PAGE as u64 + 25;
+        let expected = seed_pool_index(&env, &factory_addr, total, false);
+
+        // Page size well under the cap: every pool is still reachable, and no
+        // single call reads more than `page` entries.
+        let page = 10u32;
+        let mut seen = Vec::new(&env);
+        let count = factory.get_pool_count();
+        let mut offset = 0u64;
+        while offset < count {
+            let chunk = factory.get_pools(&(offset as u32), &page);
+            assert!(chunk.len() <= page);
+            for i in 0..chunk.len() {
+                seen.push_back(chunk.get(i).unwrap());
+            }
+            offset += page as u64;
+        }
+
+        assert_eq!(seen.len() as u64, total);
+        for i in 0..total {
+            assert_eq!(seen.get(i as u32).unwrap(), expected.get(i as u32).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_paginated_cl_reads_reach_every_pool_past_the_cap() {
+        let env = Env::default();
+        let factory_addr = bounded_factory(&env);
+        let factory = FactoryClient::new(&env, &factory_addr);
+
+        let total = Factory::MAX_UNBOUNDED_PAGE as u64 + 13;
+        let expected = seed_pool_index(&env, &factory_addr, total, true);
+
+        let page = 25u32;
+        let mut seen = Vec::new(&env);
+        let mut offset = 0u64;
+        while offset < total {
+            let chunk = factory.get_cl_pools(&(offset as u32), &page);
+            assert!(chunk.len() <= page);
+            for i in 0..chunk.len() {
+                seen.push_back(chunk.get(i).unwrap());
+            }
+            offset += page as u64;
+        }
+
+        assert_eq!(seen.len() as u64, total);
+        for i in 0..total {
+            assert_eq!(seen.get(i as u32).unwrap(), expected.get(i as u32).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_all_pools_below_the_cap_is_unchanged() {
+        let env = Env::default();
+        let factory_addr = bounded_factory(&env);
+        let factory = FactoryClient::new(&env, &factory_addr);
+
+        // Under the cap, `all_pools()` must still behave exactly as before:
+        // every pool, in index order, identical to a full-range `get_pools`.
+        let total = 5u64;
+        let expected = seed_pool_index(&env, &factory_addr, total, false);
+
+        let all = factory.all_pools();
+        assert_eq!(all.len() as u64, total);
+        assert_eq!(all, expected);
+        assert_eq!(all, factory.get_pools(&0, &(total as u32)));
+        assert_eq!(factory.all_pools(), factory.get_pools(&0, &u32::MAX));
     }
 }

@@ -21,6 +21,7 @@ class FakeElement {
     this.dataset = {};
     this.listeners = {};
     this.value = "";
+    this.title = "";
     this.classList = new FakeClassList(this);
   }
   set textContent(value) { this._textContent = value; this.children = []; }
@@ -41,7 +42,17 @@ class FakeElement {
 
 export class FakeDocument {
   constructor() { this.elements = new Map(); }
-  registerElement(id, el) { this.elements.set(id, el); }
+  /**
+   * Register an element under `id`. Accepts either a FakeElement or a plain
+   * object of properties to seed a fresh one with (e.g. `{ value: "tvl" }` for
+   * an input), so tests can set up form fields without building elements by
+   * hand.
+   */
+  registerElement(id, el) {
+    const element = el instanceof FakeElement ? el : Object.assign(new FakeElement("div"), el || {});
+    this.elements.set(id, element);
+    return element;
+  }
   getElementById(id) { return this.elements.get(id) || null; }
   createElement(tag) { return new FakeElement(tag); }
   querySelector() { return new FakeElement("div"); }

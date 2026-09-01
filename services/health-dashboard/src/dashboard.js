@@ -59,7 +59,7 @@ function setSectionState(message) {
   if (state) { state.textContent = message; state.hidden = !message; }
 }
 
-function renderStats(stats) {
+export function renderStats(stats) {
   const value = stats?.[0];
   if (!value) { ["m-tvl", "m-vol", "m-fees", "m-swaps"].forEach((id) => setText(id, "—")); return; }
   setText("m-tvl", `$${formatMetric(value.tvl)}`);
@@ -71,7 +71,7 @@ function renderStats(stats) {
   setText("m-swaps", Number(value.swapCount).toLocaleString());
 }
 
-function renderHealth(health) {
+export function renderHealth(health) {
   if (!health) { setText("health-score-text", "—"); setText("hd-status", "Unavailable"); return; }
   const score = Number(health.healthScore);
   const circumference = 2 * Math.PI * 34;
@@ -102,7 +102,7 @@ export function renderFiredAlerts(alerts) {
   }
 }
 
-function renderEvents(events) {
+export function renderEvents(events) {
   const tbody = $("events-body");
   if (!tbody) return;
   tbody.replaceChildren();
@@ -114,7 +114,7 @@ function renderEvents(events) {
   }
 }
 
-function renderHistory(history) {
+export function renderHistory(history) {
   const chart = $("price-chart");
   if (!chart) return;
   chart.replaceChildren();
@@ -129,7 +129,7 @@ function renderHistory(history) {
   }
 }
 
-function renderHeatmap(events) {
+export function renderHeatmap(events) {
   const heatmap = $("heatmap");
   if (!heatmap) return;
   heatmap.replaceChildren();

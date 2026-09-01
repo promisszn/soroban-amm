@@ -378,7 +378,7 @@ After each `initialize`, the script reads state and asserts:
 | Contract | Verification call | Asserts |
 |----------|-------------------|---------|
 | Token A/B/Reward | `name`, `total_supply`, `admin` | `admin == $SOURCE_PUBLIC_KEY`, `name` readable |
-| Factory | `get_pool_count`, `all_pools` | Hashes registered, count readable; `creation_paused == false` (unless paused) |
+| Factory | `get_pool_count`, `get_pools` | Hashes registered, count readable; `creation_paused == false` (unless paused) |
 | AMM Pool (via factory) | `get_info` | `token_a/b == expected`, `fee_bps == 30`, `total_shares == 0`, `admin == gov or factory_admin` |
 | LP Token | `admin` | `admin == AMM_POOL_CONTRACT_ID` |
 | CL Pool | `current_tick` / `get_pool_state` | Returns `initial_tick` |
@@ -667,17 +667,26 @@ admin remains in control. Calling `accept_admin` with a wrong address reverts
 `WrongAdmin (13)`; calling without a pending nomination reverts
 `NoPendingAdmin (12)`.
 
-**Protocol-wide rotation** — repeat for every contract listed in `all_pools()`
-and `all_cl_pools()` plus each auxiliary contract. The factory's
-`get_pool_count` + `get_pools(offset, limit)` (or `all_pools`) enumerate pools
-to rotate. Use `scripts/deploy.sh --only <contract>` or a script loop:
+**Protocol-wide rotation** — repeat for every pool the factory has deployed,
+plus each auxiliary contract. Enumerate with `get_pool_count` +
+`get_pools(offset, limit)` (and `get_cl_pool_count` + `get_cl_pools` for CL
+pools). Do **not** drive the loop off `all_pools()`: it is capped at 200
+entries (issue #790) and silently truncates past that, which would leave the
+pools beyond the cap still under the old admin. Use `scripts/deploy.sh --only
+<contract>` or a script loop:
 
 ```sh
 source .soroban-amm.deploy.env
-for pool in $(stellar contract invoke --id $FACTORY_CONTRACT_ID -- all_pools | grep -Eo 'C[A-Z0-9]{55}'); do
-  echo "Rotating $pool"
-  stellar contract invoke --id $pool -- propose_admin --current_admin $OLD --new_admin $NEW --source $OLD
-  stellar contract invoke --id $pool -- accept_admin --new_admin $NEW --source $NEW
+page=50
+count=$(stellar contract invoke --id $FACTORY_CONTRACT_ID -- get_pool_count)
+for ((offset = 0; offset < count; offset += page)); do
+  pools=$(stellar contract invoke --id $FACTORY_CONTRACT_ID \
+    -- get_pools --offset "$offset" --limit "$page" | grep -Eo 'C[A-Z0-9]{55}')
+  for pool in $pools; do
+    echo "Rotating $pool"
+    stellar contract invoke --id $pool -- propose_admin --current_admin $OLD --new_admin $NEW --source $OLD
+    stellar contract invoke --id $pool -- accept_admin --new_admin $NEW --source $NEW
+  done
 done
 ```
 
