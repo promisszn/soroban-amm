@@ -1,0 +1,73 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule: { interval: weekly }
+    groups: { patch-updates: { update-types: [patch] } }
+    ignore:
+      # Major bumps have broken the build (events API redesign, deprecated
+      # Env methods) - needs a deliberate migration, not an automatic PR.
+      - dependency-name: "soroban-sdk"
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: npm
+    directory: "/packages/sdk"
+    schedule: { interval: weekly }
+    groups: { patch-updates: { update-types: [patch] } }
+    ignore:
+      # TypeScript 7 requires an explicit tsconfig `rootDir`, which this
+      # package doesn't set yet - bumping breaks `tsc`.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      # v17 introduces ScValType changes that break src/governance.ts.
+      - dependency-name: "@stellar/stellar-sdk"
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: npm
+    directory: "/packages/ui-components"
+    schedule: { interval: weekly }
+    groups:
+      patch-updates: { update-types: [patch] }
+      react:
+        patterns: ["react", "react-dom", "@types/react", "@types/react-dom"]
+    ignore:
+      # TypeScript 7's stricter cast checking breaks GovernanceForum.tsx.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: npm
+    directory: "/packages/ts-advanced-client"
+    schedule: { interval: weekly }
+    groups: { patch-updates: { update-types: [patch] } }
+    ignore:
+      # Same TypeScript 7 rootDir issue as packages/sdk.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: npm
+    directory: "/services/graphql-api"
+    schedule: { interval: weekly }
+    groups:
+      patch-updates: { update-types: [patch] }
+      graphql:
+        patterns: ["graphql", "@apollo/server"]
+  - package-ecosystem: npm
+    directory: "/services/webhook-streamer"
+    schedule: { interval: weekly }
+    groups: { patch-updates: { update-types: [patch] } }
+  - package-ecosystem: npm
+    directory: "/services/health-dashboard"
+    schedule: { interval: weekly }
+    groups: { patch-updates: { update-types: [patch] } }
+  - package-ecosystem: npm
+    directory: "/examples/client"
+    schedule: { interval: weekly }
+    groups: { patch-updates: { update-types: [patch] } }
+  - package-ecosystem: gomod
+    directory: "/packages/go-sdk"
+    schedule: { interval: weekly }
+    groups: { patch-updates: { update-types: [patch] } }
+  - package-ecosystem: pip
+    directory: "/examples/python"
+    schedule: { interval: weekly }
+    groups: { patch-updates: { update-types: [patch] } }
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule: { interval: weekly }
+    groups: { patch-updates: { update-types: [patch] } }

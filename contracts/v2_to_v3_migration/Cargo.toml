@@ -1,5 +1,5 @@
 [package]
-name = "v2-to-v3-migration"
+name = "v2_to_v3_migration"
 version = "0.1.0"
 edition = "2021"
 
@@ -11,8 +11,9 @@ testutils = ["soroban-sdk/testutils", "token/testutils"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
-soroban-amm-sdk = { path = "../amm-sdk" }
+soroban_amm_sdk = { path = "../amm-sdk" }
 
 [dev-dependencies]
+amm = { path = "../amm", features = ["testutils"] }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 token = { path = "../token", features = ["testutils"] }

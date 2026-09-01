@@ -43,6 +43,19 @@ export type VoteChoice = "For" | "Against" | "Abstain";
 /** On-chain vote record for a voter. */
 export type VoteRecord = "DidNotVote" | "VotedFor" | "VotedAgainst" | "VotedAbstain";
 
+/** A voter's participation record on a proposal. */
+export interface VoterRecord {
+  voter: string;
+  vote: VoteRecord;
+  weight: bigint;
+}
+
+/** Page of proposal ids from a resumable status scan. */
+export interface ProposalStatusPage {
+  ids: number[];
+  nextId: number;
+}
+
 /** Governance configuration returned by `get_params`. */
 export interface GovernanceParams {
   votingPeriodSecs: bigint;
@@ -89,6 +102,25 @@ export class GovernanceClient {
     return simulateRead(this.server, this.contract, this.networkPassphrase, method, args);
   }
 
+  private proposalFromNative(native: Record<string, unknown>, fallbackId?: number): Proposal {
+    const id = Number(native.id ?? fallbackId ?? 0);
+    return {
+      id,
+      proposer: String(native.proposer ?? ""),
+      snapshotTotalSupply: BigInt(String(native.snapshot_total_supply ?? 0)),
+      voteStart: BigInt(String(native.vote_start ?? 0)),
+      voteEnd: BigInt(String(native.vote_end ?? 0)),
+      executeAfter: BigInt(String(native.execute_after ?? 0)),
+      expiresAt: BigInt(String(native.expires_at ?? 0)),
+      votesFor: BigInt(String(native.votes_for ?? 0)),
+      votesAgainst: BigInt(String(native.votes_against ?? 0)),
+      votesAbstain: BigInt(String(native.votes_abstain ?? 0)),
+      executed: Boolean(native.executed),
+      cancelled: Boolean(native.cancelled),
+      status: String(native.status ?? "Active") as ProposalStatus,
+    };
+  }
+
   // ── Read-only methods ──────────────────────────────────────────────────────
 
   /** Returns the current governance configuration. */
@@ -104,30 +136,105 @@ export class GovernanceClient {
   }
 
   /** Returns the total number of proposals created so far. */
-  async proposalCount(): Promise<number> {
-    const raw = await this.simulate("proposal_count");
+  async getProposalCount(): Promise<number> {
+    const raw = await this.simulate("get_proposal_count");
     return Number(scValToNative(raw));
+  }
+
+  /** Alias for `getProposalCount`. */
+  async proposalCount(): Promise<number> {
+    return this.getProposalCount();
   }
 
   /** Returns the on-chain data for `proposalId`. */
   async getProposal(proposalId: number): Promise<Proposal> {
     const raw = await this.simulate("get_proposal", u32(proposalId));
-    const native = scValToNative(raw) as Record<string, unknown>;
-    return {
-      id: Number(native.id ?? proposalId),
-      proposer: String(native.proposer ?? ""),
-      snapshotTotalSupply: BigInt(String(native.snapshot_total_supply ?? 0)),
-      voteStart: BigInt(String(native.vote_start ?? 0)),
-      voteEnd: BigInt(String(native.vote_end ?? 0)),
-      executeAfter: BigInt(String(native.execute_after ?? 0)),
-      expiresAt: BigInt(String(native.expires_at ?? 0)),
-      votesFor: BigInt(String(native.votes_for ?? 0)),
-      votesAgainst: BigInt(String(native.votes_against ?? 0)),
-      votesAbstain: BigInt(String(native.votes_abstain ?? 0)),
-      executed: Boolean(native.executed),
-      cancelled: Boolean(native.cancelled),
-      status: "Active",
-    };
+    return this.proposalFromNative(scValToNative(raw) as Record<string, unknown>, proposalId);
+  }
+
+  /** Returns `None` (via `null`) if the proposal id is unknown. */
+  async tryGetProposal(proposalId: number): Promise<Proposal | null> {
+    const raw = await this.simulate("try_get_proposal", u32(proposalId));
+    const native = scValToNative(raw);
+    if (native === null || native === undefined) return null;
+    return this.proposalFromNative(native as Record<string, unknown>, proposalId);
+  }
+
+  /** Lists proposals by ascending id, paginated. */
+  async listProposals(offset: number, limit: number): Promise<Proposal[]> {
+    const raw = await this.simulate("list_proposals", u32(offset), u32(limit));
+    const native = scValToNative(raw) as Array<Record<string, unknown>>;
+    return native.map((n) => this.proposalFromNative(n));
+  }
+
+  /** Lists proposals by descending id (newest first), paginated. */
+  async listProposalsDesc(offset: number, limit: number): Promise<Proposal[]> {
+    const raw = await this.simulate("list_proposals_desc", u32(offset), u32(limit));
+    const native = scValToNative(raw) as Array<Record<string, unknown>>;
+    return native.map((n) => this.proposalFromNative(n));
+  }
+
+  /** Returns ids of proposals matching `status`, paginated. */
+  async listProposalsByStatus(status: ProposalStatus, offset: number, limit: number): Promise<number[]> {
+    const raw = await this.simulate("list_proposals_by_status", nativeToScVal(status), u32(offset), u32(limit));
+    return scValToNative(raw) as number[];
+  }
+
+  /** Returns all currently active proposal ids (bounded by the contract). */
+  async getActiveProposalIds(): Promise<number[]> {
+    const raw = await this.simulate("get_active_proposal_ids");
+    return scValToNative(raw) as number[];
+  }
+
+  /** Counts proposals by status. */
+  async countProposalsByStatus(status: ProposalStatus): Promise<number> {
+    const raw = await this.simulate("count_proposals_by_status", nativeToScVal(status));
+    return Number(scValToNative(raw));
+  }
+
+  /** Resumable status scan: returns a page of ids and the next id to resume from. */
+  async listProposalsByStatusFrom(
+    status: ProposalStatus,
+    startId: number,
+    scanLimit: number
+  ): Promise<ProposalStatusPage> {
+    const raw = await this.simulate(
+      "list_proposals_by_status_from",
+      nativeToScVal(status),
+      u32(startId),
+      u32(scanLimit)
+    );
+    const native = scValToNative(raw) as [number[], number];
+    return { ids: native[0], nextId: native[1] };
+  }
+
+  /** Returns proposal ids proposed by a specific address, paginated. */
+  async getProposalsByProposer(proposer: string, offset: number, limit: number): Promise<number[]> {
+    const raw = await this.simulate("get_proposals_by_proposer", addr(proposer), u32(offset), u32(limit));
+    return scValToNative(raw) as number[];
+  }
+
+  /** Returns the number of voters on a proposal. */
+  async getVoterCount(proposalId: number): Promise<number> {
+    const raw = await this.simulate("get_voter_count", u32(proposalId));
+    return Number(scValToNative(raw));
+  }
+
+  /** Lists voters on a proposal with their recorded choice and weight. */
+  async listVoters(proposalId: number, offset: number, limit: number): Promise<VoterRecord[]> {
+    const raw = await this.simulate("list_voters", u32(proposalId), u32(offset), u32(limit));
+    const native = scValToNative(raw) as Array<Record<string, unknown>>;
+    return native.map((n) => ({
+      voter: String(n.voter ?? ""),
+      vote: String(n.vote ?? "DidNotVote") as VoteRecord,
+      weight: BigInt(String(n.weight ?? 0)),
+    }));
+  }
+
+  /** Returns addresses that delegate to `delegate`, paginated. */
+  async getDelegators(delegate: string, offset: number, limit: number): Promise<string[]> {
+    const raw = await this.simulate("get_delegators", addr(delegate), u32(offset), u32(limit));
+    return scValToNative(raw) as string[];
   }
 
   /** Returns whether `voter` has voted on `proposalId`. */

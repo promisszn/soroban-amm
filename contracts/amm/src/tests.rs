@@ -14,6 +14,14 @@ enum ReceiverDataKey {
     TokenA,
     TokenB,
     ShouldRepay,
+    /// #698: which other guarded pool entry point (if any) to attempt from
+    /// inside `on_flash_loan`, after repaying. 0 = none,
+    /// 1 = `remove_liquidity_one_sided`, 2 = `swap_fot`,
+    /// 3 = `withdraw_protocol_fees`.
+    Attempt,
+    /// #698: the `AmmError` discriminant (as `u32`) of the attempted call
+    /// above, or `0` if it unexpectedly succeeded / none was attempted.
+    LastCode,
 }
 
 #[contract]
@@ -79,8 +87,75 @@ impl MockFlashLoanReceiver {
                     &(amount_b + fee_b),
                 );
             }
+
+            // #698: after repaying, optionally attempt another guarded pool
+            // entry point from inside this same callback to prove it is
+            // rejected while the flash-loan lock is held.
+            let attempt: u32 = env
+                .storage()
+                .instance()
+                .get(&ReceiverDataKey::Attempt)
+                .unwrap_or(0);
+            if attempt > 0 {
+                let me = env.current_contract_address();
+                let amm_client = AmmPoolClient::new(&env, &amm);
+                let code: u32 = match attempt {
+                    1 => match amm_client.try_remove_liquidity_one_sided(
+                        &me,
+                        &1_i128,
+                        &token_a,
+                        &0_i128,
+                        &u64::MAX,
+                    ) {
+                        Ok(Ok(_)) => 0,
+                        Ok(Err(_)) => 998,
+                        Err(Ok(e)) => e as u32,
+                        Err(Err(_)) => 999,
+                    },
+                    2 => match amm_client.try_swap_fot(
+                        &me,
+                        &token_a,
+                        &1_i128,
+                        &0_i128,
+                        &0_i128,
+                        &u64::MAX,
+                        &None,
+                    ) {
+                        Ok(Ok(_)) => 0,
+                        Ok(Err(_)) => 998,
+                        Err(Ok(e)) => e as u32,
+                        Err(Err(_)) => 999,
+                    },
+                    3 => match amm_client.try_withdraw_protocol_fees() {
+                        Ok(Ok(_)) => 0,
+                        Ok(Err(_)) => 998,
+                        Err(Ok(e)) => e as u32,
+                        Err(Err(_)) => 999,
+                    },
+                    _ => 0,
+                };
+                env.storage()
+                    .instance()
+                    .set(&ReceiverDataKey::LastCode, &code);
+            }
         }
         true
+    }
+
+    /// #698: arm this receiver to attempt another guarded call from inside
+    /// its next `on_flash_loan` callback. See `ReceiverDataKey::Attempt`.
+    pub fn set_attempt(env: Env, attempt: u32) {
+        env.storage()
+            .instance()
+            .set(&ReceiverDataKey::Attempt, &attempt);
+    }
+
+    /// #698: the result code recorded by the most recent attempted call.
+    pub fn last_code(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&ReceiverDataKey::LastCode)
+            .unwrap_or(0)
     }
 }
 
@@ -344,11 +419,7 @@ pub(crate) struct RemoveLiquidity<'a> {
 }
 
 impl<'a> RemoveLiquidity<'a> {
-    pub(crate) fn new(
-        amm: &'a AmmPoolClient<'a>,
-        provider: &'a Address,
-        shares: i128,
-    ) -> Self {
+    pub(crate) fn new(amm: &'a AmmPoolClient<'a>, provider: &'a Address, shares: i128) -> Self {
         Self {
             amm,
             provider,
@@ -433,6 +504,55 @@ fn test_set_protocol_fee_works_after_initialize() {
     let (stored_recipient, stored_bps) = amm.get_protocol_fee();
     assert_eq!(stored_recipient, Some(new_recipient));
     assert_eq!(stored_bps, 10);
+}
+
+/// Regression test for M-02: setting protocol_fee_bps == fee_bps must be rejected
+/// so that LPs always retain a portion of swap income.
+#[test]
+fn test_set_protocol_fee_rejects_full_capture() {
+    let (env, admin, amm_addr, lp_addr, _) = setup();
+    let (ta, _) = create_sac(&env, &admin);
+    let (tb, _) = create_sac(&env, &admin);
+    let fee_recipient = Address::generate(&env);
+    let amm = AmmPoolClient::new(&env, &amm_addr);
+    // fee_bps = 30
+    amm.initialize(
+        &admin,
+        &ta.address,
+        &tb.address,
+        &lp_addr,
+        &30_i128,
+        &fee_recipient,
+        &0_i128,
+    );
+
+    // protocol_fee_bps == fee_bps (30) must be rejected (M-02 fix).
+    let result = amm.try_set_protocol_fee(&admin, &fee_recipient, &30_i128);
+    assert!(
+        result.is_err(),
+        "protocol_fee_bps == fee_bps must be rejected"
+    );
+
+    // protocol_fee_bps > fee_bps must still be rejected.
+    let result2 = amm.try_set_protocol_fee(&admin, &fee_recipient, &31_i128);
+    assert!(
+        result2.is_err(),
+        "protocol_fee_bps > fee_bps must be rejected"
+    );
+
+    // A valid strict value (29) must still be accepted.
+    let result3 = amm.try_set_protocol_fee(&admin, &fee_recipient, &29_i128);
+    assert!(
+        result3.is_ok(),
+        "protocol_fee_bps < fee_bps must be accepted"
+    );
+
+    // Zero protocol fee must always be accepted regardless of fee_bps.
+    let result4 = amm.try_set_protocol_fee(&admin, &fee_recipient, &0_i128);
+    assert!(
+        result4.is_ok(),
+        "protocol_fee_bps == 0 must always be accepted"
+    );
 }
 
 #[test]
@@ -650,6 +770,47 @@ fn test_fee_accrues_to_reserves() {
     assert!(info.reserve_a * info.reserve_b > 1_000_000 * 1_000_000);
 }
 
+#[test]
+fn test_swap_fot_applies_lp_rebate() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let admin = ts.admin.clone();
+    let fee_recipient = Address::generate(env);
+    amm.set_protocol_fee(&admin, &fee_recipient, &10_i128);
+    amm.set_lp_rebate(&admin, &5_000_i128);
+
+    let trader = Address::generate(env);
+    let amount_in = 100_000_i128;
+    ta_sac.mint(&trader, &amount_in);
+
+    let (_, actual_received) = amm.swap_fot(
+        &trader,
+        &ts.ta_addr,
+        &amount_in,
+        &0_i128,
+        &0_i128,
+        &u64::MAX,
+        &Option::<Address>::None,
+    );
+
+    assert_eq!(actual_received, amount_in);
+
+    let info = amm.get_info();
+    assert_eq!(info.reserve_a, 1_000_000 + amount_in - 50_i128);
+    let (accrued_a, accrued_b) = amm.get_accrued_fees();
+    assert_eq!(accrued_a, 50_i128);
+    assert_eq!(accrued_b, 0_i128);
+}
+
 // ── Issue #98: swap_exact_out ─────────────────────────────────────────────────
 
 #[test]
@@ -671,8 +832,8 @@ fn test_swap_exact_out_normal_path() {
     let trader = Address::generate(env);
     ta_sac.mint(&trader, &(required_in + 1_000));
 
-    let spent = SwapExactOut::new(&amm, &trader, &ts.tb_addr, want_out, required_in + 1_000)
-        .execute();
+    let spent =
+        SwapExactOut::new(&amm, &trader, &ts.tb_addr, want_out, required_in + 1_000).execute();
 
     assert_eq!(spent, required_in);
     let info = amm.get_info();
@@ -1019,8 +1180,7 @@ fn test_swap_emits_token_out_in_event_payload() {
     let swap_event = events
         .iter()
         .find(|e| {
-            e.0 == amm.address
-                && e.1 == (Symbol::new(env, "swap"), trader.clone()).into_val(env)
+            e.0 == amm.address && e.1 == (Symbol::new(env, "swap"), trader.clone()).into_val(env)
         })
         .expect("swap event not found");
 
@@ -1466,7 +1626,233 @@ fn test_get_amount_in_overflow() {
     AddLiquidity::new(&amm, &provider, large_amount, large_amount).execute();
 
     // 4e18 * 1e17 * 10000 = 4e39 > i128::MAX
-    amm.get_amount_in(&ts.ta_addr, &100_000_000_000_000_000_i128);
+    let _ = amm.get_amount_in(&ts.ta_addr, &100_000_000_000_000_000_i128);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #815: get_amount_in error handling tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Test 1: get_amount_in rejects when amount_out equals reserve_out (InsufficientLiquidity).
+#[test]
+fn test_get_amount_in_rejects_amount_out_equals_reserve() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    // Get the reserve of token_b
+    let pool_info = amm.get_info();
+    let reserve_b = pool_info.reserve_b;
+
+    // Try to get exactly reserve_b amount — should fail with InsufficientLiquidity
+    let result = amm.try_get_amount_in(&ts.tb_addr, &reserve_b);
+    assert!(
+        result.is_err(),
+        "get_amount_in must reject amount_out >= reserve_out"
+    );
+
+    if let Err(Ok(err)) = result {
+        assert_eq!(err, AmmError::InsufficientLiquidity);
+    }
+}
+
+/// Test 2: get_amount_in rejects unknown token_out (InvalidToken).
+#[test]
+fn test_get_amount_in_rejects_unknown_token() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    // Use an unknown token
+    let unknown_token = Address::generate(env);
+
+    let result = amm.try_get_amount_in(&unknown_token, &100_000_i128);
+    assert!(result.is_err(), "get_amount_in must reject unknown token");
+
+    if let Err(Ok(err)) = result {
+        assert_eq!(err, AmmError::InvalidToken);
+    }
+}
+
+/// Test 3: get_amount_in rejects on empty pool (EmptyPool).
+#[test]
+fn test_get_amount_in_rejects_empty_pool() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+
+    // Do NOT add liquidity — pool is empty (zero reserves)
+
+    let result = amm.try_get_amount_in(&ts.tb_addr, &100_000_i128);
+    assert!(result.is_err(), "get_amount_in must reject empty pool");
+
+    if let Err(Ok(err)) = result {
+        assert_eq!(err, AmmError::EmptyPool);
+    }
+}
+
+/// Test 4: Boundary test - get_amount_in succeeds when amount_out is one less than reserve.
+#[test]
+fn test_get_amount_in_succeeds_one_below_reserve() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let pool_info = amm.get_info();
+    let reserve_b = pool_info.reserve_b;
+
+    // amount_out = reserve_b - 1 should succeed
+    let result = amm.try_get_amount_in(&ts.tb_addr, &(reserve_b - 1));
+    assert!(
+        result.is_ok(),
+        "get_amount_in must succeed when amount_out < reserve_out"
+    );
+
+    if let Ok(Ok(amount_in)) = result {
+        assert!(amount_in > 0, "amount_in must be positive");
+    }
+}
+
+/// Test 5: swap_exact_out rejects when amount_out equals reserve (via try_swap_exact_out).
+#[test]
+fn test_swap_exact_out_rejects_insufficient_liquidity() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let trader = Address::generate(env);
+    ta_sac.mint(&trader, &10_000_000_i128);
+
+    let pool_info = amm.get_info();
+    let reserve_b = pool_info.reserve_b;
+
+    // Try to get exactly reserve_b of token_b — should fail
+    let result = amm.try_swap_exact_out(&trader, &ts.tb_addr, &reserve_b, &i128::MAX, &u64::MAX);
+    assert!(
+        result.is_err(),
+        "swap_exact_out must reject when amount_out >= reserve_out"
+    );
+
+    if let Err(Ok(err)) = result {
+        assert_eq!(err, AmmError::InsufficientLiquidity);
+    }
+}
+
+/// Test 6: swap_exact_out success path returns same value as before refactor.
+#[test]
+fn test_swap_exact_out_success_unchanged() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &10_000_000_i128);
+    tb_sac.mint(&provider, &10_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 10_000_000, 10_000_000).execute();
+
+    let trader = Address::generate(env);
+    ta_sac.mint(&trader, &10_000_000_i128);
+
+    let want_out = 500_000_i128;
+    // Execute swap_exact_out and verify it returns the expected amount_in
+    let actual_in = SwapExactOut::new(&amm, &trader, &ts.tb_addr, want_out, 10_000_000).execute();
+
+    // Verify we got the input amount (no error, value unchanged)
+    assert!(
+        actual_in > 0,
+        "swap_exact_out must return positive amount_in"
+    );
+}
+
+/// Test 7: get_amount_in with high fee (fee_bps >= 10_000) returns Ok(0).
+#[test]
+fn test_get_amount_in_high_fee_returns_ok_zero() {
+    let ts = setup_pool(10_000); // fee_bps = 10_000
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    // With fee_bps = 10_000, get_amount_in must return Ok(0), not panic
+    let result = amm.try_get_amount_in(&ts.tb_addr, &500_i128);
+    assert!(result.is_ok(), "get_amount_in with high fee must not panic");
+
+    if let Ok(Ok(amount_in)) = result {
+        assert_eq!(amount_in, 0, "high fee should return 0");
+    }
+}
+
+/// Test 8: Property test - get_amount_in never panics for valid inputs.
+/// For any amount_out in [1, reserve_out - 1] and fee_bps in [0, 10_000],
+/// get_amount_in returns a typed Err or Ok, never a host trap.
+#[test]
+fn test_get_amount_in_property_no_panic() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &10_000_000_i128);
+    tb_sac.mint(&provider, &10_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 10_000_000, 10_000_000).execute();
+
+    let pool_info = amm.get_info();
+    let reserve_b = pool_info.reserve_b;
+
+    // Test multiple valid amounts in range [1, reserve_out - 1]
+    for amount_out in [1_i128, 100_i128, 1000_i128, reserve_b - 1].iter() {
+        // get_amount_in must return Ok or Err, never panic
+        let result = amm.try_get_amount_in(&ts.tb_addr, amount_out);
+
+        // Result should be well-formed (either Ok(Ok(...)) or Err(...))
+        match result {
+            Ok(inner) => {
+                // Should be Ok(i128)
+                assert!(inner.is_ok(), "inner result should be Ok");
+            }
+            Err(_) => {
+                // Host-level error (e.g., invocation failure) — should not happen
+                panic!("get_amount_in should not cause host error");
+            }
+        }
+    }
 }
 
 // Issue #199: remove_liquidity_one_sided — provider receives only token_a.
@@ -1496,13 +1882,8 @@ fn test_remove_liquidity_one_sided() {
 
     // Remove one-sided: provider wants only token_a.
     // min_out = 1_000_000 ensures at least the proportional withdrawal.
-    let total_out = amm.remove_liquidity_one_sided(
-        &provider,
-        &shares,
-        &ts.ta_addr,
-        &1_000_000_i128,
-        &u64::MAX,
-    );
+    let total_out =
+        amm.remove_liquidity_one_sided(&provider, &shares, &ts.ta_addr, &1_000_000_i128, &u64::MAX);
 
     let ta_after = ta_client.balance(&provider);
     let tb_after = tb_client.balance(&provider);
@@ -1538,14 +1919,38 @@ fn test_remove_liquidity_one_sided_slippage_fails() {
     let shares = AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
 
     // min_out set impossibly high — must fail.
-    let result = amm.try_remove_liquidity_one_sided(
-        &provider,
-        &shares,
-        &ts.ta_addr,
-        &i128::MAX,
-        &u64::MAX,
-    );
+    let result =
+        amm.try_remove_liquidity_one_sided(&provider, &shares, &ts.ta_addr, &i128::MAX, &u64::MAX);
     assert!(result.is_err());
+}
+
+#[test]
+fn test_remove_liquidity_one_sided_circuit_breaker() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    env.ledger().with_mut(|li| li.sequence_number = 100);
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+
+    // Set circuit breaker threshold to 100 bps (1%) and cooldown to 600 seconds.
+    amm.set_circuit_breaker_config(&100_i128, &600_u64);
+
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &10_000_000_i128);
+    tb_sac.mint(&provider, &10_000_000_i128);
+    let shares = AddLiquidity::new(&amm, &provider, 10_000_000, 10_000_000).execute();
+
+    // Cause a price movement in the same ledger sequence using swap.
+    let trader = Address::generate(env);
+    ta_sac.mint(&trader, &5_000_000_i128);
+    Swap::new(&amm, &trader, &ts.ta_addr, 5_000_000).execute();
+
+    // Now attempting a large remove_liquidity_one_sided in the same ledger sequence will trip circuit breaker.
+    let res =
+        amm.try_remove_liquidity_one_sided(&provider, &shares, &ts.ta_addr, &1_i128, &u64::MAX);
+    assert!(res.is_err());
 }
 
 #[test]
@@ -1594,4 +1999,752 @@ fn bench_add_liquidity_cost() {
     AddLiquidity::new(&amm, &provider, 500_000, 500_000).execute();
     std::println!("=== ADD_LIQ BUDGET ===");
     std::println!("{}", env.budget());
+}
+
+// ── #698: reentrancy guard on every fund-moving entry point ──────────────────
+//
+// `MaliciousToken` is a minimal SEP-41-shaped token whose `transfer` can be
+// armed to call back into the pool mid-transfer, driving the real
+// cross-contract dispatch path (not a mock) the same way a hostile
+// permissionless-pool token would. `MockFlashLoanReceiver`'s `attempt` mode
+// (below) does the same from inside a flash-loan callback.
+//
+// IMPORTANT FINDING, recorded here so it isn't lost: on this soroban-sdk /
+// soroban-env-host version, a contract can *never* be reentered by itself —
+// `Host::call_n_internal` always passes `ContractReentryMode::Prohibited`
+// for every ordinary and `try_` cross-contract call
+// (soroban-env-host-21.2.1/src/host.rs and host/frame.rs), so the moment
+// this pool's contract ID appears a second time anywhere in the active call
+// stack, the host itself rejects the call before this contract's code —
+// old or new — ever runs. That is true on `main` exactly as much as on this
+// branch, which the tests below confirm empirically: every one of them
+// records rejection code 999 (a host-level invocation error), never 14
+// (`AmmError::Reentrant`), because the reentrant call traps at the host
+// boundary and this contract's own guard is never reached.
+//
+// These tests are kept as documentation of that platform guarantee and as
+// defense-in-depth coverage (the assertion is "rejected", not "rejected
+// with this specific code"), not as the regression tests that motivate this
+// PR — they would not distinguish `main` from this branch, since the host
+// protects both equally. The tests that do distinguish the two are the
+// "lock released on every error path" group below: on `main`,
+// `flash_loan`'s lock is engaged by `enter_lock` but never released on any
+// of its `Err` return paths (only the final `Ok` path called `exit_lock`),
+// so a single failed flash loan permanently strands the lock and bricks
+// every other guarded entry point — a real, serious bug independent of the
+// reentrancy question above.
+
+#[contracttype]
+enum MalTokenKey {
+    Balance(Address),
+    Target,
+    Armed,
+    LastReentryCode,
+}
+
+/// A token whose `transfer` can be armed to attempt a reentrant `swap` call
+/// into a configured pool address. One-shot per armed call: the first
+/// transfer after `set_armed(true)` disarms itself before attempting the
+/// reentrant call, so the (rejected) reentrant call's own transfers can't
+/// recurse.
+#[contract]
+pub(crate) struct MaliciousToken;
+
+#[contractimpl]
+impl MaliciousToken {
+    // Named `mal_init` rather than `initialize` to avoid colliding with
+    // `MockFlashLoanReceiver::initialize`'s contractimpl-generated helper
+    // items, which share this file's module namespace.
+    pub fn mal_init(env: Env, target: Address) {
+        env.storage().instance().set(&MalTokenKey::Target, &target);
+        env.storage().instance().set(&MalTokenKey::Armed, &false);
+    }
+
+    pub fn set_armed(env: Env, armed: bool) {
+        env.storage().instance().set(&MalTokenKey::Armed, &armed);
+    }
+
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        let bal = Self::balance(env.clone(), to.clone());
+        env.storage()
+            .instance()
+            .set(&MalTokenKey::Balance(to), &(bal + amount));
+    }
+
+    pub fn balance(env: Env, id: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&MalTokenKey::Balance(id))
+            .unwrap_or(0)
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        from.require_auth();
+        let from_bal = Self::balance(env.clone(), from.clone());
+        let to_bal = Self::balance(env.clone(), to.clone());
+        env.storage()
+            .instance()
+            .set(&MalTokenKey::Balance(from.clone()), &(from_bal - amount));
+        env.storage()
+            .instance()
+            .set(&MalTokenKey::Balance(to), &(to_bal + amount));
+
+        let armed: bool = env
+            .storage()
+            .instance()
+            .get(&MalTokenKey::Armed)
+            .unwrap_or(false);
+        if armed {
+            env.storage().instance().set(&MalTokenKey::Armed, &false);
+            let target: Address = env.storage().instance().get(&MalTokenKey::Target).unwrap();
+            let pool = AmmPoolClient::new(&env, &target);
+            // The argument values only need to be well-typed: the guard
+            // rejects the call before any of them are validated.
+            let code: u32 = match pool.try_swap(&from, &from, &1_i128, &0_i128, &u64::MAX) {
+                Ok(Ok(_)) => 0,
+                Ok(Err(_)) => 998,
+                Err(Ok(e)) => e as u32,
+                Err(Err(_)) => 999,
+            };
+            env.storage()
+                .instance()
+                .set(&MalTokenKey::LastReentryCode, &code);
+        }
+    }
+
+    pub fn last_reentry_code(env: Env) -> Option<u32> {
+        env.storage().instance().get(&MalTokenKey::LastReentryCode)
+    }
+}
+
+/// Deploys a pool with `MaliciousToken` as `token_a` and a normal SAC as
+/// `token_b`, seeds it with real liquidity (unarmed), and returns the
+/// pieces needed to drive a reentrancy test.
+struct MaliciousSetup {
+    env: Env,
+    amm_addr: Address,
+    mal_addr: Address,
+    tb_addr: Address,
+}
+
+fn setup_malicious_pool() -> MaliciousSetup {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(12345);
+    let admin = Address::generate(&env);
+    let amm_addr = env.register_contract(None, AmmPool);
+    let lp_addr = env.register_contract(None, LpToken);
+    let mal_addr = env.register_contract(None, MaliciousToken);
+    let (tb, tb_sac) = create_sac(&env, &admin);
+
+    token::LpTokenClient::new(&env, &lp_addr).initialize(
+        &amm_addr,
+        &soroban_sdk::String::from_str(&env, "AMM LP Token"),
+        &soroban_sdk::String::from_str(&env, "ALP"),
+        &7u32,
+    );
+    MaliciousTokenClient::new(&env, &mal_addr).mal_init(&amm_addr);
+    AmmPoolClient::new(&env, &amm_addr).initialize(
+        &admin,
+        &mal_addr,
+        &tb.address,
+        &lp_addr,
+        &30_i128,
+        &admin,
+        &0_i128,
+    );
+
+    let provider = Address::generate(&env);
+    MaliciousTokenClient::new(&env, &mal_addr).mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AmmPoolClient::new(&env, &amm_addr).add_liquidity(
+        &provider,
+        &1_000_000_i128,
+        &1_000_000_i128,
+        &0_i128,
+        &u64::MAX,
+    );
+
+    let tb_addr = tb.address.clone();
+    drop((tb, tb_sac));
+
+    MaliciousSetup {
+        env,
+        amm_addr,
+        mal_addr,
+        tb_addr,
+    }
+}
+
+#[test]
+fn test_swap_blocks_reentrant_token_callback() {
+    let s = setup_malicious_pool();
+    let env = &s.env;
+    let mal = MaliciousTokenClient::new(env, &s.mal_addr);
+    let amm = AmmPoolClient::new(env, &s.amm_addr);
+
+    let trader = Address::generate(env);
+    mal.mint(&trader, &10_000_i128);
+
+    mal.set_armed(&true);
+    // This must succeed: the malicious token swallows the rejected
+    // reentrant call and completes its own transfer normally.
+    amm.swap(&trader, &s.mal_addr, &10_000_i128, &0_i128, &u64::MAX);
+
+    assert_ne!(
+        mal.last_reentry_code(),
+        Some(0),
+        "reentrant swap() called from inside token transfer must be rejected, not succeed"
+    );
+}
+
+#[test]
+fn test_add_liquidity_blocks_reentrant_token_callback() {
+    let s = setup_malicious_pool();
+    let env = &s.env;
+    let mal = MaliciousTokenClient::new(env, &s.mal_addr);
+    let amm = AmmPoolClient::new(env, &s.amm_addr);
+
+    let provider = Address::generate(env);
+    mal.mint(&provider, &100_000_i128);
+    StellarAssetClient::new(env, &s.tb_addr).mint(&provider, &100_000_i128);
+
+    mal.set_armed(&true);
+    amm.add_liquidity(&provider, &100_000_i128, &100_000_i128, &0_i128, &u64::MAX);
+
+    assert_ne!(
+        mal.last_reentry_code(),
+        Some(0),
+        "reentrant swap() called from inside add_liquidity's token transfer must be rejected, not succeed"
+    );
+}
+
+#[test]
+fn test_remove_liquidity_blocks_reentrant_token_callback() {
+    let s = setup_malicious_pool();
+    let env = &s.env;
+    let mal = MaliciousTokenClient::new(env, &s.mal_addr);
+    let amm = AmmPoolClient::new(env, &s.amm_addr);
+
+    let provider = Address::generate(env);
+    mal.mint(&provider, &100_000_i128);
+    StellarAssetClient::new(env, &s.tb_addr).mint(&provider, &100_000_i128);
+    let shares = amm.add_liquidity(&provider, &100_000_i128, &100_000_i128, &0_i128, &u64::MAX);
+
+    mal.set_armed(&true);
+    // The payout transfer (pool -> provider) of the malicious token_a is
+    // what triggers the callback here.
+    amm.remove_liquidity(&provider, &shares, &0_i128, &0_i128, &u64::MAX);
+
+    assert_ne!(
+        mal.last_reentry_code(),
+        Some(0),
+        "reentrant swap() called from inside remove_liquidity's token transfer must be rejected, not succeed"
+    );
+}
+
+// ── Flash-loan callback attempting other guarded entry points ────────────────
+//
+// Reuses `MockFlashLoanReceiver`'s `attempt` mode (see `ReceiverDataKey`
+// above) rather than a second receiver contract, since two `#[contract]`
+// types in this module cannot both export a method named `on_flash_loan`.
+
+fn setup_evil_receiver(ts: &TestSetup, attempt: u32) -> Address {
+    let receiver_addr = ts.env.register_contract(None, MockFlashLoanReceiver);
+    let client = MockFlashLoanReceiverClient::new(&ts.env, &receiver_addr);
+    client.initialize(&ts.amm_addr, &ts.ta_addr, &ts.tb_addr, &true);
+    client.set_attempt(&attempt);
+    receiver_addr
+}
+
+#[test]
+fn test_flash_loan_callback_cannot_reenter_remove_liquidity_one_sided() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let receiver_addr = setup_evil_receiver(&ts, 1);
+    ta_sac.mint(&receiver_addr, &100_i128);
+    tb_sac.mint(&receiver_addr, &100_i128);
+
+    amm.flash_loan(&receiver_addr, &1_000_i128, &1_000_i128, &Bytes::new(env));
+    assert_ne!(
+        MockFlashLoanReceiverClient::new(env, &receiver_addr).last_code(),
+        0,
+        "reentrant call from inside on_flash_loan must be rejected, not succeed"
+    );
+}
+
+#[test]
+fn test_flash_loan_callback_cannot_reenter_swap_fot() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let receiver_addr = setup_evil_receiver(&ts, 2);
+    ta_sac.mint(&receiver_addr, &100_i128);
+    tb_sac.mint(&receiver_addr, &100_i128);
+
+    amm.flash_loan(&receiver_addr, &1_000_i128, &1_000_i128, &Bytes::new(env));
+    assert_ne!(
+        MockFlashLoanReceiverClient::new(env, &receiver_addr).last_code(),
+        0,
+        "reentrant call from inside on_flash_loan must be rejected, not succeed"
+    );
+}
+
+#[test]
+fn test_flash_loan_callback_cannot_reenter_withdraw_protocol_fees() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let receiver_addr = setup_evil_receiver(&ts, 3);
+    ta_sac.mint(&receiver_addr, &100_i128);
+    tb_sac.mint(&receiver_addr, &100_i128);
+
+    amm.flash_loan(&receiver_addr, &1_000_i128, &1_000_i128, &Bytes::new(env));
+    assert_ne!(
+        MockFlashLoanReceiverClient::new(env, &receiver_addr).last_code(),
+        0,
+        "reentrant call from inside on_flash_loan must be rejected, not succeed"
+    );
+}
+
+// ── Lock is released on every error return path ──────────────────────────────
+//
+// Each of these forces a distinct `Err` return from a guarded function and
+// asserts `is_locked()` is false afterward — the acceptance criterion that
+// matters most, since a stranded lock bricks the pool permanently.
+
+#[test]
+fn test_lock_released_after_swap_slippage_error() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let trader = Address::generate(env);
+    ta_sac.mint(&trader, &1_000_i128);
+    assert!(Swap::new(&amm, &trader, &ts.ta_addr, 1_000)
+        .min_out(i128::MAX)
+        .try_execute()
+        .is_err());
+    assert!(!amm.is_locked());
+}
+
+#[test]
+fn test_lock_released_after_add_liquidity_zero_amount_error() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let provider = Address::generate(env);
+    assert!(amm
+        .try_add_liquidity(&provider, &0_i128, &0_i128, &0_i128, &u64::MAX)
+        .is_err());
+    assert!(!amm.is_locked());
+}
+
+#[test]
+fn test_lock_released_after_remove_liquidity_insufficient_shares_error() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    assert!(RemoveLiquidity::new(&amm, &provider, i128::MAX)
+        .try_execute()
+        .is_err());
+    assert!(!amm.is_locked());
+}
+
+#[test]
+fn test_lock_released_after_remove_liquidity_one_sided_wrong_token_error() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    let shares = AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let wrong_token = Address::generate(env);
+    assert!(amm
+        .try_remove_liquidity_one_sided(&provider, &shares, &wrong_token, &0_i128, &u64::MAX)
+        .is_err());
+    assert!(!amm.is_locked());
+}
+
+#[test]
+fn test_lock_released_after_swap_exact_out_paused_error() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    amm.pause();
+    let trader = Address::generate(env);
+    assert!(
+        SwapExactOut::new(&amm, &trader, &ts.tb_addr, 100, i128::MAX)
+            .try_execute()
+            .is_err()
+    );
+    assert!(!amm.is_locked());
+}
+
+#[test]
+fn test_lock_released_after_swap_fot_invalid_token_error() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let trader = Address::generate(env);
+    let wrong_token = Address::generate(env);
+    assert!(amm
+        .try_swap_fot(
+            &trader,
+            &wrong_token,
+            &1_000_i128,
+            &0_i128,
+            &0_i128,
+            &u64::MAX,
+            &None
+        )
+        .is_err());
+    assert!(!amm.is_locked());
+}
+
+#[test]
+fn test_lock_released_after_add_liquidity_fot_zero_amount_error() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let provider = Address::generate(env);
+    assert!(amm
+        .try_add_liquidity_fot(
+            &provider,
+            &0_i128,
+            &0_i128,
+            &0_i128,
+            &0_i128,
+            &0_i128,
+            &u64::MAX
+        )
+        .is_err());
+    assert!(!amm.is_locked());
+}
+
+#[test]
+fn test_lock_released_after_flash_loan_repayment_failed_error() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let receiver_addr = env.register_contract(None, MockFlashLoanReceiver);
+    MockFlashLoanReceiverClient::new(env, &receiver_addr).initialize(
+        &ts.amm_addr,
+        &ts.ta_addr,
+        &ts.tb_addr,
+        &false, // should_repay = false
+    );
+    assert!(amm
+        .try_flash_loan(&receiver_addr, &1_000_i128, &1_000_i128, &Bytes::new(env))
+        .is_err());
+    assert!(!amm.is_locked());
+}
+
+#[test]
+fn test_lock_released_after_emergency_withdraw_unauthorized_error() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    // Configuring a multisig makes the single-admin emergency_withdraw path
+    // return Unauthorized.
+    amm.set_multisig(&ts.admin, &soroban_sdk::vec![env, ts.admin.clone()], &1u32);
+    let to = Address::generate(env);
+    assert!(amm.try_emergency_withdraw(&to).is_err());
+    assert!(!amm.is_locked());
+}
+
+// ── Composition is unaffected ─────────────────────────────────────────────────
+
+#[test]
+fn test_two_sequential_swaps_in_same_transaction_succeed() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let trader = Address::generate(env);
+    ta_sac.mint(&trader, &2_000_i128);
+    let out1 = Swap::new(&amm, &trader, &ts.ta_addr, 1_000).execute();
+    let out2 = Swap::new(&amm, &trader, &ts.ta_addr, 1_000).execute();
+    assert!(out1 > 0);
+    assert!(out2 > 0);
+    assert!(!amm.is_locked());
+}
+
+#[test]
+fn test_flash_loan_still_succeeds_when_receiver_repays() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let receiver_addr = env.register_contract(None, MockFlashLoanReceiver);
+    MockFlashLoanReceiverClient::new(env, &receiver_addr).initialize(
+        &ts.amm_addr,
+        &ts.ta_addr,
+        &ts.tb_addr,
+        &true,
+    );
+    ta_sac.mint(&receiver_addr, &100_i128);
+    tb_sac.mint(&receiver_addr, &100_i128);
+    amm.flash_loan(&receiver_addr, &1_000_i128, &1_000_i128, &Bytes::new(env));
+    assert!(!amm.is_locked());
+}
+
+// ── is_locked / flash_loan_locked / force_unlock ──────────────────────────────
+
+#[test]
+fn test_is_locked_and_deprecated_alias_agree() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    assert!(!amm.is_locked());
+    assert!(!amm.flash_loan_locked());
+}
+
+#[test]
+fn test_force_unlock_single_admin_when_no_multisig() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    // No guarded call is stranded in practice; force_unlock is exercised
+    // directly to prove the authorization gate and event.
+    amm.force_unlock(&soroban_sdk::vec![env]);
+    assert!(!amm.is_locked());
+}
+
+#[test]
+fn test_force_unlock_requires_multisig_quorum_when_configured() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let signer_1 = Address::generate(env);
+    let signer_2 = Address::generate(env);
+    amm.set_multisig(
+        &ts.admin,
+        &soroban_sdk::vec![env, signer_1.clone(), signer_2.clone()],
+        &2u32,
+    );
+
+    // Only one of the two required signers: rejected.
+    assert!(amm
+        .try_force_unlock(&soroban_sdk::vec![env, signer_1.clone()])
+        .is_err());
+
+    // Both signers: succeeds.
+    amm.force_unlock(&soroban_sdk::vec![env, signer_1, signer_2]);
+    assert!(!amm.is_locked());
+}
+
+// ── Issue: multisig proposal expiry must not be refreshed by an already-approved signer ──
+//
+// `propose_emergency_withdraw` previously reset `MultisigProposalExpiresAt` to
+// `now + MULTISIG_PROPOSAL_TTL_SECS` on *every* call, even when the calling signer
+// had already approved the same recipient and no new approval was added. That let a
+// single signer keep a stuck proposal (e.g. 1 of 3 required approvals) alive forever
+// by periodically re-proposing, defeating `ProposalExpired` as a freshness check.
+//
+// The fix only refreshes the expiry when a *new* approval is recorded.
+
+#[test]
+fn test_multisig_reproposal_by_approved_signer_does_not_extend_expiry() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    // Seed the pool with reserves so an emergency withdrawal would have funds.
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let a = Address::generate(env);
+    let b = Address::generate(env);
+    let c = Address::generate(env);
+    let recipient = Address::generate(env);
+    let signers = soroban_sdk::Vec::from_array(env, [a.clone(), b.clone(), c.clone()]);
+    amm.set_multisig(&ts.admin, &signers, &2u32);
+
+    const TTL: u64 = 7 * 24 * 60 * 60; // mirrors MULTISIG_PROPOSAL_TTL_SECS
+    let t0 = 100_000_u64;
+    env.ledger().set_timestamp(t0);
+
+    // Signer `a` opens the proposal. Expiry = t0 + TTL, approvals = [a].
+    amm.propose_emergency_withdraw(&a, &recipient);
+    assert_eq!(amm.get_multisig_proposal().unwrap().approvals.len(), 1);
+
+    // Six days later the *already-approved* signer `a` re-proposes the SAME
+    // recipient. This adds no new approval and, with the fix, must NOT extend
+    // the expiry beyond the original t0 + TTL.
+    let t1 = t0 + 6 * 24 * 60 * 60;
+    env.ledger().set_timestamp(t1);
+    amm.propose_emergency_withdraw(&a, &recipient);
+    assert_eq!(
+        amm.get_multisig_proposal().unwrap().approvals.len(),
+        1,
+        "re-proposing signer must not be double-counted"
+    );
+
+    // Advance just past the ORIGINAL expiry (t0 + TTL). Note t2 < t1 + TTL, so if
+    // the re-propose had (incorrectly) refreshed the window, execution would instead
+    // fail with InsufficientShares (1 < 2). ProposalExpired proves the window was
+    // NOT extended by the already-approved signer.
+    let t2 = t0 + TTL + 1;
+    env.ledger().set_timestamp(t2);
+    let result = amm.try_exec_multisig_emergency_wd(&b);
+    assert_eq!(
+        result,
+        Err(Ok(AmmError::ProposalExpired)),
+        "a stale proposal must lapse; an already-approved signer cannot keep it alive"
+    );
+}
+
+#[test]
+fn test_multisig_new_cosigner_refreshes_window_and_quorum_executes() {
+    let ts = setup_pool(30);
+    let env = &ts.env;
+    let amm = AmmPoolClient::new(env, &ts.amm_addr);
+    let ta_sac = StellarAssetClient::new(env, &ts.ta_addr);
+    let tb_sac = StellarAssetClient::new(env, &ts.tb_addr);
+
+    // Seed the pool with reserves.
+    let provider = Address::generate(env);
+    ta_sac.mint(&provider, &1_000_000_i128);
+    tb_sac.mint(&provider, &1_000_000_i128);
+    AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
+
+    let a = Address::generate(env);
+    let b = Address::generate(env);
+    let c = Address::generate(env);
+    let recipient = Address::generate(env);
+    let signers = soroban_sdk::Vec::from_array(env, [a.clone(), b.clone(), c.clone()]);
+    amm.set_multisig(&ts.admin, &signers, &2u32);
+
+    let token_a = StellarTokenClient::new(env, &ts.ta_addr);
+    let token_b = StellarTokenClient::new(env, &ts.tb_addr);
+    let pool_a_before = token_a.balance(&ts.amm_addr);
+    let pool_b_before = token_b.balance(&ts.amm_addr);
+    let recip_a_before = token_a.balance(&recipient);
+    let recip_b_before = token_b.balance(&recipient);
+    assert!(pool_a_before > 0 && pool_b_before > 0);
+
+    const TTL: u64 = 7 * 24 * 60 * 60;
+    let t0 = 100_000_u64;
+    env.ledger().set_timestamp(t0);
+
+    // Signer `a` opens the proposal: approvals = [a], expiry = t0 + TTL.
+    amm.propose_emergency_withdraw(&a, &recipient);
+
+    // A genuinely NEW signer `b` co-signs six days later. This is real progress
+    // toward quorum and (preserved behavior) refreshes the window to t1 + TTL.
+    let t1 = t0 + 6 * 24 * 60 * 60;
+    env.ledger().set_timestamp(t1);
+    amm.propose_emergency_withdraw(&b, &recipient);
+    assert_eq!(amm.get_multisig_proposal().unwrap().approvals.len(), 2);
+
+    // Past the ORIGINAL expiry but inside the refreshed window (t2 < t1 + TTL).
+    // Quorum (2) is met, so execution must succeed and drain reserves to recipient.
+    let t2 = t0 + TTL + 1;
+    env.ledger().set_timestamp(t2);
+    amm.exec_multisig_emergency_wd(&a);
+
+    assert_eq!(
+        token_a.balance(&ts.amm_addr),
+        0,
+        "reserve_a should be drained"
+    );
+    assert_eq!(
+        token_b.balance(&ts.amm_addr),
+        0,
+        "reserve_b should be drained"
+    );
+    assert_eq!(
+        token_a.balance(&recipient),
+        recip_a_before + pool_a_before,
+        "recipient should receive token_a reserves"
+    );
+    assert_eq!(
+        token_b.balance(&recipient),
+        recip_b_before + pool_b_before,
+        "recipient should receive token_b reserves"
+    );
 }

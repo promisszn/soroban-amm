@@ -1,53 +1,31 @@
-# Soroban AMM TypeScript Client Example
+# Soroban AMM TypeScript client example
 
-This example shows how to interact with a deployed AMM contract from a JavaScript or TypeScript application.
+This example targets **Soroban Testnet** and uses the local `@soroban-amm/sdk` package rather than hand-encoding contract calls. It demonstrates the safe order for reading pool state, quoting a swap, applying slippage and deadline bounds, reviewing liquidity operations, and reading LP balances.
 
-It demonstrates:
+## Install and build
 
-- connecting to the Stellar testnet RPC
-- reading pool state with `get_info()`
-- quoting a swap with `get_amount_out()`
-- executing a swap with `swap()`
-- reading LP share balance with `shares_of()`
-
-## Install
+From this directory:
 
 ```sh
 npm install
+npm run build
+npm test
 ```
+
+The SDK is consumed through the local workspace dependency `file:../../packages/sdk`, so the example stays aligned with the checked-in typed clients.
 
 ## Configure
 
-Set the required environment variables before running the example:
+Required variables are `AMM_CONTRACT_ID`, `TOKEN_IN_CONTRACT_ID`, and `SOURCE_ADDRESS`. `SOURCE_ADDRESS` is the public key that will act as trader/provider when a wallet adapter submits transactions. Optional variables are `LP_TOKEN_CONTRACT_ID`, `FACTORY_CONTRACT_ID`, `SWAP_AMOUNT_IN` (default `100000`), `SLIPPAGE_BPS` (default `50`), `DEADLINE_SECONDS` (default `300`), `STELLAR_RPC_URL` (default Soroban Testnet), and `STELLAR_NETWORK_PASSPHRASE` (default Testnet passphrase).
+
+A complete configured run is:
 
 ```sh
-AMM_CONTRACT_ID=<deployed AMM contract id>
-SOURCE_SECRET=<secret key for the transaction source and default trader>
-TOKEN_IN_CONTRACT_ID=<token A or token B contract id>
-SWAP_AMOUNT_IN=100000
-SWAP_MIN_OUT=0
+AMM_CONTRACT_ID=<pool> TOKEN_IN_CONTRACT_ID=<token> SOURCE_ADDRESS=<G...> LP_TOKEN_CONTRACT_ID=<lp-token> npm start
 ```
 
-Optional environment variables:
+The example prints a readable contract error and links to `docs/error-codes.md` if an RPC or simulation call fails. It deliberately does not recreate `TransactionBuilder`, `nativeToScVal`, or raw XDR encoding.
 
-```sh
-STELLAR_RPC_URL=https://soroban-testnet.stellar.org
-STELLAR_NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
-LP_PROVIDER_ADDRESS=<defaults to SOURCE_SECRET public key>
-```
+## SDK limitation and follow-up
 
-The account behind `SOURCE_SECRET` is used as the transaction source and swap trader. It must exist on testnet, have enough XLM to pay transaction fees, and hold the input token being swapped.
-
-## Build
-
-```sh
-npm run build
-```
-
-## Run
-
-```sh
-npm start
-```
-
-The example simulates read-only calls first, then submits a signed `swap()` transaction.
+The current SDK exposes typed pool simulation, pool information, share reads, token reads, and parameter types, but it does not yet expose signed `AmmPool` methods for swap, add-liquidity, or remove-liquidity submission. The example therefore prints the reviewed execution parameters and delegates those writes to the application’s wallet adapter rather than silently reaching back to the raw Stellar SDK. A follow-up should add typed signed lifecycle methods to `packages/sdk` before these three operations can be automated here.

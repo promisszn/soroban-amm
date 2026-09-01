@@ -56,7 +56,7 @@ pub fn next_initialized_tick_within_word(env: &Env, tick: i32, lte: bool) -> (i3
         let mask = if bit_pos == 0 {
             u128::MAX
         } else {
-            u128::MAX.wrapping_shl(bit_pos as u32)
+            u128::MAX.wrapping_shl(bit_pos)
         };
         let masked = word & mask;
         if masked == 0 {

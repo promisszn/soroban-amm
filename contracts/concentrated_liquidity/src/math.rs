@@ -33,7 +33,22 @@ pub const MAX_SQRT_PRICE: u128 = 340_275_971_719_517_849_884_931_781_110_561_029
 ///
 /// Accuracy: within 1 ULP for ticks in [MIN_TICK, MAX_TICK].
 pub fn tick_to_sqrt_price_x96(tick: i32) -> u128 {
-    assert!(tick >= MIN_TICK && tick <= MAX_TICK, "tick out of range");
+    assert!((MIN_TICK..=MAX_TICK).contains(&tick), "tick out of range");
+
+    // Positive ticks are derived from the (exact) negative side rather than
+    // inverting the Q128 ratio in u128. The Q128 inverse needs a 2^256
+    // numerator that does not fit in u128, which loses precision that grows
+    // with the tick magnitude (issue #347). Instead use the identity
+    //
+    //   sqrt_price(t) * sqrt_price(-t) = (2^96)^2 = 2^192
+    //
+    // so sqrt_price(t) = 2^192 / sqrt_price(-t). `sqrt_price(-t)` is already
+    // exact, and `div_pow2` performs the wide division without overflow.
+    if tick > 0 {
+        let inv_sqrt_price = tick_to_sqrt_price_x96(-tick);
+        let sqrt_price = div_pow2(192, inv_sqrt_price);
+        return sqrt_price.clamp(MIN_SQRT_PRICE, MAX_SQRT_PRICE);
+    }
 
     // Work with the absolute value; negate at the end if tick < 0.
     let abs_tick = tick.unsigned_abs() as u64;
@@ -97,12 +112,8 @@ pub fn tick_to_sqrt_price_x96(tick: i32) -> u128 {
     apply_bit!(18, 0x2216e584f5fa1ea926041bedfe98_u128);
     apply_bit!(19, 0x48a170391f7dc42444e8fa2_u128);
 
-    // If tick > 0, invert: ratio = 2^256 / ratio (in Q128: 2^128 * 2^128 / ratio).
-    // We approximate using u128 division.
-    if tick > 0 {
-        // ratio = u128::MAX / ratio  (approximates 2^128 / ratio with ~1 ULP error)
-        ratio = u128::MAX / ratio;
-    }
+    // Positive ticks are handled by the early-return inversion above, so here
+    // `tick <= 0` and `ratio` already holds the correct Q128 sqrt price.
 
     // Convert from Q128 to Q96: shift right by 32 bits, with rounding.
     // sqrtPriceX96 = ratio >> 32
@@ -114,7 +125,7 @@ pub fn tick_to_sqrt_price_x96(tick: i32) -> u128 {
         };
 
     // Clamp to valid range.
-    sqrt_price.max(MIN_SQRT_PRICE).min(MAX_SQRT_PRICE)
+    sqrt_price.clamp(MIN_SQRT_PRICE, MAX_SQRT_PRICE)
 }
 
 /// Multiply two Q128 values and return the result as Q128.
@@ -146,6 +157,34 @@ fn mul_shift128(a: u128, b: u128) -> u128 {
     top.wrapping_add(mid_sum).wrapping_add(mid_lo_carry)
 }
 
+/// Computes `floor(2^pow / d)`, saturating at `u128::MAX` when the quotient
+/// would not fit in a u128.
+///
+/// Used to invert a sqrt price for positive ticks: `2^192 / sqrt_price(-t)`.
+/// The numerator `2^pow` cannot be materialised in a u128, so this performs
+/// bitwise long division, processing the single numerator bit at position
+/// `pow` and trailing zeros. The caller passes `d < 2^97` (a Q96 sqrt price),
+/// which keeps the running remainder below `2^98` so it never overflows.
+fn div_pow2(pow: u32, d: u128) -> u128 {
+    debug_assert!(d != 0, "division by zero");
+    let mut rem: u128 = 0;
+    let mut quo: u128 = 0;
+    for i in (0..=pow).rev() {
+        // Shift in bit `i` of the numerator (set only at position `pow`).
+        rem = (rem << 1) | u128::from(i == pow);
+        // Appending the next quotient bit would drop the top bit: saturate.
+        if quo >> 127 != 0 {
+            return u128::MAX;
+        }
+        quo <<= 1;
+        if rem >= d {
+            rem -= d;
+            quo |= 1;
+        }
+    }
+    quo
+}
+
 /// Convert sqrtPriceX96 back to the floor tick.
 ///
 /// Uses binary search over [MIN_TICK, MAX_TICK]: ~21 iterations, each calling
@@ -153,7 +192,7 @@ fn mul_shift128(a: u128, b: u128) -> u128 {
 /// `TickMath.getTickAtSqrtRatio` which doesn't fit in u128.
 pub fn sqrt_price_x96_to_tick(sqrt_price: u128) -> i32 {
     assert!(
-        sqrt_price >= MIN_SQRT_PRICE && sqrt_price <= MAX_SQRT_PRICE,
+        (MIN_SQRT_PRICE..=MAX_SQRT_PRICE).contains(&sqrt_price),
         "sqrt price out of range"
     );
 
@@ -193,13 +232,9 @@ pub fn get_amount0_delta(mut sqrt_a: u128, mut sqrt_b: u128, liquidity: i128) ->
     //         = abs_liq * (sqrt_b - sqrt_a) * 2^192 / (sqrt_b * sqrt_a)
     // Use wide arithmetic via splitting to stay in u128.
     let numerator = mul_u128_u96(abs_liq, sqrt_b - sqrt_a); // abs_liq * (sqrt_b - sqrt_a) * 2^96
-    // Compute sqrt_a * sqrt_b / Q96 without overflow using mul_shift128
+                                                            // Compute sqrt_a * sqrt_b / Q96 without overflow using mul_shift128
     let denominator = mul_shift128(sqrt_a, sqrt_b).wrapping_shl(32);
-    let abs_result = if denominator == 0 {
-        0
-    } else {
-        numerator / denominator
-    };
+    let abs_result = numerator.checked_div(denominator).unwrap_or(0);
     if liquidity >= 0 {
         abs_result as i128
     } else {
@@ -309,17 +344,39 @@ mod tests {
     fn tick_max_is_clamped() {
         let sp = tick_to_sqrt_price_x96(MAX_TICK);
         // The u128 implementation clamps to valid range; just verify it's ≥ MIN_SQRT_PRICE.
-        assert!(sp >= MIN_SQRT_PRICE, "MAX_TICK must yield at least MIN_SQRT_PRICE");
+        assert!(
+            sp >= MIN_SQRT_PRICE,
+            "MAX_TICK must yield at least MIN_SQRT_PRICE"
+        );
     }
 
     #[test]
     fn round_trip_tick_to_sqrt_and_back() {
-        // Only test negative ticks: the u128 inversion step for positive ticks
-        // returns incorrect values (2^128 cannot be represented in u128).
-        for tick in [-100_000_i32, -10_000, -100, -1] {
+        // Both signs round-trip now that positive ticks are derived from the
+        // exact negative side via the 2^192 / sqrt_price(-t) identity (#347).
+        for tick in [-100_000_i32, -10_000, -100, -1, 1, 100, 10_000, 100_000] {
             let sp = tick_to_sqrt_price_x96(tick);
             let back = sqrt_price_x96_to_tick(sp);
             assert_eq!(back, tick, "round-trip failed for tick {tick}: got {back}");
+        }
+    }
+
+    #[test]
+    fn positive_tick_is_inverse_of_negative() {
+        // sqrt_price(t) * sqrt_price(-t) must equal (2^96)^2 = 2^192, the
+        // identity the positive-tick path relies on. Reduce both factors by
+        // 2^48 first so the product stays within u128 for large magnitudes;
+        // (pos >> 48) * (neg >> 48) then approximates (pos * neg) >> 96 ≈ 2^96.
+        let q96_target: i128 = 1i128 << 96;
+        for tick in [1_i32, 50, 100, 1_000, 10_000, 50_000] {
+            let pos = tick_to_sqrt_price_x96(tick);
+            let neg = tick_to_sqrt_price_x96(-tick);
+            let product = ((pos >> 48) * (neg >> 48)) as i128;
+            let rel_err = (product - q96_target).abs() * 1_000_000 / q96_target;
+            assert!(
+                rel_err < 200,
+                "tick {tick}: product {product} drifts from 2^96 ({q96_target}) by {rel_err} ppm"
+            );
         }
     }
 

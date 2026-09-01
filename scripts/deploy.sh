@@ -1,151 +1,318 @@
 #!/usr/bin/env bash
+# Soroban AMM — full-protocol deployment orchestrator
+#
+# Deploys and initializes every contract in dependency order, persisting each
+# address and step to $DEPLOY_ENV as it completes so the run is idempotent
+# and resumable (kill mid-run and re-run to continue). Verification reads
+# state back after each initialization — a zero exit code does NOT mean success.
+#
+# Usage:
+#   scripts/deploy.sh [network] [--only a,b] [--skip c,d] [--force] [--help]
+#   NETWORK=testnet SOURCE_ACCOUNT=mykey scripts/deploy.sh --only factory,pools
+#
+# Helpers are importable (sourceable):
+#   source scripts/deploy.sh  # or source scripts/deploy/common.sh
+#   # then call deploy_tokens, deploy_factory, etc. individually
+#
+# WASM target: wasm32v1-none (the only supported Soroban target).
+# All WASM artifacts are expected under target/wasm32v1-none/release/.
+
 set -Eeuo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NETWORK="${1:-${STELLAR_NETWORK:-${NETWORK:-testnet}}}"
-SOURCE_ACCOUNT="${SOURCE_ACCOUNT:-soroban-amm-deployer}"
-DEPLOY_ENV="${DEPLOY_ENV:-"$ROOT_DIR/.soroban-amm.deploy.env"}"
-ADMIN_ADDRESS="${ADMIN_ADDRESS:-}"
-FEE_RECIPIENT="${FEE_RECIPIENT:-}"
-PROTOCOL_FEE_BPS="${PROTOCOL_FEE_BPS:-0}"
-
-TOKEN_WASM="${TOKEN_WASM:-"$ROOT_DIR/target/wasm32-unknown-unknown/release/token.wasm"}"
-AMM_WASM="${AMM_WASM:-"$ROOT_DIR/target/wasm32-unknown-unknown/release/amm.wasm"}"
-
-log() {
-  printf '[deploy] %s\n' "$*" >&2
-}
-
-require_cmd() {
-  if ! command -v "$1" >/dev/null 2>&1; then
-    printf '[deploy] missing required command: %s\n' "$1" >&2
-    exit 1
-  fi
-}
-
-extract_contract_id() {
-  grep -Eo 'C[A-Z0-9]{55}' | tail -n 1
-}
-
-deploy_contract() {
-  local wasm="$1"
-  local output contract_id
-
-  output="$(stellar contract deploy \
-    --wasm "$wasm" \
-    --network "$NETWORK" \
-    --source "$SOURCE_ACCOUNT")"
-
-  contract_id="$(printf '%s\n' "$output" | extract_contract_id)"
-  if [[ -z "$contract_id" ]]; then
-    printf '[deploy] could not parse contract id from output:\n%s\n' "$output" >&2
-    exit 1
-  fi
-
-  printf '%s\n' "$contract_id"
-}
-
-invoke() {
-  local contract_id="$1"
-  shift
-
-  stellar contract invoke \
-    --id "$contract_id" \
-    --network "$NETWORK" \
-    --source "$SOURCE_ACCOUNT" \
-    -- "$@"
-}
-
-generate_and_fund_source() {
-  if stellar keys address "$SOURCE_ACCOUNT" >/dev/null 2>&1; then
-    log "source account exists: $SOURCE_ACCOUNT"
-    return
-  fi
-
-  log "generating and funding source account: $SOURCE_ACCOUNT"
-  if stellar keys generate "$SOURCE_ACCOUNT" --network "$NETWORK" --fund >/dev/null 2>&1; then
-    return
-  fi
-
-  stellar keys generate --default-seed "$SOURCE_ACCOUNT" >/dev/null
-  stellar keys fund "$SOURCE_ACCOUNT" --network "$NETWORK" >/dev/null
-}
-
-require_cmd stellar
-
-generate_and_fund_source
-SOURCE_PUBLIC_KEY="$(stellar keys address "$SOURCE_ACCOUNT")"
-
-if [[ -z "$ADMIN_ADDRESS" ]]; then
-  ADMIN_ADDRESS="$SOURCE_PUBLIC_KEY"
+# ── Resolve ROOT_DIR even when sourced ─────────────────────────────────────
+if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+  ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+else
+  ROOT_DIR="$(pwd)"
 fi
 
-if [[ -z "$FEE_RECIPIENT" ]]; then
-  FEE_RECIPIENT="$SOURCE_PUBLIC_KEY"
+# Only set defaults if not already set (allows caller to override before sourcing)
+: "${NETWORK:=testnet}"
+: "${SOURCE_ACCOUNT:=soroban-amm-deployer}"
+: "${DEPLOY_ENV:=${ROOT_DIR}/.soroban-amm.deploy.env}"
+: "${ADMIN_ADDRESS:=}"
+: "${FEE_RECIPIENT:=}"
+: "${PROTOCOL_FEE_BPS:=0}"
+
+WASM_TARGET="wasm32v1-none"
+
+# ── Source common helpers ──────────────────────────────────────────────────
+# When this file is sourced, ROOT_DIR/NETWORK etc. are already set above so
+# common.sh can use them.
+
+# shellcheck disable=SC1091
+if [[ -f "${ROOT_DIR}/scripts/deploy/common.sh" ]]; then
+  source "${ROOT_DIR}/scripts/deploy/common.sh"
+else
+  # Fallback: minimal log/die if common.sh not yet present (e.g. during bootstrap)
+  log() { printf '[deploy] %s\n' "$*" >&2; }
+  die() { printf '[deploy][error] %s\n' "$*" >&2; exit 1; }
 fi
 
-if [[ ! -f "$TOKEN_WASM" || ! -f "$AMM_WASM" ]]; then
-  require_cmd cargo
-  log "building release WASM artifacts"
-  (cd "$ROOT_DIR" && cargo build --release --target wasm32-unknown-unknown)
+# Source per-contract modules (all are sourceable and idempotent to source)
+for mod in token amm concentrated_liquidity factory pools governance \
+           staking incentive_campaigns pol_vesting reserve_manager \
+           oracle_aggregator twap_consumer router batch_router \
+           dex_aggregator batch_auction cl_position_nft v2_to_v3_migration; do
+  if [[ -f "${ROOT_DIR}/scripts/deploy/${mod}.sh" ]]; then
+    # shellcheck disable=SC1090
+    source "${ROOT_DIR}/scripts/deploy/${mod}.sh"
+  fi
+done
+
+# ── Argument parsing ───────────────────────────────────────────────────────
+ONLY_RAW=""
+SKIP_RAW=""
+FORCE=false
+POSITIONAL_NETWORK=""
+
+print_help() {
+  cat <<'HELP'
+Soroban AMM deploy — full protocol deployment to Stellar (testnet/mainnet)
+
+Usage:
+  scripts/deploy.sh [network] [options]
+
+Arguments:
+  network                 Stellar network name (testnet, mainnet, futurenet).
+                          Also reads $NETWORK / $STELLAR_NETWORK. Default: testnet.
+
+Options:
+  --only LIST             Deploy only these contracts (comma-separated).
+                          Example: --only factory,pools,governance
+  --skip LIST             Skip these contracts.
+                          Example: --skip staking,incentive_campaigns
+  --force                 Re-deploy and re-initialize even if already persisted.
+                          Without --force, a re-run is a no-op for completed steps.
+  --help, -h              Show this help.
+
+Available contract names (in deployment order):
+  token, amm, concentrated_liquidity, factory, pools,
+  governance, oracle_aggregator, twap_consumer, twal_consumer,
+  staking, incentive_campaigns, pol_vesting, reserve_manager,
+  router, batch_router, dex_aggregator, batch_auction,
+  cl_position_nft, v2_to_v3_migration
+
+  Aliases: amm covers the AMM WASM artifact (pools via factory).
+           concentrated_liquidity is also "cl".
+
+Persistence:
+  Every deployed address and init marker is appended to $DEPLOY_ENV
+  immediately after it completes. Kill the script mid-run and re-run —
+  it resumes from where it left off. A completed deployment re-run
+  is a no-op unless --force is passed.
+
+Verification:
+  After each initialization the script reads state back (get_info,
+  get_params, etc.) and asserts expected values.
+
+Examples:
+  scripts/deploy.sh testnet
+  scripts/deploy.sh --only factory,pools
+  scripts/deploy.sh --skip governance,staking
+  NETWORK=mainnet SOURCE_ACCOUNT=mainnet-deployer scripts/deploy.sh --force
+
+Runbook:
+  See docs/deployment-runbook.md for prerequisites, deployment order,
+  per-contract parameters, verification, upgrades, and emergency procedures.
+
+HELP
+}
+
+parse_args() {
+  local args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --only)
+        ONLY_RAW="${2:-}"
+        shift 2
+        ;;
+      --only=*)
+        ONLY_RAW="${1#--only=}"
+        shift
+        ;;
+      --skip)
+        SKIP_RAW="${2:-}"
+        shift 2
+        ;;
+      --skip=*)
+        SKIP_RAW="${1#--skip=}"
+        shift
+        ;;
+      --force)
+        FORCE=true
+        shift
+        ;;
+      --help|-h)
+        print_help
+        exit 0
+        ;;
+      --network)
+        NETWORK="${2:-testnet}"
+        shift 2
+        ;;
+      --network=*)
+        NETWORK="${1#--network=}"
+        shift
+        ;;
+      --*)
+        die "unknown option: $1 (see --help)"
+        ;;
+      *)
+        # Positional arg — treat first as network if it looks like a network name
+        if [[ -z "$POSITIONAL_NETWORK" ]] && [[ "$1" =~ ^(testnet|mainnet|futurenet|local|standalone)$ ]]; then
+          POSITIONAL_NETWORK="$1"
+        else
+          args+=("$1")
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -n "$POSITIONAL_NETWORK" ]]; then
+    NETWORK="$POSITIONAL_NETWORK"
+  fi
+  # Backward compat: if first positional arg was not a network name but caller
+  # passed "testnet" as $1, it's already handled above.
+
+  # Normalize filters to lowercase underscore form, split on comma
+  ONLY_FILTER=()
+  SKIP_FILTER=()
+  if [[ -n "$ONLY_RAW" ]]; then
+    IFS=',' read -ra _only_parts <<< "$ONLY_RAW"
+    for p in "${_only_parts[@]}"; do
+      p=$(echo "$p" | tr '[:upper:]' '[:lower:]' | tr '-' '_' | xargs)
+      # Alias: cl -> concentrated_liquidity
+      if [[ "$p" == "cl" ]]; then p="concentrated_liquidity"; fi
+      if [[ -n "$p" ]]; then ONLY_FILTER+=("$p"); fi
+    done
+  fi
+  if [[ -n "$SKIP_RAW" ]]; then
+    IFS=',' read -ra _skip_parts <<< "$SKIP_RAW"
+    for p in "${_skip_parts[@]}"; do
+      p=$(echo "$p" | tr '[:upper:]' '[:lower:]' | tr '-' '_' | xargs)
+      if [[ "$p" == "cl" ]]; then p="concentrated_liquidity"; fi
+      if [[ -n "$p" ]]; then SKIP_FILTER+=("$p"); fi
+    done
+  fi
+
+  export NETWORK FORCE
+  # Export for common.sh filter functions
+  export ONLY_RAW SKIP_RAW
+}
+
+# ── Main orchestration ─────────────────────────────────────────────────────
+
+main() {
+  parse_args "$@"
+
+  log "network=$NETWORK source=$SOURCE_ACCOUNT env=$DEPLOY_ENV force=$FORCE"
+  if [[ ${#ONLY_FILTER[@]} -gt 0 ]]; then log "only: ${ONLY_FILTER[*]}"; fi
+  if [[ ${#SKIP_FILTER[@]} -gt 0 ]]; then log "skip: ${SKIP_FILTER[*]}"; fi
+
+  require_cmd stellar
+
+  # Load any existing deployment state (for resumability)
+  load_env
+
+  generate_and_fund_source
+  SOURCE_PUBLIC_KEY="$(stellar keys address "$SOURCE_ACCOUNT")"
+  persist_var "NETWORK" "$NETWORK"
+  persist_var "SOURCE_ACCOUNT" "$SOURCE_ACCOUNT"
+  persist_var "SOURCE_PUBLIC_KEY" "$SOURCE_PUBLIC_KEY"
+
+  if [[ -z "${ADMIN_ADDRESS:-}" ]]; then
+    ADMIN_ADDRESS="$SOURCE_PUBLIC_KEY"
+    log "ADMIN_ADDRESS not set — using source public key: $ADMIN_ADDRESS"
+  fi
+  if [[ -z "${FEE_RECIPIENT:-}" ]]; then
+    FEE_RECIPIENT="$SOURCE_PUBLIC_KEY"
+  fi
+  persist_var "ADMIN_ADDRESS" "$ADMIN_ADDRESS"
+  persist_var "FEE_RECIPIENT" "$FEE_RECIPIENT"
+  persist_var "PROTOCOL_FEE_BPS" "$PROTOCOL_FEE_BPS"
+  export ADMIN_ADDRESS FEE_RECIPIENT PROTOCOL_FEE_BPS SOURCE_PUBLIC_KEY
+
+  # ── Build WASM artifacts (correct target: wasm32v1-none) ────────────────
+  if [[ "$FORCE" == true ]] || ! ls "${ROOT_DIR}/target/${WASM_TARGET}/release/"*.wasm >/dev/null 2>&1; then
+    # Determine if we should build: missing files or --force
+    local need_build=false
+    for wasm in "${ROOT_DIR}/target/${WASM_TARGET}/release/token.wasm" "${ROOT_DIR}/target/${WASM_TARGET}/release/amm.wasm" "${ROOT_DIR}/target/${WASM_TARGET}/release/factory.wasm"; do
+      if [[ ! -f "$wasm" ]]; then need_build=true; break; fi
+    done
+    if [[ "$FORCE" == true ]]; then need_build=true; fi
+    if [[ "$need_build" == true ]]; then
+      require_cmd cargo
+      log "building release WASM artifacts (target ${WASM_TARGET})"
+      CURRENT_CONTRACT="build"
+      CURRENT_STEP="cargo build --release --target ${WASM_TARGET}"
+      (cd "$ROOT_DIR" && cargo build --release --target "${WASM_TARGET}") || die "cargo build failed"
+    fi
+  else
+    log "WASM artifacts already present — skipping build (use --force to rebuild)"
+  fi
+
+  # Ensure wasm32v1-none artifacts are what we deploy; fail fast if wrong target was built elsewhere
+  if compgen -G "${ROOT_DIR}/target/wasm32-unknown-unknown/release/*.wasm" >/dev/null 2>&1; then
+    warn "found wasm32-unknown-unknown artifacts — these are the WRONG target and will not be used (expected wasm32v1-none)"
+  fi
+
+  # ── Deploy in dependency order ──────────────────────────────────────────
+  # 1. Underlying tokens (no dependencies)
+  deploy_tokens
+
+  # 2. Factory (needs WASM hashes; uploads token/amm/cl wasm inside)
+  deploy_factory
+
+  # 3. Pools via factory (needs factory + tokens)
+  deploy_pools
+
+  # 4. Governance (needs AMM pool + LP token)
+  deploy_governance
+
+  # 5. Oracle stack
+  deploy_oracle_aggregator
+  deploy_twap_consumer
+  deploy_twal_consumer
+
+  # 6. Staking & incentives
+  deploy_staking
+  deploy_incentive_campaigns
+  deploy_pol_vesting
+  deploy_reserve_manager
+
+  # 7. Routing
+  deploy_router
+  deploy_batch_router
+  deploy_dex_aggregator
+  deploy_batch_auction
+
+  # 8. NFTs & migration
+  deploy_cl_position_nft
+  deploy_v2_to_v3_migration
+
+  # ── Summary ─────────────────────────────────────────────────────────────
+  log "wrote deployment env to $DEPLOY_ENV"
+  log "deployment complete — persisted addresses:"
+
+  # Print summary from DEPLOY_ENV (only contract addresses)
+  if [[ -f "$DEPLOY_ENV" ]]; then
+    grep -E '^export .*_CONTRACT_ID=' "$DEPLOY_ENV" 2>/dev/null | sed 's/export /  /' >&2 || true
+    grep -E '^export .*_WASM_HASH=' "$DEPLOY_ENV" 2>/dev/null | sed 's/export /  /' >&2 || true
+  fi
+
+  # Also print to stdout for PR evidence
+  echo "=== Deployment addresses (network: $NETWORK) ==="
+  if [[ -f "$DEPLOY_ENV" ]]; then
+    grep -E '^export .*_(CONTRACT_ID|WASM_HASH)=' "$DEPLOY_ENV" 2>/dev/null | sed 's/export //' || true
+  fi
+  echo "=== Verification: all post-deploy checks ran (see log above) ==="
+  echo "Env file: $DEPLOY_ENV"
+}
+
+# ── Entrypoint guard — only run main if executed, not when sourced ────────
+# This keeps helpers importable for e2e.sh reuse without triggering a deploy.
+if [[ "${BASH_SOURCE[0]:-}" == "${0}" ]]; then
+  main "$@"
 fi
-
-log "deploying Token A"
-TOKEN_A_CONTRACT_ID="$(deploy_contract "$TOKEN_WASM")"
-
-log "deploying Token B"
-TOKEN_B_CONTRACT_ID="$(deploy_contract "$TOKEN_WASM")"
-
-log "deploying LP token"
-LP_TOKEN_CONTRACT_ID="$(deploy_contract "$TOKEN_WASM")"
-
-log "deploying AMM"
-AMM_CONTRACT_ID="$(deploy_contract "$AMM_WASM")"
-
-log "initializing Token A"
-invoke "$TOKEN_A_CONTRACT_ID" initialize \
-  --admin "$SOURCE_PUBLIC_KEY" \
-  --name "E2E Token A" \
-  --symbol "E2EA" \
-  --decimals 7 >/dev/null
-
-log "initializing Token B"
-invoke "$TOKEN_B_CONTRACT_ID" initialize \
-  --admin "$SOURCE_PUBLIC_KEY" \
-  --name "E2E Token B" \
-  --symbol "E2EB" \
-  --decimals 7 >/dev/null
-
-log "initializing LP token"
-invoke "$LP_TOKEN_CONTRACT_ID" initialize \
-  --admin "$AMM_CONTRACT_ID" \
-  --name "E2E AMM LP" \
-  --symbol "E2ELP" \
-  --decimals 7 >/dev/null
-
-log "initializing AMM"
-invoke "$AMM_CONTRACT_ID" initialize \
---admin "$ADMIN_ADDRESS" \
-  --token_a "$TOKEN_A_CONTRACT_ID" \
-  --token_b "$TOKEN_B_CONTRACT_ID" \
-  --lp_token "$LP_TOKEN_CONTRACT_ID" \
-  --fee_bps 30 \
-  --fee_recipient "$FEE_RECIPIENT" \
-  --protocol_fee_bps "$PROTOCOL_FEE_BPS" >/dev/null
-
-cat >"$DEPLOY_ENV" <<EOF
-export NETWORK="$NETWORK"
-export SOURCE_ACCOUNT="$SOURCE_ACCOUNT"
-export SOURCE_PUBLIC_KEY="$SOURCE_PUBLIC_KEY"
-export TOKEN_A_CONTRACT_ID="$TOKEN_A_CONTRACT_ID"
-export TOKEN_B_CONTRACT_ID="$TOKEN_B_CONTRACT_ID"
-export LP_TOKEN_CONTRACT_ID="$LP_TOKEN_CONTRACT_ID"
-export AMM_CONTRACT_ID="$AMM_CONTRACT_ID"
-EOF
-
-log "wrote deployment env to $DEPLOY_ENV"
-log "deployment successful"
-printf 'AMM_CONTRACT_ID=%s\n' "$AMM_CONTRACT_ID"
-printf 'TOKEN_A_CONTRACT_ID=%s\n' "$TOKEN_A_CONTRACT_ID"
-printf 'TOKEN_B_CONTRACT_ID=%s\n' "$TOKEN_B_CONTRACT_ID"
-printf 'LP_TOKEN_CONTRACT_ID=%s\n' "$LP_TOKEN_CONTRACT_ID"

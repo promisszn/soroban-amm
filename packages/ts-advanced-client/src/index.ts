@@ -1,62 +1,79 @@
-export type MiddlewareContext = {
-  tx: any
-  metadata?: Record<string, unknown>
+export type Transaction = object
+
+export type MiddlewareContext<TTransaction extends Transaction = Transaction> = {
+  tx: TTransaction
+  metadata: Record<string, unknown>
 }
 
-export type Middleware = (ctx: MiddlewareContext, next: () => Promise<void>) => Promise<void>
+export type Middleware<TTransaction extends Transaction = Transaction> = (
+  ctx: MiddlewareContext<TTransaction>,
+  next: () => Promise<void>,
+) => Promise<void>
 
-export class MiddlewareStack {
-  private middlewares: Middleware[] = []
+export interface TransactionSubmitter<
+  TTransaction extends Transaction = Transaction,
+  TResult = unknown,
+> {
+  sendTransaction(tx: TTransaction): Promise<TResult>
+}
 
-  use(m: Middleware) {
-    this.middlewares.push(m)
+export class MiddlewareStack<TTransaction extends Transaction = Transaction> {
+  private readonly middlewares: Array<Middleware<TTransaction>> = []
+
+  use(middleware: Middleware<TTransaction>): this {
+    this.middlewares.push(middleware)
     return this
   }
 
-  async run(ctx: MiddlewareContext) {
-    let idx = -1
-    const dispatch = async (i: number): Promise<void> => {
-      if (i <= idx) throw new Error('next() called multiple times')
-      idx = i
-      const fn = this.middlewares[i]
-      if (fn) {
-        await fn(ctx, () => dispatch(i + 1))
-      }
+  async run(ctx: MiddlewareContext<TTransaction>): Promise<void> {
+    let index = -1
+    const dispatch = async (current: number): Promise<void> => {
+      if (current <= index) throw new Error('next() called multiple times')
+      index = current
+      const middleware = this.middlewares[current]
+      if (middleware) await middleware(ctx, () => dispatch(current + 1))
     }
     await dispatch(0)
   }
 }
 
-export class AdvancedClient {
-  private stack = new MiddlewareStack()
+export class AdvancedClient<
+  TTransaction extends Transaction = Transaction,
+  TResult = unknown,
+> {
+  private readonly stack = new MiddlewareStack<TTransaction>()
 
-  middleware(): MiddlewareStack {
+  constructor(private readonly submitter: TransactionSubmitter<TTransaction, TResult>) {}
+
+  middleware(): MiddlewareStack<TTransaction> {
     return this.stack
   }
 
-  async sendTransaction(tx: any) {
-    const ctx: MiddlewareContext = { tx, metadata: {} }
-    // run middlewares in order
+  async sendTransaction(tx: TTransaction): Promise<TResult> {
+    const ctx: MiddlewareContext<TTransaction> = { tx, metadata: {} }
     await this.stack.run(ctx)
-    // after middleware stack, tx should be signed/validated
-    // TODO: submit to network
-    return { status: 'ok', tx }
+    return this.submitter.sendTransaction(ctx.tx)
   }
 }
 
-// Example plugin: signer middleware
-export function signerMiddleware(signer: { sign: (tx: any) => Promise<any> }): Middleware {
+export interface Signer<TTransaction extends Transaction = Transaction> {
+  sign(tx: TTransaction): Promise<TTransaction>
+}
+
+export function signerMiddleware<TTransaction extends Transaction>(
+  signer: Signer<TTransaction>,
+): Middleware<TTransaction> {
   return async (ctx, next) => {
     ctx.tx = await signer.sign(ctx.tx)
     await next()
   }
 }
 
-// Example plugin: price feed middleware
-export function priceFeedMiddleware(getPrice: () => Promise<number>): Middleware {
+export function priceFeedMiddleware<TTransaction extends Transaction = Transaction>(
+  getPrice: () => Promise<number>,
+): Middleware<TTransaction> {
   return async (ctx, next) => {
-    const price = await getPrice()
-    ctx.metadata = { ...(ctx.metadata || {}), price }
+    ctx.metadata.price = await getPrice()
     await next()
   }
 }

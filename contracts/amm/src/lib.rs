@@ -19,6 +19,7 @@ pub const WASM: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../target/wasm32v1-none/release/amm.wasm"
 ));
+
 // Standard SEP-41 interface for pool tokens (token_a, token_b)
 use soroban_sdk::token::Client as SepTokenClient;
 
@@ -53,6 +54,9 @@ pub trait LpTokenInterface {
     fn burn(env: Env, from: Address, amount: i128);
     fn balance(env: Env, id: Address) -> i128;
 }
+
+/// Lifetime of a multisig emergency-withdraw proposal before it expires.
+const MULTISIG_PROPOSAL_TTL_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
 
 // ── Typed errors ─────────────────────────────────────────────────────────────
 
@@ -90,6 +94,10 @@ pub enum AmmError {
     OracleDeviationExceeded = 17,
     /// Flash-loan receiver did not return the borrowed amounts plus fees.
     FlashLoanRepaymentFailed = 18,
+    /// Multisig emergency withdrawal was already executed.
+    AlreadyExecuted = 19,
+    /// Multisig emergency withdrawal proposal has expired.
+    ProposalExpired = 20,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -127,13 +135,17 @@ pub enum DataKey {
     LpRebateBps,
 
     // Issue #293: k-of-n multisig guard for emergency operations.
-    /// Vec<Address> of multisig signers.
+    /// `Vec<Address>` of multisig signers.
     MultisigSigners,
     /// Required quorum (k in k-of-n).
     MultisigQuorum,
-    /// Pending emergency-withdraw proposal: (recipient, Vec<Address> approvals).
+    /// Pending emergency-withdraw proposal: (recipient, `Vec<Address>` approvals).
     MultisigProposalRecipient,
     MultisigProposalApprovals,
+    /// Expiration timestamp for the pending multisig proposal.
+    MultisigProposalExpiresAt,
+    /// Whether the pending multisig proposal has already been executed.
+    MultisigProposalExecuted,
 
     // Issue #294: minimum liquidity lock — LP tokens permanently locked on first deposit.
     /// Whether the minimum liquidity has already been locked (set on first deposit).
@@ -245,6 +257,48 @@ pub struct CircuitBreakerConfig {
     pub tripped: bool,
 }
 
+// ── Reentrancy guard ─────────────────────────────────────────────────────────
+
+/// RAII guard for the pool-wide reentrancy lock (`DataKey::Locked`).
+///
+/// `ReentrancyGuard::acquire` sets the lock and returns a guard; the lock is
+/// released by the guard's `Drop` impl, which runs when the guard goes out
+/// of scope — on the `Ok` return path, on every `Err` return path (including
+/// every early return via `?`), and on a panic. This is deliberately chosen
+/// over hand-placing a release call at each exit: a function with several
+/// `?`-chained fallible steps only has to bind `let _guard = ...;` once at
+/// the top, and there is no exit path left for a future edit to miss.
+///
+/// Every fund-moving entry point (`swap`, `swap_exact_out`, `swap_fot`,
+/// `add_liquidity`, `add_liquidity_fot`, `remove_liquidity`,
+/// `remove_liquidity_one_sided`, `flash_loan`, `withdraw_protocol_fees`,
+/// `emergency_withdraw`) acquires one of these before doing anything else
+/// that could be observed by a reentrant call, and none of these functions
+/// call each other internally, so a guard is never acquired twice in the
+/// same call stack during legitimate use.
+struct ReentrancyGuard<'a> {
+    env: &'a Env,
+}
+
+impl<'a> ReentrancyGuard<'a> {
+    /// Acquires the lock, or returns `Err(AmmError::Reentrant)` if it is
+    /// already held — including when held by an enclosing invocation of this
+    /// very function, reached via a cross-contract callback.
+    fn acquire(env: &'a Env) -> Result<Self, AmmError> {
+        if AmmPool::lock_held(env) {
+            return Err(AmmError::Reentrant);
+        }
+        env.storage().instance().set(&DataKey::Locked, &true);
+        Ok(Self { env })
+    }
+}
+
+impl<'a> Drop for ReentrancyGuard<'a> {
+    fn drop(&mut self) {
+        self.env.storage().instance().set(&DataKey::Locked, &false);
+    }
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -312,6 +366,7 @@ impl AmmPool {
         protocol_fee_bps: i128,
         flash_loan_fee_bps: i128,
     ) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
         if env.storage().instance().has(&DataKey::TokenA) {
             return Err(AmmError::AlreadyInitialized);
         }
@@ -399,6 +454,7 @@ impl AmmPool {
 
     /// Admin: attach or remove the oracle aggregator used for swap deviation checks.
     pub fn set_oracle(env: Env, admin: Address, oracle: Option<Address>) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if admin != stored_admin {
             return Err(AmmError::Unauthorized);
@@ -416,6 +472,7 @@ impl AmmPool {
         admin: Address,
         max_deviation_bps: i128,
     ) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if admin != stored_admin {
             return Err(AmmError::Unauthorized);
@@ -431,6 +488,7 @@ impl AmmPool {
     }
 
     pub fn pause(env: Env) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
@@ -438,6 +496,7 @@ impl AmmPool {
     }
 
     pub fn unpause(env: Env) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
@@ -454,6 +513,9 @@ impl AmmPool {
     /// Emergency withdraw of all pool reserves to a designated address.
     /// Admin-only, callable via a timed governance proposal.
     pub fn emergency_withdraw(env: Env, to: Address) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
+        // Acquire the reentrancy lock before any external transfer below.
+        let _guard = ReentrancyGuard::acquire(&env)?;
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
@@ -500,9 +562,18 @@ impl AmmPool {
             );
         }
 
-        // Zero out reserves
+        // Zero out reserves and total shares so the pool is in a clean empty
+        // state. Leaving TotalShares non-zero while reserves are 0 would cause
+        // add_liquidity to divide by zero (reserve_a == 0 in the proportional
+        // shares formula), permanently bricking deposits. Resetting
+        // MinLiquidityLocked allows the first re-deposit to re-establish the
+        // minimum-liquidity lock correctly. (Fixes #569)
         env.storage().instance().set(&DataKey::ReserveA, &0_i128);
         env.storage().instance().set(&DataKey::ReserveB, &0_i128);
+        env.storage().instance().set(&DataKey::TotalShares, &0_i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinLiquidityLocked, &false);
 
         // Emit event for audit trail
         soroban_amm_sdk::emit_versioned_event!(
@@ -514,15 +585,70 @@ impl AmmPool {
         Ok(())
     }
 
-    /// Return `true` while a flash loan is executing on this pool.
+    /// Return `true` while the reentrancy lock is held.
     ///
-    /// During this window all state-mutating functions (`swap`,
-    /// `add_liquidity`, `remove_liquidity`, `flash_loan`) will reject calls
-    /// with `AmmError::Reentrant`. This is a read-only diagnostic; callers
-    /// should not rely on this for security checks — the guard is enforced
-    /// internally by `enter_lock`.
+    /// The lock is held for the duration of every fund-moving entry point —
+    /// `swap`, `swap_exact_out`, `swap_fot`, `add_liquidity`,
+    /// `add_liquidity_fot`, `remove_liquidity`, `remove_liquidity_one_sided`,
+    /// `flash_loan`, `withdraw_protocol_fees`, and `emergency_withdraw` —
+    /// not only `flash_loan`. Any of them will reject a reentrant call with
+    /// `AmmError::Reentrant` while this is `true`. This is a read-only
+    /// diagnostic; the guard itself is enforced internally by
+    /// `ReentrancyGuard::acquire`.
+    pub fn is_locked(env: Env) -> bool {
+        Self::lock_held(&env)
+    }
+
+    /// Deprecated alias for `is_locked`, kept for ABI compatibility.
+    /// The name described only the flash-loan holder of the lock; every
+    /// fund-moving entry point now holds it while executing.
     pub fn flash_loan_locked(env: Env) -> bool {
-        Self::is_locked(&env)
+        Self::is_locked(env)
+    }
+
+    /// Admin-only, multisig-gated last resort to clear a stranded lock.
+    ///
+    /// The lock is released automatically by `ReentrancyGuard`'s `Drop` on
+    /// every return path of every guarded function, so this should never be
+    /// needed in practice. It exists purely as recovery if some future
+    /// change reintroduces a stranded lock. When a multisig is configured
+    /// (`quorum > 0`), at least `quorum` of the configured signers passed in
+    /// `callers` must each authorize this call; otherwise the pool admin
+    /// alone must authorize it.
+    pub fn force_unlock(env: Env, callers: soroban_sdk::Vec<Address>) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
+        let quorum: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigQuorum)
+            .unwrap_or(0);
+        if quorum == 0 {
+            let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+            admin.require_auth();
+        } else {
+            let signers: soroban_sdk::Vec<Address> = env
+                .storage()
+                .instance()
+                .get(&DataKey::MultisigSigners)
+                .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
+            let mut approved: u32 = 0;
+            for caller in callers.iter() {
+                if signers.contains(&caller) {
+                    caller.require_auth();
+                    approved += 1;
+                }
+            }
+            if approved < quorum {
+                return Err(AmmError::Unauthorized);
+            }
+        }
+        env.storage().instance().set(&DataKey::Locked, &false);
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "force_unlock"),),
+            (env.ledger().timestamp(),)
+        );
+        Ok(())
     }
 
     // ── Circuit breaker ───────────────────────────────────────────────────────
@@ -542,6 +668,7 @@ impl AmmPool {
         threshold_bps: i128,
         cooldown_secs: u64,
     ) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
@@ -598,6 +725,7 @@ impl AmmPool {
 
     /// Attempt automatic recovery after the circuit breaker cooldown.
     pub fn try_circuit_breaker_recovery(env: Env) -> Result<bool, AmmError> {
+        Self::extend_ttl(&env);
         let triggered_at: u64 = env
             .storage()
             .instance()
@@ -723,13 +851,21 @@ impl AmmPool {
         recipient: Address,
         protocol_fee_bps: i128,
     ) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if admin != stored_admin {
             return Err(AmmError::Unauthorized);
         }
         admin.require_auth();
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
-        if protocol_fee_bps < 0 || protocol_fee_bps > fee_bps {
+        // Fix M-02: protocol_fee_bps must be *strictly* less than fee_bps so LPs
+        // always retain a portion of swap income. Allowing protocol_fee_bps == fee_bps
+        // would route 100% of swap fees to the protocol, leaving LPs with nothing.
+        // Special case: both zero is valid (fees entirely disabled).
+        if protocol_fee_bps < 0
+            || (fee_bps > 0 && protocol_fee_bps >= fee_bps)
+            || (fee_bps == 0 && protocol_fee_bps != 0)
+        {
             return Err(AmmError::InvalidFeeBps);
         }
         env.storage()
@@ -738,6 +874,11 @@ impl AmmPool {
         env.storage()
             .instance()
             .set(&DataKey::ProtocolFeeBps, &protocol_fee_bps);
+        // Emit an event so LPs and indexers can monitor protocol-fee changes.
+        env.events().publish(
+            (Symbol::new(&env, "protocol_fee_set"),),
+            (protocol_fee_bps, recipient),
+        );
         Ok(())
     }
 
@@ -762,6 +903,7 @@ impl AmmPool {
     /// (e.g. 5_000 = 50 % of the protocol cut goes back to LPs).
     /// Must be in `[0, 10_000]`. Admin-only.
     pub fn set_lp_rebate(env: Env, admin: Address, lp_rebate_bps: i128) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if admin != stored_admin {
             return Err(AmmError::Unauthorized);
@@ -802,6 +944,7 @@ impl AmmPool {
         signers: soroban_sdk::Vec<Address>,
         quorum: u32,
     ) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if admin != stored_admin {
             return Err(AmmError::Unauthorized);
@@ -825,6 +968,12 @@ impl AmmPool {
             &DataKey::MultisigProposalApprovals,
             &soroban_sdk::Vec::<Address>::new(&env),
         );
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigProposalExpiresAt, &0u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigProposalExecuted, &false);
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "multisig_set"), admin),
@@ -859,6 +1008,7 @@ impl AmmPool {
         signer: Address,
         recipient: Address,
     ) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
         signer.require_auth();
         let quorum: u32 = env
             .storage()
@@ -891,7 +1041,23 @@ impl AmmPool {
             } else {
                 soroban_sdk::Vec::new(&env)
             };
-        if !approvals.contains(&signer) {
+        // Only record a new approval — and only refresh the expiry window — when
+        // this signer has not already approved the same recipient.
+        //
+        // A brand-new proposal (first proposal, or a recipient change which resets
+        // the approval set above) always starts from an empty approval set, so the
+        // proposer is a *new* approval and is granted a fresh TTL window.
+        //
+        // Crucially, re-calling with an already-approved signer must NOT extend
+        // `MultisigProposalExpiresAt`. Otherwise a single signer could keep a stuck
+        // proposal (e.g. 1 of 3 required approvals) alive forever by periodically
+        // re-proposing with their own address and the same recipient, defeating the
+        // `ProposalExpired` freshness/security check on stale multisig proposals.
+        // Since each signer can only add a new approval once (approvals never
+        // contain duplicates and are only cleared on execution or a recipient
+        // change), the expiry can no longer be refreshed indefinitely.
+        let added_approval = !approvals.contains(&signer);
+        if added_approval {
             approvals.push_back(signer.clone());
         }
         env.storage().instance().set(
@@ -901,6 +1067,15 @@ impl AmmPool {
         env.storage()
             .instance()
             .set(&DataKey::MultisigProposalApprovals, &approvals);
+        if added_approval {
+            env.storage().instance().set(
+                &DataKey::MultisigProposalExpiresAt,
+                &(env.ledger().timestamp() + MULTISIG_PROPOSAL_TTL_SECS),
+            );
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigProposalExecuted, &false);
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "ms_proposed"), signer),
@@ -930,6 +1105,7 @@ impl AmmPool {
     ///
     /// Any signer may call this after enough approvals have been collected.
     pub fn exec_multisig_emergency_wd(env: Env, signer: Address) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
         signer.require_auth();
         let quorum: u32 = env
             .storage()
@@ -947,12 +1123,28 @@ impl AmmPool {
         if !signers.contains(&signer) {
             return Err(AmmError::Unauthorized);
         }
+        let executed: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigProposalExecuted)
+            .unwrap_or(false);
+        if executed {
+            return Err(AmmError::AlreadyExecuted);
+        }
         let recipient: Option<Address> = env
             .storage()
             .instance()
             .get(&DataKey::MultisigProposalRecipient)
             .unwrap_or(None);
         let to = recipient.ok_or(AmmError::NoPendingAdmin)?;
+        let expires_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigProposalExpiresAt)
+            .unwrap_or(0);
+        if env.ledger().timestamp() > expires_at {
+            return Err(AmmError::ProposalExpired);
+        }
         let approvals: soroban_sdk::Vec<Address> = env
             .storage()
             .instance()
@@ -981,7 +1173,21 @@ impl AmmPool {
         }
         env.storage().instance().set(&DataKey::ReserveA, &0_i128);
         env.storage().instance().set(&DataKey::ReserveB, &0_i128);
-        // Clear proposal.
+        // Zero TotalShares and reset MinLiquidityLocked so the pool is in a
+        // clean empty state after the drain. Leaving TotalShares non-zero
+        // while reserves are 0 causes add_liquidity to divide by zero in the
+        // proportional-shares formula, permanently bricking deposits.
+        // Resetting MinLiquidityLocked allows the first re-deposit to
+        // re-establish the minimum-liquidity lock correctly. (Fixes #569)
+        env.storage().instance().set(&DataKey::TotalShares, &0_i128);
+        env.storage()
+            .instance()
+            .set(&DataKey::MinLiquidityLocked, &false);
+        // Mark executed so re-execution returns AlreadyExecuted.
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigProposalExecuted, &true);
+        // Clear proposal details.
         env.storage().instance().set(
             &DataKey::MultisigProposalRecipient,
             &Option::<Address>::None,
@@ -990,6 +1196,9 @@ impl AmmPool {
             &DataKey::MultisigProposalApprovals,
             &soroban_sdk::Vec::<Address>::new(&env),
         );
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigProposalExpiresAt, &0u64);
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "ms_ew"), signer),
@@ -1021,8 +1230,11 @@ impl AmmPool {
 
         let agg =
             OracleAggregatorClient::new(env, &oracle_addr).get_price_safe(token_in, token_out);
-        if amount_in <= 0 || agg.confidence == 0 || agg.price <= 0 {
+        if amount_in <= 0 {
             return Ok(());
+        }
+        if agg.confidence == 0 || agg.price <= 0 {
+            return Err(AmmError::OracleDeviationExceeded);
         }
 
         let spot_price = amount_out * 1_000_000 / amount_in;
@@ -1046,6 +1258,10 @@ impl AmmPool {
         Ok(())
     }
 
+    fn extend_ttl(env: &Env) {
+        env.storage().instance().extend_ttl(172_800, 518_400);
+    }
+
     /// Update the swap fee post-deployment. Admin-only.
     ///
     /// The new fee takes effect on the very next swap.
@@ -1060,6 +1276,7 @@ impl AmmPool {
     /// - If `new_fee_bps` is outside [0, 10_000].
     /// - If `new_fee_bps` is less than the current `protocol_fee_bps`.
     pub fn update_fee(env: Env, new_fee_bps: i128) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         Self::validate_fee_bps(new_fee_bps)?;
@@ -1079,6 +1296,7 @@ impl AmmPool {
 
     /// Update the flash loan fee post-deployment. Admin-only.
     pub fn update_flash_loan_fee(env: Env, new_fee_bps: i128) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         Self::validate_fee_bps(new_fee_bps)?;
@@ -1103,6 +1321,7 @@ impl AmmPool {
         current_admin: Address,
         new_admin: Address,
     ) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
         let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if current_admin != stored {
             return Err(AmmError::Unauthorized);
@@ -1121,6 +1340,7 @@ impl AmmPool {
 
     /// Accept the pending admin nomination. Caller becomes the new admin.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
         let pending: Option<Address> = env
             .storage()
             .instance()
@@ -1148,6 +1368,7 @@ impl AmmPool {
     /// The new WASM must already be uploaded to the network.
     /// State is preserved; only bytecode is replaced.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.deployer()
@@ -1167,38 +1388,17 @@ impl AmmPool {
 
     // ── Reentrancy guard ──────────────────────────────────────────────────────
 
-    /// Return `true` if a flash loan is currently executing on this contract.
+    /// Return `true` if the reentrancy lock is currently held.
     ///
-    /// Any state-mutating entry point that could be exploited via a reentrant
-    /// callback (swap, add_liquidity, remove_liquidity, flash_loan) calls this
-    /// before proceeding. The lock is stored in instance storage so it is
-    /// visible to all cross-contract calls within the same transaction.
-    fn is_locked(env: &Env) -> bool {
+    /// The lock is stored in instance storage so it is visible to every
+    /// cross-contract call within the same transaction, including a
+    /// callback made by an external token or flash-loan receiver contract
+    /// back into this pool.
+    fn lock_held(env: &Env) -> bool {
         env.storage()
             .instance()
             .get(&DataKey::Locked)
             .unwrap_or(false)
-    }
-
-    /// Acquire the reentrancy lock.
-    ///
-    /// Returns `Err(AmmError::Reentrant)` if the lock is already held,
-    /// preventing a flash-loan receiver from calling back into the pool.
-    fn enter_lock(env: &Env) -> Result<(), AmmError> {
-        if Self::is_locked(env) {
-            return Err(AmmError::Reentrant);
-        }
-        env.storage().instance().set(&DataKey::Locked, &true);
-        Ok(())
-    }
-
-    /// Release the reentrancy lock.
-    ///
-    /// Must be called on every successful return path after `enter_lock`.
-    /// On error paths the Soroban runtime reverts all storage writes
-    /// (including the lock), so an explicit release is not required there.
-    fn exit_lock(env: &Env) {
-        env.storage().instance().set(&DataKey::Locked, &false);
     }
 
     // ── TWAP ──────────────────────────────────────────────────────────────────
@@ -1313,16 +1513,18 @@ impl AmmPool {
         min_shares: i128,
         deadline: u64,
     ) -> Result<i128, AmmError> {
+        Self::extend_ttl(&env);
         if deadline < env.ledger().timestamp() {
             return Err(AmmError::DeadlineExceeded);
         }
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
-        // Block reentrant calls from flash loan receivers.
-        if Self::is_locked(&env) {
-            return Err(AmmError::Reentrant);
-        }
+        // Acquire the reentrancy lock for the duration of this call; a
+        // reentrant call arriving via a token/receiver callback is rejected
+        // here with `Reentrant`, and the lock is released automatically
+        // when `_guard` drops on any return path below.
+        let _guard = ReentrancyGuard::acquire(&env)?;
         provider.require_auth();
         if amount_a <= 0 || amount_b <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -1444,16 +1646,18 @@ impl AmmPool {
         min_b: i128,
         deadline: u64,
     ) -> Result<(i128, i128), AmmError> {
+        Self::extend_ttl(&env);
         if deadline < env.ledger().timestamp() {
             return Err(AmmError::DeadlineExceeded);
         }
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
-        // Block reentrant calls from flash loan receivers.
-        if Self::is_locked(&env) {
-            return Err(AmmError::Reentrant);
-        }
+        // Acquire the reentrancy lock for the duration of this call; a
+        // reentrant call arriving via a token/receiver callback is rejected
+        // here with `Reentrant`, and the lock is released automatically
+        // when `_guard` drops on any return path below.
+        let _guard = ReentrancyGuard::acquire(&env)?;
         provider.require_auth();
         if shares <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -1544,16 +1748,18 @@ impl AmmPool {
         min_out: i128,
         deadline: u64,
     ) -> Result<i128, AmmError> {
+        Self::extend_ttl(&env);
         if deadline < env.ledger().timestamp() {
             return Err(AmmError::DeadlineExceeded);
         }
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
-        // Block reentrant calls from flash loan receivers.
-        if Self::is_locked(&env) {
-            return Err(AmmError::Reentrant);
-        }
+        // Acquire the reentrancy lock for the duration of this call; a
+        // reentrant call arriving via a token/receiver callback is rejected
+        // here with `Reentrant`, and the lock is released automatically
+        // when `_guard` drops on any return path below.
+        let _guard = ReentrancyGuard::acquire(&env)?;
         provider.require_auth();
         if shares <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -1561,6 +1767,7 @@ impl AmmPool {
 
         // Checkpoint TWAP before updating reserves.
         let (reserve_a, reserve_b) = Self::checkpoint_oracles(&env);
+        Self::check_circuit_breaker(&env)?;
 
         let owned = Self::shares_of(env.clone(), provider.clone());
         if owned < shares {
@@ -1586,7 +1793,7 @@ impl AmmPool {
         lp_client.burn(&provider, &shares);
 
         // Determine which token we keep and which we swap away.
-        let (_token_keep, _token_swap, amount_keep, amount_swap) = if token_out == token_a {
+        let (_token_keep, token_swap, amount_keep, amount_swap) = if token_out == token_a {
             (token_a.clone(), token_b.clone(), withdraw_a, withdraw_b)
         } else {
             (token_b.clone(), token_a.clone(), withdraw_b, withdraw_a)
@@ -1632,6 +1839,8 @@ impl AmmPool {
             // We're swapping token_a for more token_b.
             amount_swap_with_fee * new_reserve_b / (new_reserve_a * 10_000 + amount_swap_with_fee)
         };
+
+        Self::check_oracle_deviation(&env, &token_swap, &token_out, amount_swap, swap_output)?;
 
         // Total output is the amount we kept from withdrawal plus the swap output.
         let total_out = amount_keep + swap_output;
@@ -1755,16 +1964,18 @@ impl AmmPool {
         min_out: i128,
         deadline: u64,
     ) -> Result<i128, AmmError> {
+        Self::extend_ttl(&env);
         if deadline < env.ledger().timestamp() {
             return Err(AmmError::DeadlineExceeded);
         }
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
-        // Block reentrant calls from flash loan receivers.
-        if Self::is_locked(&env) {
-            return Err(AmmError::Reentrant);
-        }
+        // Acquire the reentrancy lock for the duration of this call; a
+        // reentrant call arriving via a token/receiver callback is rejected
+        // here with `Reentrant`, and the lock is released automatically
+        // when `_guard` drops on any return path below.
+        let _guard = ReentrancyGuard::acquire(&env)?;
         trader.require_auth();
         if amount_in <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -1915,16 +2126,18 @@ impl AmmPool {
         max_in: i128,
         deadline: u64,
     ) -> Result<i128, AmmError> {
+        Self::extend_ttl(&env);
         if deadline < env.ledger().timestamp() {
             return Err(AmmError::DeadlineExceeded);
         }
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
-        // Block reentrant calls from flash loan receivers.
-        if Self::is_locked(&env) {
-            return Err(AmmError::Reentrant);
-        }
+        // Acquire the reentrancy lock for the duration of this call; a
+        // reentrant call arriving via a token/receiver callback is rejected
+        // here with `Reentrant`, and the lock is released automatically
+        // when `_guard` drops on any return path below.
+        let _guard = ReentrancyGuard::acquire(&env)?;
         trader.require_auth();
         if amount_out <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -1946,7 +2159,7 @@ impl AmmPool {
             return Err(AmmError::InvalidToken);
         };
 
-        let amount_in = Self::get_amount_in(env.clone(), token_out.clone(), amount_out);
+        let amount_in = Self::get_amount_in(env.clone(), token_out.clone(), amount_out)?;
         if amount_in > max_in {
             return Err(AmmError::SlippageExceeded);
         }
@@ -2044,6 +2257,9 @@ impl AmmPool {
     /// Only callable by the fee recipient. Resets accrued balances to zero.
     /// Returns `(fee_a_withdrawn, fee_b_withdrawn)`.
     pub fn withdraw_protocol_fees(env: Env) -> Result<(i128, i128), AmmError> {
+        Self::extend_ttl(&env);
+        // Acquire the reentrancy lock before any external transfer below.
+        let _guard = ReentrancyGuard::acquire(&env)?;
         let fee_recipient: Address = env
             .storage()
             .instance()
@@ -2089,12 +2305,14 @@ impl AmmPool {
     /// Borrow pool liquidity and repay it plus a fee during the receiver callback.
     ///
     /// # Reentrancy safety
-    /// This function acquires a reentrancy lock before calling the external
-    /// `on_flash_loan` callback and holds it for the duration of that call.
-    /// Any attempt by the receiver to call back into `swap`, `add_liquidity`,
-    /// `remove_liquidity`, or `flash_loan` on this same pool will fail with
-    /// `AmmError::Reentrant`. The lock is released only after repayment is
-    /// verified, ensuring pool state cannot be manipulated via callbacks.
+    /// This function acquires the pool-wide reentrancy lock before calling
+    /// the external `on_flash_loan` callback and holds it for the duration
+    /// of that call — the same lock every other fund-moving entry point
+    /// (`swap`, `add_liquidity`, `remove_liquidity`, `flash_loan`, and the
+    /// rest) now acquires. Any attempt by the receiver to call back into any
+    /// of them on this same pool will fail with `AmmError::Reentrant`. The
+    /// lock is released by `ReentrancyGuard`'s `Drop` on every return path —
+    /// success, repayment failure, or any other error — not only on success.
     pub fn flash_loan(
         env: Env,
         receiver: Address,
@@ -2102,6 +2320,7 @@ impl AmmPool {
         amount_b: i128,
         data: Bytes,
     ) -> Result<(i128, i128), AmmError> {
+        Self::extend_ttl(&env);
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
@@ -2110,10 +2329,12 @@ impl AmmPool {
         }
 
         let (reserve_a, reserve_b) = Self::checkpoint_oracles(&env);
-        // Acquire the reentrancy lock before any external call.
-        // This prevents the receiver's on_flash_loan callback from calling
-        // back into swap / add_liquidity / remove_liquidity / flash_loan.
-        Self::enter_lock(&env)?;
+        // Acquire the reentrancy lock before any external call. This
+        // prevents the receiver's on_flash_loan callback from calling back
+        // into any fund-moving entry point on this pool, and is released
+        // automatically (including on every error path below) when `_guard`
+        // drops.
+        let _guard = ReentrancyGuard::acquire(&env)?;
 
         // Circuit breaker check before borrowing funds.
         Self::check_circuit_breaker(&env)?;
@@ -2189,9 +2410,8 @@ impl AmmPool {
             (amount_a, amount_b, fee_a, fee_b)
         );
 
-        // Release the lock only on the success path; on error paths Soroban
-        // reverts all storage writes (including the lock) automatically.
-        Self::exit_lock(&env);
+        // `_guard` releases the lock when it drops here on the success path
+        // (and would release it identically had any `?` above returned early).
         Ok((fee_a, fee_b))
     }
 
@@ -2313,7 +2533,13 @@ impl AmmPool {
     }
 
     /// Quote how much `token_in` is required to receive exactly `amount_out` of `token_out`.
-    pub fn get_amount_in(env: Env, token_out: Address, amount_out: i128) -> i128 {
+    ///
+    /// # Returns
+    /// The amount of input token needed, or an error if:
+    /// - `token_out` does not match either pool token (InvalidToken)
+    /// - Either reserve is zero (EmptyPool)
+    /// - `amount_out` is >= the output reserve (InsufficientLiquidity)
+    pub fn get_amount_in(env: Env, token_out: Address, amount_out: i128) -> Result<i128, AmmError> {
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
@@ -2328,17 +2554,34 @@ impl AmmPool {
                 Self::get_reserve_b(env.clone()),
             )
         } else {
-            panic!("unknown token");
+            return Err(AmmError::InvalidToken);
         };
-        assert!(reserve_in > 0 && reserve_out > 0, "zero reserve");
-        assert!(amount_out < reserve_out, "amount_out >= reserve_out");
+        if reserve_in <= 0 || reserve_out <= 0 {
+            return Err(AmmError::EmptyPool);
+        }
+        if amount_out >= reserve_out {
+            return Err(AmmError::InsufficientLiquidity);
+        }
         // Defensive guard for any pool created before the tightened fee bound:
         // a 100% fee makes the `(10_000 - fee_bps)` divisor zero. A swap can
         // never return any output in that case, so the input is unquotable.
         if fee_bps >= 10_000 {
-            return 0;
+            return Ok(0);
         }
-        (reserve_in * amount_out * 10_000) / ((reserve_out - amount_out) * (10_000 - fee_bps)) + 1
+        Ok(
+            (reserve_in * amount_out * 10_000) / ((reserve_out - amount_out) * (10_000 - fee_bps))
+                + 1,
+        )
+    }
+
+    /// Return the current swap fee in basis points.
+    ///
+    /// This is a read-only view function; it makes no state changes.
+    ///
+    /// # Returns
+    /// The pool's `fee_bps` as an `i128`. For the full pool state, see [`AmmPool::get_info`].
+    pub fn get_fee_info(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::FeeBps).unwrap()
     }
 
     /// Return full pool state.
@@ -2356,10 +2599,6 @@ impl AmmPool {
     /// - `admin` — the pool administrator.
     /// - `fee_recipient` — recipient of accrued protocol fees.
     /// - `protocol_fee_bps` — protocol fee in basis points (subset of `fee_bps`).
-    pub fn get_fee_info(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::FeeBps).unwrap()
-    }
-
     pub fn get_info(env: Env) -> PoolInfo {
         PoolInfo {
             token_a: env.storage().instance().get(&DataKey::TokenA).unwrap(),
@@ -2428,7 +2667,7 @@ impl AmmPool {
 
     /// Swap with fee-on-transfer (FOT) token support.
     ///
-    /// Identical to [`swap`] but measures the actual amount of `token_in`
+    /// Identical to `swap` but measures the actual amount of `token_in`
     /// received by the pool via a pre/post balance snapshot instead of trusting
     /// `amount_in`. This handles tokens that silently deduct a transfer fee, so
     /// the constant-product calculation always uses the true net amount.
@@ -2455,15 +2694,18 @@ impl AmmPool {
         deadline: u64,
         referrer: Option<Address>,
     ) -> Result<(i128, i128), AmmError> {
+        Self::extend_ttl(&env);
         if deadline < env.ledger().timestamp() {
             return Err(AmmError::DeadlineExceeded);
         }
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
-        if Self::is_locked(&env) {
-            return Err(AmmError::Reentrant);
-        }
+        // Acquire the reentrancy lock for the duration of this call; a
+        // reentrant call arriving via a token/receiver callback is rejected
+        // here with `Reentrant`, and the lock is released automatically
+        // when `_guard` drops on any return path below.
+        let _guard = ReentrancyGuard::acquire(&env)?;
         trader.require_auth();
         if amount_in <= 0 {
             return Err(AmmError::ZeroAmount);
@@ -2535,16 +2777,28 @@ impl AmmPool {
         } else {
             0
         };
+        // Issue #502: LP rebate — fraction of protocol fee returned to LP reserves.
+        let lp_rebate_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LpRebateBps)
+            .unwrap_or(0);
+        let lp_rebate = if protocol_fee > 0 && lp_rebate_bps > 0 {
+            protocol_fee * lp_rebate_bps / 10_000
+        } else {
+            0
+        };
+        let net_protocol_fee = protocol_fee - lp_rebate;
 
         if token_in == token_a {
             env.storage().instance().set(
                 &DataKey::ReserveA,
-                &(reserve_in + actual_received - protocol_fee),
+                &(reserve_in + actual_received - net_protocol_fee),
             );
             env.storage()
                 .instance()
                 .set(&DataKey::ReserveB, &(reserve_out - amount_out));
-            if protocol_fee > 0 {
+            if net_protocol_fee > 0 {
                 let accrued: i128 = env
                     .storage()
                     .instance()
@@ -2552,17 +2806,17 @@ impl AmmPool {
                     .unwrap_or(0);
                 env.storage()
                     .instance()
-                    .set(&DataKey::AccruedFeeA, &(accrued + protocol_fee));
+                    .set(&DataKey::AccruedFeeA, &(accrued + net_protocol_fee));
             }
         } else {
             env.storage().instance().set(
                 &DataKey::ReserveB,
-                &(reserve_in + actual_received - protocol_fee),
+                &(reserve_in + actual_received - net_protocol_fee),
             );
             env.storage()
                 .instance()
                 .set(&DataKey::ReserveA, &(reserve_out - amount_out));
-            if protocol_fee > 0 {
+            if net_protocol_fee > 0 {
                 let accrued: i128 = env
                     .storage()
                     .instance()
@@ -2570,7 +2824,7 @@ impl AmmPool {
                     .unwrap_or(0);
                 env.storage()
                     .instance()
-                    .set(&DataKey::AccruedFeeB, &(accrued + protocol_fee));
+                    .set(&DataKey::AccruedFeeB, &(accrued + net_protocol_fee));
             }
         }
 
@@ -2593,7 +2847,7 @@ impl AmmPool {
 
     /// Add liquidity with fee-on-transfer (FOT) token support.
     ///
-    /// Like [`add_liquidity`] but measures the actual token amounts received
+    /// Like `add_liquidity` but measures the actual token amounts received
     /// by the pool via pre/post balance snapshots rather than trusting the
     /// nominal `amount_a`/`amount_b` values. LP shares are minted proportional
     /// to what the pool actually received.
@@ -2612,15 +2866,18 @@ impl AmmPool {
         min_shares: i128,
         deadline: u64,
     ) -> Result<i128, AmmError> {
+        Self::extend_ttl(&env);
         if deadline < env.ledger().timestamp() {
             return Err(AmmError::DeadlineExceeded);
         }
         if Self::is_paused(env.clone()) {
             return Err(AmmError::Paused);
         }
-        if Self::is_locked(&env) {
-            return Err(AmmError::Reentrant);
-        }
+        // Acquire the reentrancy lock for the duration of this call; a
+        // reentrant call arriving via a token/receiver callback is rejected
+        // here with `Reentrant`, and the lock is released automatically
+        // when `_guard` drops on any return path below.
+        let _guard = ReentrancyGuard::acquire(&env)?;
         provider.require_auth();
         if amount_a <= 0 || amount_b <= 0 {
             return Err(AmmError::ZeroAmount);

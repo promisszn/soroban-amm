@@ -1,38 +1,40 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Build and optimize all contracts producing wasm artifacts.
-# Requires: cargo, wasm-opt (binaryen) optional but recommended.
+# Build and optimize all contracts producing WASM artifacts.
+# Requires: cargo and the wasm32v1-none Rust target. The Stellar CLI is used
+# when available; wasm-opt is supported as a fallback.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONTRACTS_DIR="$ROOT_DIR/contracts"
-TARGET=wasm32-unknown-unknown
+TARGET="wasm32v1-none"
+WASM_DIR="$ROOT_DIR/target/$TARGET/release"
+OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/optimized-artifacts}"
 
-echo "[optimize] Starting contract optimization"
+cd "$ROOT_DIR"
+printf '[optimize] Building workspace for %s\n' "$TARGET"
+cargo build --workspace --release --target "$TARGET"
 
-for d in "$CONTRACTS_DIR"/*/; do
-  if [ -f "$d/Cargo.toml" ]; then
-    name=$(basename "$d")
-    echo "\n[optimize] Building contract: $name"
-    pushd "$d" >/dev/null
-    cargo build --release --target "$TARGET" || true
-    # locate wasm
-    wasm_path="$(find target -path "*/release/*.wasm" -print -quit 2>/dev/null || true)"
-    if [ -n "$wasm_path" ]; then
-      echo "[optimize] found wasm: $wasm_path"
-      if command -v wasm-opt >/dev/null 2>&1; then
-        out="$(dirname "$wasm_path")/$(basename "$wasm_path" .wasm).opt.wasm"
-        echo "[optimize] running wasm-opt -O3 --strip-dwarf"
-        wasm-opt -O3 --strip-dwarf -o "$out" "$wasm_path" || true
-        echo "[optimize] optimized wasm written to $out"
-      else
-        echo "[optimize] wasm-opt not found; skipping binary-level optimization"
-      fi
-    else
-      echo "[optimize] no wasm found for $name (skipping wasm-opt)"
-    fi
-    popd >/dev/null
+shopt -s nullglob
+artifacts=("$WASM_DIR"/*.wasm)
+if [[ ${#artifacts[@]} -eq 0 ]]; then
+  echo "[optimize] no WASM artifacts found in $WASM_DIR" >&2
+  exit 1
+fi
+
+mkdir -p "$OUTPUT_DIR"
+for wasm in "${artifacts[@]}"; do
+  name=$(basename "$wasm")
+  output="$OUTPUT_DIR/$name"
+  printf '[optimize] %s -> %s\n' "${wasm#$ROOT_DIR/}" "${output#$ROOT_DIR/}"
+
+  if command -v stellar >/dev/null 2>&1; then
+    stellar contract optimize --wasm "$wasm" --output "$output"
+  elif command -v wasm-opt >/dev/null 2>&1; then
+    wasm-opt -O3 --strip-dwarf -o "$output" "$wasm"
+  else
+    echo '[optimize] neither stellar CLI nor wasm-opt is installed' >&2
+    exit 1
   fi
 done
 
-echo "[optimize] Done. Run scripts/size_report.sh to view sizes."
+printf '[optimize] Optimized artifacts are in %s\n' "${OUTPUT_DIR#$ROOT_DIR/}"

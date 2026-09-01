@@ -5,7 +5,15 @@
 //!   2. Call `initialize` with the admin address and pre-uploaded WASM hashes
 //!      for the AMM pool and LP token contracts.
 //!   3. Call `create_pool` for each token pair you want a pool for.
-//!   4. Use `get_pool` / `all_pools` to discover deployed pools.
+//!   4. Use `get_pool` / `get_pools` to discover deployed AMM pools, or
+//!      `get_cl_pool` / `get_cl_pools` for concentrated-liquidity pools.
+//!      The two kinds are indexed separately (issue #493) — the AMM
+//!      accessors never return a CL pool address, since CL pools don't
+//!      implement the AMM-only `get_info`/`withdraw_protocol_fees`/
+//!      `set_protocol_fee` interface that AMM callers rely on.
+//!      `all_pools()` / `all_cl_pools()` are convenience wrappers capped at
+//!      `Factory::MAX_UNBOUNDED_PAGE` (issue #790); anything that must see
+//!      every pool should page with `get_pool_count()` + `get_pools()`.
 
 #![no_std]
 
@@ -41,6 +49,8 @@ pub trait ClPoolInterface {
         initial_tick: i32,
         tick_spacing: i32,
     );
+
+    fn get_pool_state(env: Env) -> concentrated_liquidity::PoolState;
 }
 
 #[contractclient(name = "AmmPoolClient")]
@@ -100,24 +110,26 @@ pub trait GovernanceInterface {
 pub enum DataKey {
     Pool(Address, Address), // normalized (token_a, token_b) → pool Address
     LpToken(Address),       // pool address → LP token address
-    PoolByIndex(u64),       // u64 index -> pool Address
+    PoolByIndex(u64),       // u64 index -> AMM pool Address (issue #493: AMM-only)
     Admin,
     AmmWasmHash,
     TokenWasmHash,
     ClWasmHash,                     // WASM hash for concentrated_liquidity deployments
-    PoolCount,                      // u64 monotonic counter — used to derive unique deploy salts
-    GovernanceFor(Address),         // pool address → Option<Address>
+    PoolCount, // u64 monotonic counter — AMM pools only; also derives deploy salts
+    GovernanceFor(Address), // pool address → Option<Address>
     ClPool(Address, Address, i128), // normalized (token_a, token_b, fee_bps) → CL pool Address
-    PermissionlessMode,             // bool — true = anyone can create pools (with fee)
-    PoolCreationFee,                // i128 — fee charged per pool in permissionless mode
-    FeeToken,                       // Address — token used to pay the pool creation fee
-    RateLimitLedgers,               // u32 — minimum ledgers between pool creations per address
-    LastPoolCreation(Address),      // u32 — ledger when this address last created a pool
-    DefaultFeeTier,                 // i128 — default fee tier ID (0-3) for new pool deployments
-    Treasury,                       // Address — protocol treasury for fee sweeps
-    GlobalProtocolFeeBps,           // i128 — global protocol fee rate (0 = off)
-    PoolTokens(Address),            // pool address → (token_a, token_b) for sweep forwarding
-    CreationPaused,                 // bool — true blocks new V2 and CL pool creation
+    ClPoolByIndex(u64), // u64 index -> CL pool Address (issue #493: separate from PoolByIndex)
+    ClPoolCount, // u64 monotonic counter for CL pools — independent of PoolCount (issue #493)
+    PermissionlessMode, // bool — true = anyone can create pools (with fee)
+    PoolCreationFee, // i128 — fee charged per pool in permissionless mode
+    FeeToken,  // Address — token used to pay the pool creation fee
+    RateLimitLedgers, // u32 — minimum ledgers between pool creations per address
+    LastPoolCreation(Address), // u32 — ledger when this address last created a pool
+    DefaultFeeTier, // i128 — default fee tier ID (0-3) for new pool deployments
+    Treasury,  // Address — protocol treasury for fee sweeps
+    GlobalProtocolFeeBps, // i128 — global protocol fee rate (0 = off)
+    PoolTokens(Address), // pool address → (token_a, token_b) for sweep forwarding
+    CreationPaused, // bool — true blocks new V2 and CL pool creation
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -147,6 +159,18 @@ pub struct Factory;
 
 #[contractimpl]
 impl Factory {
+    /// Hard cap on how many pool addresses a single `all_pools()` /
+    /// `all_cl_pools()` call will return (issue #790).
+    ///
+    /// Those accessors used to loop over every pool ever deployed, so their
+    /// CPU and read-entry cost grew without bound and would eventually exceed
+    /// Soroban's per-invocation resource budget, making the call permanently
+    /// unusable. Capping the result keeps them a cheap, predictable read for
+    /// the common small-factory case; callers that must see every pool past
+    /// the cap should page with `get_pool_count()` + `get_pools(offset, limit)`
+    /// (or the CL equivalents), which have always been bounded.
+    pub const MAX_UNBOUNDED_PAGE: u32 = 200;
+
     // ── Setup ─────────────────────────────────────────────────────────────────
 
     /// One-time factory setup.
@@ -162,6 +186,7 @@ impl Factory {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(FactoryError::AlreadyInitialized);
         }
+        admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
             .instance()
@@ -173,6 +198,7 @@ impl Factory {
             .instance()
             .set(&DataKey::TokenWasmHash, &token_wasm_hash);
         env.storage().instance().set(&DataKey::PoolCount, &0u64);
+        env.storage().instance().set(&DataKey::ClPoolCount, &0u64);
         // Initialize default fee tier to Medium (0.3% = 30 bps)
         env.storage()
             .instance()
@@ -214,6 +240,10 @@ impl Factory {
     /// For most use cases, prefer `create_pool` with a standard fee tier.
     ///
     /// Token pair order is normalised. Panics if a pool for this pair already exists.
+    ///
+    /// Validations (fee_bps bounds, duplicate-pool check) are performed before
+    /// the rate-limit check and fee charge so a caller is never charged for a
+    /// request that would be rejected (issue #520).
     pub fn create_pool_with_fee_bps(
         env: Env,
         caller: Address,
@@ -223,6 +253,33 @@ impl Factory {
         governance_wasm_hash: Option<BytesN<32>>,
     ) -> Result<(Address, Option<Address>), FactoryError> {
         Self::ensure_creation_unpaused(&env)?;
+
+        // ── Validate BEFORE charging (issue #520) ─────────────────────────
+        // All checks below are pure validation with no side effects.  They
+        // must run before `check_and_update_rate_limit` / `charge_pool_creation_fee`
+        // so a caller is never charged or rate-limited for a request that
+        // would have been rejected anyway.
+
+        if !(0..=10_000).contains(&fee_bps) {
+            return Err(FactoryError::InvalidFeeBps);
+        }
+
+        // Normalise: smaller address is always token_a.
+        let (ta, tb) = if token_a < token_b {
+            (token_a, token_b)
+        } else {
+            (token_b, token_a)
+        };
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Pool(ta.clone(), tb.clone()))
+        {
+            return Err(FactoryError::PoolAlreadyExists);
+        }
+
+        // ── Auth, rate-limit, fee ─────────────────────────────────────────
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         let permissionless: bool = env
             .storage()
@@ -236,25 +293,6 @@ impl Factory {
             Self::charge_pool_creation_fee(&env, &caller, &admin)?;
         } else {
             admin.require_auth();
-        }
-
-        // Normalise: smaller address is always token_a.
-        let (ta, tb) = if token_a < token_b {
-            (token_a, token_b)
-        } else {
-            (token_b, token_a)
-        };
-
-        if !(0..=10_000).contains(&fee_bps) {
-            return Err(FactoryError::InvalidFeeBps);
-        }
-
-        if env
-            .storage()
-            .instance()
-            .has(&DataKey::Pool(ta.clone(), tb.clone()))
-        {
-            return Err(FactoryError::PoolAlreadyExists);
         }
 
         let amm_wasm: BytesN<32> = env.storage().instance().get(&DataKey::AmmWasmHash).unwrap();
@@ -331,17 +369,21 @@ impl Factory {
         );
 
         // Register pool in lookup indexes and record the LP token address.
+        // These are per-pool entries and grow without bound as pools accumulate,
+        // so they belong in persistent storage (each with its own TTL) rather
+        // than instance storage, which is a single blob loaded on every call
+        // to the contract (issue #468).
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::Pool(ta.clone(), tb.clone()), &pool_addr);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::LpToken(pool_addr.clone()), &lp_addr);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::GovernanceFor(pool_addr.clone()), &gov_addr);
         // Store reverse token-pair lookup used by sweep_fees to forward tokens.
-        env.storage().instance().set(
+        env.storage().persistent().set(
             &DataKey::PoolTokens(pool_addr.clone()),
             &(ta.clone(), tb.clone()),
         );
@@ -479,6 +521,10 @@ impl Factory {
     /// the CL contract itself.
     ///
     /// Applies the same permissioned/permissionless access controls as `create_pool`.
+    ///
+    /// Validations (fee_bps bounds, duplicate-pool check) are performed before
+    /// the rate-limit check and fee charge so a caller is never charged for a
+    /// request that would be rejected (issue #520).
     pub fn create_cl_pool(
         env: Env,
         caller: Address,
@@ -488,6 +534,25 @@ impl Factory {
         initial_tick: i32,
     ) -> Result<Address, FactoryError> {
         Self::ensure_creation_unpaused(&env)?;
+
+        // ── Validate BEFORE charging (issue #520) ─────────────────────────
+        if !(0..=10_000).contains(&fee_bps) {
+            return Err(FactoryError::InvalidFeeBps);
+        }
+
+        // Normalise token order.
+        let (ta, tb) = if token_a < token_b {
+            (token_a, token_b)
+        } else {
+            (token_b, token_a)
+        };
+
+        let cl_key = DataKey::ClPool(ta.clone(), tb.clone(), fee_bps);
+        if env.storage().persistent().has(&cl_key) {
+            return Err(FactoryError::ClPoolAlreadyExists);
+        }
+
+        // ── Auth, rate-limit, fee ─────────────────────────────────────────
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         let permissionless: bool = env
             .storage()
@@ -503,47 +568,42 @@ impl Factory {
             admin.require_auth();
         }
 
-        if !(0..=10_000).contains(&fee_bps) {
-            return Err(FactoryError::InvalidFeeBps);
-        }
-
-        // Normalise token order.
-        let (ta, tb) = if token_a < token_b {
-            (token_a, token_b)
-        } else {
-            (token_b, token_a)
-        };
-
-        let cl_key = DataKey::ClPool(ta.clone(), tb.clone(), fee_bps);
-        if env.storage().instance().has(&cl_key) {
-            return Err(FactoryError::ClPoolAlreadyExists);
-        }
-
         let cl_wasm: BytesN<32> = env
             .storage()
             .instance()
             .get(&DataKey::ClWasmHash)
             .ok_or(FactoryError::ClWasmNotSet)?;
 
+        // Issue #493: CL pools are indexed and counted separately from AMM
+        // pools (`ClPoolCount`/`ClPoolByIndex`, not `PoolCount`/`PoolByIndex`),
+        // so the AMM accessors (`all_pools()`/`get_pools()`) never return a CL
+        // pool address. The salt is still offset by `0x8000_0000_0000_0000` so
+        // a CL pool's deploy salt can never collide with an AMM pool's, even
+        // though the two now count independently.
         let n: u64 = env
             .storage()
             .instance()
-            .get(&DataKey::PoolCount)
+            .get(&DataKey::ClPoolCount)
             .unwrap_or(0);
-        // CL pools use n * 3 + 2 so they don't collide with V2 pool/LP/gov salts.
         let cl_salt = Self::make_salt(&env, n * 3 + 2 + 0x8000_0000_0000_0000);
-        env.storage().instance().set(&DataKey::PoolCount, &(n + 1));
+        env.storage()
+            .instance()
+            .set(&DataKey::ClPoolCount, &(n + 1));
 
         let pool_addr = env
             .deployer()
             .with_current_contract(cl_salt)
             .deploy(cl_wasm);
 
-        // Derive tick_spacing from fee tier (matching Uniswap v3 conventions).
+        // Derive tick_spacing from fee tier using the same tiering as the
+        // dex_aggregator and the standard concentrated-liquidity fee tiers.
+        // The 500 bps tier is an actively routed fee tier and must not fall
+        // back to the near-zero-fee spacing.
         let tick_spacing: i32 = match fee_bps {
             5 => 1,
             30 => 10,
             100 => 60,
+            500 => 200,
             _ => 1,
         };
         ClPoolClient::new(&env, &pool_addr).initialize(
@@ -555,11 +615,11 @@ impl Factory {
             &tick_spacing,
         );
 
-        env.storage().instance().set(&cl_key, &pool_addr);
+        env.storage().persistent().set(&cl_key, &pool_addr);
 
         env.storage()
             .persistent()
-            .set(&DataKey::PoolByIndex(n), &pool_addr);
+            .set(&DataKey::ClPoolByIndex(n), &pool_addr);
 
         soroban_amm_sdk::emit_versioned_event!(
             env,
@@ -661,13 +721,13 @@ impl Factory {
 
     /// Return the LP token address for the given pool, or `None` if unknown.
     pub fn get_lp_token(env: Env, pool: Address) -> Option<Address> {
-        env.storage().instance().get(&DataKey::LpToken(pool))
+        env.storage().persistent().get(&DataKey::LpToken(pool))
     }
 
     /// Return the governance address for the given pool, or `None` if unknown.
     pub fn get_governance(env: Env, pool: Address) -> Option<Address> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::GovernanceFor(pool))
             .unwrap_or(None)
     }
@@ -702,7 +762,7 @@ impl Factory {
         } else {
             (token_b, token_a)
         };
-        env.storage().instance().get(&DataKey::Pool(ta, tb))
+        env.storage().persistent().get(&DataKey::Pool(ta, tb))
     }
 
     /// Return the CL pool address for `(token_a, token_b, fee_bps)`, or `None` if absent.
@@ -719,27 +779,30 @@ impl Factory {
             (token_b, token_a)
         };
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::ClPool(ta, tb, fee_bps))
     }
 
-    /// Return the addresses of every pool deployed by this factory.
+    /// Return **AMM** pool addresses, oldest first, capped at
+    /// [`Self::MAX_UNBOUNDED_PAGE`].
+    ///
+    /// Never includes CL pools (issue #493) — callers that treat every entry
+    /// as an AMM pool (e.g. anything calling the AMM-only `get_info()`) can
+    /// rely on that. Use `all_cl_pools()` for CL pool addresses.
+    ///
+    /// **Bounded since issue #790.** This is no longer a "return everything"
+    /// read: once the factory holds more than `MAX_UNBOUNDED_PAGE` pools, the
+    /// result is truncated to the first `MAX_UNBOUNDED_PAGE` by index and the
+    /// rest are simply not returned — silently, since the return type carries
+    /// no truncation flag. Compare `get_pool_count()` against the returned
+    /// length to detect truncation, and use `get_pools(offset, limit)` to page
+    /// through the full set. Prefer `get_pools` outright in new code.
     pub fn all_pools(env: Env) -> Vec<Address> {
-        let count: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::PoolCount)
-            .unwrap_or(0);
-        let mut all = Vec::new(&env);
-        for i in 0..count {
-            if let Some(pool) = env.storage().persistent().get(&DataKey::PoolByIndex(i)) {
-                all.push_back(pool);
-            }
-        }
-        all
+        Self::get_pools(env, 0, Self::MAX_UNBOUNDED_PAGE)
     }
 
-    /// Return the total number of pools deployed by this factory.
+    /// Return the total number of **AMM** pools deployed by this factory.
+    /// See `get_cl_pool_count()` for the CL pool count.
     pub fn get_pool_count(env: Env) -> u64 {
         env.storage()
             .instance()
@@ -747,7 +810,8 @@ impl Factory {
             .unwrap_or(0)
     }
 
-    /// Return up to `limit` pool addresses starting at `offset`.
+    /// Return up to `limit` **AMM** pool addresses starting at `offset`.
+    /// See `get_cl_pools()` for CL pool pagination.
     pub fn get_pools(env: Env, offset: u32, limit: u32) -> Vec<Address> {
         let count: u64 = env
             .storage()
@@ -764,6 +828,63 @@ impl Factory {
             }
         }
         page
+    }
+
+    /// Return **CL** (concentrated-liquidity) pool addresses, oldest first,
+    /// capped at [`Self::MAX_UNBOUNDED_PAGE`]. Mirrors `all_pools()` but for
+    /// the separately indexed CL pool sequence (issue #493), and is bounded
+    /// for the same reason (issue #790) — see `all_pools()` for how to detect
+    /// truncation and page past it with `get_cl_pools(offset, limit)`.
+    pub fn all_cl_pools(env: Env) -> Vec<Address> {
+        Self::get_cl_pools(env, 0, Self::MAX_UNBOUNDED_PAGE)
+    }
+
+    /// Return the total number of CL pools deployed by this factory.
+    pub fn get_cl_pool_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ClPoolCount)
+            .unwrap_or(0)
+    }
+
+    /// Return up to `limit` CL pool addresses starting at `offset`.
+    pub fn get_cl_pools(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ClPoolCount)
+            .unwrap_or(0);
+        let start = (offset as u64).min(count);
+        let end = (start + limit as u64).min(count);
+
+        let mut page = Vec::new(&env);
+        for i in start..end {
+            if let Some(pool) = env.storage().persistent().get(&DataKey::ClPoolByIndex(i)) {
+                page.push_back(pool);
+            }
+        }
+        page
+    }
+
+    /// Check if an address is a registered CL pool in this factory.
+    pub fn is_cl_pool(env: Env, pool: Address) -> bool {
+        let count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ClPoolCount)
+            .unwrap_or(0);
+        for i in 0..count {
+            if let Some(p) = env
+                .storage()
+                .persistent()
+                .get::<_, Address>(&DataKey::ClPoolByIndex(i))
+            {
+                if p == pool {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     // ── Treasury & protocol fee sweep ────────────────────────────────────────
@@ -824,7 +945,7 @@ impl Factory {
 
     /// Return the token pair `(token_a, token_b)` recorded for `pool`, or `None`.
     pub fn get_pool_tokens(env: Env, pool: Address) -> Option<(Address, Address)> {
-        env.storage().instance().get(&DataKey::PoolTokens(pool))
+        env.storage().persistent().get(&DataKey::PoolTokens(pool))
     }
 
     /// Set and propagate the global protocol fee configuration to all
@@ -963,7 +1084,7 @@ impl Factory {
                 // Skip governance-controlled pools.
                 let gov: Option<Option<Address>> = env
                     .storage()
-                    .instance()
+                    .persistent()
                     .get(&DataKey::GovernanceFor(pool_addr.clone()));
                 let is_governed = gov.flatten().is_some();
                 if is_governed {
@@ -972,7 +1093,7 @@ impl Factory {
 
                 let Some((token_a, token_b)) = env
                     .storage()
-                    .instance()
+                    .persistent()
                     .get::<DataKey, (Address, Address)>(&DataKey::PoolTokens(pool_addr.clone()))
                 else {
                     continue;
@@ -1084,9 +1205,22 @@ impl Factory {
                 // so the factory cannot authorize their pool-level fee update.
                 let gov: Option<Option<Address>> = env
                     .storage()
-                    .instance()
+                    .persistent()
                     .get(&DataKey::GovernanceFor(pool_addr.clone()));
                 if gov.flatten().is_some() {
+                    continue;
+                }
+
+                // Guard: only AMM pools have a PoolTokens entry. CL pools (which
+                // use a different interface and don't implement set_protocol_fee)
+                // never have this key, so we skip them. This also handles any
+                // legacy CL pool addresses that may exist in PoolByIndex from
+                // before CL pools were given their own separate index.
+                let is_amm_pool = env
+                    .storage()
+                    .persistent()
+                    .has(&DataKey::PoolTokens(pool_addr.clone()));
+                if !is_amm_pool {
                     continue;
                 }
 
@@ -1371,6 +1505,50 @@ mod tests {
         assert_eq!(factory.all_pools().len(), 2);
     }
 
+    /// Issue #493: `create_cl_pool` used to share the AMM-only `PoolCount`/
+    /// `PoolByIndex` sequence, so a CL pool address leaked into `all_pools()`
+    /// once any CL pool had ever been created — breaking every caller (like
+    /// `dex_aggregator::discover_tokens`) that assumes every `all_pools()`
+    /// entry implements the AMM `get_info()` interface.
+    #[test]
+    fn test_all_pools_excludes_cl_pools() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+        let cl_hash = env
+            .deployer()
+            .upload_contract_wasm(concentrated_liquidity::WASM);
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+        factory.set_cl_wasm_hash(&cl_hash);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+
+        let (amm_pool, _) = factory.create_pool_with_fee_bps(&admin, &ta, &tb, &30_i128, &None);
+        let cl_pool = factory.create_cl_pool(&admin, &ta, &tb, &5_i128, &0_i32);
+
+        // The CL pool must never show up in the AMM-only listing/count.
+        let all = factory.all_pools();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all.get(0).unwrap(), amm_pool);
+        assert_eq!(factory.get_pool_count(), 1);
+        assert_eq!(factory.get_pools(&0, &10).len(), 1);
+
+        // The CL pool is discoverable through its own dedicated accessors.
+        let all_cl = factory.all_cl_pools();
+        assert_eq!(all_cl.len(), 1);
+        assert_eq!(all_cl.get(0).unwrap(), cl_pool);
+        assert_eq!(factory.get_cl_pool_count(), 1);
+        assert_eq!(factory.get_cl_pools(&0, &10).len(), 1);
+    }
+
     // ── Issue #96: LP token name/symbol reflect the token pair ───────────────
 
     #[test]
@@ -1569,6 +1747,33 @@ mod tests {
 
         // Missing tier returns None.
         assert_eq!(factory.get_cl_pool(&ta, &tb, &500_i128), None);
+    }
+
+    #[test]
+    fn test_create_cl_pool_500_bps_uses_wider_tick_spacing() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+        let cl_hash = env
+            .deployer()
+            .upload_contract_wasm(concentrated_liquidity::WASM);
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+        factory.set_cl_wasm_hash(&cl_hash);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+
+        let pool_addr = factory.create_cl_pool(&admin, &ta, &tb, &500_i128, &0_i32);
+        let state = ClPoolClient::new(&env, &pool_addr).get_pool_state();
+
+        assert_eq!(state.tick_spacing, 200);
     }
 
     #[test]
@@ -2063,6 +2268,52 @@ mod tests {
         assert_eq!(bps, 5_i128);
     }
 
+    /// Issue #493 (same root cause): `sync_global_fee_page` walks the shared
+    /// `PoolByIndex` sequence and, unlike `sweep_fees_page`, had no guard
+    /// against non-AMM entries — it would call the AMM-only
+    /// `set_protocol_fee()` on whatever address it found. Before CL pools got
+    /// their own counter/index, a factory with even one CL pool would trap
+    /// here as soon as the loop reached it. Now that CL pools are indexed
+    /// separately, `set_global_fee` must skip them cleanly (0 CL pools ever
+    /// enter this loop) and only report the AMM pool as updated.
+    #[test]
+    fn test_set_global_fee_skips_cl_pools() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+        let cl_hash = env
+            .deployer()
+            .upload_contract_wasm(concentrated_liquidity::WASM);
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+        factory.set_cl_wasm_hash(&cl_hash);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+
+        let (pool_addr, _) = factory.create_pool_with_fee_bps(&admin, &ta, &tb, &30_i128, &None);
+        // Creating a CL pool for the same pair must not disturb the AMM fee sync.
+        factory.create_cl_pool(&admin, &ta, &tb, &5_i128, &0_i32);
+
+        factory.set_treasury(&admin, &treasury, &10_i128);
+
+        // Must not trap on the CL pool and must only update the AMM pool.
+        let updated = factory.set_global_fee(&admin, &5_i128);
+        assert_eq!(updated, 1);
+
+        let amm_client = amm::AmmPoolClient::new(&env, &pool_addr);
+        let (recipient, bps) = amm_client.get_protocol_fee();
+        assert_eq!(recipient, Some(factory_addr.clone()));
+        assert_eq!(bps, 5_i128);
+    }
+
     #[test]
     fn test_sweep_fees_transfers_to_treasury() {
         let env = Env::default();
@@ -2372,5 +2623,337 @@ mod tests {
 
         // Execute global fee update proposal
         gov.execute(&pid2);
+    }
+
+    // ── Issue #520: validate before charging ────────────────────────────────────
+
+    /// Verify that a duplicate-pool error does NOT charge the pool-creation
+    /// fee or consume the caller's rate-limit slot (issue #520).
+    ///
+    /// Before the fix, `check_and_update_rate_limit` and
+    /// `charge_pool_creation_fee` ran *before* the `PoolAlreadyExists` check,
+    /// so a caller who accidentally requested an existing pair paid the fee
+    /// and burned their rate-limit cooldown for nothing.
+    #[test]
+    fn test_duplicate_pool_does_not_charge_fee_or_consume_rate_limit() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        let fee_token_addr = setup_fee_token(&env, &admin, &user, 10_000);
+        let fee_client = soroban_sdk::token::Client::new(&env, &fee_token_addr);
+        factory.set_pool_creation_fee(&fee_token_addr, &100_i128);
+        factory.set_permissionless_mode(&true);
+        factory.set_rate_limit(&5u32);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+
+        // First creation succeeds — fee charged, rate limit recorded.
+        factory.create_pool_with_fee_bps(&user, &ta, &tb, &30_i128, &None);
+        let balance_after_first = fee_client.balance(&user);
+
+        // Duplicate creation must fail WITHOUT charging a second fee.
+        let result = factory.try_create_pool_with_fee_bps(&user, &ta, &tb, &30_i128, &None);
+        assert_eq!(
+            result,
+            Err(Ok(FactoryError::PoolAlreadyExists)),
+            "duplicate pool must return PoolAlreadyExists"
+        );
+        assert_eq!(
+            fee_client.balance(&user),
+            balance_after_first,
+            "fee must NOT be charged for a rejected duplicate"
+        );
+
+        // The rate limit must not have been consumed by the failed call, so
+        // after advancing past the window, an immediate creation of a
+        // DIFFERENT pair must succeed.
+        let tc = Address::generate(&env);
+        let td = Address::generate(&env);
+        // Advance past the 5-ledger rate limit window.
+        env.ledger().with_mut(|l| l.sequence_number = 6);
+        let result2 = factory.try_create_pool_with_fee_bps(&user, &tc, &td, &30_i128, &None);
+        assert!(
+            result2.is_ok(),
+            "rate limit must not be consumed by the rejected duplicate"
+        );
+    }
+
+    /// Same as above but for invalid fee_bps — the caller must not be
+    /// charged or rate-limited when the request is rejected up front.
+    #[test]
+    fn test_invalid_fee_bps_does_not_charge_fee_or_consume_rate_limit() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        let fee_token_addr = setup_fee_token(&env, &admin, &user, 10_000);
+        let fee_client = soroban_sdk::token::Client::new(&env, &fee_token_addr);
+        factory.set_pool_creation_fee(&fee_token_addr, &100_i128);
+        factory.set_permissionless_mode(&true);
+        factory.set_rate_limit(&5u32);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+
+        // Invalid fee_bps (> 10 000) must be rejected without charge.
+        let result = factory.try_create_pool_with_fee_bps(&user, &ta, &tb, &99_999_i128, &None);
+        assert_eq!(
+            result,
+            Err(Ok(FactoryError::InvalidFeeBps)),
+            "invalid fee_bps must return InvalidFeeBps"
+        );
+        assert_eq!(
+            fee_client.balance(&user),
+            10_000_i128,
+            "fee must NOT be charged for invalid fee_bps"
+        );
+
+        // Rate limit was not consumed — a valid creation must succeed.
+        let tc = Address::generate(&env);
+        let td = Address::generate(&env);
+        let result2 = factory.try_create_pool_with_fee_bps(&user, &tc, &td, &30_i128, &None);
+        assert!(
+            result2.is_ok(),
+            "rate limit must not be consumed by the rejected call"
+        );
+    }
+
+    /// CL pool variant: duplicate-pool error must not charge or rate-limit.
+    #[test]
+    fn test_cl_duplicate_pool_does_not_charge_fee_or_consume_rate_limit() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+        let cl_hash = env
+            .deployer()
+            .upload_contract_wasm(concentrated_liquidity::WASM);
+
+        let admin = Address::generate(&env);
+        let user = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+        factory.set_cl_wasm_hash(&cl_hash);
+
+        let fee_token_addr = setup_fee_token(&env, &admin, &user, 10_000);
+        let fee_client = soroban_sdk::token::Client::new(&env, &fee_token_addr);
+        factory.set_pool_creation_fee(&fee_token_addr, &100_i128);
+        factory.set_permissionless_mode(&true);
+        factory.set_rate_limit(&5u32);
+
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+
+        // First CL pool creation succeeds.
+        factory.create_cl_pool(&user, &ta, &tb, &30_i128, &0_i32);
+        let balance_after_first = fee_client.balance(&user);
+
+        // Duplicate must fail without a second charge.
+        let result = factory.try_create_cl_pool(&user, &ta, &tb, &30_i128, &0_i32);
+        assert_eq!(
+            result,
+            Err(Ok(FactoryError::ClPoolAlreadyExists)),
+            "duplicate CL pool must return ClPoolAlreadyExists"
+        );
+        assert_eq!(
+            fee_client.balance(&user),
+            balance_after_first,
+            "fee must NOT be charged for a rejected CL duplicate"
+        );
+
+        // Rate limit was not consumed by the failed call — advance past the
+        // window and create a different pair.
+        let tc = Address::generate(&env);
+        let td = Address::generate(&env);
+        env.ledger().with_mut(|l| l.sequence_number = 6);
+        let result2 = factory.try_create_cl_pool(&user, &tc, &td, &30_i128, &0_i32);
+        assert!(
+            result2.is_ok(),
+            "rate limit must not be consumed by the rejected CL duplicate"
+        );
+    }
+
+    // -- Bounded enumeration (issue #790) -------------------------------------
+
+    /// Registers `n` synthetic pool addresses straight into the factory's
+    /// index, bypassing `create_pool` so a cap-sized registry can be built
+    /// without deploying hundreds of real contracts. The stored addresses are
+    /// never invoked -- these tests only exercise the read/pagination path,
+    /// which reads `PoolByIndex` entries and never calls into them.
+    fn seed_pool_index(env: &Env, factory: &Address, n: u64, cl: bool) -> Vec<Address> {
+        let mut expected = Vec::new(env);
+        for _ in 0..n {
+            expected.push_back(Address::generate(env));
+        }
+        env.as_contract(factory, || {
+            for i in 0..n {
+                let addr = expected.get(i as u32).unwrap();
+                if cl {
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::ClPoolByIndex(i), &addr);
+                } else {
+                    env.storage()
+                        .persistent()
+                        .set(&DataKey::PoolByIndex(i), &addr);
+                }
+            }
+            let key = if cl {
+                DataKey::ClPoolCount
+            } else {
+                DataKey::PoolCount
+            };
+            env.storage().instance().set(&key, &n);
+        });
+        expected
+    }
+
+    fn bounded_factory(env: &Env) -> Address {
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+        let admin = Address::generate(env);
+        let factory_addr = env.register_contract(None, Factory);
+        FactoryClient::new(env, &factory_addr).initialize(&admin, &amm_hash, &token_hash);
+        factory_addr
+    }
+
+    #[test]
+    fn test_all_pools_is_capped_once_registry_exceeds_the_limit() {
+        let env = Env::default();
+        let factory_addr = bounded_factory(&env);
+        let factory = FactoryClient::new(&env, &factory_addr);
+
+        let cap = Factory::MAX_UNBOUNDED_PAGE as u64;
+        let total = cap + 25;
+        let expected = seed_pool_index(&env, &factory_addr, total, false);
+
+        // The count still reports the true total, so a caller can detect that
+        // `all_pools()` truncated.
+        assert_eq!(factory.get_pool_count(), total);
+
+        let all = factory.all_pools();
+        assert_eq!(all.len(), Factory::MAX_UNBOUNDED_PAGE);
+        // Truncation keeps the oldest pools, in index order.
+        for i in 0..Factory::MAX_UNBOUNDED_PAGE {
+            assert_eq!(all.get(i).unwrap(), expected.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_all_cl_pools_is_capped_once_registry_exceeds_the_limit() {
+        let env = Env::default();
+        let factory_addr = bounded_factory(&env);
+        let factory = FactoryClient::new(&env, &factory_addr);
+
+        let total = Factory::MAX_UNBOUNDED_PAGE as u64 + 7;
+        let expected = seed_pool_index(&env, &factory_addr, total, true);
+
+        assert_eq!(factory.get_cl_pool_count(), total);
+
+        let all = factory.all_cl_pools();
+        assert_eq!(all.len(), Factory::MAX_UNBOUNDED_PAGE);
+        for i in 0..Factory::MAX_UNBOUNDED_PAGE {
+            assert_eq!(all.get(i).unwrap(), expected.get(i).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_paginated_reads_reach_every_pool_past_the_cap() {
+        let env = Env::default();
+        let factory_addr = bounded_factory(&env);
+        let factory = FactoryClient::new(&env, &factory_addr);
+
+        let total = Factory::MAX_UNBOUNDED_PAGE as u64 + 25;
+        let expected = seed_pool_index(&env, &factory_addr, total, false);
+
+        // Page size well under the cap: every pool is still reachable, and no
+        // single call reads more than `page` entries.
+        let page = 10u32;
+        let mut seen = Vec::new(&env);
+        let count = factory.get_pool_count();
+        let mut offset = 0u64;
+        while offset < count {
+            let chunk = factory.get_pools(&(offset as u32), &page);
+            assert!(chunk.len() <= page);
+            for i in 0..chunk.len() {
+                seen.push_back(chunk.get(i).unwrap());
+            }
+            offset += page as u64;
+        }
+
+        assert_eq!(seen.len() as u64, total);
+        for i in 0..total {
+            assert_eq!(seen.get(i as u32).unwrap(), expected.get(i as u32).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_paginated_cl_reads_reach_every_pool_past_the_cap() {
+        let env = Env::default();
+        let factory_addr = bounded_factory(&env);
+        let factory = FactoryClient::new(&env, &factory_addr);
+
+        let total = Factory::MAX_UNBOUNDED_PAGE as u64 + 13;
+        let expected = seed_pool_index(&env, &factory_addr, total, true);
+
+        let page = 25u32;
+        let mut seen = Vec::new(&env);
+        let mut offset = 0u64;
+        while offset < total {
+            let chunk = factory.get_cl_pools(&(offset as u32), &page);
+            assert!(chunk.len() <= page);
+            for i in 0..chunk.len() {
+                seen.push_back(chunk.get(i).unwrap());
+            }
+            offset += page as u64;
+        }
+
+        assert_eq!(seen.len() as u64, total);
+        for i in 0..total {
+            assert_eq!(seen.get(i as u32).unwrap(), expected.get(i as u32).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_all_pools_below_the_cap_is_unchanged() {
+        let env = Env::default();
+        let factory_addr = bounded_factory(&env);
+        let factory = FactoryClient::new(&env, &factory_addr);
+
+        // Under the cap, `all_pools()` must still behave exactly as before:
+        // every pool, in index order, identical to a full-range `get_pools`.
+        let total = 5u64;
+        let expected = seed_pool_index(&env, &factory_addr, total, false);
+
+        let all = factory.all_pools();
+        assert_eq!(all.len() as u64, total);
+        assert_eq!(all, expected);
+        assert_eq!(all, factory.get_pools(&0, &(total as u32)));
+        assert_eq!(factory.all_pools(), factory.get_pools(&0, &u32::MAX));
     }
 }

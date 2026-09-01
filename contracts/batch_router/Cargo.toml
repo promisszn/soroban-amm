@@ -6,18 +6,14 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
-[features]
-testutils = [
-    "soroban-sdk/testutils",
-    "amm/testutils",
-    "token/testutils",
-]
-
 [dependencies]
 soroban-sdk = { workspace = true }
-amm = { path = "../amm" }
+pool_interfaces = { path = "../pool_interfaces" }
+soroban_amm_sdk = { path = "../amm-sdk" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 amm = { path = "../amm", features = ["testutils"] }
 token = { path = "../token", features = ["testutils"] }
+factory = { path = "../factory", features = ["testutils"] }
+concentrated_liquidity = { path = "../concentrated_liquidity", features = ["testutils"] }

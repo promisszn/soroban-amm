@@ -26,32 +26,48 @@ use soroban_sdk::{contracterror, contracttype, Address};
 /// | 13   | WrongAdmin           | `accept_admin` caller ≠ pending nominee              | Have the correct address call `accept_admin`      |
 /// | 14   | Reentrant            | Reentrant call detected during flash loan callback   | Do not call pool functions from `on_flash_loan`   |
 /// | 15   | CircuitBreaker       | Price moved > threshold, pool auto-paused            | Wait for cooldown or governance action            |
+/// | 16   | FotSlippage          | Fee-on-transfer token deducted more than min_received| Widen `min_received` or use a non-FoT token      |
+/// | 17   | OracleDeviationExceeded | Spot price deviated beyond oracle tolerance       | Retry when oracle price stabilises                |
+/// | 18   | FlashLoanRepaymentFailed | Receiver did not repay borrowed amounts + fees | Ensure `on_flash_loan` repays in full             |
+/// | 19   | AlreadyExecuted      | Multisig emergency withdrawal was already executed   | No action — proposal already carried out          |
+/// | 20   | ProposalExpired      | Multisig emergency withdrawal proposal has expired   | Submit a new proposal                             |
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum SdkAmmError {
-    AlreadyInitialized    = 1,
-    InvalidFeeBps         = 2,
-    InsufficientShares    = 3,
-    DeadlineExceeded      = 4,
-    SlippageExceeded      = 5,
-    Paused                = 6,
-    Unauthorized          = 7,
-    ZeroAmount            = 8,
-    InvalidToken          = 9,
-    EmptyPool             = 10,
+    AlreadyInitialized = 1,
+    InvalidFeeBps = 2,
+    InsufficientShares = 3,
+    DeadlineExceeded = 4,
+    SlippageExceeded = 5,
+    Paused = 6,
+    Unauthorized = 7,
+    ZeroAmount = 8,
+    InvalidToken = 9,
+    EmptyPool = 10,
     InsufficientLiquidity = 11,
-    NoPendingAdmin        = 12,
-    WrongAdmin            = 13,
-    Reentrant             = 14,
-    CircuitBreaker        = 15,
+    NoPendingAdmin = 12,
+    WrongAdmin = 13,
+    Reentrant = 14,
+    CircuitBreaker = 15,
+    FotSlippage = 16,
+    OracleDeviationExceeded = 17,
+    FlashLoanRepaymentFailed = 18,
+    AlreadyExecuted = 19,
+    ProposalExpired = 20,
 }
 
 // ── Pool state ────────────────────────────────────────────────────────────────
 
 /// Full snapshot of an AMM pool's state returned by `get_info`.
+///
+/// This mirrors the on-chain `PoolInfo` struct. Named `SdkPoolInfo` to avoid a
+/// duplicate-type collision in the WASM spec when the AMM contract is compiled
+/// with this SDK crate as a dependency (both would otherwise emit a `PoolInfo`
+/// entry, causing `soroban_sdk::contractimport!` to fail with a redefinition
+/// error in consumer crates such as `amm-fuzz`).
 #[contracttype]
 #[derive(Debug, Clone, PartialEq)]
-pub struct PoolInfo {
+pub struct SdkPoolInfo {
     pub token_a: Address,
     pub token_b: Address,
     pub reserve_a: i128,
@@ -65,6 +81,38 @@ pub struct PoolInfo {
     /// Issue #292: fraction of protocol fee rebated back to LP reserves (bps).
     pub lp_rebate_bps: i128,
 }
+
+/// Backward-compatible type alias so existing SDK consumers do not need to
+/// change their code.
+pub type PoolInfo = SdkPoolInfo;
+
+// ── Swap simulation ───────────────────────────────────────────────────────────
+
+/// Detailed breakdown of a hypothetical swap, mirroring the on-chain
+/// `SwapSimulation` struct returned by `AmmPool::simulate_swap`.
+///
+/// Named `SdkSwapSimulation` (with a `SwapSimulation` alias below) for the
+/// same reason as `SdkPoolInfo`: avoiding a duplicate-type collision in the
+/// WASM spec when the AMM contract is compiled with this SDK crate as a
+/// dependency.
+#[contracttype]
+#[derive(Debug, Clone, PartialEq)]
+pub struct SdkSwapSimulation {
+    /// Expected output amount after fees.
+    pub amount_out: i128,
+    /// Fee charged on the input (in input-token units).
+    pub fee_amount: i128,
+    /// Price impact in basis points — how far the execution price is from spot.
+    pub price_impact_bps: i128,
+    /// Effective execution price × 1 000 000 (amount_out / amount_in).
+    pub effective_price: i128,
+    /// Spot price of `token_out` in terms of `token_in` × 1 000 000.
+    pub spot_price: i128,
+}
+
+/// Backward-compatible type alias so existing SDK consumers do not need to
+/// change their code.
+pub type SwapSimulation = SdkSwapSimulation;
 
 // ── Quote types ───────────────────────────────────────────────────────────────
 

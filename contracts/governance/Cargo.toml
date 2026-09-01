@@ -11,11 +11,12 @@ testutils = ["soroban-sdk/testutils", "token/testutils", "amm/testutils"]
 
 [dependencies]
 soroban-sdk = { workspace = true }
-soroban-amm-sdk = { path = "../amm-sdk" }
+soroban_amm_sdk = { path = "../amm-sdk" }
 
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 token = { path = "../token", features = ["testutils"] }
 amm   = { path = "../amm",   features = ["testutils"] }
+concentrated_liquidity = { path = "../concentrated_liquidity" }
 proptest = "1"
 

@@ -1,5 +1,5 @@
 [package]
-name = "integration-tests"
+name = "integration_tests"
 version = "0.1.0"
 edition = "2021"
 
@@ -11,14 +11,29 @@ path = "src/lib.rs"
 [features]
 legacy-integration-matrix = []
 
-[dev-dependencies]
+# `pub mod fixture` (src/fixture.rs) is not `#[cfg(test)]`-gated, since it is
+# also linked by the external `tests/v2_to_v3_migration.rs` test binary, which
+# links against the plain (non-`--test`) library artifact. Dev-dependencies
+# are only available to code compiled with `--cfg test`, so anything fixture
+# needs must live here as a regular dependency, not a dev-dependency — even
+# though this whole crate is test-only.
+[dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 amm              = { path = "../amm",              features = ["testutils"] }
 token            = { path = "../token",            features = ["testutils"] }
 factory          = { path = "../factory",          features = ["testutils"] }
-twap-consumer    = { path = "../twap_consumer",    features = ["testutils"] }
-twal-consumer    = { path = "../twal_consumer",    features = ["testutils"] }
-dex-aggregator   = { path = "../dex_aggregator",   features = ["testutils"] }
-incentive-campaigns = { path = "../incentive_campaigns", features = ["testutils"] }
 governance       = { path = "../governance",       features = ["testutils"] }
 concentrated_liquidity = { path = "../concentrated_liquidity", features = ["testutils"] }
+staking          = { path = "../staking",          features = ["testutils"] }
+cl_position_nft  = { path = "../cl_position_nft",  features = ["testutils"] }
+
+[dev-dependencies]
+twap_consumer    = { path = "../twap_consumer",    features = ["testutils"] }
+twal_consumer    = { path = "../twal_consumer",    features = ["testutils"] }
+dex_aggregator   = { path = "../dex_aggregator",   features = ["testutils"] }
+incentive_campaigns = { path = "../incentive_campaigns", features = ["testutils"] }
+v2_to_v3_migration   = { path = "../v2_to_v3_migration",   features = ["testutils"] }
+
+[[test]]
+name = "v2_to_v3_migration"
+path = "tests/v2_to_v3_migration.rs"

@@ -302,7 +302,7 @@ export class ConcentratedLiquidityClient {
    * Mirrors `ConcentratedLiquidity::modify_position` —
    * contracts/concentrated_liquidity/src/lib.rs:540
    * `(provider: Address, lower_tick: i32, upper_tick: i32,
-   *   liquidity_delta: i128, min_a: i128, min_b: i128)`
+   *   liquidity_delta: i128, min_a: i128, min_b: i128, deadline: u64)`
    *
    * Returns `(amount_a, amount_b)`.
    */
@@ -312,9 +312,10 @@ export class ConcentratedLiquidityClient {
     upperTick: number,
     liquidityDelta: bigint,
     minA: bigint,
-    minB: bigint
+    minB: bigint,
+    deadline: bigint
   ): xdr.ScVal[] {
-    return [addr(provider), i32(lowerTick), i32(upperTick), i128(liquidityDelta), i128(minA), i128(minB)];
+    return [addr(provider), i32(lowerTick), i32(upperTick), i128(liquidityDelta), i128(minA), i128(minB), u64(deadline)];
   }
 
   /**

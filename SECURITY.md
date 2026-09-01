@@ -7,9 +7,26 @@ Only the latest released version of each contract receives security fixes. Older
 | Contract | Supported |
 |---|---|
 | `amm` (latest) | ✅ |
-| `token` (latest) | ✅ |
+| `concentrated_liquidity` (latest) | ✅ |
 | `factory` (latest) | ✅ |
+| `router` (latest) | ✅ |
+| `batch_router` (latest) | ✅ |
+| `batch_auction` (latest) | ✅ |
+| `token` (latest) | ✅ |
+| `reserve_manager` (latest) | ✅ |
+| `twap_consumer` (latest) | ✅ |
+| `twal_consumer` (latest) | ✅ |
+| `incentive_campaigns` (latest) | ✅ |
+| `dex_aggregator` (latest) | ✅ |
+| `governance` (latest) | ✅ |
+| `staking` (latest) | ✅ |
+| `oracle_aggregator` (latest) | ✅ |
+| `cl_position_nft` (latest) | ✅ |
+| `v2_to_v3_migration` (latest) | ✅ |
+| `pol_vesting` (latest) | ✅ |
 | Any prior version | ❌ |
+
+> This table must be kept in sync with the `[workspace]` `members` list in `Cargo.toml`. When adding or removing a deployable contract, update both. The test-only crates (`amm-fuzz`, `integration-tests`) and the `amm-sdk` library are not deployable contracts and are omitted.
 
 ---
 

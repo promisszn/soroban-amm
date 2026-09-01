@@ -19,7 +19,10 @@
 
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { defaultRegistry } from "./registry.js";
+import { InvalidWebhookUrlError } from "./url-validation.js";
 import { WebhookDispatcher } from "./dispatcher.js";
+import { DeadLetterQueue } from "./dead-letter.js";
+import { CircuitBreaker } from "./circuit-breaker.js";
 import { HorizonPoller } from "./horizon-poller.js";
 import type { PoolEvent } from "./types.js";
 
@@ -31,8 +34,21 @@ const CONTRACT_IDS = (process.env["CONTRACT_IDS"] ?? "")
   .map((s) => s.trim())
   .filter(Boolean);
 const POLL_INTERVAL_MS = Number(process.env["POLL_INTERVAL_MS"] ?? 5_000);
+const DELIVERY_TIMEOUT_MS = Number(process.env["DELIVERY_TIMEOUT_MS"] ?? 10_000);
+const DELIVERY_CONCURRENCY = Number(process.env["DELIVERY_CONCURRENCY"] ?? 10);
+const DEAD_LETTER_MAX = Number(process.env["DEAD_LETTER_MAX"] ?? 1_000);
+const CIRCUIT_THRESHOLD = Number(process.env["CIRCUIT_FAILURE_THRESHOLD"] ?? 5);
+const CIRCUIT_COOLDOWN_MS = Number(process.env["CIRCUIT_COOLDOWN_MS"] ?? 30_000);
 
-const dispatcher = new WebhookDispatcher(defaultRegistry);
+const dispatcher = new WebhookDispatcher(defaultRegistry, {
+  timeoutMs: DELIVERY_TIMEOUT_MS,
+  concurrency: DELIVERY_CONCURRENCY,
+  deadLetterQueue: new DeadLetterQueue(DEAD_LETTER_MAX),
+  circuitBreaker: new CircuitBreaker({
+    failureThreshold: CIRCUIT_THRESHOLD,
+    cooldownMs: CIRCUIT_COOLDOWN_MS,
+  }),
+});
 
 // ── Horizon poller ──────────────────────────────────────────────────────────
 
@@ -81,9 +97,46 @@ const server = createServer(async (req, res) => {
     return json(res, 200, { status: "ok", webhooks: defaultRegistry.size });
   }
 
-  // GET /webhooks
+  // GET /webhooks — includes each subscription's circuit state.
   if (method === "GET" && url === "/webhooks") {
-    return json(res, 200, defaultRegistry.list());
+    return json(
+      res,
+      200,
+      defaultRegistry
+        .list()
+        .map((sub) => ({
+          ...sub,
+          circuit: dispatcher.circuitBreaker.snapshot(sub.id),
+        })),
+    );
+  }
+
+  // GET /metrics
+  if (method === "GET" && url === "/metrics") {
+    return json(res, 200, dispatcher.metrics());
+  }
+
+  // GET /dead-letters
+  if (method === "GET" && url === "/dead-letters") {
+    return json(res, 200, dispatcher.deadLetters.list());
+  }
+
+  // POST /dead-letters/:id/replay
+  const replayMatch = url.match(/^\/dead-letters\/([^/]+)\/replay$/);
+  if (method === "POST" && replayMatch) {
+    const id = replayMatch[1]!;
+    const result = await dispatcher.replay(id);
+    if (!result) {
+      return json(res, 404, { error: "dead letter not found" });
+    }
+    return json(res, result.success ? 200 : 502, { replayed: result.success, result });
+  }
+
+  // DELETE /dead-letters/:id
+  const deadLetterMatch = url.match(/^\/dead-letters\/([^/]+)$/);
+  if (method === "DELETE" && deadLetterMatch) {
+    const removed = dispatcher.deadLetters.remove(deadLetterMatch[1]!);
+    return json(res, removed ? 200 : 404, { removed });
   }
 
   // POST /webhooks
@@ -98,11 +151,19 @@ const server = createServer(async (req, res) => {
       if (!body.url) {
         return json(res, 400, { error: "url is required" });
       }
-      const sub = defaultRegistry.register(body.url, {
-        contractId: body.contractId,
-        eventType: body.eventType,
-        secret: body.secret,
-      });
+      let sub;
+      try {
+        sub = defaultRegistry.register(body.url, {
+          contractId: body.contractId,
+          eventType: body.eventType,
+          secret: body.secret,
+        });
+      } catch (err) {
+        if (err instanceof InvalidWebhookUrlError) {
+          return json(res, 400, { error: err.message });
+        }
+        throw err;
+      }
       return json(res, 201, sub);
     } catch {
       return json(res, 400, { error: "invalid JSON" });
@@ -114,6 +175,7 @@ const server = createServer(async (req, res) => {
   if (method === "DELETE" && deleteMatch) {
     const id = deleteMatch[1]!;
     const removed = defaultRegistry.unregister(id);
+    if (removed) dispatcher.circuitBreaker.forget(id);
     return json(res, removed ? 200 : 404, { removed });
   }
 

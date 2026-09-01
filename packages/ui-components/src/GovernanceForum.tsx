@@ -720,11 +720,11 @@ function ProposalWizard({ onSubmit, onToast }: {
                 <button onClick={() => removeAction(i)} aria-label={`Remove action ${i + 1}`}
                   style={{ ...S.btn, background: "transparent", border: `1px solid ${T.border}`, color: T.muted, padding: ".2rem .5rem", fontSize: ".8rem" }}>✕</button>
               </div>
-              {[["Contract ID", "contractId", "C..."], ["Function", "functionName", "set_fee_rate"], ["Arguments (JSON)", "args", '{"bps": 150}']].map(([l, k, ph]) => (
+              {([["Contract ID", "contractId", "C..."], ["Function", "functionName", "set_fee_rate"], ["Arguments (JSON)", "args", '{"bps": 150}']] as const).map(([l, k, ph]) => (
                 <div key={k} style={{ marginBottom: ".5rem" }}>
                   <label htmlFor={`action-${i}-${k}`} style={{ display: "block", fontSize: ".82rem", marginBottom: ".25rem", color: T.muted }}>{l}</label>
                   <input id={`action-${i}-${k}`} type="text" placeholder={ph}
-                    value={(a as Record<string, string>)[k]}
+                    value={a[k]}
                     onChange={e => set("actions", form.actions.map((x, xi) => xi === i ? { ...x, [k]: e.target.value } : x))}
                     style={inputStyle} />
                 </div>

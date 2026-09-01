@@ -96,6 +96,7 @@ export function PositionManager({
   const [amountA, setAmountA] = useState(position?.amountA ?? 0);
   const [amountB, setAmountB] = useState(position?.amountB ?? 0);
   const [activeTab, setActiveTab] = useState<"range" | "fee" | "efficiency" | "risk">("range");
+  const [errors, setErrors] = useState<string[]>([]);
 
   const minPrice = currentPrice * 0.01;
   const maxPrice = currentPrice * 10;
@@ -117,6 +118,20 @@ export function PositionManager({
   const handleSubmit = useCallback(
     (e: React.FormEvent) => {
       e.preventDefault();
+      const nextErrors: string[] = [];
+      if (!(amountA > 0)) {
+        nextErrors.push("Amount A must be a positive number.");
+      }
+      if (!(amountB > 0)) {
+        nextErrors.push("Amount B must be a positive number.");
+      }
+      if (priceRange.lower >= priceRange.upper) {
+        nextErrors.push("Lower price must be below the upper price.");
+      }
+      setErrors(nextErrors);
+      if (nextErrors.length > 0) {
+        return;
+      }
       onSubmit?.({ feeBps, priceRange, amountA, amountB });
     },
     [feeBps, priceRange, amountA, amountB, onSubmit],
@@ -262,6 +277,16 @@ export function PositionManager({
         </div>
       </fieldset>
 
+      {errors.length > 0 && (
+        <div style={styles.errorList}>
+          {errors.map((message) => (
+            <div key={message} role="alert" style={styles.errorAlert}>
+              {message}
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Actions */}
       <div style={styles.actions}>
         {onCancel && (
@@ -282,6 +307,20 @@ export function PositionManager({
 }
 
 const styles: Record<string, React.CSSProperties> = {
+  errorList: {
+    display: "flex",
+    flexDirection: "column",
+    gap: 6,
+    marginTop: 12,
+  },
+  errorAlert: {
+    background: "rgba(248, 81, 73, 0.15)",
+    border: "1px solid #f85149",
+    borderRadius: 6,
+    padding: "8px 12px",
+    color: "#f85149",
+    fontSize: 13,
+  },
   root: {
     background: "#161b22",
     border: "1px solid #30363d",

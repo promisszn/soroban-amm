@@ -6,12 +6,24 @@ price feeds and plugins.
 Usage example:
 
 ```ts
-import { AdvancedClient, signerMiddleware, priceFeedMiddleware } from '@example/ts-advanced-client'
+import {
+  AdvancedClient,
+  priceFeedMiddleware,
+  signerMiddleware,
+} from '@example/ts-advanced-client'
 
-const client = new AdvancedClient()
+type Transaction = { kind: string; amount: number; signed?: boolean }
+type Result = { hash: string }
+
+const client = new AdvancedClient<Transaction, Result>({
+  async sendTransaction(tx) {
+    // Adapt this call to the Soroban SDK/RPC client used by your application.
+    return sorobanRpc.sendTransaction(tx)
+  },
+})
 client.middleware()
   .use(priceFeedMiddleware(async () => 123.45))
-  .use(signerMiddleware({ sign: async (tx)=> ({...tx, signed:true}) }))
+  .use(signerMiddleware({ sign: async (tx) => ({ ...tx, signed: true }) }))
 
-await client.sendTransaction({ kind: 'swap', amount: 1000 })
+const result = await client.sendTransaction({ kind: 'swap', amount: 1000 })
 ```

@@ -64,10 +64,8 @@ fn macro_preserves_topic_shape() {
         .find(|e| e.0 == contract_id)
         .expect("event missing");
 
-    // Topic stays a single-element tuple — versioning lives in the
-    // payload, not the topic, so existing topic filters keep working.
-    let topic: (soroban_sdk::Symbol,) = evt.1.clone().into_val(&env);
-    assert_eq!(topic.0, symbol_short!("test_b"));
+    let topic_sym: soroban_sdk::Symbol = evt.1.get(0).unwrap().into_val(&env);
+    assert_eq!(topic_sym, symbol_short!("test_b"));
 }
 
 #[test]

@@ -1,6 +1,6 @@
 # Security Audit — Soroban AMM Pool Contract
 
-**Scope:** `contracts/amm/src/lib.rs` — constant-product AMM pool  
+**Scope:** `contracts/amm/src/lib.rs` (constant-product pool) and `contracts/concentrated_liquidity/src/lib.rs` (concentrated-liquidity pool)
 **Audit type:** Internal property-based audit with manual review  
 **Methodology:** Static analysis, manual code review, and property-based testing via proptest
 
@@ -10,14 +10,19 @@
 
 | Component | File | Focus |
 |-----------|------|-------|
-| AMM pool | `contracts/amm/src/lib.rs` | Liquidity accounting, fee calculations, swap invariants |
+| Constant-product AMM | `contracts/amm/src/lib.rs` | Liquidity accounting, fee calculations, swap invariants |
+| Concentrated-liquidity AMM | `contracts/concentrated_liquidity/src/lib.rs` | Tick bounds, positions, liquidity accounting, swaps |
 | LP token | `contracts/token/src/lib.rs` | Mint/burn authorization |
 | Factory | `contracts/factory/src/lib.rs` | Deployment and initialization |
 | Fuzz suite | `contracts/amm-fuzz/src/lib.rs` | Property-based invariant verification |
 
-> Note: This AMM uses the constant-product formula (x\*y=k). There is no
-> concentrated liquidity or tick-based pricing in this codebase. Audit findings
-> are scoped to the constant-product model accordingly.
+> Scope note: This report contains the findings from the original constant-product
+> review and identifies the concentrated-liquidity contract as a separate review
+> surface. The concentrated-liquidity implementation uses tick-based ranges and
+> position liquidity; the x*y=k findings below must not be generalized to that
+> contract. A complete concentrated-liquidity security review should separately
+> cover tick transitions, price bounds, position ownership, fee accounting, and
+> liquidity-crossing arithmetic.
 
 ---
 
@@ -142,7 +147,9 @@ can use to detect initial price discovery.
 ## 3. Property-Based Testing Summary
 
 The fuzz suite in `contracts/amm-fuzz/src/lib.rs` verified the following
-properties over **10 000 random cases each**:
+constant-product properties over **10 000 random cases each**. These results
+apply to `contracts/amm/src/lib.rs` only and are not evidence that the
+concentrated-liquidity contract has the same invariant.
 
 | Property | Result |
 |----------|--------|
@@ -171,7 +178,11 @@ All regression cases pinned in `regression` module also pass.
 
 ## 5. Conclusion
 
-The constant-product AMM pool is functionally sound. The x\*y=k invariant holds
-across all fee tiers verified by the fuzz suite. Three open issues (H-01, M-01,
-L-03) are recommended for remediation before a mainnet deployment handling
-significant value. No critical vulnerabilities were identified.
+The constant-product AMM review found the x*y=k invariant holding across the
+fee tiers exercised by the fuzz suite, subject to the open findings listed above.
+The concentrated-liquidity contract is an additional production component with
+tick-based pricing and position ranges; it requires its own complete audit
+before deployment handling significant value. This document must therefore be
+read as a scoped review, not a claim that the entire workspace is functionally
+sound. No critical vulnerabilities were identified within the reviewed
+constant-product scope.

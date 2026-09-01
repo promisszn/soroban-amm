@@ -2,12 +2,27 @@
 //! amm, token, factory, twap_consumer, and concentrated_liquidity.
 //!
 //! Issue #166: Integration test matrix covering all five contracts.
+//! Issue #728: Real cross-contract suite with 45+ tests across 7 areas.
 //!
 //! All tests run fully in-process using the Soroban test environment —
 //! no external network calls are made.
 
+pub mod fixture;
+
+#[cfg(test)]
+mod factory_test;
+
 #[cfg(test)]
 mod upgrade_integration_test;
+
+#[cfg(test)]
+mod multisig_emergency_withdraw_test;
+
+#[cfg(test)]
+mod flash_loan_integration_test;
+
+#[cfg(test)]
+mod memory_leak_detection_test;
 
 #[cfg(all(test, feature = "legacy-integration-matrix"))]
 mod tests {
@@ -37,7 +52,7 @@ mod tests {
     fn set_ledger_ts(env: &Env, ts: u64) {
         env.ledger().set(LedgerInfo {
             timestamp: ts,
-            protocol_version: 22,
+            protocol_version: 21,
             sequence_number: env.ledger().sequence(),
             network_id: Default::default(),
             base_reserve: 10,
@@ -512,7 +527,8 @@ mod tests {
 
         let agg_addr = env.register_contract(None, DexAggregator);
         let agg = DexAggregatorClient::new(&env, &agg_addr);
-        agg.initialize(&factory_addr);
+        let agg_admin = Address::generate(&env);
+        agg.initialize(&agg_admin, &factory_addr);
         let quote = agg
             .find_best_route(&token_a, &token_c, &50_000_i128, &4u32)
             .unwrap();
@@ -541,5 +557,129 @@ mod tests {
             let back = sqrt_price_x96_to_tick(sp);
             assert_eq!(back, tick, "round-trip failed for tick {tick}: got {back}");
         }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // Scenario: Circuit breaker trigger, cooldown, and recovery (#390)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn scenario_circuit_breaker_trigger_and_recovery() {
+        use amm::AmmError;
+
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash: BytesN<32> = env.deployer().upload_contract_wasm(AMM_WASM);
+        let token_hash: BytesN<32> = env.deployer().upload_contract_wasm(TOKEN_WASM);
+
+        let admin = Address::generate(&env);
+
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let (pool_addr, _) = factory.create_pool(&token_a, &token_b, &30_i128, &None);
+        let amm = AmmPoolClient::new(&env, &pool_addr);
+
+        // Set up pool with liquidity
+        let provider = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_a).mint(&provider, &1_000_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&provider, &1_000_000_i128);
+        set_ledger_ts(&env, 1_000);
+        amm.add_liquidity(&provider, &500_000_i128, &500_000_i128, &1_i128, &DEADLINE);
+
+        // Configure circuit breaker with low threshold (10% = 1_000 bps) and short cooldown (60s)
+        amm.set_circuit_breaker_config(&1_000_i128, &60_u64);
+
+        let config = amm.get_circuit_breaker_config();
+        assert_eq!(config.threshold_bps, 1_000);
+        assert_eq!(config.cooldown_secs, 60);
+        assert!(!config.tripped);
+
+        // Execute a large swap that will cross the circuit breaker threshold
+        // With 500k reserves each, a 400k swap should cause >10% price impact
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_a).mint(&trader, &400_000_i128);
+
+        // This swap should trigger the circuit breaker
+        let swap_result = amm.try_swap(&trader, &token_a, &400_000_i128, &1_i128, &DEADLINE, &None);
+        assert!(
+            swap_result.is_err(),
+            "large swap should trigger circuit breaker and fail"
+        );
+        assert_eq!(swap_result.unwrap_err(), AmmError::CircuitBreaker);
+
+        // Verify circuit-breaker-triggered event was emitted
+        let events = env.events().all();
+        let cb_triggered = events
+            .iter()
+            .any(|e| e.topics[0].to_string() == "circuit_break");
+        assert!(
+            cb_triggered,
+            "circuit-breaker-triggered event should be emitted"
+        );
+
+        // Verify circuit breaker state
+        let config_after = amm.get_circuit_breaker_config();
+        assert!(config_after.tripped, "circuit breaker should be tripped");
+        assert!(config_after.triggered_at > 0, "triggered_at should be set");
+
+        // Verify subsequent swaps are rejected with CircuitBreaker error
+        let trader2 = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_a).mint(&trader2, &10_000_i128);
+        let blocked_swap =
+            amm.try_swap(&trader2, &token_a, &10_000_i128, &1_i128, &DEADLINE, &None);
+        assert!(
+            blocked_swap.is_err(),
+            "swaps should be blocked while circuit breaker is tripped"
+        );
+        assert_eq!(blocked_swap.unwrap_err(), AmmError::CircuitBreaker);
+
+        // Advance ledger time past the cooldown window (60s)
+        set_ledger_ts(&env, 1_000 + 61);
+
+        // Call try_circuit_breaker_recovery and verify the pool resumes swapping
+        let recovered = amm.try_circuit_breaker_recovery();
+        assert!(recovered.unwrap(), "recovery should succeed after cooldown");
+
+        // Verify circuit-breaker-recovered event was emitted
+        let events = env.events().all();
+        let cb_recovered = events
+            .iter()
+            .any(|e| e.topics[0].to_string() == "cb_recovered");
+        assert!(
+            cb_recovered,
+            "circuit-breaker-recovered event should be emitted"
+        );
+
+        // Verify circuit breaker is no longer tripped
+        let config_recovered = amm.get_circuit_breaker_config();
+        assert!(
+            !config_recovered.tripped,
+            "circuit breaker should no longer be tripped"
+        );
+        assert_eq!(
+            config_recovered.triggered_at, 0,
+            "triggered_at should be reset"
+        );
+
+        // Verify swaps work again after recovery
+        let trader3 = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_a).mint(&trader3, &10_000_i128);
+        let recovered_swap =
+            amm.try_swap(&trader3, &token_a, &10_000_i128, &1_i128, &DEADLINE, &None);
+        assert!(
+            recovered_swap.is_ok(),
+            "swaps should work after circuit breaker recovery"
+        );
     }
 }

@@ -18,6 +18,12 @@ A full-stack AMM protocol built on Stellar's Soroban smart contract platform. It
   - [Governance Contract](#governance-contract)
   - [TWAP Consumer Contract](#twap-consumer-contract)
   - [Concentrated Liquidity Contract](#concentrated-liquidity-contract)
+  - [Staking Contract](#staking-contract)
+- [Error Codes](#error-codes)
+  - [AMM Pool Contract (`AmmError`)](#amm-pool-contract-ammerror)
+  - [Factory Contract (`FactoryError`)](#factory-contract-factoryerror)
+  - [Governance Contract (`GovernanceError`)](#governance-contract-governanceerror)
+  - [LP Token Contract](#lp-token-contract-errors)
 - [Math & Formulas](#math--formulas)
 - [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
@@ -34,6 +40,8 @@ A full-stack AMM protocol built on Stellar's Soroban smart contract platform. It
   - [TypeScript Client Example](#typescript-client-example)
   - [Python Client Example](#python-client-example)
 - [Off-chain Simulator](#off-chain-simulator)
+- [Deployment Runbook](docs/deployment-runbook.md)
+- [Roadmap](#roadmap)
 - [Contributing](#contributing)
 - [Changelog](#changelog)
 - [Security](#security)
@@ -228,7 +236,7 @@ A single-entry-point contract for creating and discovering AMM pools. The factor
 | `create_pool(token_a, token_b, fee_bps) → Address` | Deploy a new AMM + LP token pair; panics on duplicate |
 | `get_pool(token_a, token_b) → Option<Address>` | Look up an existing pool (order-independent) |
 | `get_lp_token(pool) → Option<Address>` | Look up the LP token for a given pool address |
-| `all_pools() → Vec<Address>` | List every pool deployed by this factory |
+| `all_pools() → Vec<Address>` | List pool addresses, capped at `MAX_UNBOUNDED_PAGE` (200); use `get_pools` to page past it |
 | `get_pool_count() → u64` | Return the total number of deployed pools |
 | `get_pools(offset, limit) → Vec<Address>` | Return a paginated page of pool addresses starting at offset |
 | `update_wasm_hashes(amm_wasm_hash, token_wasm_hash)` | Update the WASM hashes used for future pool deployments |
@@ -260,6 +268,8 @@ Allows LP token holders to propose and vote on parameter changes to a pool on-ch
 | `cancel_proposal(proposal_id, proposer)` | Cancel a pending proposal before voting ends |
 | `unlock_vote(voter, proposal_id)` | Release vote-locked LP tokens after a proposal is resolved |
 | `get_proposal(proposal_id) → Proposal` | Read proposal details |
+| `get_proposal_count() → u32` | Total proposals ever created; ids run `[0, count)` |
+| `get_proposals_paginated(offset, limit) → Vec<Proposal>` | Read a page of proposals in creation order |
 | `proposal_status(proposal_id) → ProposalStatus` | Read the current status of a proposal |
 | `get_vote_info(proposal_id, voter) → VoteRecord` | Read a specific voter's record on a proposal |
 | `get_params() → GovernanceParams` | Read current governance configuration |
@@ -313,7 +323,7 @@ A V3-style tick-based AMM where liquidity providers specify a price range `[lowe
 |---|---|
 | `initialize(token_a, token_b, fee_bps, initial_tick)` | One-time pool setup |
 | `mint_position(provider, lower_tick, upper_tick, amount_a_desired, amount_b_desired, min_a, min_b) → (a, b)` | Open or add to a tick-range position |
-| `modify_position(provider, lower_tick, upper_tick, liquidity_delta, min_a, min_b) → (a, b)` | Increase liquidity on an existing position in place |
+| `modify_position(provider, lower_tick, upper_tick, liquidity_delta, min_a, min_b, deadline) → (a, b)` | Increase liquidity on an existing position in place |
 | `burn_position(provider, lower_tick, upper_tick, liquidity) → (a, b)` | Reduce or close a position and withdraw tokens |
 | `collect_fees(provider, lower_tick, upper_tick) → (a, b)` | Collect accrued fees for a position |
 | `get_position(provider, lower_tick, upper_tick) → Position` | Read a position's current state |
@@ -340,6 +350,8 @@ pub trait FlashLoanReceiver {
 
 During `flash_loan`, the AMM transfers `amount` of `token` to `receiver`, invokes `on_flash_loan`, and then checks that the pool's token balance increased by at least `fee`. If the receiver does not return `amount + fee` before the callback finishes, the transaction reverts.
 
+**Reference Implementation:** See [examples/flash_loan_receiver/README.md](examples/flash_loan_receiver/README.md) for a canonical example implementation covering arbitrage, collateral swaps, and all failure modes.
+
 ### LP Token Contract
 
 Located in [contracts/token/src/lib.rs](contracts/token/src/lib.rs).
@@ -355,6 +367,149 @@ Located in [contracts/token/src/lib.rs](contracts/token/src/lib.rs).
 | `balance(id) → i128` | Read account balance |
 | `allowance(from, spender) → i128` | Read spending allowance |
 | `total_supply() → i128` | Read total tokens minted |
+
+---
+
+### Staking Contract
+
+Located in [contracts/staking/src/lib.rs](contracts/staking/src/lib.rs). See [contracts/staking/README.md](contracts/staking/README.md) for a full overview.
+
+Lets liquidity providers stake LP tokens to earn a separate reward token, distributed through a rewards-per-share accumulator. Stakers can optionally lock their stake for a fixed duration to earn a boost multiplier on their reward share, modelled on Curve's veToken design.
+
+| Function | Description |
+|---|---|
+| `initialize(lp_token, reward_token, admin)` | One-time setup with default boost and lock bounds |
+| `initialize_with_boost_config(lp_token, reward_token, admin, min_boost_scaled, max_boost_scaled, min_lock_duration_secs, max_lock_duration_secs)` | One-time setup with custom boost and lock bounds |
+| `stake(staker, amount)` | Stake LP tokens with no lock (1x boost) |
+| `stake_locked(staker, amount, lock_duration_secs)` | Stake with an optional lock duration for a boost multiplier |
+| `lock(staker, amount, lock_duration_seconds)` | Escrow LP tokens for a fixed lock at a boosted rate |
+| `extend_lock(staker, new_duration_seconds)` | Extend an existing lock forward in time only |
+| `unlock(staker) → (amount, rewards)` | Withdraw all LP and accrued rewards after the lock expires |
+| `unstake(staker, amount) → (amount, rewards)` | Unstake LP and claim pending rewards; panics if still locked |
+| `add_rewards(admin, amount)` | Transfer reward tokens into the pool; admin only |
+| `update_rewards(admin, new_rewards)` | Distribute new rewards across all stakers; admin only |
+| `claim(staker) → rewards` | Claim accrued rewards without unstaking |
+| `pending_rewards(staker) → i128` | Read a staker's unclaimed rewards |
+| `get_pool_info() → PoolInfo` | Read pool state |
+| `get_staker_info(staker) → StakerInfo` | Read a staker's amounts, debt, lock, and boost |
+| `get_locked_position(staker) → LockedPosition` | Read a staker's locked amount, expiry, and boost |
+
+---
+
+## Error Codes
+
+Contract entry points that fail return a typed contract error rather than a
+plain trap. Each error below is transcribed from the contract's
+`#[contracterror]` enum; the numeric code is the enum discriminant that a
+caller observes on-chain (for example as `Error(Contract, #5)`). Clients using
+a generated binding receive the variant name; clients decoding raw XDR receive
+the numeric code.
+
+### AMM Pool Contract (`AmmError`)
+
+Source: [`contracts/amm/src/lib.rs`](contracts/amm/src/lib.rs).
+
+| Code | Variant | Meaning |
+| ---: | --- | --- |
+| 1 | `AlreadyInitialized` | `initialize` was called on a pool that is already initialized. |
+| 2 | `InvalidFeeBps` | The fee (in basis points) is outside the permitted range. |
+| 3 | `InsufficientShares` | The caller holds fewer LP shares than the operation requires. |
+| 4 | `DeadlineExceeded` | The transaction deadline passed before execution. |
+| 5 | `SlippageExceeded` | The output amount fell below (or the input rose above) the caller's limit. |
+| 6 | `Paused` | The pool is paused. |
+| 7 | `Unauthorized` | The caller is not authorized for this action. |
+| 8 | `ZeroAmount` | An amount argument was zero. |
+| 9 | `InvalidToken` | The supplied token is not one of the pool's two tokens. |
+| 10 | `EmptyPool` | The operation needs liquidity but the pool has none. |
+| 11 | `InsufficientLiquidity` | Pool liquidity is too low to satisfy the request. |
+| 12 | `NoPendingAdmin` | An admin transfer was accepted while no pending admin is set. |
+| 13 | `WrongAdmin` | The caller is not the pending admin for the transfer. |
+| 14 | `Reentrant` | A reentrant call was detected during a flash loan or state-mutating operation. |
+| 15 | `CircuitBreaker` | The circuit breaker tripped on excessive single-block price deviation; the pool auto-paused. |
+| 16 | `FotSlippage` | A fee-on-transfer token deducted more than the caller's `min_received` threshold permitted. |
+| 17 | `OracleDeviationExceeded` | Spot price deviated beyond the configured oracle tolerance. |
+| 18 | `FlashLoanRepaymentFailed` | The flash-loan receiver did not return the borrowed amounts plus fees. |
+| 19 | `AlreadyExecuted` | The multisig emergency-withdrawal proposal was already executed. |
+| 20 | `ProposalExpired` | The multisig emergency-withdrawal proposal has expired. |
+
+### Factory Contract (`FactoryError`)
+
+Source: [`contracts/factory/src/lib.rs`](contracts/factory/src/lib.rs).
+
+| Code | Variant | Meaning |
+| ---: | --- | --- |
+| 1 | `AlreadyInitialized` | `initialize` was called on an already-initialized factory. |
+| 2 | `InvalidFeeBps` | The fee (in basis points) is outside the permitted range. |
+| 3 | `PoolAlreadyExists` | A constant-product pool already exists for this token pair. |
+| 4 | `ClPoolAlreadyExists` | A concentrated-liquidity pool already exists for this pair and fee tier. |
+| 5 | `ClWasmNotSet` | CL pool creation was attempted before the CL pool Wasm hash was configured. |
+| 6 | `Unauthorized` | The caller is not authorized (not the admin). |
+| 7 | `FeeNotConfigured` | The requested fee tier has not been configured. |
+| 8 | `RateLimitExceeded` | The pool-creation rate limit was exceeded. |
+| 9 | `CreationPaused` | Pool creation is currently paused. |
+
+### Governance Contract (`GovernanceError`)
+
+Source: [`contracts/governance/src/lib.rs`](contracts/governance/src/lib.rs).
+
+| Code | Variant | Meaning |
+| ---: | --- | --- |
+| 1 | `AlreadyInitialized` | `initialize` was called on an already-initialized contract. |
+| 2 | `InvalidVotingPeriod` | The voting-period parameter is out of range. |
+| 3 | `InvalidTimelock` | The timelock parameter is out of range. |
+| 4 | `InvalidQuorumBps` | The quorum (in basis points) is out of range. |
+| 5 | `InvalidProposerStake` | The proposer-stake parameter is invalid. |
+| 6 | `InvalidFeeBps` | The proposed fee (in basis points) is out of range. |
+| 7 | `ZeroTotalSupply` | LP total supply is zero, so voting power cannot be computed. |
+| 8 | `InsufficientStake` | The proposer holds less than the required stake. |
+| 9 | `ProposalNotFound` | No proposal exists with the given id. |
+| 10 | `VotingNotStarted` | Voting has not yet started for this proposal. |
+| 11 | `VotingPeriodEnded` | The voting period has ended. |
+| 12 | `AlreadyExecuted` | The proposal has already been executed. |
+| 13 | `ProposalCancelled` | The proposal was cancelled. |
+| 14 | `AlreadyVoted` | The caller has already voted on this proposal. |
+| 15 | `NoVotingPower` | The caller has no voting power. |
+| 16 | `VotingPeriodActive` | The action is not allowed while voting is still active. |
+| 17 | `ProposalExpired` | The proposal expired before execution. |
+| 18 | `TimelockNotElapsed` | The timelock has not yet elapsed. |
+| 19 | `QuorumNotMet` | Quorum was not reached. |
+| 20 | `ProposalDefeated` | The proposal did not pass. |
+| 21 | `NotProposer` | The caller is not the proposal's proposer. |
+| 22 | `NoLockedVote` | There is no locked vote to release. |
+| 23 | `ProposalNotConcluded` | The proposal has not concluded yet. |
+| 24 | `CannotDelegateToSelf` | Voting power cannot be delegated to oneself. |
+| 25 | `Unauthorized` | The caller is not authorized for this action. |
+| 26 | `HasDelegated` | The action is not allowed because the caller has delegated their voting power. |
+| 27 | `DelegationCycle` | The delegation would create a cycle. |
+| 28 | `ProposalVetoed` | The proposal was vetoed. |
+| 29 | `VetoWindowExpired` | The veto window has expired. |
+| 30 | `NotVetoMultisig` | The caller is not the veto multisig. |
+| 31 | `InsufficientSnapshotBal` | The snapshot balance is below the required threshold. |
+| 32 | `VetoMultisigNotSet` | The veto multisig address has not been configured. |
+| 33 | `NoPendingAdmin` | An admin transfer was accepted while no pending admin is set. |
+| 34 | `PartialFactoryUpdate` | An `UpdateFactoryGlobalFee` proposal's `offset`/`limit` window does not start at 0 or does not cover every pool in the factory; execution is rejected to prevent the proposal from being marked executed while pools remain untouched. |
+
+### LP Token Contract Errors
+
+Source: [`contracts/token/src/lib.rs`](contracts/token/src/lib.rs).
+
+The LP token contract does not define a `#[contracterror]` enum; it fails with
+assertion/panic messages instead, so there are no numeric discriminants to
+transcribe. Callers observe these as contract traps with the following
+messages:
+
+| Message | Raised when |
+| --- | --- |
+| `already initialized: contract <address>` | `initialize` is called after the token is already initialized. |
+| `amount must be positive` | A `transfer`, `transfer_from`, `mint`, `burn`, `lock`, or `unlock` amount is not greater than zero. |
+| `insufficient allowance: available=<n>, requested=<n>` | `transfer_from` is called for more than the spender's current allowance. |
+| `live_until_ledger must be >= current ledger` | `approve` sets a non-zero allowance whose expiry ledger is already in the past. |
+| `insufficient balance: available=<n>, requested=<n>` | `burn` is called for more than the account's balance. |
+| `insufficient unlocked balance: available=<n>, requested=<n>` | A transfer would spend balance that is currently locked. |
+| `insufficient unlocked balance to lock` | `lock` is called for more than the holder's unlocked balance. |
+| `unlock exceeds locked balance` | `unlock` is called for more than the holder's locked balance. |
+| `current_admin is not admin` | `propose_admin` is called with a `current_admin` that is not the stored admin. |
+| `not pending admin` | `accept_admin` is called by an address that is not the pending admin. |
 
 ---
 
@@ -544,15 +699,17 @@ The script deploys fresh contracts, funds a test account, adds liquidity, swaps,
 
 ### Automated Deployment
 
-The fastest way to deploy a full AMM environment (Token A, Token B, LP Token, and AMM Pool) to testnet is using the provided deployment script:
+The fastest way to deploy the full protocol (all 18 contracts) to testnet or mainnet is using the provided deployment script. For prerequisites, deployment order, per-contract parameters, verification, upgrades, and emergency procedures, see the **[Deployment Runbook](docs/deployment-runbook.md)**.
 
 ```sh
-./scripts/deploy.sh [network]
+./scripts/deploy.sh [network] [--only factory,pools] [--skip staking] [--force]
 ```
 
-- **network**: Optional target network (defaults to `testnet`).
-- The script builds contracts, generates/funds a deployer account, deploys all contracts, and initialises them.
-- Deployed contract IDs are printed to the console and saved to `.soroban-amm.deploy.env`.
+- **network**: Optional target network (defaults to `testnet`). Also reads `$NETWORK` / `$STELLAR_NETWORK`.
+- **--only / --skip**: Deploy a subset of contracts (comma-separated names). Useful for incremental or single-contract redeploys.
+- **--force**: Re-deploy even if an address is already persisted; without it, re-running is a no-op and a killed run resumes where it left off.
+- The script builds `wasm32v1-none` artifacts, generates/funds a deployer account if needed, uploads WASM hashes, deploys and initializes every contract in dependency order, and verifies each initialization by reading state back.
+- Deployed contract IDs and WASM hashes are printed to the console and persisted to `.soroban-amm.deploy.env` incrementally (every address as it is created).
 
 ### ABI Schema
 
@@ -880,9 +1037,20 @@ See [packages/amm-simulator/README.md](packages/amm-simulator/README.md) for the
 
 ---
 
+## Roadmap
+
+See **[ROADMAP.md](ROADMAP.md)** for the full phased plan. In brief: the V2
+constant-product core (AMM, LP token, factory, governance, TWAP oracle) is
+shipped and covered by 460+ tests and a fuzz suite; the V3-style concentrated
+liquidity engine and the routing/ecosystem contracts are in active development;
+and a formal third-party audit, testnet/mainnet deployment, and a web frontend
+are planned.
+
+---
+
 ## Contributing
 
-Contributions are welcome. Please follow the guidelines below to keep the codebase consistent and review cycles short.
+Contributions are welcome. See **[CONTRIBUTING.md](CONTRIBUTING.md)** for the full contributor guide — setup, project layout, testing, and the pull-request process. New contributors should start with issues labeled [`good first issue`](https://github.com/promisszn/soroban-amm/labels/good%20first%20issue) and [`help wanted`](https://github.com/promisszn/soroban-amm/labels/help%20wanted). The guidelines below summarize the key points.
 
 ### Reporting Issues
 

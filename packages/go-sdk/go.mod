@@ -1,7 +1,3 @@
-module github.com/example/soroban-amm-go
+module github.com/promisszn/soroban-amm/packages/go-sdk
 
-go 1.20
-
-require (
-    github.com/stellar/go v0.0.0
-)
+go 1.21

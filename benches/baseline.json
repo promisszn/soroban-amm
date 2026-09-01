@@ -1,17 +1,17 @@
 {
   "metrics": [
-    { "name": "amm.swap", "cpu_instructions": 706442, "mem_bytes": 94731 },
-    { "name": "amm.add_liquidity", "cpu_instructions": 831329, "mem_bytes": 119252 },
-    { "name": "amm.remove_liquidity", "cpu_instructions": 867891, "mem_bytes": 123187 },
-    { "name": "amm.flash_loan", "cpu_instructions": 1010873, "mem_bytes": 131219 },
-    { "name": "cl.mint_position", "cpu_instructions": 685173, "mem_bytes": 81048 },
-    { "name": "cl.swap", "cpu_instructions": 714500, "mem_bytes": 94270 },
-    { "name": "batch.settle_batch", "cpu_instructions": 61120, "mem_bytes": 6081 },
-    { "name": "governance.propose", "cpu_instructions": 271470, "mem_bytes": 43912 },
-    { "name": "governance.vote", "cpu_instructions": 382746, "mem_bytes": 66886 },
-    { "name": "governance.execute", "cpu_instructions": 402084, "mem_bytes": 63865 },
-    { "name": "staking.stake", "cpu_instructions": 410118, "mem_bytes": 65389 },
-    { "name": "staking.claim", "cpu_instructions": 375765, "mem_bytes": 54322 },
-    { "name": "incentive_campaigns.claim_rewards", "cpu_instructions": 410453, "mem_bytes": 64682 }
+    { "name": "amm.swap", "cpu_instructions": 779265, "mem_bytes": 103813 },
+    { "name": "amm.add_liquidity", "cpu_instructions": 914412, "mem_bytes": 130680 },
+    { "name": "amm.remove_liquidity", "cpu_instructions": 959794, "mem_bytes": 136404 },
+    { "name": "amm.flash_loan", "cpu_instructions": 1046594, "mem_bytes": 138653 },
+    { "name": "cl.mint_position", "cpu_instructions": 725934, "mem_bytes": 93658 },
+    { "name": "cl.swap", "cpu_instructions": 682376, "mem_bytes": 87594 },
+    { "name": "batch.settle_batch", "cpu_instructions": 71468, "mem_bytes": 7795 },
+    { "name": "governance.propose", "cpu_instructions": 271785, "mem_bytes": 43912 },
+    { "name": "governance.vote", "cpu_instructions": 471993, "mem_bytes": 88018 },
+    { "name": "governance.execute", "cpu_instructions": 442287, "mem_bytes": 73475 },
+    { "name": "staking.stake", "cpu_instructions": 551075, "mem_bytes": 85884 },
+    { "name": "staking.claim", "cpu_instructions": 498383, "mem_bytes": 67892 },
+    { "name": "incentive_campaigns.claim_rewards", "cpu_instructions": 293108, "mem_bytes": 46121 }
   ]
 }

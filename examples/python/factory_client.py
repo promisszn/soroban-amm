@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
+import argparse
 
-import json
 import os
 import sys
-from typing import Any, List, Optional
+from typing import List, Optional, Tuple
 
 from stellar_sdk import Keypair, Network, scval
 from stellar_sdk.address import Address
 from stellar_sdk.contract import ContractClient
+from common import format_json, required_env, simulate_contract_call, submit_contract_call
 
 def main() -> int:
+    argparse.ArgumentParser(description="Soroban AMM integration example").parse_args()
     rpc_url = os.getenv("STELLAR_RPC_URL", "https://soroban-testnet.stellar.org")
     network_passphrase = os.getenv(
         "STELLAR_NETWORK_PASSPHRASE",
@@ -42,8 +44,14 @@ def main() -> int:
     if not pool_address:
         print(f"\n2. Creating pool for pair with fee_bps={fee_bps}...")
         try:
-            pool_address = create_pool(client, source_keypair, token_a_contract_id, token_b_contract_id, fee_bps)
+            pool_address, governance_address = create_pool(
+                client, source_keypair, source_keypair.public_key, token_a_contract_id, token_b_contract_id, fee_bps
+            )
             print(f"Pool created successfully at: {pool_address}")
+            if governance_address:
+                print(f"Governance contract deployed at: {governance_address}")
+            else:
+                print("No governance contract was deployed (governance_wasm_hash not supplied).")
         except Exception as e:
             print(f"Failed to create pool (might already exist): {e}")
     else:
@@ -58,18 +66,36 @@ def main() -> int:
     return 0
 
 
-def create_pool(client: ContractClient, source_kp: Keypair, token_a: str, token_b: str, fee_bps: int) -> str:
+def create_pool(
+    client: ContractClient,
+    source_kp: Keypair,
+    caller: str,
+    token_a: str,
+    token_b: str,
+    fee_bps: int,
+    governance_wasm_hash: Optional[bytes] = None,
+) -> Tuple[str, Optional[str]]:
     result = submit_contract_call(
         client,
         source_kp,
         "create_pool",
+        scval.to_address(caller),
         scval.to_address(token_a),
         scval.to_address(token_b),
         scval.to_int128(fee_bps),
+        scval.to_bytes(governance_wasm_hash) if governance_wasm_hash is not None else scval.to_void(),
     )
-    if isinstance(result, Address):
-        return result.address
-    return str(result)
+
+    pool_result, governance_result = result
+
+    pool_address = pool_result.address if isinstance(pool_result, Address) else str(pool_result)
+    governance_address: Optional[str] = None
+    if isinstance(governance_result, Address):
+        governance_address = governance_result.address
+    elif governance_result is not None:
+        governance_address = str(governance_result)
+
+    return pool_address, governance_address
 
 
 def get_pool(client: ContractClient, token_a: str, token_b: str) -> Optional[str]:
@@ -93,65 +119,6 @@ def all_pools(client: ContractClient) -> List[str]:
     if isinstance(result, list):
         return [r.address if isinstance(r, Address) else str(r) for r in result]
     return [str(result)]
-
-
-def simulate_contract_call(
-    client: ContractClient,
-    method: str,
-    *parameters: Any,
-) -> Any:
-    return client.invoke(
-        method,
-        parameters=list(parameters),
-        parse_result_xdr_fn=scval.to_native,
-    ).result()
-
-
-def submit_contract_call(
-    client: ContractClient,
-    source_keypair: Keypair,
-    method: str,
-    *parameters: Any,
-) -> Any:
-    assembled = client.invoke(
-        method,
-        parameters=list(parameters),
-        source=source_keypair.public_key,
-        signer=source_keypair,
-        parse_result_xdr_fn=scval.to_native,
-    )
-    assembled.sign_auth_entries(source_keypair)
-    return assembled.sign_and_submit()
-
-
-def required_env(name: str) -> str:
-    value = os.getenv(name)
-    if not value:
-        raise ValueError(f"Missing required environment variable: {name}")
-    return value
-
-
-def format_json(value: Any) -> str:
-    return json.dumps(normalize_for_json(value), indent=2)
-
-
-def normalize_for_json(value: Any) -> Any:
-    if isinstance(value, Address):
-        return value.address
-
-    if isinstance(value, bytes):
-        return value.hex()
-
-    if isinstance(value, list):
-        return [normalize_for_json(entry) for entry in value]
-
-    if isinstance(value, dict):
-        return {
-            str(normalize_for_json(key)): normalize_for_json(entry_value)
-            for key, entry_value in value.items()
-        }
-
-    return value
 
 
 if __name__ == "__main__":

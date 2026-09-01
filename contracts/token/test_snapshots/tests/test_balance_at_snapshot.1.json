@@ -58,12 +58,11 @@
         }
       ]
     ],
-    [],
     []
   ],
   "ledger": {
     "protocol_version": 21,
-    "sequence_number": 1,
+    "sequence_number": 0,
     "timestamp": 0,
     "network_id": "0000000000000000000000000000000000000000000000000000000000000000",
     "base_reserve": 0,
@@ -197,7 +196,7 @@
             },
             "ext": "v0"
           },
-          4096
+          4095
         ]
       ],
       [
@@ -246,29 +245,6 @@
                           "val": {
                             "i128": {
                               "hi": 0,
-                              "lo": 1000
-                            }
-                          }
-                        },
-                        {
-                          "key": {
-                            "symbol": "ledger"
-                          },
-                          "val": {
-                            "u32": 0
-                          }
-                        }
-                      ]
-                    },
-                    {
-                      "map": [
-                        {
-                          "key": {
-                            "symbol": "balance"
-                          },
-                          "val": {
-                            "i128": {
-                              "hi": 0,
                               "lo": 600
                             }
                           }
@@ -278,7 +254,7 @@
                             "symbol": "ledger"
                           },
                           "val": {
-                            "u32": 1
+                            "u32": 0
                           }
                         }
                       ]
@@ -347,7 +323,7 @@
                             "symbol": "ledger"
                           },
                           "val": {
-                            "u32": 1
+                            "u32": 0
                           }
                         }
                       ]
@@ -358,7 +334,7 @@
             },
             "ext": "v0"
           },
-          4096
+          4095
         ]
       ],
       [
@@ -499,7 +475,7 @@
             },
             "ext": "v0"
           },
-          6312000
+          6311999
         ]
       ],
       [
@@ -782,58 +758,6 @@
               },
               {
                 "symbol": "balance_at"
-              }
-            ],
-            "data": {
-              "i128": {
-                "hi": 0,
-                "lo": 1000
-              }
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": null,
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_call"
-              },
-              {
-                "bytes": "0000000000000000000000000000000000000000000000000000000000000002"
-              },
-              {
-                "symbol": "balance"
-              }
-            ],
-            "data": {
-              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000002",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_return"
-              },
-              {
-                "symbol": "balance"
               }
             ],
             "data": {

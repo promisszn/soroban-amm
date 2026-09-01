@@ -1,8 +1,197 @@
-# Go SDK for AMM Contracts
+# Go SDK for the Soroban AMM
 
-This package provides a lightweight Go client to interact with the AMM contracts.
+A Go client for the AMM pool contract (`contracts/amm`). Read methods run
+through simulation and need no signer; write methods build, simulate, sign,
+submit and poll a transaction.
 
-Quick start:
+The SDK has **no third-party dependencies** — the ScVal encoding, the strkey
+codec and the transaction envelope builder are all in this package, so there is
+no `go.sum` to vendor and nothing to audit beyond the standard library.
 
-1. Initialize the module: `go mod tidy`
-2. See `examples/basic_example.go` for usage.
+## Installation
+
+```sh
+go get github.com/promisszn/soroban-amm/packages/go-sdk
+```
+
+Requires Go 1.21 or newer.
+
+## Quick start
+
+```go
+package main
+
+import (
+	"context"
+	"errors"
+	"log"
+	"math/big"
+	"time"
+
+	gosdk "github.com/promisszn/soroban-amm/packages/go-sdk"
+)
+
+func main() {
+	client, err := gosdk.NewClient(gosdk.Config{
+		RPCURL:            "https://soroban-testnet.stellar.org",
+		NetworkPassphrase: gosdk.NetworkTestnet,
+		Timeout:           20 * time.Second,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	ctx := context.Background()
+	poolID := "C..."   // the AMM pool contract
+	tokenIn := "C..."  // one of the pool's two tokens
+
+	// Read: no signer required.
+	quote, err := client.SimulateSwap(ctx, poolID, tokenIn, big.NewInt(10_000_000))
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("out=%s fee=%s impact=%s bps",
+		quote.AmountOut, quote.FeeAmount, quote.PriceImpactBps)
+
+	// Write: requires Config.Signer, plus an explicit deadline and bound.
+	_, err = client.Swap(ctx, gosdk.SwapParams{
+		PoolID:   poolID,
+		Trader:   "G...",
+		TokenIn:  tokenIn,
+		AmountIn: big.NewInt(10_000_000),
+		MinOut:   minOut, // derive from quote.AmountOut
+		Deadline: uint64(time.Now().Add(2 * time.Minute).Unix()),
+	})
+	if errors.Is(err, gosdk.ErrSlippageExceeded) {
+		log.Fatal("price moved; re-quote and retry")
+	}
+}
+```
+
+A complete, commented walkthrough lives in
+[`examples/basic_example.go`](examples/basic_example.go).
+
+## Read methods
+
+Every read is a simulation. None of them requires a `Signer`, none submits a
+transaction, and none consumes fees.
+
+| Method | Returns |
+|--------|---------|
+| `GetInfo(ctx, poolID)` | `*PoolInfo` — both tokens, both reserves, total shares, all fee parameters, admin |
+| `GetReserves(ctx, poolID)` | `*Reserves` |
+| `SimulateSwap(ctx, poolID, tokenIn, amountIn)` | `*SwapQuote` — output, fee, price impact, effective and spot price |
+| `GetAmountOut(ctx, poolID, tokenIn, amountIn)` | `*big.Int` |
+| `GetAmountIn(ctx, poolID, tokenOut, amountOut)` | `*big.Int` |
+| `SharesOf(ctx, poolID, provider)` | `*big.Int` |
+
+`PoolInfo`'s fields mirror the contract's `PoolInfo` struct field for field.
+
+## Write methods
+
+`Swap`, `AddLiquidity` and `RemoveLiquidity` each take a params struct, and
+each requires a `Signer`.
+
+**Deadlines and slippage bounds are never defaulted.** A zero `Deadline`
+returns `ErrDeadlineRequired` and a nil slippage bound returns
+`ErrSlippageRequired`, before any RPC call is made. Both are safety parameters:
+a silently-defaulted bound is how a swap gets sandwiched, and a
+silently-defaulted deadline is how one sits in the mempool until the price has
+moved. A bound of zero is accepted, because that is an explicit decision to
+take any price.
+
+Derive the bound from a fresh quote:
+
+```go
+quote, _ := client.SimulateSwap(ctx, poolID, tokenIn, amountIn)
+
+// 50 bps of tolerance.
+minOut := new(big.Int).Mul(quote.AmountOut, big.NewInt(9_950))
+minOut.Div(minOut, big.NewInt(10_000))
+```
+
+## Signing
+
+The client never holds a secret key. Supply a `Signer`:
+
+```go
+type Signer interface {
+	Address() string
+	SignEnvelope(ctx context.Context, envelopeXDR, networkPassphrase string) (string, error)
+}
+```
+
+`SignEnvelope` receives a base64 transaction envelope and returns the signed
+envelope. Back it with a local keypair, an HSM, or a remote signing service.
+`SignerFunc` adapts a plain function:
+
+```go
+signer := gosdk.SignerFunc{
+	Addr: "G...",
+	Sign: func(ctx context.Context, envelopeXDR, passphrase string) (string, error) {
+		return myHSM.Sign(ctx, envelopeXDR, passphrase)
+	},
+}
+```
+
+## Errors
+
+Contract errors decode into typed sentinels, so callers branch with
+`errors.Is` rather than matching strings:
+
+```go
+switch {
+case errors.Is(err, gosdk.ErrSlippageExceeded):  // AmmError #5
+case errors.Is(err, gosdk.ErrDeadlineExceeded):  // AmmError #4
+case errors.Is(err, gosdk.ErrPaused):            // AmmError #6
+case errors.Is(err, gosdk.ErrInsufficientLiquidity): // AmmError #11
+}
+```
+
+All fifteen `AmmError` discriminants from
+[docs/error-codes.md](../../docs/error-codes.md) are mapped. An unrecognised
+discriminant still yields a `*ContractError` carrying `Code` and the raw RPC
+text, so a new contract error is legible rather than opaque.
+
+Client-side failures have their own sentinels: `ErrInvalidConfig`,
+`ErrNoSigner`, `ErrDeadlineRequired`, `ErrSlippageRequired`, `ErrRPC`,
+`ErrTransactionFailed`.
+
+## 128-bit integers
+
+The contracts use `i128` for every amount, reserve and share balance. Go has no
+native 128-bit integer, so the SDK uses `*big.Int` and range-checks at the
+boundary:
+
+```go
+parts, err := gosdk.EncodeI128(v)   // ErrI128OutOfRange outside [MinI128, MaxI128]
+b, err := gosdk.EncodeI128Bytes(v)  // 16-byte big-endian two's complement
+s, err := gosdk.EncodeI128Base64(v) // as carried by JSON-RPC
+```
+
+An out-of-range value is **rejected, never truncated** — a truncated amount is
+a different transaction, and it would fail on-chain or, worse, succeed for the
+wrong number.
+
+## Transport
+
+Override the HTTP client to control transport, proxying and timeouts:
+
+```go
+client = client.WithHTTPClient(&http.Client{Timeout: 45 * time.Second})
+client = client.WithPolling(2*time.Second, 60) // getTransaction backoff and budget
+```
+
+## Testing
+
+```sh
+go build ./... && go vet ./... && gofmt -l . && go test ./... -count=1
+```
+
+The suite runs entirely against `httptest` servers returning recorded RPC
+responses. No test touches the network. CI runs the same four commands.
+
+## Scope
+
+This SDK covers the AMM pool. Governance, staking and concentrated-liquidity
+clients are not implemented here.

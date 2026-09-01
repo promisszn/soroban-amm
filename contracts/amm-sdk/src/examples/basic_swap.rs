@@ -10,10 +10,10 @@ mod basic_swap {
     use soroban_sdk::{
         testutils::{Address as _, Ledger},
         token::StellarAssetClient,
-        Address, Bytes, Env,
+        Address, Env,
     };
 
-    use soroban_amm_sdk::client::AmmPoolSdk;
+    use crate::client::AmmPoolSdk;
 
     /// Demonstrates:
     /// 1. Binding the SDK to a deployed pool.
@@ -84,7 +84,7 @@ mod basic_swap {
         ta_sac.mint(&trader, &amount_in);
 
         let actual_out = sdk
-            .execute_swap(&trader, &ta.address, amount_in, min_out, u64::MAX, None)
+            .execute_swap(&trader, &ta.address, amount_in, min_out, u64::MAX)
             .unwrap();
 
         assert_eq!(actual_out, quote.amount_out, "actual output matches quote");

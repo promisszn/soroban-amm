@@ -1,0 +1,307 @@
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0d1117;
+      --surface:   #161b22;
+      --border:    #30363d;
+      --text:      #e6edf3;
+      --muted:     #8b949e;
+      --accent:    #58a6ff;
+      --green:     #3fb950;
+      --yellow:    #d29922;
+      --red:       #f85149;
+      --radius:    8px;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+
+    header h1 { font-size: 18px; font-weight: 600; }
+
+    #connection-status {
+      font-size: 12px;
+      padding: 4px 10px;
+      border-radius: 12px;
+      background: var(--border);
+      color: var(--muted);
+    }
+    #connection-status.connected { background: #1f4a2e; color: var(--green); }
+    #connection-status.error     { background: #3d1a1a; color: var(--red); }
+
+    main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+
+    .toolbar label { color: var(--muted); font-size: 13px; }
+
+    input, select, button {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: var(--radius);
+      padding: 6px 12px;
+      font-size: 13px;
+      outline: none;
+    }
+    input:focus, select:focus { border-color: var(--accent); }
+    button {
+      cursor: pointer;
+      background: var(--accent);
+      color: #0d1117;
+      border: none;
+      font-weight: 600;
+      transition: opacity .15s;
+    }
+    button:hover { opacity: .85; }
+    button.secondary {
+      background: var(--surface);
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+      gap: 16px;
+      margin-bottom: 24px;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+    }
+
+    .card-title {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+
+    .card-value {
+      font-size: 28px;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .card-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+
+    /* Health score ring */
+    .health-ring-wrap {
+      display: flex;
+      align-items: center;
+      gap: 20px;
+    }
+    .health-ring {
+      width: 80px;
+      height: 80px;
+      position: relative;
+      flex-shrink: 0;
+    }
+    .health-ring svg { transform: rotate(-90deg); }
+    .health-ring text {
+      font-size: 22px;
+      font-weight: 700;
+      fill: var(--text);
+      dominant-baseline: middle;
+      text-anchor: middle;
+      transform: rotate(90deg) translate(0, -80px);
+    }
+    .health-details { flex: 1; }
+    .health-detail-row {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 4px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .health-detail-row span:last-child { color: var(--text); }
+
+    /* Status badge */
+    .badge {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 10px;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .badge-healthy  { background: #1f4a2e; color: var(--green); }
+    .badge-warning  { background: #3d2e00; color: var(--yellow); }
+    .badge-critical { background: #3d1a1a; color: var(--red); }
+
+    /* Deviation bar */
+    .deviation-bar-wrap { margin-top: 8px; }
+    .deviation-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+    .deviation-bar {
+      height: 6px;
+      border-radius: 3px;
+      background: var(--border);
+      overflow: hidden;
+    }
+    .deviation-fill {
+      height: 100%;
+      border-radius: 3px;
+      background: var(--green);
+      transition: width .4s;
+    }
+
+    /* Events table */
+    .table-wrap {
+      overflow-x: auto;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      margin-bottom: 24px;
+    }
+    table { width: 100%; border-collapse: collapse; }
+    th {
+      text-align: left;
+      padding: 10px 14px;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    td {
+      padding: 10px 14px;
+      font-size: 13px;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: rgba(88,166,255,.05); }
+
+    /* Heatmap */
+    .heatmap-section { margin-bottom: 24px; }
+    .heatmap-section h2 { font-size: 15px; font-weight: 600; margin-bottom: 12px; }
+    .heatmap {
+      display: flex;
+      gap: 3px;
+      align-items: flex-end;
+      height: 80px;
+      padding: 0 2px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px;
+    }
+    .heatmap-bar {
+      flex: 1;
+      border-radius: 2px 2px 0 0;
+      min-height: 4px;
+      transition: height .3s;
+      cursor: pointer;
+      position: relative;
+    }
+    .heatmap-bar:hover::after {
+      content: attr(data-tip);
+      position: absolute;
+      bottom: calc(100% + 6px);
+      left: 50%;
+      transform: translateX(-50%);
+      background: #1f2937;
+      color: var(--text);
+      font-size: 11px;
+      padding: 4px 8px;
+      border-radius: 4px;
+      white-space: nowrap;
+      pointer-events: none;
+      border: 1px solid var(--border);
+    }
+
+    /* Alert panel */
+    .alerts-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px;
+      margin-bottom: 24px;
+    }
+    .alerts-panel h2 { font-size: 15px; font-weight: 600; margin-bottom: 12px; }
+    .alert-form {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+    .alert-list { display: flex; flex-direction: column; gap: 8px; }
+    .alert-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 13px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 8px 12px;
+    }
+    .alert-item .alert-fired { color: var(--red); font-size: 12px; margin-left: auto; }
+    .alert-item button.remove { background: transparent; border: none; color: var(--muted); font-size: 16px; padding: 0 4px; cursor: pointer; }
+    .alert-item button.remove:hover { color: var(--red); }
+
+    /* Price chart placeholder */
+    #price-chart {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      height: 160px;
+      display: flex;
+      align-items: flex-end;
+      padding: 12px;
+      gap: 2px;
+      margin-bottom: 24px;
+      overflow: hidden;
+    }
+
+    .chart-bar {
+      flex: 1;
+      background: var(--accent);
+      opacity: .6;
+      border-radius: 2px 2px 0 0;
+      min-height: 2px;
+      transition: height .3s;
+    }
+
+    .empty-state {
+      color: var(--muted);
+      text-align: center;
+      padding: 40px 0;
+      font-size: 13px;
+    }
+
+    /* Responsive */
+    @media (max-width: 600px) {
+      main { padding: 16px; }
+      .grid-2 { grid-template-columns: 1fr; }
+      .card-value { font-size: 22px; }
+    }

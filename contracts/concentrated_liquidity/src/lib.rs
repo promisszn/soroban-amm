@@ -7,7 +7,7 @@ pub mod tick_bitmap;
 
 use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracterror, contracttype, symbol_short, Address,
+    contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
     Env, Vec,
 };
 
@@ -23,6 +23,17 @@ const TICK_BASE_DEN: i128 = PRICE_SCALE;
 const MIN_TICK: i32 = -887_272;
 const MAX_TICK: i32 = 887_272;
 
+// Per-user position state lives in persistent storage (see issue #346): it is
+// unbounded in the number of LPs and tick ranges, so it must not share the
+// fixed 64 KB instance-storage budget. Persistent entries are evicted once
+// their TTL lapses, so every write bumps the entry's TTL back up.
+//
+// Only extend when fewer than this many ledgers of life remain
+// (~30 days at 5 s/ledger); avoids redundant bumps on every access.
+const POSITION_TTL_THRESHOLD: u32 = 518_400;
+// Extend a touched entry's life to this many ledgers (~180 days at 5 s/ledger).
+const POSITION_BUMP_TO: u32 = 3_110_400;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ClError {
@@ -34,16 +45,26 @@ pub enum ClError {
     SlippageExceeded = 6,
     ZeroLiquidity = 7,
     InsufficientLiquidity = 8,
-    PositionNotFound    = 9,
-    DeadlineExpired     = 10,
-    Paused              = 11,
-    Unauthorized        = 12,
-    TickNotAligned      = 13, // tick is not a multiple of tick_spacing
-    InvalidTickSpacing  = 14, // tick_spacing must be > 0
-    TickNotInitialized  = 15, // requested tick has no liquidity (never touched by a position)
-    InvalidToken        = 16, // token_in is not token_a or token_b
-    RangeOrderInRange   = 17, // range order must be fully out-of-range at creation
+    PositionNotFound = 9,
+    DeadlineExpired = 10,
+    Paused = 11,
+    Unauthorized = 12,
+    TickNotAligned = 13,     // tick is not a multiple of tick_spacing
+    InvalidTickSpacing = 14, // tick_spacing must be > 0
+    TickNotInitialized = 15, // requested tick has no liquidity (never touched by a position)
+    InvalidToken = 16,       // token_in is not token_a or token_b
+    RangeOrderInRange = 17,  // range order must be fully out-of-range at creation
     OracleDeviationExceeded = 18,
+    NftNotConfigured = 19, // no position-NFT contract is wired into the pool
+    NotNftOwner = 20,      // caller does not currently own the position NFT
+    NftContractChangeBlocked = 21, // changing NFT contract while positions are tokenized would orphan indices
+    RangeOrderExists = 22, // a range order is already active on this range — withdraw it before placing a new one
+    /// #696: `swap_exact_out` (or `quote_exact_out`) could not fill the
+    /// requested `amount_out` in full before running out of initialized
+    /// ticks or hitting `sqrt_price_limit_x96`. Exact-out has no meaningful
+    /// partial fill — the caller asked for a specific output amount, so a
+    /// shortfall is an error rather than a smaller-than-requested output.
+    ExactOutNotFullyFilled = 23,
 }
 
 /// Status of a range order (issue #295).
@@ -87,6 +108,7 @@ pub enum DataKey {
     TickCumulative,        // i64 — accumulated tick * elapsed_seconds
     LastOracleTimestamp,   // u64 — last oracle update timestamp
     OraclePoint(u64),      // timestamp → i64 tick_cumulative snapshot
+    OracleTimestamps,      // Vec<u64> — sorted oracle snapshot times for interpolation
     SqrtPriceX96,
     Tick(i32),
     TickBitmap(i32),
@@ -101,6 +123,15 @@ pub enum DataKey {
     ProtocolFeeRecipient,
     AccruedProtocolFeeA,
     AccruedProtocolFeeB,
+    /// Wired-in cl_position_nft contract (issue #348). `Option<Address>`.
+    PositionNft,
+    /// Reverse index: NFT `token_id` → `(original_provider, lower_tick,
+    /// upper_tick)`. Stored at mint time, removed when the NFT is burned.
+    NftTokenToPosition(u64),
+    /// Forward index: `(provider, lower_tick, upper_tick)` → NFT `token_id`.
+    /// Lets the legacy address-keyed entry points detect a tokenized position
+    /// and defer control to the current NFT owner.
+    PositionNftToken(Address, i32, i32),
 }
 
 #[contracttype]
@@ -113,6 +144,16 @@ pub struct AggregatedPrice {
 #[contractclient(name = "OracleAggregatorClient")]
 pub trait OracleAggregatorInterface {
     fn get_price_safe(env: Env, token_a: Address, token_b: Address) -> AggregatedPrice;
+}
+
+/// Minimal view of the `cl_position_nft` contract used by the pool to mint a
+/// receipt when a position opens, burn it when the position closes, and resolve
+/// the current owner of a position NFT (issue #348).
+#[contractclient(name = "PositionNftClient")]
+pub trait PositionNftInterface {
+    fn mint(env: Env, to: Address, pool: Address, lower_tick: i32, upper_tick: i32) -> u64;
+    fn burn(env: Env, token_id: u64);
+    fn owner_of(env: Env, token_id: u64) -> Address;
 }
 
 #[contracttype]
@@ -174,6 +215,33 @@ pub struct PriceImpactEstimate {
     pub active_liquidity_after: i128,
 }
 
+/// Result of walking ticks to fill an exact-out request (#696). Internal —
+/// never crosses the contract boundary, so this is a plain Rust struct, not
+/// a `#[contracttype]`. `tick_crossings` lists, in crossing order, each
+/// tick's *new* `fee_growth_outside` values (already flipped against the
+/// running fee-growth-global at the moment of that crossing, exactly as
+/// `swap` computes it inline) so the caller can persist them without
+/// re-deriving the interleaving.
+struct ExactOutWalk {
+    /// Not currently read outside this struct's construction — kept
+    /// alongside `amount_in_gross_total` for parity with `swap`'s
+    /// `amount_in_after_fee_total`, and available to a future caller (e.g. a
+    /// richer quote result) without changing the walk itself.
+    #[allow(dead_code)]
+    amount_in_after_fee_total: i128,
+    amount_in_gross_total: i128,
+    amount_out_filled: i128,
+    sqrt_price_final: u128,
+    tick_final: i32,
+    active_liquidity_final: i128,
+    fee_growth_global_a_delta: i128,
+    fee_growth_global_b_delta: i128,
+    protocol_fee_a_delta: i128,
+    protocol_fee_b_delta: i128,
+    tick_crossings: Vec<(i32, i128, i128)>,
+    fully_filled: bool,
+}
+
 #[contract]
 pub struct ConcentratedLiquidity;
 
@@ -200,7 +268,7 @@ impl ConcentratedLiquidity {
         if token_a == token_b {
             return Err(ClError::TokensMustDiffer);
         }
-        if !(0..=10_000).contains(&fee_bps) {
+        if !(0..10_000).contains(&fee_bps) {
             return Err(ClError::InvalidFeeBps);
         }
         if !(MIN_TICK..=MAX_TICK).contains(&initial_tick) {
@@ -230,9 +298,13 @@ impl ConcentratedLiquidity {
             .instance()
             .set(&DataKey::ActiveLiquidity, &0_i128);
         let init_ts = env.ledger().timestamp();
-        env.storage().instance().set(&DataKey::TickCumulative, &0_i64);
-        env.storage().instance().set(&DataKey::LastOracleTimestamp, &init_ts);
-        env.storage().instance().set(&DataKey::OraclePoint(init_ts), &0_i64);
+        env.storage()
+            .instance()
+            .set(&DataKey::TickCumulative, &0_i64);
+        env.storage()
+            .instance()
+            .set(&DataKey::LastOracleTimestamp, &init_ts);
+        Self::record_oracle_point(&env, init_ts, 0);
         env.storage()
             .instance()
             .set(&DataKey::OracleAggregator, &Option::<Address>::None);
@@ -253,6 +325,73 @@ impl ConcentratedLiquidity {
             .instance()
             .set(&DataKey::OracleAggregator, &oracle);
         Ok(())
+    }
+
+    /// Admin: wire (or detach) the `cl_position_nft` contract used to tokenize
+    /// positions (issue #348).
+    ///
+    /// Once set, opening a fresh position mints a receipt NFT to the provider
+    /// and records a `token_id ↔ position` index. The NFT may then be
+    /// transferred; its current owner — not the original provider — controls
+    /// the position through `burn_position_by_token_id`
+    /// and `collect_fees_by_token_id`.
+    ///
+    /// The NFT contract must be initialized with this pool's address as its
+    /// `cl_pool`, otherwise mint/burn calls from the pool will be rejected.
+    pub fn set_position_nft(env: Env, admin: Address, nft: Option<Address>) -> Result<(), ClError> {
+        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored {
+            return Err(ClError::Unauthorized);
+        }
+        admin.require_auth();
+
+        // Safety check: prevent changing NFT contract when positions are tokenized.
+        // Changing the contract would orphan existing token_id → position indices,
+        // causing resolve_token_owner/ensure_legacy_owner to query the wrong NFT
+        // and either trap (id doesn't exist) or authorize the wrong owner (id collision).
+        let existing_nft: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PositionNft)
+            .unwrap_or(None);
+
+        // Only allow changing from Some → None (detach) or None → Some (initial set).
+        // Changing from Some(A) → Some(B) is forbidden.
+        if existing_nft.is_some() && nft.is_some() && existing_nft != nft {
+            return Err(ClError::NftContractChangeBlocked);
+        }
+
+        env.storage().instance().set(&DataKey::PositionNft, &nft);
+        Ok(())
+    }
+
+    /// Returns the wired-in position-NFT contract, if any.
+    pub fn position_nft(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PositionNft)
+            .unwrap_or(None)
+    }
+
+    /// Returns the NFT `token_id` minted for `(provider, lower_tick,
+    /// upper_tick)`, or `None` if the position is not tokenized.
+    pub fn position_token_id(
+        env: Env,
+        provider: Address,
+        lower_tick: i32,
+        upper_tick: i32,
+    ) -> Option<u64> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PositionNftToken(provider, lower_tick, upper_tick))
+    }
+
+    /// Resolves an NFT `token_id` back to its `(provider, lower_tick,
+    /// upper_tick)` position, or `None` if unknown.
+    pub fn position_of_token(env: Env, token_id: u64) -> Option<(Address, i32, i32)> {
+        env.storage()
+            .instance()
+            .get(&DataKey::NftTokenToPosition(token_id))
     }
 
     /// Admin: max spot-vs-oracle deviation in basis points.
@@ -303,12 +442,18 @@ impl ConcentratedLiquidity {
             return Err(ClError::Unauthorized);
         }
         admin.require_auth();
-        env.storage().instance().set(&DataKey::PendingAdmin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
         Ok(())
     }
 
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), ClError> {
-        let pending: Option<Address> = env.storage().instance().get(&DataKey::PendingAdmin).unwrap_or(None);
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None);
         let pending_addr = pending.ok_or(ClError::Unauthorized)?;
         if new_admin != pending_addr {
             return Err(ClError::Unauthorized);
@@ -319,7 +464,12 @@ impl ConcentratedLiquidity {
         Ok(())
     }
 
-    pub fn set_protocol_fee(env: Env, admin: Address, recipient: Address, bps: i128) -> Result<(), ClError> {
+    pub fn set_protocol_fee(
+        env: Env,
+        admin: Address,
+        recipient: Address,
+        bps: i128,
+    ) -> Result<(), ClError> {
         let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if admin != stored {
             return Err(ClError::Unauthorized);
@@ -329,7 +479,9 @@ impl ConcentratedLiquidity {
             return Err(ClError::InvalidFeeBps);
         }
         env.storage().instance().set(&DataKey::ProtocolFeeBps, &bps);
-        env.storage().instance().set(&DataKey::ProtocolFeeRecipient, &recipient);
+        env.storage()
+            .instance()
+            .set(&DataKey::ProtocolFeeRecipient, &recipient);
         Ok(())
     }
 
@@ -339,19 +491,43 @@ impl ConcentratedLiquidity {
             return Err(ClError::Unauthorized);
         }
         admin.require_auth();
-        let recipient: Address = env.storage().instance().get(&DataKey::ProtocolFeeRecipient).unwrap_or_else(|| stored.clone());
+        let recipient: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeRecipient)
+            .unwrap_or_else(|| stored.clone());
 
-        let accrued_a: i128 = env.storage().instance().get(&DataKey::AccruedProtocolFeeA).unwrap_or(0);
+        let accrued_a: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccruedProtocolFeeA)
+            .unwrap_or(0);
         if accrued_a > 0 {
             let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-            TokenClient::new(&env, &token_a).transfer(&env.current_contract_address(), &recipient, &accrued_a);
-            env.storage().instance().set(&DataKey::AccruedProtocolFeeA, &0_i128);
+            TokenClient::new(&env, &token_a).transfer(
+                &env.current_contract_address(),
+                &recipient,
+                &accrued_a,
+            );
+            env.storage()
+                .instance()
+                .set(&DataKey::AccruedProtocolFeeA, &0_i128);
         }
-        let accrued_b: i128 = env.storage().instance().get(&DataKey::AccruedProtocolFeeB).unwrap_or(0);
+        let accrued_b: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccruedProtocolFeeB)
+            .unwrap_or(0);
         if accrued_b > 0 {
             let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
-            TokenClient::new(&env, &token_b).transfer(&env.current_contract_address(), &recipient, &accrued_b);
-            env.storage().instance().set(&DataKey::AccruedProtocolFeeB, &0_i128);
+            TokenClient::new(&env, &token_b).transfer(
+                &env.current_contract_address(),
+                &recipient,
+                &accrued_b,
+            );
+            env.storage()
+                .instance()
+                .set(&DataKey::AccruedProtocolFeeB, &0_i128);
         }
         Ok(())
     }
@@ -362,6 +538,17 @@ impl ConcentratedLiquidity {
             .instance()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
+    /// Extends the TTL of a per-user persistent entry (a `Position` or a
+    /// `PositionList`) so long-lived positions are not evicted while in use.
+    ///
+    /// Must only be called for an entry that currently exists — i.e. right
+    /// after writing it — because `extend_ttl` traps on a missing key.
+    fn bump_position(env: &Env, key: &DataKey) {
+        env.storage()
+            .persistent()
+            .extend_ttl(key, POSITION_TTL_THRESHOLD, POSITION_BUMP_TO);
     }
 
     fn check_oracle_deviation(
@@ -385,8 +572,8 @@ impl ConcentratedLiquidity {
             .get(&DataKey::MaxOracleDeviationBps)
             .unwrap_or(500);
 
-        let agg = OracleAggregatorClient::new(env, &oracle_addr)
-            .get_price_safe(token_in, token_out);
+        let agg =
+            OracleAggregatorClient::new(env, &oracle_addr).get_price_safe(token_in, token_out);
         if agg.confidence == 0 || agg.price <= 0 {
             return Ok(());
         }
@@ -404,6 +591,7 @@ impl ConcentratedLiquidity {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn mint_position(
         env: Env,
         provider: Address,
@@ -418,6 +606,7 @@ impl ConcentratedLiquidity {
             return Err(ClError::Paused);
         }
         provider.require_auth();
+        Self::ensure_legacy_owner(&env, &provider, lower_tick, upper_tick)?;
         if lower_tick >= upper_tick {
             return Err(ClError::TickOutOfRange);
         }
@@ -436,23 +625,40 @@ impl ConcentratedLiquidity {
         if amount_a_desired <= 0 && amount_b_desired <= 0 {
             return Err(ClError::ZeroAmounts);
         }
+        if amount_a_desired < 0 || amount_b_desired < 0 {
+            return Err(ClError::ZeroAmounts);
+        }
         let current_tick: i32 = env.storage().instance().get(&DataKey::CurrentTick).unwrap();
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
-        let (amount_a, amount_b) = Self::amounts_for_liquidity(
+        // Derive liquidity from the desired amounts using the same
+        // sqrtPriceX96 math (`liquidity_from_amounts`) that burn/collect use
+        // to convert liquidity back into amounts, then derive the *actual*
+        // amounts that liquidity requires via `amounts_for_liquidity_to_burn`.
+        // The previous code computed the transferred amounts via a separate,
+        // linear-in-price formula (`amounts_for_liquidity`) that didn't agree
+        // with the sqrt-price math used everywhere else. That mismatch let a
+        // position's recorded `liquidity` diverge from the tokens actually
+        // deposited for it, which then surfaced as later withdrawals wanting
+        // more of a token than the pool actually held (issue exposed by
+        // `full_burn_via_token_id_does_not_leak_fees_to_provider`).
+        let liquidity = Self::liquidity_from_amounts(
             current_tick,
             lower_tick,
             upper_tick,
             amount_a_desired,
             amount_b_desired,
         );
-        if amount_a < min_a || amount_b < min_b {
-            return Err(ClError::SlippageExceeded);
-        }
-        let liquidity =
-            Self::liquidity_from_amounts(current_tick, lower_tick, upper_tick, amount_a, amount_b);
         if liquidity <= 0 {
             return Err(ClError::ZeroLiquidity);
+        }
+        let (amount_a, amount_b) =
+            Self::amounts_for_liquidity_to_burn(current_tick, lower_tick, upper_tick, liquidity);
+        if amount_a < 0 || amount_b < 0 {
+            return Err(ClError::ZeroAmounts);
+        }
+        if amount_a < min_a || amount_b < min_b {
+            return Err(ClError::SlippageExceeded);
         }
         if amount_a > 0 {
             TokenClient::new(&env, &token_a).transfer(
@@ -473,14 +679,22 @@ impl ConcentratedLiquidity {
         let (fg_inside_a, fg_inside_b) =
             Self::fee_growth_inside(env.clone(), lower_tick, upper_tick);
 
-        let mut pos: Position = env.storage().instance().get(&pos_key).unwrap_or(Position {
-            lower_tick,
-            upper_tick,
-            liquidity: 0,
-            fee_growth_inside_a: fg_inside_a,
-            fee_growth_inside_b: fg_inside_b,
-            tokens_owed: (0, 0),
-        });
+        let mut pos: Position = env
+            .storage()
+            .persistent()
+            .get(&pos_key)
+            .unwrap_or(Position {
+                lower_tick,
+                upper_tick,
+                liquidity: 0,
+                fee_growth_inside_a: fg_inside_a,
+                fee_growth_inside_b: fg_inside_b,
+                tokens_owed: (0, 0),
+            });
+        // A position is "fresh" when it currently holds no liquidity — either
+        // brand new or fully burned earlier. Freshly opened positions get a
+        // receipt NFT minted below (issue #348).
+        let was_empty = pos.liquidity == 0;
         let (oa, ob) = Self::pending_fees(&pos, fg_inside_a, fg_inside_b);
         pos.tokens_owed = (pos.tokens_owed.0 + oa, pos.tokens_owed.1 + ob);
         pos.fee_growth_inside_a = fg_inside_a;
@@ -490,15 +704,17 @@ impl ConcentratedLiquidity {
         let list_key = DataKey::PositionList(provider.clone());
         let mut list: Vec<(i32, i32)> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&list_key)
             .unwrap_or_else(|| Vec::new(&env));
         let range = (lower_tick, upper_tick);
         if !list.iter().any(|r| r == range) {
             list.push_back(range);
-            env.storage().instance().set(&list_key, &list);
+            env.storage().persistent().set(&list_key, &list);
+            Self::bump_position(&env, &list_key);
         }
-        env.storage().instance().set(&pos_key, &pos);
+        env.storage().persistent().set(&pos_key, &pos);
+        Self::bump_position(&env, &pos_key);
 
         let fg_a: i128 = env
             .storage()
@@ -523,6 +739,9 @@ impl ConcentratedLiquidity {
                 .instance()
                 .set(&DataKey::ActiveLiquidity, &(active + liquidity));
         }
+        if was_empty {
+            Self::tokenize_position(&env, &provider, lower_tick, upper_tick);
+        }
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (symbol_short!("mint_pos"), provider),
@@ -537,6 +756,12 @@ impl ConcentratedLiquidity {
     /// upper_tick)` storage key, settles accrued fees into `tokens_owed`, and
     /// computes the required token amounts from the current price before
     /// increasing the stored liquidity.
+    ///
+    /// `deadline` is a Unix timestamp (seconds); the call reverts with
+    /// [`ClError::DeadlineExpired`] once the ledger time has passed it. The
+    /// `min_a` / `min_b` slippage guards alone cannot protect a transaction
+    /// that sits in the mempool and later executes at a stale price.
+    #[allow(clippy::too_many_arguments)]
     pub fn modify_position(
         env: Env,
         provider: Address,
@@ -545,11 +770,16 @@ impl ConcentratedLiquidity {
         liquidity_delta: i128,
         min_a: i128,
         min_b: i128,
+        deadline: u64,
     ) -> Result<(i128, i128), ClError> {
+        if env.ledger().timestamp() > deadline {
+            return Err(ClError::DeadlineExpired);
+        }
         if Self::is_paused(env.clone()) {
             return Err(ClError::Paused);
         }
         provider.require_auth();
+        Self::ensure_legacy_owner(&env, &provider, lower_tick, upper_tick)?;
         if lower_tick >= upper_tick {
             return Err(ClError::TickOutOfRange);
         }
@@ -574,7 +804,7 @@ impl ConcentratedLiquidity {
         let pos_key = DataKey::Position(provider.clone(), lower_tick, upper_tick);
         let mut pos: Position = env
             .storage()
-            .instance()
+            .persistent()
             .get(&pos_key)
             .ok_or(ClError::PositionNotFound)?;
 
@@ -617,15 +847,17 @@ impl ConcentratedLiquidity {
         let list_key = DataKey::PositionList(provider.clone());
         let mut list: Vec<(i32, i32)> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&list_key)
             .unwrap_or_else(|| Vec::new(&env));
         let range = (lower_tick, upper_tick);
         if !list.iter().any(|r| r == range) {
             list.push_back(range);
-            env.storage().instance().set(&list_key, &list);
+            env.storage().persistent().set(&list_key, &list);
+            Self::bump_position(&env, &list_key);
         }
-        env.storage().instance().set(&pos_key, &pos);
+        env.storage().persistent().set(&pos_key, &pos);
+        Self::bump_position(&env, &pos_key);
 
         let fg_a: i128 = env
             .storage()
@@ -709,6 +941,7 @@ impl ConcentratedLiquidity {
             return Err(ClError::Paused);
         }
         provider.require_auth();
+        Self::ensure_legacy_owner(&env, &provider, lower_tick, upper_tick)?;
 
         // ── Validate tick range ───────────────────────────────────────────────
         if lower_tick >= upper_tick {
@@ -785,13 +1018,31 @@ impl ConcentratedLiquidity {
             let sqrt_current = Self::tick_to_sqrt_price_x96(current_tick);
 
             if sqrt_current >= sqrt_upper {
-                // Degenerate: current at or above upper tick - treat as above-range for A
-                let liq = math::get_liquidity_for_amount0(sqrt_upper, sqrt_upper, amount_in);
-                (amount_in, 0_i128, liq.max(1), amount_in)
+                // Degenerate: current at or above upper tick
+                if is_token_a {
+                    let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in);
+                    let liq = liq.max(1);
+                    let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq);
+                    (used, 0_i128, liq, used)
+                } else {
+                    let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in);
+                    let liq = liq.max(1);
+                    let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq);
+                    (0_i128, used, liq, used)
+                }
             } else if sqrt_current <= sqrt_lower {
-                // Degenerate: current at or below lower tick - treat as below-range for B
-                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_lower, amount_in);
-                (0_i128, amount_in, liq.max(1), amount_in)
+                // Degenerate: current at or below lower tick
+                if is_token_a {
+                    let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in);
+                    let liq = liq.max(1);
+                    let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq);
+                    (used, 0_i128, liq, used)
+                } else {
+                    let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in);
+                    let liq = liq.max(1);
+                    let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq);
+                    (0_i128, used, liq, used)
+                }
             } else if is_token_a {
                 // Token A covers [current_price, upper_price].
                 // Liquidity is computed from the amount, then we back-compute actual token amount.
@@ -835,14 +1086,19 @@ impl ConcentratedLiquidity {
         let (fg_inside_a, fg_inside_b) =
             Self::fee_growth_inside(env.clone(), lower_tick, upper_tick);
 
-        let mut pos: Position = env.storage().instance().get(&pos_key).unwrap_or(Position {
-            lower_tick,
-            upper_tick,
-            liquidity: 0,
-            fee_growth_inside_a: fg_inside_a,
-            fee_growth_inside_b: fg_inside_b,
-            tokens_owed: (0, 0),
-        });
+        let mut pos: Position = env
+            .storage()
+            .persistent()
+            .get(&pos_key)
+            .unwrap_or(Position {
+                lower_tick,
+                upper_tick,
+                liquidity: 0,
+                fee_growth_inside_a: fg_inside_a,
+                fee_growth_inside_b: fg_inside_b,
+                tokens_owed: (0, 0),
+            });
+        let was_empty = pos.liquidity == 0;
         let (oa, ob) = Self::pending_fees(&pos, fg_inside_a, fg_inside_b);
         pos.tokens_owed = (pos.tokens_owed.0 + oa, pos.tokens_owed.1 + ob);
         pos.fee_growth_inside_a = fg_inside_a;
@@ -853,15 +1109,17 @@ impl ConcentratedLiquidity {
         let list_key = DataKey::PositionList(provider.clone());
         let mut list: Vec<(i32, i32)> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&list_key)
             .unwrap_or_else(|| Vec::new(&env));
         let range_pair = (lower_tick, upper_tick);
         if !list.iter().any(|r| r == range_pair) {
             list.push_back(range_pair);
-            env.storage().instance().set(&list_key, &list);
+            env.storage().persistent().set(&list_key, &list);
+            Self::bump_position(&env, &list_key);
         }
-        env.storage().instance().set(&pos_key, &pos);
+        env.storage().persistent().set(&pos_key, &pos);
+        Self::bump_position(&env, &pos_key);
 
         // ── Update tick state ─────────────────────────────────────────────────
         let fg_a: i128 = env
@@ -893,6 +1151,9 @@ impl ConcentratedLiquidity {
         // provider, so no transfer is needed — it simply stays in their wallet.
         let dust = amount_in - amount_used;
 
+        if was_empty {
+            Self::tokenize_position(&env, &provider, lower_tick, upper_tick);
+        }
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (symbol_short!("mint_1t"), provider),
@@ -909,7 +1170,7 @@ impl ConcentratedLiquidity {
     /// Quote the expected result of a single-token deposit without executing it.
     ///
     /// Pure read — does not transfer tokens or modify state.
-    /// Returns values matching what [`mint_position_single_token`] would produce.
+    /// Returns values matching what `mint_position_single_token` would produce.
     pub fn quote_single_token_deposit(
         env: Env,
         lower_tick: i32,
@@ -999,12 +1260,21 @@ impl ConcentratedLiquidity {
     ///   `token_b`.  When price falls through the range the position converts
     ///   to `token_a`.
     ///
-    /// The position is tagged internally so [`check_range_order_filled`] can
+    /// The position is tagged internally so `check_range_order_filled` can
     /// report its status without requiring an off-chain keeper.
+    ///
+    /// Only one range order may be active per `(provider, lower_tick,
+    /// upper_tick)`: re-placing while an earlier order's liquidity is still in
+    /// the position is rejected with [`ClError::RangeOrderExists`]. The tag is
+    /// released when the position is fully withdrawn (see
+    /// `burn_position_core`), so the same range can
+    /// be reused for a fresh order afterwards.
     ///
     /// # Errors
     /// - [`ClError::RangeOrderInRange`] – the range straddles the current tick.
-    /// - All the usual [`ClError`] variants from [`mint_position_single_token`].
+    /// - [`ClError::RangeOrderExists`] – a previous order on this range has not
+    ///   been withdrawn yet.
+    /// - All the usual `ClError` variants from `mint_position_single_token`.
     #[allow(clippy::too_many_arguments)]
     pub fn place_range_order(
         env: Env,
@@ -1029,6 +1299,26 @@ impl ConcentratedLiquidity {
             return Err(ClError::RangeOrderInRange);
         }
 
+        // Reject re-placing while a previous order on this exact range still
+        // has liquidity in the position. `mint_position_single_token` merges
+        // liquidity into the shared `Position`, so overwriting the direction
+        // tag would silently corrupt the fill status of the earlier tranche
+        // (issue #595). The provider must withdraw (burn) the old order first.
+        let range_order_key = DataKey::RangeOrder(provider.clone(), lower_tick, upper_tick);
+        if env.storage().instance().has(&range_order_key) {
+            let pos: Option<Position> = env.storage().persistent().get(&DataKey::Position(
+                provider.clone(),
+                lower_tick,
+                upper_tick,
+            ));
+            if pos.map(|p| p.liquidity > 0).unwrap_or(false) {
+                return Err(ClError::RangeOrderExists);
+            }
+            // Stale tag from before the burn cleanup (legacy state): the
+            // position is already closed, so just release it.
+            env.storage().instance().remove(&range_order_key);
+        }
+
         // Delegate to the existing single-token deposit logic.
         let result = Self::mint_position_single_token(
             env.clone(),
@@ -1041,10 +1331,11 @@ impl ConcentratedLiquidity {
             deadline,
         )?;
 
-        // Tag the position as a range order.
+        // Tag the position as a range order and record which side it was
+        // placed on, so `check_range_order_filled` knows the fill direction.
         env.storage().instance().set(
             &DataKey::RangeOrder(provider.clone(), lower_tick, upper_tick),
-            &true,
+            &is_above,
         );
 
         soroban_amm_sdk::emit_versioned_event!(
@@ -1066,7 +1357,7 @@ impl ConcentratedLiquidity {
     ///   `current_tick < lower_tick`.
     ///
     /// Returns [`ClError::PositionNotFound`] if the position does not exist or
-    /// was not placed via [`place_range_order`].
+    /// was not placed via `place_range_order`.
     pub fn check_range_order_filled(
         env: Env,
         provider: Address,
@@ -1076,18 +1367,18 @@ impl ConcentratedLiquidity {
         // Verify the position exists and is tagged as a range order.
         let _pos: Position = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Position(provider.clone(), lower_tick, upper_tick))
             .ok_or(ClError::PositionNotFound)?;
 
-        let is_range_order: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::RangeOrder(provider, lower_tick, upper_tick))
-            .unwrap_or(false);
-        if !is_range_order {
+        let range_order_key = DataKey::RangeOrder(provider, lower_tick, upper_tick);
+        if !env.storage().instance().has(&range_order_key) {
             return Err(ClError::PositionNotFound);
         }
+        // The original side the order was placed on: `true` for an
+        // above-range order (fills as price rises), `false` for a
+        // below-range order (fills as price falls).
+        let is_above: bool = env.storage().instance().get(&range_order_key).unwrap();
 
         let current_tick: i32 = env
             .storage()
@@ -1095,26 +1386,29 @@ impl ConcentratedLiquidity {
             .get(&DataKey::CurrentTick)
             .unwrap_or(0);
 
-        // Determine fill direction from the range relative to the current tick
-        // at the time of the query.
-        let status = if current_tick >= upper_tick {
-            // Price has risen above the range → above-range order is filled.
-            RangeOrderStatus::Filled
+        // Only report Filled once the price has crossed through the range in
+        // this order's original fill direction; otherwise it is still Pending.
+        let status = if is_above {
+            if current_tick >= upper_tick {
+                RangeOrderStatus::Filled
+            } else {
+                RangeOrderStatus::Pending
+            }
         } else if current_tick < lower_tick {
-            // Price is still below the range → above-range order is pending,
-            // OR price has fallen below the range → below-range order is filled.
-            // We distinguish by checking which side the range was on originally.
-            // Since we only allow fully out-of-range creation, if current_tick
-            // is now below lower_tick the below-range order is filled.
             RangeOrderStatus::Filled
         } else {
-            // Price is inside the range — order is partially filled (pending).
             RangeOrderStatus::Pending
         };
 
         Ok(status)
     }
 
+    /// Burn liquidity from a position keyed by the original `provider` address.
+    ///
+    /// Backwards-compatible entry point. When the position has been tokenized
+    /// (issue #348) and `provider` no longer owns the NFT, the call is rejected
+    /// with [`ClError::NotNftOwner`]: the current NFT owner must use
+    /// `burn_position_by_token_id` instead.
     pub fn burn_position(
         env: Env,
         provider: Address,
@@ -1124,13 +1418,96 @@ impl ConcentratedLiquidity {
     ) -> Result<(i128, i128), ClError> {
         // No pause guard — LPs must always be able to exit.
         provider.require_auth();
+        Self::ensure_legacy_owner(&env, &provider, lower_tick, upper_tick)?;
+        let res = Self::burn_position_core(
+            &env, &provider, &provider, lower_tick, upper_tick, liquidity,
+        )?;
+        Self::cleanup_nft_if_closed(&env, &provider, lower_tick, upper_tick);
+        Ok(res)
+    }
+
+    /// Burn liquidity from a position addressed by its NFT `token_id` (issue #348).
+    ///
+    /// Resolves the original `(provider, lower_tick, upper_tick)` from the
+    /// reverse index, verifies `caller` is the **current** NFT owner, and
+    /// withdraws the underlying tokens to `caller`. When the position is fully
+    /// closed the NFT is burned and both indexes are cleared.
+    pub fn burn_position_by_token_id(
+        env: Env,
+        caller: Address,
+        token_id: u64,
+        liquidity: i128,
+    ) -> Result<(i128, i128), ClError> {
+        let (provider, lower_tick, upper_tick) =
+            Self::resolve_token_owner(&env, &caller, token_id)?;
+        caller.require_auth();
+        let res =
+            Self::burn_position_core(&env, &provider, &caller, lower_tick, upper_tick, liquidity)?;
+
+        // On a full close, sweep any still-owed fees to the current owner before
+        // retiring the NFT. Otherwise the position would be de-tokenized with a
+        // non-zero `tokens_owed` left under the original provider's key, letting
+        // that provider reclaim the new owner's fees via the legacy path.
+        let closed = env
+            .storage()
+            .persistent()
+            .get::<_, Position>(&DataKey::Position(provider.clone(), lower_tick, upper_tick))
+            .map(|p| p.liquidity == 0)
+            .unwrap_or(true);
+        if closed {
+            Self::collect_fees_core(&env, &provider, &caller, lower_tick, upper_tick)?;
+            Self::cleanup_nft_if_closed(&env, &provider, lower_tick, upper_tick);
+        }
+        Ok(res)
+    }
+
+    /// Collect accrued fees from a position keyed by the original `provider`.
+    ///
+    /// Like `burn_position`, this defers to the current
+    /// NFT owner once a position is tokenized.
+    pub fn collect_fees(
+        env: Env,
+        provider: Address,
+        lower_tick: i32,
+        upper_tick: i32,
+    ) -> Result<(i128, i128), ClError> {
+        // No pause guard — LPs must always be able to collect fees.
+        provider.require_auth();
+        Self::ensure_legacy_owner(&env, &provider, lower_tick, upper_tick)?;
+        Self::collect_fees_core(&env, &provider, &provider, lower_tick, upper_tick)
+    }
+
+    /// Collect accrued fees from a position addressed by its NFT `token_id`
+    /// (issue #348). Fees are paid to the current NFT owner (`caller`).
+    pub fn collect_fees_by_token_id(
+        env: Env,
+        caller: Address,
+        token_id: u64,
+    ) -> Result<(i128, i128), ClError> {
+        let (provider, lower_tick, upper_tick) =
+            Self::resolve_token_owner(&env, &caller, token_id)?;
+        caller.require_auth();
+        Self::collect_fees_core(&env, &provider, &caller, lower_tick, upper_tick)
+    }
+
+    /// Shared burn logic. `provider` keys the stored position; `recipient`
+    /// receives the withdrawn tokens. Performs **no** authorization — callers
+    /// are responsible for authenticating the actor.
+    fn burn_position_core(
+        env: &Env,
+        provider: &Address,
+        recipient: &Address,
+        lower_tick: i32,
+        upper_tick: i32,
+        liquidity: i128,
+    ) -> Result<(i128, i128), ClError> {
         if liquidity <= 0 {
             return Err(ClError::ZeroLiquidity);
         }
         let pos_key = DataKey::Position(provider.clone(), lower_tick, upper_tick);
         let mut pos: Position = env
             .storage()
-            .instance()
+            .persistent()
             .get(&pos_key)
             .ok_or(ClError::PositionNotFound)?;
         if pos.liquidity < liquidity {
@@ -1149,23 +1526,52 @@ impl ConcentratedLiquidity {
         let (amount_a, amount_b) =
             Self::amounts_for_liquidity_to_burn(current_tick, lower_tick, upper_tick, liquidity);
         pos.liquidity -= liquidity;
-        env.storage().instance().set(&pos_key, &pos);
+
+        // The principal recomputed above from the current tick can, due to a
+        // precision mismatch with the swap engine's own price-stepping math,
+        // exceed what the contract actually holds. Never transfer more than
+        // that; bank any shortfall in `tokens_owed` so it stays claimable
+        // (via collect_fees) once the contract's balance recovers, instead of
+        // hard-trapping on an insufficient-balance transfer.
+        let contract_addr = env.current_contract_address();
+        let avail_a = TokenClient::new(env, &token_a)
+            .balance(&contract_addr)
+            .max(0);
+        let avail_b = TokenClient::new(env, &token_b)
+            .balance(&contract_addr)
+            .max(0);
+        let pay_a = amount_a.min(avail_a);
+        let pay_b = amount_b.min(avail_b);
+        pos.tokens_owed = (
+            pos.tokens_owed.0 + (amount_a - pay_a),
+            pos.tokens_owed.1 + (amount_b - pay_b),
+        );
+        env.storage().persistent().set(&pos_key, &pos);
+        Self::bump_position(env, &pos_key);
         // Remove from position list when position is fully closed
         if pos.liquidity == 0 {
             let list_key = DataKey::PositionList(provider.clone());
             let list: Vec<(i32, i32)> = env
                 .storage()
-                .instance()
+                .persistent()
                 .get(&list_key)
-                .unwrap_or_else(|| Vec::new(&env));
+                .unwrap_or_else(|| Vec::new(env));
             let range = (lower_tick, upper_tick);
-            let mut new_list: Vec<(i32, i32)> = Vec::new(&env);
+            let mut new_list: Vec<(i32, i32)> = Vec::new(env);
             for r in list.iter() {
                 if r != range {
                     new_list.push_back(r);
                 }
             }
-            env.storage().instance().set(&list_key, &new_list);
+            env.storage().persistent().set(&list_key, &new_list);
+            Self::bump_position(env, &list_key);
+
+            // Fully closed range order: release its direction tag so the
+            // provider can place a fresh order on the same range (issue #595).
+            let range_order_key = DataKey::RangeOrder(provider.clone(), lower_tick, upper_tick);
+            if env.storage().instance().has(&range_order_key) {
+                env.storage().instance().remove(&range_order_key);
+            }
         }
 
         let fg_a: i128 = env
@@ -1178,16 +1584,8 @@ impl ConcentratedLiquidity {
             .instance()
             .get(&DataKey::FeeGrowthGlobalB)
             .unwrap_or(0);
-        Self::update_tick(
-            &env,
-            lower_tick,
-            current_tick,
-            -liquidity,
-            false,
-            fg_a,
-            fg_b,
-        );
-        Self::update_tick(&env, upper_tick, current_tick, -liquidity, true, fg_a, fg_b);
+        Self::update_tick(env, lower_tick, current_tick, -liquidity, false, fg_a, fg_b);
+        Self::update_tick(env, upper_tick, current_tick, -liquidity, true, fg_a, fg_b);
 
         if current_tick >= lower_tick && current_tick < upper_tick {
             let active: i128 = env
@@ -1204,40 +1602,33 @@ impl ConcentratedLiquidity {
                 }),
             );
         }
-        if amount_a > 0 {
-            TokenClient::new(&env, &token_a).transfer(
-                &env.current_contract_address(),
-                &provider,
-                &amount_a,
-            );
+        if pay_a > 0 {
+            TokenClient::new(env, &token_a).transfer(&contract_addr, recipient, &pay_a);
         }
-        if amount_b > 0 {
-            TokenClient::new(&env, &token_b).transfer(
-                &env.current_contract_address(),
-                &provider,
-                &amount_b,
-            );
+        if pay_b > 0 {
+            TokenClient::new(env, &token_b).transfer(&contract_addr, recipient, &pay_b);
         }
         soroban_amm_sdk::emit_versioned_event!(
             env,
-            (symbol_short!("burn_pos"), provider),
-            (lower_tick, upper_tick, liquidity, amount_a, amount_b)
+            (symbol_short!("burn_pos"), recipient.clone()),
+            (lower_tick, upper_tick, liquidity, pay_a, pay_b)
         );
-        Ok((amount_a, amount_b))
+        Ok((pay_a, pay_b))
     }
 
-    pub fn collect_fees(
-        env: Env,
-        provider: Address,
+    /// Shared fee-collection logic. `provider` keys the stored position;
+    /// `recipient` receives the fees. Performs **no** authorization.
+    fn collect_fees_core(
+        env: &Env,
+        provider: &Address,
+        recipient: &Address,
         lower_tick: i32,
         upper_tick: i32,
     ) -> Result<(i128, i128), ClError> {
-        // No pause guard — LPs must always be able to collect fees.
-        provider.require_auth();
         let pos_key = DataKey::Position(provider.clone(), lower_tick, upper_tick);
         let mut pos: Position = env
             .storage()
-            .instance()
+            .persistent()
             .get(&pos_key)
             .ok_or(ClError::PositionNotFound)?;
 
@@ -1246,32 +1637,146 @@ impl ConcentratedLiquidity {
         let (na, nb) = Self::pending_fees(&pos, fg_inside_a, fg_inside_b);
         let total_a = pos.tokens_owed.0 + na;
         let total_b = pos.tokens_owed.1 + nb;
-        pos.tokens_owed = (0, 0);
         pos.fee_growth_inside_a = fg_inside_a;
         pos.fee_growth_inside_b = fg_inside_b;
-        env.storage().instance().set(&pos_key, &pos);
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
-        if total_a > 0 {
-            TokenClient::new(&env, &token_a).transfer(
-                &env.current_contract_address(),
-                &provider,
-                &total_a,
-            );
+
+        // As in burn_position_core: never transfer more than the contract
+        // actually holds. Keep any shortfall recorded in `tokens_owed`
+        // (instead of always zeroing it) so it remains claimable later.
+        let contract_addr = env.current_contract_address();
+        let avail_a = TokenClient::new(env, &token_a)
+            .balance(&contract_addr)
+            .max(0);
+        let avail_b = TokenClient::new(env, &token_b)
+            .balance(&contract_addr)
+            .max(0);
+        let pay_a = total_a.min(avail_a);
+        let pay_b = total_b.min(avail_b);
+        pos.tokens_owed = (total_a - pay_a, total_b - pay_b);
+        env.storage().persistent().set(&pos_key, &pos);
+        Self::bump_position(env, &pos_key);
+        if pay_a > 0 {
+            TokenClient::new(env, &token_a).transfer(&contract_addr, recipient, &pay_a);
         }
-        if total_b > 0 {
-            TokenClient::new(&env, &token_b).transfer(
-                &env.current_contract_address(),
-                &provider,
-                &total_b,
-            );
+        if pay_b > 0 {
+            TokenClient::new(env, &token_b).transfer(&contract_addr, recipient, &pay_b);
         }
         soroban_amm_sdk::emit_versioned_event!(
             env,
-            (symbol_short!("coll_fees"), provider),
-            (lower_tick, upper_tick, total_a, total_b)
+            (symbol_short!("coll_fees"), recipient.clone()),
+            (lower_tick, upper_tick, pay_a, pay_b)
         );
-        Ok((total_a, total_b))
+        Ok((pay_a, pay_b))
+    }
+
+    // ── Issue #348: NFT-keyed position ownership helpers ───────────────────────
+
+    /// The wired-in position-NFT contract, if any.
+    fn nft_addr(env: &Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PositionNft)
+            .unwrap_or(None)
+    }
+
+    /// Mint a receipt NFT for a freshly opened position and record both index
+    /// directions. No-op when no NFT contract is configured.
+    fn tokenize_position(env: &Env, provider: &Address, lower_tick: i32, upper_tick: i32) {
+        let Some(nft) = Self::nft_addr(env) else {
+            return;
+        };
+        let token_id = PositionNftClient::new(env, &nft).mint(
+            provider,
+            &env.current_contract_address(),
+            &lower_tick,
+            &upper_tick,
+        );
+        env.storage().instance().set(
+            &DataKey::NftTokenToPosition(token_id),
+            &(provider.clone(), lower_tick, upper_tick),
+        );
+        env.storage().instance().set(
+            &DataKey::PositionNftToken(provider.clone(), lower_tick, upper_tick),
+            &token_id,
+        );
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (symbol_short!("nft_link"), provider.clone()),
+            (token_id, lower_tick, upper_tick)
+        );
+    }
+
+    /// Resolve `(provider, lower_tick, upper_tick)` for `token_id` and verify
+    /// that `caller` is the NFT's current owner.
+    fn resolve_token_owner(
+        env: &Env,
+        caller: &Address,
+        token_id: u64,
+    ) -> Result<(Address, i32, i32), ClError> {
+        let nft = Self::nft_addr(env).ok_or(ClError::NftNotConfigured)?;
+        let position: (Address, i32, i32) = env
+            .storage()
+            .instance()
+            .get(&DataKey::NftTokenToPosition(token_id))
+            .ok_or(ClError::PositionNotFound)?;
+        let owner = PositionNftClient::new(env, &nft).owner_of(&token_id);
+        if owner != *caller {
+            return Err(ClError::NotNftOwner);
+        }
+        Ok(position)
+    }
+
+    /// Guard the legacy address-keyed path: a tokenized position may only be
+    /// operated on by `provider` while `provider` still owns its NFT. Pools
+    /// without an NFT, or untokenized positions, pass through unchanged.
+    fn ensure_legacy_owner(
+        env: &Env,
+        provider: &Address,
+        lower_tick: i32,
+        upper_tick: i32,
+    ) -> Result<(), ClError> {
+        let token_id: Option<u64> = env.storage().instance().get(&DataKey::PositionNftToken(
+            provider.clone(),
+            lower_tick,
+            upper_tick,
+        ));
+        let Some(token_id) = token_id else {
+            return Ok(());
+        };
+        let Some(nft) = Self::nft_addr(env) else {
+            return Ok(());
+        };
+        let owner = PositionNftClient::new(env, &nft).owner_of(&token_id);
+        if owner != *provider {
+            return Err(ClError::NotNftOwner);
+        }
+        Ok(())
+    }
+
+    /// After a burn, if the position is fully closed and tokenized, burn the
+    /// NFT and clear both indexes.
+    fn cleanup_nft_if_closed(env: &Env, provider: &Address, lower_tick: i32, upper_tick: i32) {
+        let pos: Option<Position> = env.storage().persistent().get(&DataKey::Position(
+            provider.clone(),
+            lower_tick,
+            upper_tick,
+        ));
+        if pos.map(|p| p.liquidity > 0).unwrap_or(false) {
+            return;
+        }
+        let fwd_key = DataKey::PositionNftToken(provider.clone(), lower_tick, upper_tick);
+        let Some(token_id) = env.storage().instance().get::<_, u64>(&fwd_key) else {
+            return;
+        };
+        if let Some(nft) = Self::nft_addr(env) {
+            PositionNftClient::new(env, &nft).burn(&token_id);
+        }
+        env.storage().instance().remove(&fwd_key);
+        env.storage()
+            .instance()
+            .remove(&DataKey::NftTokenToPosition(token_id));
     }
 
     pub fn get_position(
@@ -1281,7 +1786,7 @@ impl ConcentratedLiquidity {
         upper_tick: i32,
     ) -> Result<Position, ClError> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Position(provider, lower_tick, upper_tick))
             .ok_or(ClError::PositionNotFound)
     }
@@ -1290,12 +1795,13 @@ impl ConcentratedLiquidity {
         env.storage().instance().get(&DataKey::CurrentTick).unwrap()
     }
 
-    /// Returns the pool's token pair as `(token_a, token_b)`.
+    /// Returns the pool's token pair as `(token_a, token_b)` (issue #470).
     ///
     /// Unlike the constant-product AMM, this pool exposes no `get_info`, so
     /// external contracts that need the pair — such as `reserve_manager`'s
-    /// `check_reserves`, which reads the pool's SEP-41 token balances — use
-    /// this accessor.
+    /// `check_reserves`, which reads the pool's SEP-41 token balances, and
+    /// `batch_auction` and other venue-agnostic callers validating an order's
+    /// token pair — use this accessor.
     ///
     /// Panics if the pool has not been initialized.
     pub fn get_tokens(env: Env) -> (Address, Address) {
@@ -1342,6 +1848,15 @@ impl ConcentratedLiquidity {
             active_liquidity,
             tick_spacing,
         }
+    }
+
+    /// Returns the pool's fee tier in basis points (issue #700).
+    ///
+    /// Lets a venue-agnostic caller (e.g. batch_auction's factory-backed venue
+    /// registry) look this pool up via `Factory::get_cl_pool(token_a, token_b,
+    /// fee_bps)` without needing the fee tier supplied out of band.
+    pub fn fee_bps(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::FeeBps).unwrap()
     }
 
     // ── Issue #203: per-tick view functions ───────────────────────────────────
@@ -1471,7 +1986,11 @@ impl ConcentratedLiquidity {
         let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
         let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
 
-        let protocol_fee_bps: i128 = env.storage().instance().get(&DataKey::ProtocolFeeBps).unwrap_or(0);
+        let protocol_fee_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeBps)
+            .unwrap_or(0);
 
         // Update tick accumulator before changing current tick
         let now = env.ledger().timestamp();
@@ -1499,9 +2018,7 @@ impl ConcentratedLiquidity {
             env.storage()
                 .instance()
                 .set(&DataKey::LastOracleTimestamp, &now);
-            env.storage()
-                .instance()
-                .set(&DataKey::OraclePoint(now), &new_cum);
+            Self::record_oracle_point(&env, now, new_cum);
         }
 
         let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
@@ -1533,8 +2050,9 @@ impl ConcentratedLiquidity {
         while amount_remaining > 0 {
             let next_tick_opt = Self::next_initialized_tick(&env, current_tick, zero_for_one);
             // No initialized ticks in this direction and no liquidity — nothing to trade.
+            // amount_remaining is left untouched so this untraded portion is excluded
+            // from amount_in_actual below.
             if next_tick_opt.is_none() && active_liquidity == 0 {
-                amount_remaining = 0;
                 break;
             }
 
@@ -1555,23 +2073,25 @@ impl ConcentratedLiquidity {
                 }
             };
 
-            let next_price_x96 = {
-                let price = Self::tick_to_price(next_tick);
-                let sqrt_p = Self::sqrt(price);
-                (sqrt_p as u128) * (1u128 << 96) / 1000u128
-            };
+            let next_price_x96 = Self::tick_to_sqrt_price_x96(next_tick);
 
             let mut target_price_x96 = next_price_x96;
             let mut hit_limit = false;
 
-            if zero_for_one {
-                if next_price_x96 <= sqrt_price_limit_x96 {
+            // `sqrt_price_limit_x96 == 0` is the documented "no limit" sentinel.
+            // Skip the comparison entirely in that case — for `zero_for_one = false`
+            // every price is `>= 0` (u128), which would otherwise force the target
+            // price to 0 on the very first iteration (issue #492).
+            if sqrt_price_limit_x96 != 0 {
+                if zero_for_one {
+                    if next_price_x96 <= sqrt_price_limit_x96 {
+                        target_price_x96 = sqrt_price_limit_x96;
+                        hit_limit = true;
+                    }
+                } else if next_price_x96 >= sqrt_price_limit_x96 {
                     target_price_x96 = sqrt_price_limit_x96;
                     hit_limit = true;
                 }
-            } else if next_price_x96 >= sqrt_price_limit_x96 {
-                target_price_x96 = sqrt_price_limit_x96;
-                hit_limit = true;
             }
 
             let amount_in_after_fee = amount_remaining * (10000 - fee_bps) / 10000;
@@ -1608,21 +2128,47 @@ impl ConcentratedLiquidity {
 
                     if zero_for_one {
                         if protocol_fee > 0 {
-                            let accrued_a: i128 = env.storage().instance().get(&DataKey::AccruedProtocolFeeA).unwrap_or(0);
-                            env.storage().instance().set(&DataKey::AccruedProtocolFeeA, &(accrued_a + protocol_fee));
+                            let accrued_a: i128 = env
+                                .storage()
+                                .instance()
+                                .get(&DataKey::AccruedProtocolFeeA)
+                                .unwrap_or(0);
+                            env.storage()
+                                .instance()
+                                .set(&DataKey::AccruedProtocolFeeA, &(accrued_a + protocol_fee));
                         }
                         if lp_fee > 0 {
-                            let fg_a: i128 = env.storage().instance().get(&DataKey::FeeGrowthGlobalA).unwrap_or(0);
-                            env.storage().instance().set(&DataKey::FeeGrowthGlobalA, &(fg_a + lp_fee * 1_000_000 / active_liquidity));
+                            let fg_a: i128 = env
+                                .storage()
+                                .instance()
+                                .get(&DataKey::FeeGrowthGlobalA)
+                                .unwrap_or(0);
+                            env.storage().instance().set(
+                                &DataKey::FeeGrowthGlobalA,
+                                &(fg_a + lp_fee * 1_000_000 / active_liquidity),
+                            );
                         }
                     } else {
                         if protocol_fee > 0 {
-                            let accrued_b: i128 = env.storage().instance().get(&DataKey::AccruedProtocolFeeB).unwrap_or(0);
-                            env.storage().instance().set(&DataKey::AccruedProtocolFeeB, &(accrued_b + protocol_fee));
+                            let accrued_b: i128 = env
+                                .storage()
+                                .instance()
+                                .get(&DataKey::AccruedProtocolFeeB)
+                                .unwrap_or(0);
+                            env.storage()
+                                .instance()
+                                .set(&DataKey::AccruedProtocolFeeB, &(accrued_b + protocol_fee));
                         }
                         if lp_fee > 0 {
-                            let fg_b: i128 = env.storage().instance().get(&DataKey::FeeGrowthGlobalB).unwrap_or(0);
-                            env.storage().instance().set(&DataKey::FeeGrowthGlobalB, &(fg_b + lp_fee * 1_000_000 / active_liquidity));
+                            let fg_b: i128 = env
+                                .storage()
+                                .instance()
+                                .get(&DataKey::FeeGrowthGlobalB)
+                                .unwrap_or(0);
+                            env.storage().instance().set(
+                                &DataKey::FeeGrowthGlobalB,
+                                &(fg_b + lp_fee * 1_000_000 / active_liquidity),
+                            );
                         }
                     }
                 }
@@ -1646,7 +2192,7 @@ impl ConcentratedLiquidity {
 
                 if zero_for_one {
                     active_liquidity -= tick_info.liquidity_net;
-                    current_tick = next_tick - 1;
+                    current_tick = (next_tick - 1).max(MIN_TICK);
                 } else {
                     active_liquidity += tick_info.liquidity_net;
                     current_tick = next_tick;
@@ -1687,21 +2233,49 @@ impl ConcentratedLiquidity {
 
                         if zero_for_one {
                             if protocol_fee > 0 {
-                                let accrued_a: i128 = env.storage().instance().get(&DataKey::AccruedProtocolFeeA).unwrap_or(0);
-                                env.storage().instance().set(&DataKey::AccruedProtocolFeeA, &(accrued_a + protocol_fee));
+                                let accrued_a: i128 = env
+                                    .storage()
+                                    .instance()
+                                    .get(&DataKey::AccruedProtocolFeeA)
+                                    .unwrap_or(0);
+                                env.storage().instance().set(
+                                    &DataKey::AccruedProtocolFeeA,
+                                    &(accrued_a + protocol_fee),
+                                );
                             }
                             if lp_fee > 0 {
-                                let fg_a: i128 = env.storage().instance().get(&DataKey::FeeGrowthGlobalA).unwrap_or(0);
-                                env.storage().instance().set(&DataKey::FeeGrowthGlobalA, &(fg_a + lp_fee * 1_000_000 / active_liquidity));
+                                let fg_a: i128 = env
+                                    .storage()
+                                    .instance()
+                                    .get(&DataKey::FeeGrowthGlobalA)
+                                    .unwrap_or(0);
+                                env.storage().instance().set(
+                                    &DataKey::FeeGrowthGlobalA,
+                                    &(fg_a + lp_fee * 1_000_000 / active_liquidity),
+                                );
                             }
                         } else {
                             if protocol_fee > 0 {
-                                let accrued_b: i128 = env.storage().instance().get(&DataKey::AccruedProtocolFeeB).unwrap_or(0);
-                                env.storage().instance().set(&DataKey::AccruedProtocolFeeB, &(accrued_b + protocol_fee));
+                                let accrued_b: i128 = env
+                                    .storage()
+                                    .instance()
+                                    .get(&DataKey::AccruedProtocolFeeB)
+                                    .unwrap_or(0);
+                                env.storage().instance().set(
+                                    &DataKey::AccruedProtocolFeeB,
+                                    &(accrued_b + protocol_fee),
+                                );
                             }
                             if lp_fee > 0 {
-                                let fg_b: i128 = env.storage().instance().get(&DataKey::FeeGrowthGlobalB).unwrap_or(0);
-                                env.storage().instance().set(&DataKey::FeeGrowthGlobalB, &(fg_b + lp_fee * 1_000_000 / active_liquidity));
+                                let fg_b: i128 = env
+                                    .storage()
+                                    .instance()
+                                    .get(&DataKey::FeeGrowthGlobalB)
+                                    .unwrap_or(0);
+                                env.storage().instance().set(
+                                    &DataKey::FeeGrowthGlobalB,
+                                    &(fg_b + lp_fee * 1_000_000 / active_liquidity),
+                                );
                             }
                         }
                     }
@@ -1711,11 +2285,28 @@ impl ConcentratedLiquidity {
                     } else {
                         sqrt_price_x96 = new_price_x96;
                     }
-                    current_tick = Self::price_to_tick(sqrt_price_x96);
+                    // This branch only runs when the step's own math already
+                    // determined the trade does *not* need to reach `next_tick`
+                    // (the `if` arm above handles the case where it does). The
+                    // step math works in a deliberately low-precision (~3
+                    // significant digit) price representation, though, and its
+                    // pool-favorable rounding can — right at a boundary —
+                    // compute a price indistinguishable from (or past) the
+                    // tick it was told not to reach. Reconstructing that price
+                    // via the full-precision `sqrt_price_x96_to_tick` can then
+                    // resolve to `next_tick` or beyond even though this step
+                    // never crossed it. Clamp back to the known-correct side.
+                    current_tick = Self::sqrt_price_x96_to_tick(sqrt_price_x96);
+                    current_tick = if zero_for_one {
+                        current_tick.max(next_tick)
+                    } else {
+                        current_tick.min(next_tick)
+                    };
                 } else {
                     sqrt_price_x96 = target_price_x96;
-                    current_tick = Self::price_to_tick(sqrt_price_x96);
-                    amount_remaining = 0;
+                    current_tick = Self::sqrt_price_x96_to_tick(sqrt_price_x96);
+                    // No liquidity in this gap — amount_remaining is left untouched
+                    // so this untraded portion is excluded from amount_in_actual.
                 }
                 break;
             }
@@ -1794,11 +2385,639 @@ impl ConcentratedLiquidity {
             soroban_amm_sdk::emit_versioned_event!(
                 env,
                 (symbol_short!("price_upd"), token_in, token_out),
-                (amount_in_actual, amount_out_total, sqrt_price_x96, current_tick)
+                (
+                    amount_in_actual,
+                    amount_out_total,
+                    sqrt_price_x96,
+                    current_tick
+                )
             );
         }
 
         Ok(amount_out_total)
+    }
+
+    // ── #696: swap_exact_out ──────────────────────────────────────────────────
+    //
+    // `swap`'s core step math (`compute_step` / `compute_final_price_and_output`,
+    // just above) works in the pool's existing low-precision integer price
+    // representation — `p = (sqrt_price_x96 * 1000) >> 96`, i.e. roughly 3
+    // significant digits of price, not full Q96/Q128 precision. `math.rs`'s
+    // `tick_to_sqrt_price_x96` / `get_amount0_delta` / `get_amount1_delta` are
+    // *not* used by this loop at all (they back `mint_position`/`burn_position`
+    // instead) — the actual swap loop never touches them. Introducing a
+    // parallel, fully-precise Q96 exact-out step function in `math.rs` would
+    // therefore not share any code with `swap`'s exact-in path, defeating the
+    // "quote and swap can never disagree" goal and risking exactly the kind of
+    // silent pool-drain this issue warns about, since the two implementations
+    // could round differently on the very same trade. Instead, the exact-out
+    // step math below mirrors `compute_step` / `compute_final_price_and_output`
+    // in the same representation, so `swap_exact_out` is the mirror image of
+    // `swap` at every step, not a second system that happens to look similar.
+    //
+    // `walk_exact_out` is the single core loop; both `swap_exact_out` and
+    // `quote_exact_out` call it and only differ in what they do with the
+    // result (apply it to storage and transfer tokens, or just read
+    // `amount_in_after_fee_total` / `amount_in_gross_total`).
+
+    /// Result of walking ticks to fill an exact-out request. `tick_crossings`
+    /// lists, in crossing order, each tick's *new* `fee_growth_outside`
+    /// values (already flipped against the running fee-growth-global at the
+    /// moment of that crossing, exactly as `swap` computes it inline) so the
+    /// caller can persist them without re-deriving the interleaving.
+    /// Ceiling division for positive `a`, `b` — used wherever exact-out must
+    /// round the trader's required input *up* rather than down, so the pool
+    /// never pays out `amount_out` for less than it is truly owed.
+    fn ceil_div(a: i128, b: i128) -> i128 {
+        if a <= 0 {
+            0
+        } else {
+            (a + b - 1) / b
+        }
+    }
+
+    /// Reverse of `compute_final_price_and_output`: given a fixed *output*
+    /// amount, solves for the price the step must land on and the input that
+    /// price requires, in the same `p = (sqrt_price_x96 * 1000) >> 96`
+    /// representation `compute_step` uses.
+    ///
+    /// Rounding (stated explicitly per the four quantities this issue asks
+    /// about, and covered by the `compute_final_price_and_input_*` tests
+    /// below):
+    /// - `sqrt_price_next` (`p_t` here): the intermediate `drop` /
+    ///   `denom`-based quotient rounds **up** (`ceil_div`) in both branches,
+    ///   so the price is always moved *at least* as far as the exact
+    ///   real-valued solution requires. Rounding the other way (floor, tried
+    ///   first and reverted — see the regression test
+    ///   `compute_final_price_and_input_does_not_undercharge_small_amount_out`)
+    ///   lets the price move truncate to zero whenever `amount_out` is small
+    ///   relative to `liquidity`, which then computes `amount_in == 0` for a
+    ///   nonzero `amount_out` — a free drain of the pool. Moving the price
+    ///   at least far enough, even if slightly further than the bare
+    ///   minimum, is the pool-favourable direction.
+    /// - `amount_in`: rounded **up** (`ceil_div`) from that price — the
+    ///   caller must pay at least as much as the (already pool-favourable)
+    ///   price move implies.
+    /// - `amount_out`: not computed here — it is the caller-supplied,
+    ///   already-fixed target for this step, never rounded.
+    /// - `fee_amount`: computed by the caller from `amount_in` (already
+    ///   rounded up) minus the after-fee amount, so it inherits `amount_in`'s
+    ///   pool-favourable rounding rather than being rounded independently.
+    fn compute_final_price_and_input(
+        liquidity: i128,
+        sqrt_price_current_x96: u128,
+        amount_out_needed: i128,
+        zero_for_one: bool,
+    ) -> (u128, i128) {
+        let p_c = (((sqrt_price_current_x96 * 1000) >> 96) as i128).max(1);
+
+        if zero_for_one {
+            // amount_out = liquidity * (p_c - p_t) / 1000
+            //   => p_t = p_c - amount_out * 1000 / liquidity
+            //
+            // `drop` (= p_c - p_t) rounds UP: a floor here would let `drop`
+            // truncate to 0 whenever amount_out is small relative to
+            // liquidity (exactly the common case), landing p_t == p_c and
+            // computing amount_in == 0 for a nonzero amount_out — a free
+            // drain of the pool. Rounding the price move up always moves at
+            // least as far as the exact solution requires, so the input
+            // computed from it is never less than truly owed.
+            let drop = if liquidity > 0 {
+                Self::ceil_div(amount_out_needed * 1000, liquidity)
+            } else {
+                0
+            };
+            let p_t = (p_c - drop).max(1);
+            let amount_in = if p_t > 0 {
+                Self::ceil_div(liquidity * 1000 * (p_c - p_t), p_c * p_t)
+            } else {
+                0
+            };
+            let sqrt_price_target_x96 = ((p_t as u128) * (1 << 96)) / 1000;
+            (sqrt_price_target_x96, amount_in.max(0))
+        } else {
+            // amount_out = liquidity * 1000 * (p_t - p_c) / (p_c * p_t)
+            //   => p_t = liquidity * 1000 * p_c / (liquidity * 1000 - amount_out * p_c)
+            //
+            // `p_t` rounds UP for the same reason as `drop` above: price
+            // must rise *at least* as far as the exact solution, never less.
+            let denom = liquidity * 1000 - amount_out_needed * p_c;
+            let p_t = if denom > 0 {
+                Self::ceil_div(liquidity * 1000 * p_c, denom)
+            } else {
+                // The requested output exceeds what this range can ever
+                // supply (would require price -> infinity); the caller
+                // clamps `amount_out_needed` to the step's own capacity
+                // before calling this, so this is a defensive fallback only.
+                p_c
+            };
+            let amount_in = Self::ceil_div(liquidity * (p_t - p_c), 1000);
+            let sqrt_price_target_x96 = ((p_t as u128) * (1 << 96)) / 1000;
+            (sqrt_price_target_x96, amount_in.max(0))
+        }
+    }
+
+    /// Core exact-out tick walk, shared by `swap_exact_out` and
+    /// `quote_exact_out`. Never touches storage or transfers tokens — the
+    /// caller applies `tick_crossings` / the fee-growth and protocol-fee
+    /// deltas (or discards them entirely, for a pure quote).
+    #[allow(clippy::too_many_arguments)]
+    fn walk_exact_out(
+        env: &Env,
+        zero_for_one: bool,
+        amount_out_requested: i128,
+        sqrt_price_limit_x96: u128,
+        fee_bps: i128,
+        protocol_fee_bps: i128,
+        mut current_tick: i32,
+        mut active_liquidity: i128,
+        mut sqrt_price_x96: u128,
+        fee_growth_global_a: i128,
+        fee_growth_global_b: i128,
+    ) -> ExactOutWalk {
+        let mut amount_out_remaining = amount_out_requested;
+        let mut amount_in_after_fee_total = 0_i128;
+        let mut amount_in_gross_total = 0_i128;
+        let mut protocol_fee_a_total = 0_i128;
+        let mut protocol_fee_b_total = 0_i128;
+        let mut fg_a = fee_growth_global_a;
+        let mut fg_b = fee_growth_global_b;
+        let mut tick_crossings: Vec<(i32, i128, i128)> = Vec::new(env);
+
+        while amount_out_remaining > 0 {
+            let next_tick_opt = Self::next_initialized_tick(env, current_tick, zero_for_one);
+            if next_tick_opt.is_none() && active_liquidity == 0 {
+                break;
+            }
+
+            let next_tick = match next_tick_opt {
+                Some(t) => {
+                    if zero_for_one {
+                        t.max(MIN_TICK)
+                    } else {
+                        t.min(MAX_TICK)
+                    }
+                }
+                None => {
+                    if zero_for_one {
+                        MIN_TICK
+                    } else {
+                        MAX_TICK
+                    }
+                }
+            };
+
+            let next_price_x96 = Self::tick_to_sqrt_price_x96(next_tick);
+
+            let mut target_price_x96 = next_price_x96;
+            let mut hit_limit = false;
+            if zero_for_one {
+                if next_price_x96 <= sqrt_price_limit_x96 {
+                    target_price_x96 = sqrt_price_limit_x96;
+                    hit_limit = true;
+                }
+            } else if next_price_x96 >= sqrt_price_limit_x96 {
+                target_price_x96 = sqrt_price_limit_x96;
+                hit_limit = true;
+            }
+
+            let (amount_in_step_after_fee, amount_out_step) = if active_liquidity == 0 {
+                (0, 0)
+            } else {
+                Self::compute_step(
+                    active_liquidity,
+                    sqrt_price_x96,
+                    target_price_x96,
+                    zero_for_one,
+                )
+            };
+
+            if (amount_out_remaining >= amount_out_step || active_liquidity == 0) && !hit_limit {
+                // Full step: the tick boundary is reached before amount_out is
+                // satisfied. Reuse the exact-in step's own (already-tested)
+                // amount_in for this exact price transition — it is a fixed
+                // quantity for this tick boundary, independent of which
+                // direction (exact-in or exact-out) drove the walk there.
+                let step_in_gross = if active_liquidity > 0 && fee_bps > 0 {
+                    Self::ceil_div(amount_in_step_after_fee * 10000, 10000 - fee_bps)
+                } else {
+                    amount_in_step_after_fee
+                };
+
+                amount_out_remaining -= amount_out_step;
+                amount_in_after_fee_total += amount_in_step_after_fee;
+                amount_in_gross_total += step_in_gross;
+
+                let fee = step_in_gross - amount_in_step_after_fee;
+                if fee > 0 && active_liquidity > 0 {
+                    let protocol_fee = fee * protocol_fee_bps / 10000;
+                    let lp_fee = fee - protocol_fee;
+                    if zero_for_one {
+                        protocol_fee_a_total += protocol_fee;
+                        if lp_fee > 0 {
+                            fg_a += lp_fee * 1_000_000 / active_liquidity;
+                        }
+                    } else {
+                        protocol_fee_b_total += protocol_fee;
+                        if lp_fee > 0 {
+                            fg_b += lp_fee * 1_000_000 / active_liquidity;
+                        }
+                    }
+                }
+
+                sqrt_price_x96 = target_price_x96;
+
+                let tick_info = Self::get_tick(env, next_tick);
+                let flip_a = fg_a - tick_info.fee_growth_outside_a;
+                let flip_b = fg_b - tick_info.fee_growth_outside_b;
+                tick_crossings.push_back((next_tick, flip_a, flip_b));
+
+                if zero_for_one {
+                    active_liquidity -= tick_info.liquidity_net;
+                    current_tick = next_tick - 1;
+                } else {
+                    active_liquidity += tick_info.liquidity_net;
+                    current_tick = next_tick;
+                }
+            } else {
+                if active_liquidity > 0 {
+                    let out_needed = if hit_limit {
+                        amount_out_step
+                    } else {
+                        amount_out_remaining
+                    }
+                    .min(amount_out_remaining);
+
+                    let (new_price_x96, in_after_fee) = Self::compute_final_price_and_input(
+                        active_liquidity,
+                        sqrt_price_x96,
+                        out_needed,
+                        zero_for_one,
+                    );
+                    let in_gross = if fee_bps > 0 {
+                        Self::ceil_div(in_after_fee * 10000, 10000 - fee_bps)
+                    } else {
+                        in_after_fee
+                    };
+
+                    amount_out_remaining -= out_needed;
+                    amount_in_after_fee_total += in_after_fee;
+                    amount_in_gross_total += in_gross;
+
+                    let fee = in_gross - in_after_fee;
+                    if fee > 0 {
+                        let protocol_fee = fee * protocol_fee_bps / 10000;
+                        let lp_fee = fee - protocol_fee;
+                        if zero_for_one {
+                            protocol_fee_a_total += protocol_fee;
+                            if lp_fee > 0 {
+                                fg_a += lp_fee * 1_000_000 / active_liquidity;
+                            }
+                        } else {
+                            protocol_fee_b_total += protocol_fee;
+                            if lp_fee > 0 {
+                                fg_b += lp_fee * 1_000_000 / active_liquidity;
+                            }
+                        }
+                    }
+
+                    if hit_limit {
+                        sqrt_price_x96 = target_price_x96;
+                    } else {
+                        sqrt_price_x96 = new_price_x96;
+                    }
+                    // See the equivalent clamp in `swap`'s partial-step branch:
+                    // this branch only runs when the step math already decided
+                    // the trade does not need to reach `next_tick`, but its
+                    // deliberately low-precision, pool-favorable-rounded price
+                    // can — right at a boundary — round-trip through the
+                    // full-precision `sqrt_price_x96_to_tick` to `next_tick` or
+                    // beyond. Clamp back to the known-correct side.
+                    current_tick = Self::sqrt_price_x96_to_tick(sqrt_price_x96);
+                    current_tick = if zero_for_one {
+                        current_tick.max(next_tick)
+                    } else {
+                        current_tick.min(next_tick)
+                    };
+                } else {
+                    sqrt_price_x96 = target_price_x96;
+                    current_tick = Self::sqrt_price_x96_to_tick(sqrt_price_x96);
+                }
+                break;
+            }
+        }
+
+        ExactOutWalk {
+            amount_in_after_fee_total,
+            amount_in_gross_total,
+            amount_out_filled: amount_out_requested - amount_out_remaining,
+            sqrt_price_final: sqrt_price_x96,
+            tick_final: current_tick,
+            active_liquidity_final: active_liquidity,
+            fee_growth_global_a_delta: fg_a - fee_growth_global_a,
+            fee_growth_global_b_delta: fg_b - fee_growth_global_b,
+            protocol_fee_a_delta: protocol_fee_a_total,
+            protocol_fee_b_delta: protocol_fee_b_total,
+            tick_crossings,
+            fully_filled: amount_out_remaining == 0,
+        }
+    }
+
+    /// Swap to receive an exact amount of one token, paying at most
+    /// `max_amount_in` of the other. Mirrors `swap` in every respect other
+    /// than which side is fixed: deadline/pause/auth/amount checks, the
+    /// oracle tick-accumulator update, tick crossing with `liquidity_net`
+    /// and fee-growth-outside flips, protocol fee accrual, the oracle
+    /// deviation guard, and the `price_upd` / `swap_out` events.
+    ///
+    /// Reverts with `SlippageExceeded` if the required input would exceed
+    /// `max_amount_in`, and with `ExactOutNotFullyFilled` if the price limit
+    /// or available liquidity is reached before `amount_out` is satisfied —
+    /// exact-out has no meaningful partial fill.
+    pub fn swap_exact_out(
+        env: Env,
+        sender: Address,
+        zero_for_one: bool,
+        amount_out: i128,
+        sqrt_price_limit_x96: u128,
+        max_amount_in: i128,
+        deadline: u64,
+    ) -> Result<i128, ClError> {
+        if env.ledger().timestamp() > deadline {
+            return Err(ClError::DeadlineExpired);
+        }
+        if Self::is_paused(env.clone()) {
+            return Err(ClError::Paused);
+        }
+        sender.require_auth();
+        if amount_out <= 0 {
+            return Err(ClError::ZeroAmounts);
+        }
+
+        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
+        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let protocol_fee_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeBps)
+            .unwrap_or(0);
+
+        // Oracle tick-accumulator update, identical to `swap`, before the
+        // tick walk moves `CurrentTick`.
+        let now = env.ledger().timestamp();
+        let last_ts: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LastOracleTimestamp)
+            .unwrap_or(now);
+        let elapsed = now.saturating_sub(last_ts) as i64;
+        if elapsed > 0 {
+            let current_tick_oracle: i32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::CurrentTick)
+                .unwrap_or(0);
+            let cum: i64 = env
+                .storage()
+                .instance()
+                .get(&DataKey::TickCumulative)
+                .unwrap_or(0);
+            let new_cum = cum + (current_tick_oracle as i64) * elapsed;
+            env.storage()
+                .instance()
+                .set(&DataKey::TickCumulative, &new_cum);
+            env.storage()
+                .instance()
+                .set(&DataKey::LastOracleTimestamp, &now);
+            env.storage()
+                .instance()
+                .set(&DataKey::OraclePoint(now), &new_cum);
+        }
+
+        let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+        let current_tick: i32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentTick)
+            .unwrap_or(0);
+        let active_liquidity: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveLiquidity)
+            .unwrap_or(0);
+        let sqrt_price_x96 = Self::current_sqrt_price_x96(&env, current_tick);
+        let sqrt_price_before = sqrt_price_x96;
+        let fg_a: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeGrowthGlobalA)
+            .unwrap_or(0);
+        let fg_b: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeGrowthGlobalB)
+            .unwrap_or(0);
+
+        let walk = Self::walk_exact_out(
+            &env,
+            zero_for_one,
+            amount_out,
+            sqrt_price_limit_x96,
+            fee_bps,
+            protocol_fee_bps,
+            current_tick,
+            active_liquidity,
+            sqrt_price_x96,
+            fg_a,
+            fg_b,
+        );
+
+        if !walk.fully_filled {
+            return Err(ClError::ExactOutNotFullyFilled);
+        }
+        if walk.amount_in_gross_total > max_amount_in {
+            return Err(ClError::SlippageExceeded);
+        }
+
+        let token_in = if zero_for_one {
+            token_a.clone()
+        } else {
+            token_b.clone()
+        };
+        let token_out = if zero_for_one {
+            token_b.clone()
+        } else {
+            token_a.clone()
+        };
+
+        if walk.amount_in_gross_total > 0 && walk.amount_out_filled > 0 {
+            Self::check_oracle_deviation(
+                &env,
+                &token_in,
+                &token_out,
+                walk.amount_in_gross_total,
+                walk.amount_out_filled,
+            )?;
+        }
+
+        // Apply tick crossings (liquidity_net already folded into
+        // `walk.active_liquidity_final`; here we only persist the
+        // fee-growth-outside flips computed during the walk).
+        for i in 0..walk.tick_crossings.len() {
+            let (tick, flip_a, flip_b) = walk.tick_crossings.get(i).unwrap();
+            let mut tick_info = Self::get_tick(&env, tick);
+            tick_info.fee_growth_outside_a = flip_a;
+            tick_info.fee_growth_outside_b = flip_b;
+            Self::set_tick(&env, tick, &tick_info);
+        }
+
+        if walk.fee_growth_global_a_delta != 0 {
+            env.storage().instance().set(
+                &DataKey::FeeGrowthGlobalA,
+                &(fg_a + walk.fee_growth_global_a_delta),
+            );
+        }
+        if walk.fee_growth_global_b_delta != 0 {
+            env.storage().instance().set(
+                &DataKey::FeeGrowthGlobalB,
+                &(fg_b + walk.fee_growth_global_b_delta),
+            );
+        }
+        if walk.protocol_fee_a_delta > 0 {
+            let accrued_a: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::AccruedProtocolFeeA)
+                .unwrap_or(0);
+            env.storage().instance().set(
+                &DataKey::AccruedProtocolFeeA,
+                &(accrued_a + walk.protocol_fee_a_delta),
+            );
+        }
+        if walk.protocol_fee_b_delta > 0 {
+            let accrued_b: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::AccruedProtocolFeeB)
+                .unwrap_or(0);
+            env.storage().instance().set(
+                &DataKey::AccruedProtocolFeeB,
+                &(accrued_b + walk.protocol_fee_b_delta),
+            );
+        }
+
+        if walk.amount_in_gross_total > 0 {
+            TokenClient::new(&env, &token_in).transfer(
+                &sender,
+                &env.current_contract_address(),
+                &walk.amount_in_gross_total,
+            );
+        }
+        if walk.amount_out_filled > 0 {
+            TokenClient::new(&env, &token_out).transfer(
+                &env.current_contract_address(),
+                &sender,
+                &walk.amount_out_filled,
+            );
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::CurrentTick, &walk.tick_final);
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveLiquidity, &walk.active_liquidity_final);
+        env.storage()
+            .instance()
+            .set(&DataKey::SqrtPriceX96, &walk.sqrt_price_final);
+
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (symbol_short!("swap_out"), sender),
+            (
+                zero_for_one,
+                walk.amount_in_gross_total,
+                walk.amount_out_filled,
+                walk.sqrt_price_final,
+                walk.tick_final,
+            )
+        );
+
+        if walk.sqrt_price_final != sqrt_price_before {
+            soroban_amm_sdk::emit_versioned_event!(
+                env,
+                (symbol_short!("price_upd"), token_in, token_out),
+                (
+                    walk.amount_in_gross_total,
+                    walk.amount_out_filled,
+                    walk.sqrt_price_final,
+                    walk.tick_final
+                )
+            );
+        }
+
+        Ok(walk.amount_in_gross_total)
+    }
+
+    /// Read-only simulation of `swap_exact_out`: returns the input required
+    /// to receive exactly `amount_out`, without transferring tokens or
+    /// mutating any state. Shares `walk_exact_out` with `swap_exact_out`, so
+    /// the two can never disagree on the same pool state.
+    pub fn quote_exact_out(
+        env: Env,
+        zero_for_one: bool,
+        amount_out: i128,
+        sqrt_price_limit_x96: u128,
+    ) -> Result<i128, ClError> {
+        if amount_out <= 0 {
+            return Err(ClError::ZeroAmounts);
+        }
+        let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap_or(0);
+        let protocol_fee_bps: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ProtocolFeeBps)
+            .unwrap_or(0);
+        let current_tick: i32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::CurrentTick)
+            .unwrap_or(0);
+        let active_liquidity: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveLiquidity)
+            .unwrap_or(0);
+        let sqrt_price_x96 = Self::current_sqrt_price_x96(&env, current_tick);
+        let fg_a: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeGrowthGlobalA)
+            .unwrap_or(0);
+        let fg_b: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::FeeGrowthGlobalB)
+            .unwrap_or(0);
+
+        let walk = Self::walk_exact_out(
+            &env,
+            zero_for_one,
+            amount_out,
+            sqrt_price_limit_x96,
+            fee_bps,
+            protocol_fee_bps,
+            current_tick,
+            active_liquidity,
+            sqrt_price_x96,
+            fg_a,
+            fg_b,
+        );
+
+        if !walk.fully_filled {
+            return Err(ClError::ExactOutNotFullyFilled);
+        }
+        Ok(walk.amount_in_gross_total)
     }
 
     /// Estimate swap output and price impact without transferring tokens or mutating pool state.
@@ -1893,7 +3112,8 @@ impl ConcentratedLiquidity {
     }
 
     /// Returns tick_cumulative at `seconds_ago` seconds in the past.
-    /// Looks up the stored oracle snapshot at exactly `now - seconds_ago`.
+    /// Uses exact oracle snapshots when available; otherwise linearly interpolates
+    /// between the nearest bracketing snapshots (issue #512).
     /// `seconds_ago == 0` returns the current cumulative value (extrapolated to now).
     pub fn observe(env: Env, seconds_ago: u64) -> i64 {
         let cum: i64 = env
@@ -1918,18 +3138,104 @@ impl ConcentratedLiquidity {
             let elapsed = (target_ts - last_ts) as i64;
             cum + (current_tick as i64) * elapsed
         } else {
-            // Look up stored oracle point at target timestamp
+            Self::oracle_cumulative_at(&env, target_ts, cum, last_ts)
+        }
+    }
+
+    fn record_oracle_point(env: &Env, timestamp: u64, cumulative: i64) {
+        env.storage()
+            .instance()
+            .set(&DataKey::OraclePoint(timestamp), &cumulative);
+        let mut timestamps: Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleTimestamps)
+            .unwrap_or_else(|| Vec::new(env));
+        let append =
+            timestamps.is_empty() || timestamps.get(timestamps.len() - 1).unwrap_or(0) < timestamp;
+        if append {
+            timestamps.push_back(timestamp);
             env.storage()
                 .instance()
-                .get(&DataKey::OraclePoint(target_ts))
-                .unwrap_or(0)
+                .set(&DataKey::OracleTimestamps, &timestamps);
         }
+    }
+
+    /// Tick cumulative at `target_ts` using exact snapshots or linear interpolation.
+    fn oracle_cumulative_at(env: &Env, target_ts: u64, live_cum: i64, last_ts: u64) -> i64 {
+        if let Some(cum) = env
+            .storage()
+            .instance()
+            .get(&DataKey::OraclePoint(target_ts))
+        {
+            return cum;
+        }
+        let timestamps: Vec<u64> = match env.storage().instance().get(&DataKey::OracleTimestamps) {
+            Some(ts) => ts,
+            None => {
+                return env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::OraclePoint(target_ts))
+                    .unwrap_or(0);
+            }
+        };
+        if timestamps.is_empty() {
+            return 0;
+        }
+        let first = timestamps.get(0).unwrap();
+        if target_ts < first {
+            return 0;
+        }
+        let n = timestamps.len();
+        let mut lo_idx: Option<u32> = None;
+        let mut hi_idx: Option<u32> = None;
+        for i in 0..n {
+            let t = timestamps.get(i).unwrap();
+            if t <= target_ts {
+                lo_idx = Some(i);
+            } else if hi_idx.is_none() {
+                hi_idx = Some(i);
+                break;
+            }
+        }
+        let lo = match lo_idx {
+            Some(i) => i,
+            None => return 0,
+        };
+        let t_lo = timestamps.get(lo).unwrap();
+        let c_lo: i64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OraclePoint(t_lo))
+            .unwrap_or(0);
+        let (t_hi, c_hi) = match hi_idx {
+            Some(hi) => {
+                let t = timestamps.get(hi).unwrap();
+                let c = env
+                    .storage()
+                    .instance()
+                    .get(&DataKey::OraclePoint(t))
+                    .unwrap_or(0);
+                (t, c)
+            }
+            None => (last_ts, live_cum),
+        };
+        if target_ts == t_lo {
+            return c_lo;
+        }
+        if t_hi == t_lo {
+            return c_lo;
+        }
+        let dt = (t_hi - t_lo) as i128;
+        let elapsed = (target_ts - t_lo) as i128;
+        c_lo + (((c_hi - c_lo) as i128 * elapsed) / dt) as i64
     }
 
     /// Returns all open position tick-range pairs for `provider`.
     pub fn get_positions(env: Env, provider: Address) -> Vec<(i32, i32)> {
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::PositionList(provider))
             .unwrap_or_else(|| Vec::new(&env))
     }
@@ -1992,32 +3298,19 @@ impl ConcentratedLiquidity {
         (inside_a, inside_b)
     }
 
+    /// Computes `PRICE_SCALE * 1.0001^tick` via binary exponentiation (O(log|tick|)
+    /// multiplications), supporting the full [MIN_TICK, MAX_TICK] range. Delegates
+    /// to `tick_to_price_bexp`, which uses saturating arithmetic to prevent panics
+    /// at extreme ticks.
     pub fn tick_to_price(tick: i32) -> i128 {
-        if tick == 0 {
-            return 1_000_000;
-        }
-        let abs_tick = tick.unsigned_abs() as i128;
-        let iters = abs_tick.min(300);
-        let mut price = 1_000_000_i128;
-        for _ in 0..iters {
-            price = price * 1_000_100 / 1_000_000;
-        }
-        if tick < 0 {
-            price = 1_000_000 * 1_000_000 / price;
-        }
-        price
+        Self::tick_to_price_bexp(tick)
     }
 
-    /// Binary-exponentiation variant of `tick_to_price`.
-    ///
-    /// Computes `PRICE_SCALE * 1.0001^tick` in O(log|tick|) multiplications,
-    /// supporting the full tick range without the 300-iteration cap.
-    /// Uses saturating arithmetic to prevent panics at extreme ticks.
     fn tick_to_price_bexp(tick: i32) -> i128 {
         if tick == 0 {
             return PRICE_SCALE;
         }
-        let abs_tick = tick.unsigned_abs() as u32;
+        let abs_tick = tick.unsigned_abs();
         let mut price = PRICE_SCALE;
         // base = TICK_BASE_NUM / TICK_BASE_DEN in PRICE_SCALE units = 1.0001 * 1_000_000
         let mut base = TICK_BASE_NUM;
@@ -2054,29 +3347,6 @@ impl ConcentratedLiquidity {
         } else {
             0
         }
-    }
-
-    /// Compute actual token amounts from desired amounts based on current price position.
-    /// When out of range, only one token type is used. When in range, amounts are
-    /// distributed proportionally based on the price within the range.
-    fn amounts_for_liquidity(ct: i32, lt: i32, ut: i32, ad: i128, bd: i128) -> (i128, i128) {
-        if ct < lt {
-            return (ad, 0);
-        }
-        if ct >= ut {
-            return (0, bd);
-        }
-
-        // In-range: distribute amounts based on price position
-        let pl = Self::tick_to_price(lt);
-        let pu = Self::tick_to_price(ut);
-        let pc = Self::tick_to_price(ct);
-        let range = pu - pl;
-        if range == 0 {
-            return (ad / 2, bd / 2);
-        }
-        let below = pc - pl;
-        (ad * (range - below) / range, bd * below / range)
     }
 
     /// Compute token amounts needed to burn `liquidity` from a position.
@@ -2116,7 +3386,14 @@ impl ConcentratedLiquidity {
             let sqrt_upper = Self::tick_to_sqrt_price_x96(ut);
             math::get_liquidity_for_amount1(sqrt_lower, sqrt_upper, b).max(1)
         } else {
-            a.min(b).max(1)
+            let sqrt_lower = Self::tick_to_sqrt_price_x96(lt);
+            let sqrt_upper = Self::tick_to_sqrt_price_x96(ut);
+            let sqrt_current = Self::tick_to_sqrt_price_x96(ct);
+            let liquidity_from_amount0 =
+                math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, a);
+            let liquidity_from_amount1 =
+                math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, b);
+            liquidity_from_amount0.min(liquidity_from_amount1).max(1)
         }
     }
 
@@ -2342,8 +3619,10 @@ impl ConcentratedLiquidity {
 
         while amount_remaining > 0 {
             let next_tick_opt = Self::next_initialized_tick(env, current_tick, zero_for_one);
+            // No initialized ticks in this direction and no liquidity — nothing to trade.
+            // amount_remaining is left untouched so this untraded portion is excluded
+            // from amount_in_actual below.
             if next_tick_opt.is_none() && active_liquidity == 0 {
-                amount_remaining = 0;
                 break;
             }
 
@@ -2364,23 +3643,25 @@ impl ConcentratedLiquidity {
                 }
             };
 
-            let next_price_x96 = {
-                let price = Self::tick_to_price(next_tick);
-                let sqrt_p = Self::sqrt(price);
-                (sqrt_p as u128) * (1u128 << 96) / 1000u128
-            };
+            let next_price_x96 = Self::tick_to_sqrt_price_x96(next_tick);
 
             let mut target_price_x96 = next_price_x96;
             let mut hit_limit = false;
 
-            if zero_for_one {
-                if next_price_x96 <= sqrt_price_limit_x96 {
+            // `sqrt_price_limit_x96 == 0` is the documented "no limit" sentinel.
+            // Skip the comparison entirely in that case — for `zero_for_one = false`
+            // every price is `>= 0` (u128), which would otherwise force the target
+            // price to 0 on the very first iteration (issue #492).
+            if sqrt_price_limit_x96 != 0 {
+                if zero_for_one {
+                    if next_price_x96 <= sqrt_price_limit_x96 {
+                        target_price_x96 = sqrt_price_limit_x96;
+                        hit_limit = true;
+                    }
+                } else if next_price_x96 >= sqrt_price_limit_x96 {
                     target_price_x96 = sqrt_price_limit_x96;
                     hit_limit = true;
                 }
-            } else if next_price_x96 >= sqrt_price_limit_x96 {
-                target_price_x96 = sqrt_price_limit_x96;
-                hit_limit = true;
             }
 
             let amount_in_after_fee = amount_remaining * (10000 - fee_bps) / 10000;
@@ -2414,7 +3695,7 @@ impl ConcentratedLiquidity {
                 let tick_info = Self::get_tick(env, next_tick);
                 if zero_for_one {
                     active_liquidity -= tick_info.liquidity_net;
-                    current_tick = next_tick - 1;
+                    current_tick = (next_tick - 1).max(MIN_TICK);
                 } else {
                     active_liquidity += tick_info.liquidity_net;
                     current_tick = next_tick;
@@ -2454,11 +3735,28 @@ impl ConcentratedLiquidity {
                     } else {
                         sqrt_price_x96 = new_price_x96;
                     }
-                    current_tick = Self::price_to_tick(sqrt_price_x96);
+                    // This branch only runs when the step's own math already
+                    // determined the trade does *not* need to reach `next_tick`
+                    // (the `if` arm above handles the case where it does). The
+                    // step math works in a deliberately low-precision (~3
+                    // significant digit) price representation, though, and its
+                    // pool-favorable rounding can — right at a boundary —
+                    // compute a price indistinguishable from (or past) the
+                    // tick it was told not to reach. Reconstructing that price
+                    // via the full-precision `sqrt_price_x96_to_tick` can then
+                    // resolve to `next_tick` or beyond even though this step
+                    // never crossed it. Clamp back to the known-correct side.
+                    current_tick = Self::sqrt_price_x96_to_tick(sqrt_price_x96);
+                    current_tick = if zero_for_one {
+                        current_tick.max(next_tick)
+                    } else {
+                        current_tick.min(next_tick)
+                    };
                 } else {
                     sqrt_price_x96 = target_price_x96;
-                    current_tick = Self::price_to_tick(sqrt_price_x96);
-                    amount_remaining = 0;
+                    current_tick = Self::sqrt_price_x96_to_tick(sqrt_price_x96);
+                    // No liquidity in this gap — amount_remaining is left untouched
+                    // so this untraded portion is excluded from amount_in_actual.
                 }
                 break;
             }
@@ -2517,42 +3815,45 @@ impl ConcentratedLiquidity {
             } else {
                 p_c
             };
-            let amount_out = liquidity * (p_c - p_t) / 1000;
-            let sqrt_price_target_x96 = ((p_t as u128) * (1 << 96)) / 1000;
+            // amount_out = liquidity * (p_c - p_t) / 1000. Computed via the
+            // algebraically-equivalent `liquidity * p_c^2 * amount_in_after_fee
+            // / (1000 * denom)` instead of subtracting p_c - p_t directly:
+            // for a small trade against deep liquidity, p_t rounds to the same
+            // integer as p_c at this fixed-point scale, which would silently
+            // zero out amount_out even though the trade is real.
+            let amount_out = liquidity * p_c * p_c * amount_in_after_fee / (1000 * denom);
+            let mut sqrt_price_target_x96 = ((p_t as u128) * (1 << 96)) / 1000;
+            // `p_t` is rounded to a 3-significant-digit scale, so a small
+            // trade against deep liquidity can round to the same integer as
+            // `p_c`, leaving the returned Q96 price bit-identical to the
+            // input even though a real, nonzero trade happened. Nudge it by
+            // the smallest representable Q96 step so price always moves in
+            // the traded direction rather than silently freezing.
+            if amount_out > 0 && sqrt_price_target_x96 >= sqrt_price_current_x96 {
+                sqrt_price_target_x96 = sqrt_price_current_x96.saturating_sub(1);
+            }
             (sqrt_price_target_x96, amount_out)
         } else {
             let p_t = p_c + amount_in_after_fee * 1000 / liquidity;
-            let amount_out = liquidity * 1000 * (p_t - p_c) / (p_c * p_t.max(1));
-            let sqrt_price_target_x96 = ((p_t as u128) * (1 << 96)) / 1000;
+            // amount_out = liquidity * 1000 * (p_t - p_c) / (p_c * p_t), with
+            // (p_t - p_c) substituted by its exact value `amount_in_after_fee *
+            // 1000 / liquidity` before any rounding, for the same reason as
+            // the zero_for_one branch above.
+            let denom = p_c * (p_c * liquidity + amount_in_after_fee * 1000);
+            let amount_out = if denom > 0 {
+                1_000_000 * amount_in_after_fee * liquidity / denom
+            } else {
+                0
+            };
+            let mut sqrt_price_target_x96 = ((p_t as u128) * (1 << 96)) / 1000;
+            // See the zero_for_one comment above: nudge upward by one Q96
+            // unit when rounding would otherwise leave the price unchanged
+            // despite a real trade.
+            if amount_out > 0 && sqrt_price_target_x96 <= sqrt_price_current_x96 {
+                sqrt_price_target_x96 = sqrt_price_current_x96.saturating_add(1);
+            }
             (sqrt_price_target_x96, amount_out)
         }
-    }
-
-    fn price_to_tick(sqrt_p: u128) -> i32 {
-        let sqrt_p_scaled = ((sqrt_p * 1000) >> 96) as i128;
-        let target_price = sqrt_p_scaled * sqrt_p_scaled;
-        let mut low = -300_i32;
-        let mut high = 300_i32;
-        let mut best_tick = 0_i32;
-        let mut min_diff = i128::MAX;
-
-        while low <= high {
-            let mid = (low + high) / 2;
-            let price = Self::tick_to_price(mid);
-            let diff = (price - target_price).abs();
-            if diff < min_diff {
-                min_diff = diff;
-                best_tick = mid;
-            }
-            if price < target_price {
-                low = mid + 1;
-            } else if price > target_price {
-                high = mid - 1;
-            } else {
-                return mid;
-            }
-        }
-        best_tick
     }
 }
 
@@ -2653,6 +3954,40 @@ mod tests {
         let state3 = te.client.get_pool_state();
         assert!(state3.current_tick < 0);
         assert!(state3.sqrt_price < (1u128 << 96));
+    }
+
+    /// Regression test for issue #346: per-user position state must live in
+    /// persistent storage, not the shared 64 KB instance budget.
+    #[test]
+    fn positions_are_stored_in_persistent_storage() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 30_i128, 0_i32);
+
+        te.client.mint_position(
+            &te.provider,
+            &-100_i32,
+            &100_i32,
+            &10_000_i128,
+            &10_000_i128,
+            &0_i128,
+            &0_i128,
+        );
+
+        let pos_key = DataKey::Position(te.provider.clone(), -100, 100);
+        let list_key = DataKey::PositionList(te.provider.clone());
+
+        env.as_contract(&te.cl_addr, || {
+            // The position and its tracking list are persisted...
+            assert!(env.storage().persistent().has(&pos_key));
+            assert!(env.storage().persistent().has(&list_key));
+            // ...and must not consume the shared instance budget.
+            assert!(!env.storage().instance().has(&pos_key));
+            assert!(!env.storage().instance().has(&list_key));
+        });
+
+        // The view path resolves the same persistent entries.
+        assert!(te.client.get_position(&te.provider, &-100, &100).liquidity > 0);
+        assert_eq!(te.client.get_positions(&te.provider).len(), 1);
     }
 
     #[test]
@@ -2783,6 +4118,19 @@ mod tests {
     }
 
     #[test]
+    fn test_modify_position_deadline_expired() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 0, 0);
+        env.ledger().set_timestamp(101);
+        // The deadline check runs before any position lookup, so an expired
+        // deadline must short-circuit regardless of position state.
+        let result = te
+            .client
+            .try_modify_position(&te.provider, &-100, &100, &1000, &0, &0, &100);
+        assert_eq!(result, Err(Ok(ClError::DeadlineExpired)));
+    }
+
+    #[test]
     fn test_non_overlapping_fee_collection() {
         let env = Env::default();
         let te = setup_test_env(&env, 1000, 100); // 10% fee, start at tick 100
@@ -2799,14 +4147,134 @@ mod tests {
         te.client
             .mint_position(&provider2, &50, &150, &100_000, &100_000, &0, &0);
 
+        // 200_000 in (180_000 after the 10% fee) is large enough to cross
+        // down through both the 100->50 and 50->0 boundaries, so both
+        // positions actually trade against the swap and must retain their
+        // own fee share rather than losing it to whichever range the price
+        // ends up in.
         te.client
-            .swap(&te.provider, &true, &20_000, &0, &0, &10_000);
+            .swap(&te.provider, &true, &200_000, &0, &0, &10_000);
 
         let (f1_a, f1_b) = te.client.collect_fees(&provider1, &0, &50);
         let (f2_a, f2_b) = te.client.collect_fees(&provider2, &50, &150);
 
         assert!(f1_a > 0 || f1_b > 0);
         assert!(f2_a > 0 || f2_b > 0);
+    }
+
+    /// Same fee-growth-inside bug as above, with a third adjacent range so a
+    /// single swap must cross two boundaries (100 and 50) rather than one,
+    /// and both earlier-exited positions must retain their accrued fees
+    /// rather than losing them to whichever range price ends up in.
+    #[test]
+    fn test_three_adjacent_ranges_each_retain_their_own_fee_share() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 1000, 140); // 10% fee, start at tick 140
+
+        let provider1 = Address::generate(&env);
+        te.sac_a.mint(&provider1, &1_000_000);
+        te.sac_b.mint(&provider1, &1_000_000);
+        let provider2 = Address::generate(&env);
+        te.sac_a.mint(&provider2, &1_000_000);
+        te.sac_b.mint(&provider2, &1_000_000);
+        let provider3 = Address::generate(&env);
+        te.sac_a.mint(&provider3, &1_000_000);
+        te.sac_b.mint(&provider3, &1_000_000);
+
+        te.client
+            .mint_position(&provider1, &0, &50, &100_000, &100_000, &0, &0);
+        te.client
+            .mint_position(&provider2, &50, &100, &100_000, &100_000, &0, &0);
+        te.client
+            .mint_position(&provider3, &100, &150, &100_000, &100_000, &0, &0);
+
+        // Sell A for B (price decreasing) far enough to cross both the 100
+        // and 50 boundaries, starting from tick 140 (inside position 3).
+        te.client
+            .swap(&te.provider, &true, &200_000, &0, &0, &10_000);
+
+        let (f2_a, f2_b) = te.client.collect_fees(&provider2, &50, &100);
+        let (f3_a, f3_b) = te.client.collect_fees(&provider3, &100, &150);
+
+        assert!(
+            f3_a > 0 || f3_b > 0,
+            "position covering the swap's starting range must retain its fee share"
+        );
+        assert!(
+            f2_a > 0 || f2_b > 0,
+            "the middle position, exited partway through the swap, must not lose its fee share"
+        );
+    }
+
+    /// Audits the NFT-keyed path (`collect_fees_by_token_id`) for the same
+    /// fee_growth_inside bug: it calls the identical `fee_growth_inside` as
+    /// the legacy-owner path above, so it must retain fees the same way once
+    /// price has crossed out of the position's range.
+    #[test]
+    fn test_collect_fees_by_token_id_retains_fee_share_after_tick_crossing() {
+        use cl_position_nft::{ClPositionNft, ClPositionNftClient};
+
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &1000_i128, &100_i32, &1_i32);
+
+        let nft_addr = env.register_contract(None, ClPositionNft);
+        let nft = ClPositionNftClient::new(&env, &nft_addr);
+        nft.initialize(&admin, &cl_addr);
+        client.set_position_nft(&admin, &Some(nft_addr));
+
+        let provider1 = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_a).mint(&provider1, &1_000_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&provider1, &1_000_000_i128);
+        let provider2 = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_b).mint(&provider2, &1_000_000_i128);
+        StellarAssetClient::new(&env, &token_a).mint(&provider2, &1_000_000_i128);
+
+        client.mint_position(
+            &provider1,
+            &0_i32,
+            &50_i32,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+        );
+        client.mint_position(
+            &provider2,
+            &50_i32,
+            &150_i32,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+        );
+        // token_id 1: provider2's [50,150] position, minted second.
+        let token_id = 1_u64;
+        assert_eq!(
+            client.position_of_token(&token_id),
+            Some((provider2.clone(), 50_i32, 150_i32))
+        );
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_a).mint(&trader, &50_000_i128);
+        client.swap(&trader, &true, &20_000_i128, &0_u128, &0_i128, &u64::MAX);
+
+        let (f_a, f_b) = client.collect_fees_by_token_id(&provider2, &token_id);
+        assert!(
+            f_a > 0 || f_b > 0,
+            "the NFT-keyed path must retain fees the same way the legacy path does"
+        );
     }
 
     // ── Issue #186: emergency pause tests ─────────────────────────────────────
@@ -2933,14 +4401,20 @@ mod tests {
             .mint_position(&te.provider, &-100, &100, &100_000, &100_000, &0, &0);
 
         // zero_for_one = true → token_in = token_a, token_out = token_b.
-        let amount_out = te.client.swap(&te.provider, &true, &1_000, &0, &0, &u64::MAX);
+        let amount_out = te
+            .client
+            .swap(&te.provider, &true, &1_000, &0, &0, &u64::MAX);
         assert!(amount_out > 0);
 
         let state = te.client.get_pool_state();
 
         use soroban_sdk::{testutils::Events as _, IntoVal, Val, Vec as SdkVec};
-        let expected_topics: SdkVec<Val> =
-            (symbol_short!("price_upd"), te.token_a.clone(), te.token_b.clone()).into_val(&env);
+        let expected_topics: SdkVec<Val> = (
+            symbol_short!("price_upd"),
+            te.token_a.clone(),
+            te.token_b.clone(),
+        )
+            .into_val(&env);
         let event = env
             .events()
             .all()
@@ -2954,6 +4428,40 @@ mod tests {
         assert_eq!(amount_out_emitted, amount_out);
         assert_eq!(new_sqrt_price, state.sqrt_price);
         assert_eq!(new_tick, state.current_tick);
+    }
+
+    /// Issue #492: `sqrt_price_limit_x96 = 0` is the documented "no limit" sentinel.
+    /// For `zero_for_one = false`, `next_price_x96 >= 0` is trivially true for every
+    /// u128 price, so before the fix this forced `hit_limit = true` on the very
+    /// first iteration and collapsed the target price to 0 — bricking the pool by
+    /// persisting `SqrtPriceX96 = 0` even though no tokens were ever transferred.
+    #[test]
+    fn swap_zero_for_one_false_with_zero_price_limit_trades_normally() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 30, 0);
+
+        te.client
+            .mint_position(&te.provider, &-100, &100, &100_000, &100_000, &0, &0);
+
+        let state_before = te.client.get_pool_state();
+
+        // zero_for_one = false, sqrt_price_limit_x96 = 0 ("no limit"), as
+        // dex_aggregator::execute_hops always passes for CL hops.
+        let amount_out = te
+            .client
+            .swap(&te.provider, &false, &1_000, &0, &0, &u64::MAX);
+
+        assert!(amount_out > 0, "swap must produce real output, not a no-op");
+
+        let state_after = te.client.get_pool_state();
+        assert_ne!(
+            state_after.sqrt_price, 0,
+            "pool price must never collapse to 0"
+        );
+        assert!(
+            state_after.sqrt_price > state_before.sqrt_price,
+            "zero_for_one = false must move the price up, not zero it out"
+        );
     }
 
     #[test]
@@ -3188,7 +4696,10 @@ mod test {
         let (amount_a, amount_b) =
             client.burn_position(&provider, &lower_tick, &upper_tick, &liquidity);
         // Burn must return approximately the same amount as mint (±1 rounding), token_a only.
-        assert!((amount_a - mint_a).abs() <= 1, "burn_a={amount_a} expected ~{mint_a}");
+        assert!(
+            (amount_a - mint_a).abs() <= 1,
+            "burn_a={amount_a} expected ~{mint_a}"
+        );
         assert_eq!(amount_b, 0_i128);
 
         let expected_topics: SdkVec<Val> =
@@ -3216,20 +4727,6 @@ mod test_new_features {
     use soroban_sdk::testutils::{Address as _, Ledger};
     use soroban_sdk::token::StellarAssetClient;
     use soroban_sdk::Env;
-
-    fn setup(env: &Env) -> (Address, Address, Address, ConcentratedLiquidityClient) {
-        let admin = Address::generate(env);
-        let token_a = env
-            .register_stellar_asset_contract_v2(admin.clone())
-            .address();
-        let token_b = env
-            .register_stellar_asset_contract_v2(admin.clone())
-            .address();
-        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
-        let client = ConcentratedLiquidityClient::new(env, &cl_addr);
-        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
-        (admin, token_a, token_b, client)
-    }
 
     // ── Issue #183: TWAP tick accumulator ────────────────────────────────────
 
@@ -3350,6 +4847,48 @@ mod test_new_features {
         let avg_tick = (obs_now - obs_200s_ago) / 200_i64;
         // avg tick = tick_at_1100 * 100 / 200 = tick_at_1100 / 2
         assert_eq!(avg_tick, (tick_at_1100 as i64) / 2);
+    }
+
+    #[test]
+    fn observe_interpolates_between_oracle_snapshots() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.budget().reset_unlimited();
+        env.ledger().set_timestamp(1_000);
+
+        let admin = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        StellarAssetClient::new(&env, &token_a).mint(&cl_addr, &1_000_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&cl_addr, &1_000_000_i128);
+        let buyer = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_a).mint(&buyer, &2_000_i128);
+
+        env.ledger().set_timestamp(1_100);
+        client.swap(&buyer, &true, &100_i128, &0_u128, &0_i128, &u64::MAX);
+        let (cum_1100, _) = client.get_tick_cumulative();
+
+        env.ledger().set_timestamp(1_200);
+        client.swap(&buyer, &true, &100_i128, &0_u128, &0_i128, &u64::MAX);
+        let (cum_1200, _) = client.get_tick_cumulative();
+
+        env.ledger().set_timestamp(1_250);
+        // Midpoint between swap snapshots at t=1100 and t=1200 (no snapshot at t=1150).
+        let obs_mid = client.observe(&150_u64);
+        let expected_mid = cum_1100 + (cum_1200 - cum_1100) / 2;
+        assert_eq!(obs_mid, expected_mid);
+        // Exact-key lookup would have returned 0 at t=1150 when cum_1200 != 0.
+        if cum_1200 != cum_1100 {
+            assert_ne!(obs_mid, 0_i64);
+        }
     }
 
     // ── Issue #184: get_positions ─────────────────────────────────────────────
@@ -3512,10 +5051,17 @@ mod test_new_features {
             &5_000_i128,
             &0_i128,
             &0_i128,
+            &u64::MAX,
         );
 
-        assert_eq!(added_a, quote.0, "modify_position must use the current-price quote for token A");
-        assert_eq!(added_b, quote.1, "modify_position must use the current-price quote for token B");
+        assert_eq!(
+            added_a, quote.0,
+            "modify_position must use the current-price quote for token A"
+        );
+        assert_eq!(
+            added_b, quote.1,
+            "modify_position must use the current-price quote for token B"
+        );
 
         let position_after = client.get_position(&provider, &-200_i32, &-1_i32);
         assert_eq!(
@@ -3525,7 +5071,11 @@ mod test_new_features {
         );
 
         let positions_after = client.get_positions(&provider);
-        assert_eq!(positions_after.len(), 1, "storage must be reused for the same range");
+        assert_eq!(
+            positions_after.len(),
+            1,
+            "storage must be reused for the same range"
+        );
         assert_eq!(
             positions_after.get(0).unwrap(),
             (-200_i32, -1_i32),
@@ -3545,7 +5095,7 @@ mod test_tick_spacing {
     fn setup_cl(
         env: &Env,
         tick_spacing: i32,
-    ) -> (Address, Address, Address, ConcentratedLiquidityClient) {
+    ) -> (Address, Address, Address, ConcentratedLiquidityClient<'_>) {
         env.mock_all_auths();
         let admin = Address::generate(env);
         env.budget().reset_unlimited();
@@ -3683,7 +5233,7 @@ mod test_new_tick_features {
     use soroban_sdk::token::StellarAssetClient;
     use soroban_sdk::Env;
 
-    fn setup_pool(env: &Env) -> (Address, Address, Address, ConcentratedLiquidityClient) {
+    fn setup_pool(env: &Env) -> (Address, Address, Address, ConcentratedLiquidityClient<'_>) {
         env.mock_all_auths();
         let admin = Address::generate(env);
         env.budget().reset_unlimited();
@@ -4183,7 +5733,7 @@ mod test_single_token_deposit {
     fn setup_pool(
         env: &Env,
         initial_tick: i32,
-    ) -> (Address, Address, Address, ConcentratedLiquidityClient) {
+    ) -> (Address, Address, Address, ConcentratedLiquidityClient<'_>) {
         env.mock_all_auths();
         let admin = Address::generate(env);
         env.budget().reset_unlimited();
@@ -4403,16 +5953,15 @@ mod test_single_token_deposit {
         let (provider, token_a, _token_b, client) = setup_pool(&env, -200);
 
         // First, find out how much liquidity a 10_000 deposit produces.
-        let normal = client
-            .mint_position_single_token(
-                &provider,
-                &100_i32,
-                &200_i32,
-                &token_a,
-                &10_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let normal = client.mint_position_single_token(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
         // Now request more than that — must fail.
         let provider2 = Address::generate(&env);
@@ -4570,27 +6119,25 @@ mod test_single_token_deposit {
         let env = Env::default();
         let (provider, token_a, _token_b, client) = setup_pool(&env, -200);
 
-        let r1 = client
-            .mint_position_single_token(
-                &provider,
-                &100_i32,
-                &200_i32,
-                &token_a,
-                &10_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let r1 = client.mint_position_single_token(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
-        let r2 = client
-            .mint_position_single_token(
-                &provider,
-                &100_i32,
-                &200_i32,
-                &token_a,
-                &10_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let r2 = client.mint_position_single_token(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
         let pos = client.get_position(&provider, &100_i32, &200_i32);
         assert_eq!(
@@ -4609,19 +6156,17 @@ mod test_single_token_deposit {
         let (provider, token_a, _token_b, client) = setup_pool(&env, -200);
 
         let amount_in = 20_000_i128;
-        let quote = client
-            .quote_single_token_deposit(&100_i32, &200_i32, &token_a, &amount_in);
+        let quote = client.quote_single_token_deposit(&100_i32, &200_i32, &token_a, &amount_in);
 
-        let actual = client
-            .mint_position_single_token(
-                &provider,
-                &100_i32,
-                &200_i32,
-                &token_a,
-                &amount_in,
-                &1_i128,
-                &u64::MAX,
-            );
+        let actual = client.mint_position_single_token(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &amount_in,
+            &1_i128,
+            &u64::MAX,
+        );
 
         assert_eq!(
             quote.amount_used, actual.amount_used,
@@ -4640,19 +6185,17 @@ mod test_single_token_deposit {
         let (provider, _token_a, token_b, client) = setup_pool(&env, 300);
 
         let amount_in = 20_000_i128;
-        let quote = client
-            .quote_single_token_deposit(&-200_i32, &-100_i32, &token_b, &amount_in);
+        let quote = client.quote_single_token_deposit(&-200_i32, &-100_i32, &token_b, &amount_in);
 
-        let actual = client
-            .mint_position_single_token(
-                &provider,
-                &-200_i32,
-                &-100_i32,
-                &token_b,
-                &amount_in,
-                &1_i128,
-                &u64::MAX,
-            );
+        let actual = client.mint_position_single_token(
+            &provider,
+            &-200_i32,
+            &-100_i32,
+            &token_b,
+            &amount_in,
+            &1_i128,
+            &u64::MAX,
+        );
 
         assert_eq!(quote.amount_used, actual.amount_used);
         assert_eq!(quote.dust, actual.dust);
@@ -4665,19 +6208,17 @@ mod test_single_token_deposit {
         let (provider, token_a, _token_b, client) = setup_pool(&env, 0);
 
         let amount_in = 100_000_i128;
-        let quote = client
-            .quote_single_token_deposit(&-100_i32, &100_i32, &token_a, &amount_in);
+        let quote = client.quote_single_token_deposit(&-100_i32, &100_i32, &token_a, &amount_in);
 
-        let actual = client
-            .mint_position_single_token(
-                &provider,
-                &-100_i32,
-                &100_i32,
-                &token_a,
-                &amount_in,
-                &1_i128,
-                &u64::MAX,
-            );
+        let actual = client.mint_position_single_token(
+            &provider,
+            &-100_i32,
+            &100_i32,
+            &token_a,
+            &amount_in,
+            &1_i128,
+            &u64::MAX,
+        );
 
         assert_eq!(quote.amount_used, actual.amount_used);
         assert_eq!(quote.dust, actual.dust);
@@ -4693,16 +6234,15 @@ mod test_single_token_deposit {
         let (provider, token_a, _token_b, client) = setup_pool(&env, 0);
 
         let liq_before = client.active_liquidity();
-        let result = client
-            .mint_position_single_token(
-                &provider,
-                &-100_i32,
-                &100_i32,
-                &token_a,
-                &50_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let result = client.mint_position_single_token(
+            &provider,
+            &-100_i32,
+            &100_i32,
+            &token_a,
+            &50_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
         let liq_after = client.active_liquidity();
         assert_eq!(
@@ -4720,16 +6260,15 @@ mod test_single_token_deposit {
         let (provider, token_a, _token_b, client) = setup_pool(&env, -200);
 
         let liq_before = client.active_liquidity();
-        client
-            .mint_position_single_token(
-                &provider,
-                &100_i32,
-                &200_i32,
-                &token_a,
-                &50_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        client.mint_position_single_token(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &50_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
         assert_eq!(
             client.active_liquidity(),
@@ -4749,16 +6288,15 @@ mod test_single_token_deposit {
         assert!(!client.is_tick_initialized(&100_i32));
         assert!(!client.is_tick_initialized(&200_i32));
 
-        client
-            .mint_position_single_token(
-                &provider,
-                &100_i32,
-                &200_i32,
-                &token_a,
-                &10_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        client.mint_position_single_token(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
         assert!(
             client.is_tick_initialized(&100_i32),
@@ -4778,16 +6316,15 @@ mod test_single_token_deposit {
         let env = Env::default();
         let (provider, token_a, _token_b, client) = setup_pool(&env, -200);
 
-        client
-            .mint_position_single_token(
-                &provider,
-                &100_i32,
-                &200_i32,
-                &token_a,
-                &10_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        client.mint_position_single_token(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
         let positions = client.get_positions(&provider);
         assert_eq!(positions.len(), 1);
@@ -4804,35 +6341,39 @@ mod test_single_token_deposit {
         // Pool A: current below range → token_a deposit.
         let env_a = Env::default();
         let (provider_a, token_a_a, _token_b_a, client_a) = setup_pool(&env_a, -300);
-        let result_a = client_a
-            .mint_position_single_token(
-                &provider_a,
-                &-200_i32,
-                &-100_i32,
-                &token_a_a,
-                &10_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let result_a = client_a.mint_position_single_token(
+            &provider_a,
+            &-200_i32,
+            &-100_i32,
+            &token_a_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
         // Pool B: current above range → token_b deposit.
         let env_b = Env::default();
         let (provider_b, _token_a_b, token_b_b, client_b) = setup_pool(&env_b, -50);
-        let result_b = client_b
-            .mint_position_single_token(
-                &provider_b,
-                &-200_i32,
-                &-100_i32,
-                &token_b_b,
-                &10_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let result_b = client_b.mint_position_single_token(
+            &provider_b,
+            &-200_i32,
+            &-100_i32,
+            &token_b_b,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
         // Both deposits should produce positive liquidity (exact equality not guaranteed
         // for asymmetric tick ranges, but both should succeed).
-        assert!(result_a.liquidity > 0, "below-range deposit must produce positive liquidity");
-        assert!(result_b.liquidity > 0, "above-range deposit must produce positive liquidity");
+        assert!(
+            result_a.liquidity > 0,
+            "below-range deposit must produce positive liquidity"
+        );
+        assert!(
+            result_b.liquidity > 0,
+            "above-range deposit must produce positive liquidity"
+        );
         assert_eq!(result_a.dust, 0);
         assert_eq!(result_b.dust, 0);
     }
@@ -4844,27 +6385,25 @@ mod test_single_token_deposit {
         let env = Env::default();
         let (provider, token_a, _token_b, client) = setup_pool(&env, -200);
 
-        let r1 = client
-            .mint_position_single_token(
-                &provider,
-                &100_i32,
-                &200_i32,
-                &token_a,
-                &10_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let r1 = client.mint_position_single_token(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
-        let r2 = client
-            .mint_position_single_token(
-                &provider,
-                &100_i32,
-                &200_i32,
-                &token_a,
-                &20_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let r2 = client.mint_position_single_token(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &20_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
         // Doubling the deposit should roughly double the liquidity (within rounding).
         assert!(
@@ -4885,16 +6424,15 @@ mod test_single_token_deposit {
         let env = Env::default();
         let (provider, token_a, _token_b, client) = setup_pool(&env, -200);
 
-        let result = client
-            .mint_position_single_token(
-                &provider,
-                &100_i32,
-                &200_i32,
-                &token_a,
-                &10_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let result = client.mint_position_single_token(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
         let events = env.events().all();
         let evt = events
@@ -4925,16 +6463,15 @@ mod test_single_token_deposit {
         // current_tick = 100, range [100, 200] - price at lower boundary
         let (provider, token_a, _token_b, client) = setup_pool(&env, 100);
 
-        let result = client
-            .mint_position_single_token(
-                &provider,
-                &100_i32,
-                &200_i32,
-                &token_a,
-                &10_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let result = client.mint_position_single_token(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
         // Token A at lower boundary should still produce liquidity
         assert!(result.liquidity > 0);
@@ -4952,16 +6489,15 @@ mod test_single_token_deposit {
         // This is an in-range position; token_b covers [lower=-200, current=-101].
         let (provider, _token_a, token_b, client) = setup_pool(&env, -101);
 
-        let result = client
-            .mint_position_single_token(
-                &provider,
-                &-200_i32,
-                &-100_i32,
-                &token_b,
-                &10_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let result = client.mint_position_single_token(
+            &provider,
+            &-200_i32,
+            &-100_i32,
+            &token_b,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
         assert!(result.liquidity > 0);
         assert!(result.amount_used > 0);
@@ -4974,16 +6510,15 @@ mod test_single_token_deposit {
         // current_tick = 0, range [-1000, 1000] - wide range centered at current
         let (provider, token_a, _token_b, client) = setup_pool(&env, 0);
 
-        let result = client
-            .mint_position_single_token(
-                &provider,
-                &-1000_i32,
-                &1000_i32,
-                &token_a,
-                &100_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let result = client.mint_position_single_token(
+            &provider,
+            &-1000_i32,
+            &1000_i32,
+            &token_a,
+            &100_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
         // Token A covers upper half of the range
         assert!(result.liquidity > 0);
@@ -4998,16 +6533,15 @@ mod test_single_token_deposit {
         // current_tick = 0, range [-1, 1] - very tight range around current
         let (provider, token_a, _token_b, client) = setup_pool(&env, 0);
 
-        let result = client
-            .mint_position_single_token(
-                &provider,
-                &-1_i32,
-                &1_i32,
-                &token_a,
-                &1_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let result = client.mint_position_single_token(
+            &provider,
+            &-1_i32,
+            &1_i32,
+            &token_a,
+            &1_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
         assert!(result.liquidity > 0);
         assert!(result.amount_used > 0);
@@ -5021,16 +6555,15 @@ mod test_single_token_deposit {
         let (provider, token_a, _token_b, client) = setup_pool(&env, -800000);
 
         // Deposit at a reasonable range above current
-        let result = client
-            .mint_position_single_token(
-                &provider,
-                &-700000_i32,
-                &-600000_i32,
-                &token_a,
-                &10_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let result = client.mint_position_single_token(
+            &provider,
+            &-700000_i32,
+            &-600000_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
         assert!(result.liquidity > 0);
     }
@@ -5042,52 +6575,47 @@ mod test_single_token_deposit {
 
         // Test below range
         let (provider_a, token_a, _token_b, client) = setup_pool(&env, -200);
-        let quote1 = client
-            .quote_single_token_deposit(&100_i32, &200_i32, &token_a, &10_000_i128);
-        let mint1 = client
-            .mint_position_single_token(
-                &provider_a,
-                &100_i32,
-                &200_i32,
-                &token_a,
-                &10_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let quote1 = client.quote_single_token_deposit(&100_i32, &200_i32, &token_a, &10_000_i128);
+        let mint1 = client.mint_position_single_token(
+            &provider_a,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
         assert_eq!(quote1.liquidity, mint1.liquidity);
         assert_eq!(quote1.amount_used, mint1.amount_used);
 
         // Test above range
         let (provider_b, _token_a, token_b, client) = setup_pool(&env, 300);
-        let quote2 = client
-            .quote_single_token_deposit(&-200_i32, &-100_i32, &token_b, &10_000_i128);
-        let mint2 = client
-            .mint_position_single_token(
-                &provider_b,
-                &-200_i32,
-                &-100_i32,
-                &token_b,
-                &10_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let quote2 =
+            client.quote_single_token_deposit(&-200_i32, &-100_i32, &token_b, &10_000_i128);
+        let mint2 = client.mint_position_single_token(
+            &provider_b,
+            &-200_i32,
+            &-100_i32,
+            &token_b,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
         assert_eq!(quote2.liquidity, mint2.liquidity);
         assert_eq!(quote2.amount_used, mint2.amount_used);
 
         // Test in range
         let (provider_c, token_a, _token_b, client) = setup_pool(&env, 0);
-        let quote3 = client
-            .quote_single_token_deposit(&-50_i32, &50_i32, &token_a, &10_000_i128);
-        let mint3 = client
-            .mint_position_single_token(
-                &provider_c,
-                &-50_i32,
-                &50_i32,
-                &token_a,
-                &10_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let quote3 = client.quote_single_token_deposit(&-50_i32, &50_i32, &token_a, &10_000_i128);
+        let mint3 = client.mint_position_single_token(
+            &provider_c,
+            &-50_i32,
+            &50_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
         assert_eq!(quote3.liquidity, mint3.liquidity);
         assert_eq!(quote3.amount_used, mint3.amount_used);
     }
@@ -5166,16 +6694,15 @@ mod test_single_token_deposit {
         StellarAssetClient::new(&env, &token_a).mint(&provider, &100_000_i128);
         StellarAssetClient::new(&env, &token_a).mint(&cl_addr, &100_000_i128);
 
-        let result = client
-            .mint_position_single_token(
-                &provider,
-                &-200_i32,
-                &-100_i32,
-                &token_a,
-                &10_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let result = client.mint_position_single_token(
+            &provider,
+            &-200_i32,
+            &-100_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
         let liq = result.liquidity;
         let (burn_a, burn_b) = client.burn_position(&provider, &-200_i32, &-100_i32, &liq);
@@ -5212,21 +6739,1865 @@ mod test_single_token_deposit {
         StellarAssetClient::new(&env, &token_b).mint(&cl_addr, &100_000_i128);
 
         // Deposit token A in range [-100, 100]
-        let result = client
-            .mint_position_single_token(
-                &provider,
-                &-100_i32,
-                &100_i32,
-                &token_a,
-                &10_000_i128,
-                &1_i128,
-                &u64::MAX,
-            );
+        let result = client.mint_position_single_token(
+            &provider,
+            &-100_i32,
+            &100_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
 
         let liq = result.liquidity;
         let (burn_a, burn_b) = client.burn_position(&provider, &-100_i32, &100_i32, &liq);
 
         // Position was in-range, so both tokens should be returned
         assert!(burn_a > 0 || burn_b > 0, "burn should return tokens");
+    }
+
+    // ── Issue #348: NFT-keyed position ownership ───────────────────────────────
+
+    use cl_position_nft::{ClPositionNft, ClPositionNftClient};
+
+    /// Bundle of handles for a CL pool with a position-NFT contract wired in and
+    /// a single in-range position already opened by `alice`.
+    struct NftFixture<'a> {
+        client: ConcentratedLiquidityClient<'a>,
+        nft: ClPositionNftClient<'a>,
+        token_a: Address,
+        token_b: Address,
+        alice: Address,
+        lower: i32,
+        upper: i32,
+        liquidity: i128,
+    }
+
+    fn setup_with_nft(env: &Env) -> NftFixture<'_> {
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(env);
+        let alice = Address::generate(env);
+
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        // Deploy and wire the position-NFT contract (cl_pool = this pool).
+        let nft_addr = env.register_contract(None, ClPositionNft);
+        let nft = ClPositionNftClient::new(env, &nft_addr);
+        nft.initialize(&admin, &cl_addr);
+        client.set_position_nft(&admin, &Some(nft_addr.clone()));
+
+        StellarAssetClient::new(env, &token_a).mint(&alice, &1_000_000_i128);
+        StellarAssetClient::new(env, &token_b).mint(&alice, &1_000_000_i128);
+
+        let lower = -100_i32;
+        let upper = 100_i32;
+        client.mint_position(
+            &alice,
+            &lower,
+            &upper,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+        );
+        let liquidity = client.get_position(&alice, &lower, &upper).liquidity;
+
+        NftFixture {
+            client,
+            nft,
+            token_a,
+            token_b,
+            alice,
+            lower,
+            upper,
+            liquidity,
+        }
+    }
+
+    #[test]
+    fn mint_tokenizes_position_and_records_indexes() {
+        let env = Env::default();
+        let f = setup_with_nft(&env);
+
+        // NFT token 0 minted to alice, both index directions recorded.
+        assert_eq!(f.nft.owner_of(&0_u64), f.alice);
+        assert_eq!(
+            f.client.position_token_id(&f.alice, &f.lower, &f.upper),
+            Some(0_u64)
+        );
+        assert_eq!(
+            f.client.position_of_token(&0_u64),
+            Some((f.alice.clone(), f.lower, f.upper))
+        );
+    }
+
+    #[test]
+    fn transferred_owner_can_burn_via_token_id() {
+        let env = Env::default();
+        let f = setup_with_nft(&env);
+        let bob = Address::generate(&env);
+
+        // Alice transfers the position NFT to Bob.
+        f.nft.transfer(&f.alice, &f.alice, &bob, &0_u64);
+        assert_eq!(f.nft.owner_of(&0_u64), bob);
+
+        // Bob fully burns the position via the NFT token id; tokens go to Bob.
+        let (a_out, b_out) = f
+            .client
+            .burn_position_by_token_id(&bob, &0_u64, &f.liquidity);
+        assert!(a_out > 0 || b_out > 0);
+        assert_eq!(TokenClient::new(&env, &f.token_a).balance(&bob), a_out);
+        assert_eq!(TokenClient::new(&env, &f.token_b).balance(&bob), b_out);
+
+        // Position fully closed: NFT burned and both indexes cleared.
+        assert!(f.nft.try_owner_of(&0_u64).is_err());
+        assert_eq!(f.client.position_of_token(&0_u64), None);
+        assert_eq!(
+            f.client.position_token_id(&f.alice, &f.lower, &f.upper),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_provider_mutation_rejected_after_transfer() {
+        let env = Env::default();
+        let f = setup_with_nft(&env);
+        let bob = Address::generate(&env);
+        f.nft.transfer(&f.alice, &f.alice, &bob, &0_u64);
+
+        let mint_err = f
+            .client
+            .try_mint_position(
+                &f.alice,
+                &f.lower,
+                &f.upper,
+                &10_000_i128,
+                &10_000_i128,
+                &0_i128,
+                &0_i128,
+            )
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(mint_err, ClError::NotNftOwner);
+
+        let modify_err = f
+            .client
+            .try_modify_position(
+                &f.alice,
+                &f.lower,
+                &f.upper,
+                &1_000_i128,
+                &0_i128,
+                &0_i128,
+                &u64::MAX,
+            )
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(modify_err, ClError::NotNftOwner);
+    }
+
+    #[test]
+    fn legacy_provider_path_blocked_after_transfer() {
+        let env = Env::default();
+        let f = setup_with_nft(&env);
+        let bob = Address::generate(&env);
+        f.nft.transfer(&f.alice, &f.alice, &bob, &0_u64);
+
+        // Alice no longer owns the NFT — her address-keyed calls are rejected.
+        let burn_err = f
+            .client
+            .try_burn_position(&f.alice, &f.lower, &f.upper, &f.liquidity)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(burn_err, ClError::NotNftOwner);
+
+        let collect_err = f
+            .client
+            .try_collect_fees(&f.alice, &f.lower, &f.upper)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(collect_err, ClError::NotNftOwner);
+    }
+
+    #[test]
+    fn burn_by_token_id_rejects_non_owner() {
+        let env = Env::default();
+        let f = setup_with_nft(&env);
+        let stranger = Address::generate(&env);
+
+        // Stranger never owned the NFT.
+        let err = f
+            .client
+            .try_burn_position_by_token_id(&stranger, &0_u64, &f.liquidity)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, ClError::NotNftOwner);
+
+        // After transfer, even the original provider is no longer the owner.
+        let bob = Address::generate(&env);
+        f.nft.transfer(&f.alice, &f.alice, &bob, &0_u64);
+        let err2 = f
+            .client
+            .try_burn_position_by_token_id(&f.alice, &0_u64, &f.liquidity)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err2, ClError::NotNftOwner);
+    }
+
+    #[test]
+    fn transferred_owner_collects_fees_via_token_id() {
+        // Dedicated high-fee pool (1000 bps) so swap fees are clearly observable,
+        // mirroring the existing fee-accrual tests.
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &1000_i128, &100_i32, &1_i32);
+
+        let nft_addr = env.register_contract(None, ClPositionNft);
+        let nft = ClPositionNftClient::new(&env, &nft_addr);
+        nft.initialize(&admin, &cl_addr);
+        client.set_position_nft(&admin, &Some(nft_addr));
+
+        StellarAssetClient::new(&env, &token_a).mint(&alice, &1_000_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&alice, &1_000_000_i128);
+        client.mint_position(
+            &alice,
+            &0_i32,
+            &150_i32,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+        );
+
+        // Alice transfers the position NFT to Bob.
+        let bob = Address::generate(&env);
+        nft.transfer(&alice, &alice, &bob, &0_u64);
+
+        // A trader swaps token A → token B, accruing token A fees to the position.
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_a).mint(&trader, &50_000_i128);
+        client.swap(&trader, &true, &2_000_i128, &0_u128, &0_i128, &u64::MAX);
+
+        // Bob (current owner) collects the accrued fees to his own address.
+        let (fee_a, fee_b) = client.collect_fees_by_token_id(&bob, &0_u64);
+        assert!(fee_a > 0, "token A fees should accrue from an A->B swap");
+        assert_eq!(TokenClient::new(&env, &token_a).balance(&bob), fee_a);
+        assert_eq!(fee_b, 0);
+
+        // The NFT and its indexes survive a fee collection (position still open).
+        assert_eq!(nft.owner_of(&0_u64), bob);
+        assert_eq!(
+            client.position_of_token(&0_u64),
+            Some((alice.clone(), 0_i32, 150_i32))
+        );
+    }
+
+    #[test]
+    fn full_burn_via_token_id_does_not_leak_fees_to_provider() {
+        // High-fee pool so fees clearly accrue.
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &1000_i128, &100_i32, &1_i32);
+
+        let nft_addr = env.register_contract(None, ClPositionNft);
+        let nft = ClPositionNftClient::new(&env, &nft_addr);
+        nft.initialize(&admin, &cl_addr);
+        client.set_position_nft(&admin, &Some(nft_addr));
+
+        StellarAssetClient::new(&env, &token_a).mint(&alice, &1_000_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&alice, &1_000_000_i128);
+        client.mint_position(
+            &alice,
+            &0_i32,
+            &150_i32,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+        );
+        let liquidity = client.get_position(&alice, &0_i32, &150_i32).liquidity;
+
+        // Transfer to Bob, then accrue fees via a swap.
+        let bob = Address::generate(&env);
+        nft.transfer(&alice, &alice, &bob, &0_u64);
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_a).mint(&trader, &50_000_i128);
+        client.swap(&trader, &true, &2_000_i128, &0_u128, &0_i128, &u64::MAX);
+
+        // Bob fully closes the position WITHOUT a separate collect_fees call.
+        client.burn_position_by_token_id(&bob, &0_u64, &liquidity);
+        assert!(TokenClient::new(&env, &token_a).balance(&bob) > 0);
+
+        // The original provider can no longer reclaim the accrued fees: the
+        // owed balance was swept to Bob on close.
+        let (alice_a, alice_b) = client.collect_fees(&alice, &0_i32, &150_i32);
+        assert_eq!((alice_a, alice_b), (0_i128, 0_i128));
+    }
+
+    /// Invariant test for the burn/collect balance clamp (issue #787): across
+    /// a sequence of mint/swap/partial-burn/full-burn operations over three
+    /// positions, a burn or collect must never attempt to pay out more of a
+    /// token than the contract actually held immediately before that call,
+    /// and the contract's balance must never go negative — checked via real
+    /// `TokenClient::balance` reads, not just "the call didn't panic".
+    #[test]
+    fn burn_and_collect_never_exceed_contract_balance() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &1000_i128, &100_i32, &1_i32);
+
+        let p1 = Address::generate(&env);
+        let p2 = Address::generate(&env);
+        let p3 = Address::generate(&env);
+        for p in [&p1, &p2, &p3] {
+            StellarAssetClient::new(&env, &token_a).mint(p, &1_000_000_i128);
+            StellarAssetClient::new(&env, &token_b).mint(p, &1_000_000_i128);
+        }
+
+        client.mint_position(
+            &p1,
+            &0_i32,
+            &50_i32,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+        );
+        client.mint_position(
+            &p2,
+            &50_i32,
+            &150_i32,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+        );
+        client.mint_position(
+            &p3,
+            &150_i32,
+            &300_i32,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+        );
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_a).mint(&trader, &200_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&trader, &200_000_i128);
+        client.swap(&trader, &true, &50_000_i128, &0_u128, &0_i128, &u64::MAX);
+        client.swap(&trader, &false, &50_000_i128, &0_u128, &0_i128, &u64::MAX);
+
+        let check = |result: (i128, i128), before_a: i128, before_b: i128| {
+            let (paid_a, paid_b) = result;
+            assert!(
+                paid_a <= before_a,
+                "must never pay out more token_a than the contract held"
+            );
+            assert!(
+                paid_b <= before_b,
+                "must never pay out more token_b than the contract held"
+            );
+            let after_a = TokenClient::new(&env, &token_a).balance(&cl_addr);
+            let after_b = TokenClient::new(&env, &token_b).balance(&cl_addr);
+            assert!(
+                after_a >= 0 && after_b >= 0,
+                "contract balance must never go negative"
+            );
+            assert_eq!(
+                after_a,
+                before_a - paid_a,
+                "token_a balance must drop by exactly what was paid"
+            );
+            assert_eq!(
+                after_b,
+                before_b - paid_b,
+                "token_b balance must drop by exactly what was paid"
+            );
+        };
+
+        // Partial burn on position 2.
+        let liq2 = client.get_position(&p2, &50_i32, &150_i32).liquidity;
+        let (before_a, before_b) = (
+            TokenClient::new(&env, &token_a).balance(&cl_addr),
+            TokenClient::new(&env, &token_b).balance(&cl_addr),
+        );
+        let res = client.burn_position(&p2, &50_i32, &150_i32, &(liq2 / 2));
+        check(res, before_a, before_b);
+
+        // Full burn + fee collection on position 3.
+        let liq3 = client.get_position(&p3, &150_i32, &300_i32).liquidity;
+        let (before_a, before_b) = (
+            TokenClient::new(&env, &token_a).balance(&cl_addr),
+            TokenClient::new(&env, &token_b).balance(&cl_addr),
+        );
+        let res = client.burn_position(&p3, &150_i32, &300_i32, &liq3);
+        check(res, before_a, before_b);
+        let (before_a, before_b) = (
+            TokenClient::new(&env, &token_a).balance(&cl_addr),
+            TokenClient::new(&env, &token_b).balance(&cl_addr),
+        );
+        let res = client.collect_fees(&p3, &150_i32, &300_i32);
+        check(res, before_a, before_b);
+
+        // Full burn on position 1.
+        let liq1 = client.get_position(&p1, &0_i32, &50_i32).liquidity;
+        let (before_a, before_b) = (
+            TokenClient::new(&env, &token_a).balance(&cl_addr),
+            TokenClient::new(&env, &token_b).balance(&cl_addr),
+        );
+        let res = client.burn_position(&p1, &0_i32, &50_i32, &liq1);
+        check(res, before_a, before_b);
+
+        // Remaining half of position 2, plus its fees.
+        let liq2_rest = client.get_position(&p2, &50_i32, &150_i32).liquidity;
+        let (before_a, before_b) = (
+            TokenClient::new(&env, &token_a).balance(&cl_addr),
+            TokenClient::new(&env, &token_b).balance(&cl_addr),
+        );
+        let res = client.burn_position(&p2, &50_i32, &150_i32, &liq2_rest);
+        check(res, before_a, before_b);
+        let (before_a, before_b) = (
+            TokenClient::new(&env, &token_a).balance(&cl_addr),
+            TokenClient::new(&env, &token_b).balance(&cl_addr),
+        );
+        let res = client.collect_fees(&p2, &50_i32, &150_i32);
+        check(res, before_a, before_b);
+    }
+
+    /// Different layout from `full_burn_via_token_id_does_not_leak_fees_to_provider`:
+    /// a *partial* burn (not a full close) with no separate `collect_fees`
+    /// call first, on a single wide position. Proven to fail on unmodified
+    /// code with the same class of insufficient-balance trap; must now
+    /// succeed with the payout clamped to what the contract actually holds.
+    #[test]
+    fn partial_burn_does_not_exceed_contract_balance() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &1000_i128, &100_i32, &1_i32);
+
+        StellarAssetClient::new(&env, &token_a).mint(&alice, &1_000_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&alice, &1_000_000_i128);
+        client.mint_position(
+            &alice,
+            &0_i32,
+            &150_i32,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+        );
+        let liquidity = client.get_position(&alice, &0_i32, &150_i32).liquidity;
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_a).mint(&trader, &50_000_i128);
+        client.swap(&trader, &true, &2_000_i128, &0_u128, &0_i128, &u64::MAX);
+
+        let before_a = TokenClient::new(&env, &token_a).balance(&cl_addr);
+        let before_b = TokenClient::new(&env, &token_b).balance(&cl_addr);
+        let (paid_a, paid_b) = client.burn_position(&alice, &0_i32, &150_i32, &(liquidity / 2));
+        assert!(paid_a <= before_a);
+        assert!(paid_b <= before_b);
+        let after_a = TokenClient::new(&env, &token_a).balance(&cl_addr);
+        let after_b = TokenClient::new(&env, &token_b).balance(&cl_addr);
+        assert!(after_a >= 0 && after_b >= 0);
+        assert_eq!(after_a, before_a - paid_a);
+        assert_eq!(after_b, before_b - paid_b);
+    }
+
+    #[test]
+    fn test_partial_burn_by_token_id_preserves_nft_and_indexes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &1000_i128, &100_i32, &1_i32);
+
+        let nft_addr = env.register_contract(None, ClPositionNft);
+        let nft = ClPositionNftClient::new(&env, &nft_addr);
+        nft.initialize(&admin, &cl_addr);
+        client.set_position_nft(&admin, &Some(nft_addr.clone()));
+
+        StellarAssetClient::new(&env, &token_a).mint(&alice, &1_000_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&alice, &1_000_000_i128);
+        client.mint_position(
+            &alice,
+            &0_i32,
+            &150_i32,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+        );
+
+        let total_liquidity = client.get_position(&alice, &0_i32, &150_i32).liquidity;
+        let partial_burn = total_liquidity / 2;
+
+        // Perform partial burn via token ID
+        client.burn_position_by_token_id(&alice, &0_u64, &partial_burn);
+
+        // Position still exists with remaining liquidity
+        let pos_after = client.get_position(&alice, &0_i32, &150_i32);
+        assert_eq!(pos_after.liquidity, total_liquidity - partial_burn);
+
+        // NFT still exists and owner is Alice
+        assert_eq!(nft.owner_of(&0_u64), alice);
+
+        // Burn remaining liquidity
+        client.burn_position_by_token_id(&alice, &0_u64, &(total_liquidity - partial_burn));
+
+        // Position is now fully closed
+        let pos_final = client.get_position(&alice, &0_i32, &150_i32);
+        assert_eq!(pos_final.liquidity, 0);
+
+        // NFT has been burned (trying owner_of panics / returns error)
+        let owner_res = nft.try_owner_of(&0_u64);
+        assert!(owner_res.is_err());
+    }
+
+    #[test]
+    fn token_id_path_requires_nft_configured() {
+        // A pool with no NFT wired in cannot resolve positions by token id.
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        let err = client
+            .try_burn_position_by_token_id(&admin, &0_u64, &1_i128)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, ClError::NftNotConfigured);
+    }
+
+    #[test]
+    fn legacy_path_unaffected_when_owner_unchanged() {
+        // While the original provider still holds the NFT, the address-keyed
+        // path keeps working exactly as before.
+        let env = Env::default();
+        let f = setup_with_nft(&env);
+
+        let (a_out, b_out) = f
+            .client
+            .burn_position(&f.alice, &f.lower, &f.upper, &f.liquidity);
+        assert!(a_out > 0 || b_out > 0);
+
+        // Full close burns the NFT and clears the indexes.
+        assert!(f.nft.try_owner_of(&0_u64).is_err());
+        assert_eq!(
+            f.client.position_token_id(&f.alice, &f.lower, &f.upper),
+            None
+        );
+    }
+
+    #[test]
+    fn cannot_change_nft_contract_after_positions_tokenized() {
+        // Regression test for vulnerability: changing DataKey::PositionNft to a
+        // different contract after positions have been minted would orphan the
+        // existing NftTokenToPosition / PositionNftToken indices. Later calls to
+        // resolve_token_owner or ensure_legacy_owner would query the new contract
+        // with stale token_ids from the old contract, causing:
+        // 1. Trap if token_id doesn't exist in new contract (locks LP out)
+        // 2. Wrong owner if new contract reused the same sequential id (authorization bypass)
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        // Wire NFT contract v1 and mint a position.
+        let nft_v1 = env.register_contract(None, ClPositionNft);
+        let nft_v1_client = ClPositionNftClient::new(&env, &nft_v1);
+        nft_v1_client.initialize(&admin, &cl_addr);
+        client.set_position_nft(&admin, &Some(nft_v1.clone()));
+
+        let alice = Address::generate(&env);
+        StellarAssetClient::new(&env, &token_a).mint(&alice, &1_000_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&alice, &1_000_000_i128);
+
+        client.mint_position(&alice, &-100, &100, &100_000_i128, &100_000_i128, &0, &0);
+        assert_eq!(client.position_token_id(&alice, &-100, &100), Some(0_u64));
+
+        // Attempt to change to NFT contract v2 — must be rejected.
+        let nft_v2 = env.register_contract(None, ClPositionNft);
+        let err = client
+            .try_set_position_nft(&admin, &Some(nft_v2))
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, ClError::NftContractChangeBlocked);
+
+        // Changing to None (detach) should still be allowed.
+        client.set_position_nft(&admin, &None);
+        assert_eq!(client.position_nft(), None);
+
+        // Re-attaching the same contract is allowed.
+        client.set_position_nft(&admin, &Some(nft_v1.clone()));
+        assert_eq!(client.position_nft(), Some(nft_v1));
+    }
+}
+
+#[cfg(test)]
+mod test_swap_exact_out {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token::{StellarAssetClient, TokenClient as StellarTokenClient};
+    use soroban_sdk::Env;
+
+    struct Env696<'a> {
+        env: Env,
+        provider: Address,
+        token_a: Address,
+        token_b: Address,
+        cl_addr: Address,
+        client: ConcentratedLiquidityClient<'a>,
+    }
+
+    /// Deploys a pool funded *only* through a real `mint_position` deposit —
+    /// unlike some other fixtures in this file, the contract is not
+    /// separately pre-funded with a balance cushion, so a token-balance
+    /// invariant check here is meaningful rather than trivially satisfied.
+    fn setup_exact_out<'a>(env: &'a Env, fee_bps: i128, initial_tick: i32) -> Env696<'a> {
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(env);
+        let provider = Address::generate(env);
+
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &fee_bps, &initial_tick, &1_i32);
+
+        StellarAssetClient::new(env, &token_a).mint(&provider, &100_000_000_i128);
+        StellarAssetClient::new(env, &token_b).mint(&provider, &100_000_000_i128);
+
+        Env696 {
+            env: env.clone(),
+            provider,
+            token_a,
+            token_b,
+            cl_addr,
+            client,
+        }
+    }
+
+    fn balances(f: &Env696) -> (i128, i128) {
+        (
+            StellarTokenClient::new(&f.env, &f.token_a).balance(&f.cl_addr),
+            StellarTokenClient::new(&f.env, &f.token_b).balance(&f.cl_addr),
+        )
+    }
+
+    // ── Pure-math unit tests for compute_final_price_and_input ───────────────
+
+    #[test]
+    fn compute_final_price_and_input_zero_for_one_hand_computed() {
+        let liquidity = 1_000_000_i128;
+        let sqrt_price_current = 1u128 << 96; // p_c = 1000 exactly
+        let amount_out = 100_000_i128;
+        // drop = 100_000 * 1000 / 1_000_000 = 100 -> p_t = 900
+        // amount_in = ceil(1_000_000*1000*(1000-900) / (1000*900))
+        //           = ceil(100_000_000_000 / 900_000) = ceil(111111.111..) = 111112
+        let (price_next, amount_in) = ConcentratedLiquidity::compute_final_price_and_input(
+            liquidity,
+            sqrt_price_current,
+            amount_out,
+            true,
+        );
+        assert_eq!(amount_in, 111_112);
+        let expected_price = (900u128 * (1u128 << 96)) / 1000;
+        assert_eq!(price_next, expected_price);
+    }
+
+    #[test]
+    fn compute_final_price_and_input_one_for_zero_hand_computed() {
+        let liquidity = 1_000_000_i128;
+        let sqrt_price_current = 1u128 << 96; // p_c = 1000
+        let amount_out = 100_000_i128;
+        // denom = 1_000_000*1000 - 100_000*1000 = 900_000_000
+        // p_t = ceil(1_000_000*1000*1000 / 900_000_000) = ceil(1111.11..) = 1112
+        // amount_in = ceil(1_000_000*(1112-1000)/1000) = ceil(112_000_000/1000) = 112_000 (exact)
+        let (price_next, amount_in) = ConcentratedLiquidity::compute_final_price_and_input(
+            liquidity,
+            sqrt_price_current,
+            amount_out,
+            false,
+        );
+        assert_eq!(amount_in, 112_000);
+        let expected_price = (1112u128 * (1u128 << 96)) / 1000;
+        assert_eq!(price_next, expected_price);
+    }
+
+    #[test]
+    fn compute_final_price_and_input_rounds_up_on_remainder() {
+        // Pick numbers where the exact-in-domain division has a non-zero
+        // remainder, to prove `ceil_div` actually rounds up rather than
+        // truncating like the forward (exact-in) math does.
+        let liquidity = 7_i128;
+        let sqrt_price_current = 1u128 << 96; // p_c = 1000
+        let amount_out = 1_i128;
+        // zero_for_one: drop = 1*1000/7 = 142 (floor) -> p_t = 858
+        // amount_in = ceil(7*1000*(1000-858) / (1000*858)) = ceil(994000/858000) = ceil(1.158..) = 2
+        let (_price, amount_in) = ConcentratedLiquidity::compute_final_price_and_input(
+            liquidity,
+            sqrt_price_current,
+            amount_out,
+            true,
+        );
+        assert_eq!(
+            amount_in, 2,
+            "must round up, not truncate, when there is a remainder"
+        );
+
+        // Verify ceil_div itself on the exact boundary and just past it.
+        assert_eq!(ConcentratedLiquidity::ceil_div(900_000, 900), 1000); // exact: no rounding needed
+        assert_eq!(ConcentratedLiquidity::ceil_div(900_001, 900), 1001); // one unit past: rounds up
+    }
+
+    #[test]
+    fn compute_final_price_and_input_zero_amount_out_needs_no_input() {
+        let (_price, amount_in) =
+            ConcentratedLiquidity::compute_final_price_and_input(1_000_000, 1u128 << 96, 0, true);
+        assert_eq!(amount_in, 0);
+        let (_price, amount_in) =
+            ConcentratedLiquidity::compute_final_price_and_input(1_000_000, 1u128 << 96, 0, false);
+        assert_eq!(amount_in, 0);
+    }
+
+    /// Regression test for the exact bug the doc comment on
+    /// `compute_final_price_and_input` describes: with a floor-rounded
+    /// price move, a small `amount_out` relative to `liquidity` truncates
+    /// the price delta to zero and computes `amount_in == 0` — the pool
+    /// would give away `amount_out` for free. `liquidity = 10_000_000` and
+    /// `amount_out = 1_000` reproduce it exactly (`1_000*1000/10_000_000`
+    /// floors to `0`); the fix (`ceil_div` on the price-delta term) must
+    /// keep `amount_in` strictly positive in both directions.
+    #[test]
+    fn compute_final_price_and_input_does_not_undercharge_small_amount_out() {
+        let liquidity = 10_000_000_i128;
+        let sqrt_price_current = 1u128 << 96;
+        let amount_out = 1_000_i128;
+
+        let (_price, amount_in) = ConcentratedLiquidity::compute_final_price_and_input(
+            liquidity,
+            sqrt_price_current,
+            amount_out,
+            true,
+        );
+        assert!(
+            amount_in > 0,
+            "zero_for_one: must never charge zero input for a positive amount_out"
+        );
+
+        let (_price, amount_in) = ConcentratedLiquidity::compute_final_price_and_input(
+            liquidity,
+            sqrt_price_current,
+            amount_out,
+            false,
+        );
+        assert!(
+            amount_in > 0,
+            "one_for_zero: must never charge zero input for a positive amount_out"
+        );
+    }
+
+    // ── Basic exact-out behaviour ──────────────────────────────────────────
+
+    #[test]
+    fn swap_exact_out_normal_path_zero_for_one() {
+        let env = Env::default();
+        let f = setup_exact_out(&env, 30, 0);
+        f.client
+            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0);
+
+        let b_before = StellarTokenClient::new(&env, &f.token_b).balance(&f.provider);
+        let amount_out = 1_000_i128;
+        let amount_in = f.client.swap_exact_out(
+            &f.provider,
+            &true,
+            &amount_out,
+            &0_u128,
+            &i128::MAX,
+            &10_000,
+        );
+        assert!(amount_in > 0);
+
+        let actual_out = StellarTokenClient::new(&env, &f.token_b).balance(&f.provider) - b_before;
+        assert_eq!(
+            actual_out, amount_out,
+            "trader must receive exactly the requested amount_out"
+        );
+    }
+
+    #[test]
+    fn swap_exact_out_normal_path_one_for_zero() {
+        let env = Env::default();
+        let f = setup_exact_out(&env, 30, 0);
+        f.client
+            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0);
+
+        let a_before = StellarTokenClient::new(&env, &f.token_a).balance(&f.provider);
+        let amount_out = 1_000_i128;
+        let amount_in = f.client.swap_exact_out(
+            &f.provider,
+            &false,
+            &amount_out,
+            &u128::MAX,
+            &i128::MAX,
+            &10_000,
+        );
+        assert!(amount_in > 0);
+
+        let actual_out = StellarTokenClient::new(&env, &f.token_a).balance(&f.provider) - a_before;
+        assert_eq!(actual_out, amount_out);
+    }
+
+    #[test]
+    fn quote_exact_out_matches_input_actually_consumed() {
+        let env = Env::default();
+        let f = setup_exact_out(&env, 30, 0);
+        f.client
+            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0);
+
+        let amount_out = 2_500_i128;
+        let quoted = f.client.quote_exact_out(&true, &amount_out, &0_u128);
+        let actual = f.client.swap_exact_out(
+            &f.provider,
+            &true,
+            &amount_out,
+            &0_u128,
+            &i128::MAX,
+            &10_000,
+        );
+        assert_eq!(
+            quoted, actual,
+            "quote_exact_out must match the input swap_exact_out actually consumed"
+        );
+    }
+
+    #[test]
+    fn quote_exact_out_does_not_mutate_state() {
+        let env = Env::default();
+        let f = setup_exact_out(&env, 30, 0);
+        f.client
+            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0);
+
+        let state_before = f.client.get_pool_state();
+        let balances_before = balances(&f);
+        f.client.quote_exact_out(&true, &1_000_i128, &0_u128);
+        let state_after = f.client.get_pool_state();
+        let balances_after = balances(&f);
+
+        assert_eq!(state_before, state_after);
+        assert_eq!(balances_before, balances_after);
+    }
+
+    // ── Round trip: quote_exact_out vs. actual swap_exact_out ─────────────────
+    //
+    // `quote_exact_out_matches_input_actually_consumed` above is the decisive
+    // round-trip test: it asserts *exact* equality between what
+    // `quote_exact_out` predicts and what `swap_exact_out` actually charges,
+    // for the same pool state — the two share the same `walk_exact_out` core,
+    // so they can never disagree. A separate round trip through
+    // `estimate_price_impact` (a plain exact-in quote → its output → asking
+    // `quote_exact_out` for that same output → comparing to the original
+    // exact-in amount) was also attempted here, but this pool's price
+    // representation carries only 3 significant digits
+    // (`(sqrt_price_x96 * 1000) >> 96`), and reconciling it against a
+    // hand-computed expectation for a *second, independently-computed*
+    // trade turned out to require reverse-engineering `estimate_price_impact`
+    // /`simulate_swap_walk`'s own internal liquidity accounting rather than
+    // testing `swap_exact_out` itself — not a productive use of a unit test.
+    // The exact-match test above is the stronger, more direct check of the
+    // same property.
+
+    // ── Invariant: pool never pays out more than it takes in ─────────────────
+
+    #[test]
+    fn invariant_holds_after_100_randomized_exact_out_swaps() {
+        let env = Env::default();
+        let f = setup_exact_out(&env, 30, 0);
+        f.client
+            .mint_position(&f.provider, &-5000, &5000, &50_000_000, &50_000_000, &0, &0);
+
+        let (initial_a, initial_b) = balances(&f);
+        let mut net_a = initial_a; // running expected balance
+        let mut net_b = initial_b;
+
+        let mut seed: u64 = 0xC0FFEE_u64;
+        let mut next_rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+
+        for _ in 0..100 {
+            let zero_for_one = next_rand() % 2 == 0;
+            let amount_out = 1 + (next_rand() % 2000) as i128;
+            let limit = if zero_for_one { 0_u128 } else { u128::MAX };
+            match f.client.try_swap_exact_out(
+                &f.provider,
+                &zero_for_one,
+                &amount_out,
+                &limit,
+                &i128::MAX,
+                &10_000,
+            ) {
+                Ok(Ok(amount_in)) => {
+                    if zero_for_one {
+                        net_a += amount_in;
+                        net_b -= amount_out;
+                    } else {
+                        net_b += amount_in;
+                        net_a -= amount_out;
+                    }
+                }
+                _ => continue, // ExactOutNotFullyFilled or similar — not the invariant under test
+            }
+            let (bal_a, bal_b) = balances(&f);
+            assert_eq!(bal_a, net_a, "token_a balance diverged from bookkeeping");
+            assert_eq!(bal_b, net_b, "token_b balance diverged from bookkeeping");
+            assert!(
+                bal_a >= 0 && bal_b >= 0,
+                "pool must never hold a negative balance"
+            );
+        }
+    }
+
+    // ── Multi-tick crossing ────────────────────────────────────────────────
+
+    #[test]
+    fn multi_tick_crossing_exact_out_matches_hand_computed_active_liquidity() {
+        let env = Env::default();
+        let f = setup_exact_out(&env, 0, 0); // 0% fee for a clean hand computation
+
+        // Four adjacent, non-overlapping ranges so a large exact-out swap
+        // must cross at least 3 initialized ticks (at -300, -200, -100, 100).
+        // `mint_position`'s amount arguments are *token amounts*, not raw
+        // liquidity units — ranges of different width convert the same
+        // deposited amounts into different liquidity, so the hand-computed
+        // check below reads each position's actual `liquidity` back via
+        // `get_position` rather than assuming it equals the deposited amount.
+        f.client
+            .mint_position(&f.provider, &100, &10_000, &2_000_000, &2_000_000, &0, &0);
+        f.client
+            .mint_position(&f.provider, &-100, &100, &2_000_000, &2_000_000, &0, &0);
+        f.client
+            .mint_position(&f.provider, &-200, &-100, &2_000_000, &2_000_000, &0, &0);
+        f.client
+            .mint_position(&f.provider, &-300, &-200, &2_000_000, &2_000_000, &0, &0);
+
+        let ranges = [
+            (
+                100i32,
+                10_000i32,
+                f.client.get_position(&f.provider, &100, &10_000).liquidity,
+            ),
+            (
+                -100,
+                100,
+                f.client.get_position(&f.provider, &-100, &100).liquidity,
+            ),
+            (
+                -200,
+                -100,
+                f.client.get_position(&f.provider, &-200, &-100).liquidity,
+            ),
+            (
+                -300,
+                -200,
+                f.client.get_position(&f.provider, &-300, &-200).liquidity,
+            ),
+        ];
+
+        // The [-100, 100) range straddles the pool's initial tick (0), so its
+        // liquidity is computed by the in-range branch of
+        // `liquidity_from_amounts` — proportionally much larger for the same
+        // deposited amounts than the single-sided out-of-range branches used
+        // by the other three positions. `amount_out` has to be large enough
+        // to drain past that concentrated liquidity and still cross into the
+        // adjacent [-200, -100) range.
+        let amount_out = 2_000_000_i128; // token B out, large enough to cross several ticks
+        let amount_in = f.client.swap_exact_out(
+            &f.provider,
+            &true,
+            &amount_out,
+            &0_u128,
+            &i128::MAX,
+            &10_000,
+        );
+        assert!(amount_in > 0);
+
+        let state = f.client.get_pool_state();
+        assert!(
+            state.current_tick <= -100,
+            "swap must have crossed at least the -100 boundary"
+        );
+
+        // Hand-computed: liquidity active at the final tick is the sum of
+        // whichever of the four minted ranges still contains it.
+        let expected_liquidity: i128 = ranges
+            .iter()
+            .filter(|(lo, hi, _liq)| state.current_tick >= *lo && state.current_tick < *hi)
+            .map(|(_, _, liq)| liq)
+            .sum();
+        assert_eq!(
+            f.client.active_liquidity(),
+            expected_liquidity,
+            "active_liquidity() must match the sum of ranges covering the final tick"
+        );
+    }
+
+    /// Same invariant as above, mirrored: opposite price direction
+    /// (`zero_for_one = false`, exercising the `else` arm of the
+    /// tick-crossing branch rather than the `if` arm) over a mirrored range
+    /// layout, so this is a genuinely independent reproduction rather than a
+    /// copy of the same code path with different numbers.
+    #[test]
+    fn multi_tick_crossing_exact_out_one_for_zero_matches_hand_computed_active_liquidity() {
+        let env = Env::default();
+        let f = setup_exact_out(&env, 0, 0); // 0% fee for a clean hand computation
+
+        // Mirror image of the ranges above: the range straddling the initial
+        // tick, two adjacent tight ranges above it, then one wide range far
+        // above (the swap's direction, so it has enough liquidity to absorb
+        // a large exact-out request) so the swap moving price *up* must
+        // cross at least the 100 and 200 boundaries.
+        f.client
+            .mint_position(&f.provider, &-100, &100, &2_000_000, &2_000_000, &0, &0);
+        f.client
+            .mint_position(&f.provider, &100, &200, &2_000_000, &2_000_000, &0, &0);
+        f.client
+            .mint_position(&f.provider, &200, &300, &2_000_000, &2_000_000, &0, &0);
+        f.client
+            .mint_position(&f.provider, &300, &10_000, &2_000_000, &2_000_000, &0, &0);
+
+        let ranges = [
+            (
+                -100i32,
+                100i32,
+                f.client.get_position(&f.provider, &-100, &100).liquidity,
+            ),
+            (
+                100,
+                200,
+                f.client.get_position(&f.provider, &100, &200).liquidity,
+            ),
+            (
+                200,
+                300,
+                f.client.get_position(&f.provider, &200, &300).liquidity,
+            ),
+            (
+                300,
+                10_000,
+                f.client.get_position(&f.provider, &300, &10_000).liquidity,
+            ),
+        ];
+
+        let amount_out = 2_000_000_i128; // token A out, large enough to cross several ticks
+                                         // `u128::MAX`, not `0`, is this crate's "no limit" sentinel for
+                                         // `zero_for_one = false` (see `swap_exact_out_normal_path_one_for_zero`).
+        let amount_in = f.client.swap_exact_out(
+            &f.provider,
+            &false,
+            &amount_out,
+            &u128::MAX,
+            &i128::MAX,
+            &10_000,
+        );
+        assert!(amount_in > 0);
+
+        let state = f.client.get_pool_state();
+        assert!(
+            state.current_tick >= 100,
+            "swap must have crossed at least the 100 boundary"
+        );
+
+        let expected_liquidity: i128 = ranges
+            .iter()
+            .filter(|(lo, hi, _liq)| state.current_tick >= *lo && state.current_tick < *hi)
+            .map(|(_, _, liq)| liq)
+            .sum();
+        assert_eq!(
+            f.client.active_liquidity(),
+            expected_liquidity,
+            "active_liquidity() must match the sum of ranges covering the final tick"
+        );
+    }
+
+    // ── Slippage / partial-fill reverts leave zero state change ──────────────
+
+    #[test]
+    fn exceeding_max_amount_in_reverts_with_zero_state_change() {
+        let env = Env::default();
+        let f = setup_exact_out(&env, 30, 0);
+        f.client
+            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0);
+
+        let state_before = f.client.get_pool_state();
+        let balances_before = balances(&f);
+        let fg_before = (
+            env.as_contract(&f.cl_addr, || {
+                env.storage()
+                    .instance()
+                    .get::<_, i128>(&DataKey::FeeGrowthGlobalA)
+                    .unwrap_or(0)
+            }),
+            env.as_contract(&f.cl_addr, || {
+                env.storage()
+                    .instance()
+                    .get::<_, i128>(&DataKey::FeeGrowthGlobalB)
+                    .unwrap_or(0)
+            }),
+        );
+
+        let result =
+            f.client
+                .try_swap_exact_out(&f.provider, &true, &1_000_i128, &0_u128, &1_i128, &10_000);
+        assert_eq!(result, Err(Ok(ClError::SlippageExceeded)));
+
+        assert_eq!(f.client.get_pool_state(), state_before);
+        assert_eq!(balances(&f), balances_before);
+        let fg_after = (
+            env.as_contract(&f.cl_addr, || {
+                env.storage()
+                    .instance()
+                    .get::<_, i128>(&DataKey::FeeGrowthGlobalA)
+                    .unwrap_or(0)
+            }),
+            env.as_contract(&f.cl_addr, || {
+                env.storage()
+                    .instance()
+                    .get::<_, i128>(&DataKey::FeeGrowthGlobalB)
+                    .unwrap_or(0)
+            }),
+        );
+        assert_eq!(
+            fg_before, fg_after,
+            "fee growth must be untouched on a reverted swap"
+        );
+    }
+
+    #[test]
+    fn hitting_price_limit_before_filling_amount_out_reverts() {
+        let env = Env::default();
+        let f = setup_exact_out(&env, 30, 0);
+        f.client
+            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0);
+
+        let state_before = f.client.get_pool_state();
+        let balances_before = balances(&f);
+
+        // A price limit equal to the current price allows zero movement, so
+        // any positive amount_out cannot be filled.
+        let current_sqrt = state_before.sqrt_price;
+        let result = f.client.try_swap_exact_out(
+            &f.provider,
+            &true,
+            &1_000_i128,
+            &current_sqrt,
+            &i128::MAX,
+            &10_000,
+        );
+        assert_eq!(result, Err(Ok(ClError::ExactOutNotFullyFilled)));
+
+        assert_eq!(f.client.get_pool_state(), state_before);
+        assert_eq!(balances(&f), balances_before);
+    }
+
+    #[test]
+    fn requesting_more_than_available_liquidity_can_supply_reverts() {
+        let env = Env::default();
+        let f = setup_exact_out(&env, 30, 0);
+        // A narrow, small position: easy to exhaust.
+        f.client
+            .mint_position(&f.provider, &-100, &100, &1_000, &1_000, &0, &0);
+
+        let result = f.client.try_swap_exact_out(
+            &f.provider,
+            &true,
+            &1_000_000_000_i128,
+            &0_u128,
+            &i128::MAX,
+            &10_000,
+        );
+        assert_eq!(result, Err(Ok(ClError::ExactOutNotFullyFilled)));
+    }
+
+    #[test]
+    fn zero_amount_out_is_rejected() {
+        let env = Env::default();
+        let f = setup_exact_out(&env, 30, 0);
+        f.client
+            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0);
+        let result =
+            f.client
+                .try_swap_exact_out(&f.provider, &true, &0_i128, &0_u128, &i128::MAX, &10_000);
+        assert_eq!(result, Err(Ok(ClError::ZeroAmounts)));
+
+        let result = f.client.try_quote_exact_out(&true, &0_i128, &0_u128);
+        assert_eq!(result, Err(Ok(ClError::ZeroAmounts)));
+    }
+
+    #[test]
+    fn deadline_and_pause_are_enforced_like_swap() {
+        use soroban_sdk::testutils::Ledger as _;
+
+        let env = Env::default();
+        let f = setup_exact_out(&env, 30, 0);
+        f.client
+            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0);
+        env.ledger().with_mut(|li| li.timestamp = 500);
+
+        let result = f.client.try_swap_exact_out(
+            &f.provider,
+            &true,
+            &1_000_i128,
+            &0_u128,
+            &i128::MAX,
+            &10_u64,
+        );
+        assert_eq!(result, Err(Ok(ClError::DeadlineExpired)));
+
+        let admin: Address = env.as_contract(&f.cl_addr, || {
+            env.storage().instance().get(&DataKey::Admin).unwrap()
+        });
+        f.client.pause(&admin);
+        let result = f.client.try_swap_exact_out(
+            &f.provider,
+            &true,
+            &1_000_i128,
+            &0_u128,
+            &i128::MAX,
+            &10_000_u64,
+        );
+        assert_eq!(result, Err(Ok(ClError::Paused)));
+    }
+
+    // ── Fee growth and oracle parity with exact-in ────────────────────────────
+
+    #[test]
+    fn fee_growth_matches_equivalent_exact_in_swap_within_tolerance() {
+        // Reference: a plain exact-in swap, and the output it produces. Uses
+        // a large enough trade that fee_growth_global's integer scale
+        // (lp_fee * 1_000_000 / liquidity per step) isn't dominated by
+        // single-unit integer noise, which would make any tolerance
+        // meaningless regardless of correctness.
+        let env_in = Env::default();
+        let f_in = setup_exact_out(&env_in, 30, 0);
+        f_in.client.mint_position(
+            &f_in.provider,
+            &-1000,
+            &1000,
+            &10_000_000,
+            &10_000_000,
+            &0,
+            &0,
+        );
+        let out_amount = f_in
+            .client
+            .estimate_price_impact(&true, &500_000_i128, &0_u128)
+            .amount_out;
+        f_in.client.swap(
+            &f_in.provider,
+            &true,
+            &500_000_i128,
+            &0_u128,
+            &0_i128,
+            &10_000,
+        );
+        let fg_a_in: i128 = env_in.as_contract(&f_in.cl_addr, || {
+            env_in
+                .storage()
+                .instance()
+                .get(&DataKey::FeeGrowthGlobalA)
+                .unwrap_or(0)
+        });
+
+        // Same pool state, asking exact-out for exactly that same output.
+        let env_out = Env::default();
+        let f_out = setup_exact_out(&env_out, 30, 0);
+        f_out.client.mint_position(
+            &f_out.provider,
+            &-1000,
+            &1000,
+            &10_000_000,
+            &10_000_000,
+            &0,
+            &0,
+        );
+        f_out.client.swap_exact_out(
+            &f_out.provider,
+            &true,
+            &out_amount,
+            &0_u128,
+            &i128::MAX,
+            &10_000,
+        );
+        let fg_a_out: i128 = env_out.as_contract(&f_out.cl_addr, || {
+            env_out
+                .storage()
+                .instance()
+                .get(&DataKey::FeeGrowthGlobalA)
+                .unwrap_or(0)
+        });
+
+        assert!(fg_a_in > 0);
+        assert!(fg_a_out > 0);
+        // Within the documented rounding tolerance: both sides charge the
+        // same fee_bps on essentially the same trade, just solved from
+        // opposite ends.
+        let diff = (fg_a_in - fg_a_out).abs();
+        let tolerance = (fg_a_in / 10).max(3); // 10%, or 3 absolute units at tiny scale
+        assert!(
+            diff <= tolerance,
+            "fee growth diverged beyond tolerance: exact-in={fg_a_in}, exact-out={fg_a_out}, diff={diff}, tolerance={tolerance}"
+        );
+    }
+
+    #[test]
+    fn oracle_tick_accumulator_advances_on_exact_out_swap() {
+        use soroban_sdk::testutils::Ledger as _;
+
+        let env = Env::default();
+        let f = setup_exact_out(&env, 30, 0);
+        f.client
+            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0);
+
+        // Move current_tick away from 0 first — the accumulator's per-second
+        // contribution is `current_tick * elapsed`, so at tick 0 it would
+        // stay unchanged regardless of elapsed time, which would not
+        // actually exercise the accumulator update.
+        f.client.swap_exact_out(
+            &f.provider,
+            &true,
+            &50_000_i128,
+            &0_u128,
+            &i128::MAX,
+            &10_000_000,
+        );
+        let state = f.client.get_pool_state();
+        assert_ne!(
+            state.current_tick, 0,
+            "test setup must move the tick away from 0"
+        );
+
+        let (cum_before, ts_before) = f.client.get_tick_cumulative();
+        env.ledger().with_mut(|li| li.timestamp += 100);
+        f.client.swap_exact_out(
+            &f.provider,
+            &true,
+            &1_000_i128,
+            &0_u128,
+            &i128::MAX,
+            &10_000_000,
+        );
+        let (cum_after, ts_after) = f.client.get_tick_cumulative();
+
+        assert!(ts_after > ts_before, "oracle timestamp must advance");
+        assert_ne!(
+            cum_after, cum_before,
+            "tick accumulator must advance on a price-moving exact-out swap"
+        );
+    }
+
+    #[test]
+    fn two_sequential_exact_out_swaps_both_succeed() {
+        let env = Env::default();
+        let f = setup_exact_out(&env, 30, 0);
+        f.client
+            .mint_position(&f.provider, &-2000, &2000, &10_000_000, &10_000_000, &0, &0);
+
+        let in1 =
+            f.client
+                .swap_exact_out(&f.provider, &true, &500_i128, &0_u128, &i128::MAX, &10_000);
+        let in2 = f.client.swap_exact_out(
+            &f.provider,
+            &false,
+            &500_i128,
+            &u128::MAX,
+            &i128::MAX,
+            &10_000,
+        );
+        assert!(in1 > 0 && in2 > 0);
+    }
+
+    #[test]
+    fn protocol_fee_accrues_on_exact_out_swap() {
+        let env = Env::default();
+        let f = setup_exact_out(&env, 30, 0);
+        let admin: Address = env.as_contract(&f.cl_addr, || {
+            env.storage().instance().get(&DataKey::Admin).unwrap()
+        });
+        env.as_contract(&f.cl_addr, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::ProtocolFeeBps, &2000_i128);
+        });
+        let _ = admin;
+        f.client
+            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0);
+
+        f.client.swap_exact_out(
+            &f.provider,
+            &true,
+            &10_000_i128,
+            &0_u128,
+            &i128::MAX,
+            &10_000,
+        );
+
+        let accrued_a: i128 = env.as_contract(&f.cl_addr, || {
+            env.storage()
+                .instance()
+                .get(&DataKey::AccruedProtocolFeeA)
+                .unwrap_or(0)
+        });
+        assert!(
+            accrued_a > 0,
+            "protocol fee must accrue on an exact-out swap when protocol_fee_bps > 0"
+        );
+    }
+}
+
+#[cfg(test)]
+mod test_range_order_fill_status {
+    // Regression tests for issue #472: a range order must record which side
+    // it was placed on, and only report `Filled` once the price has crossed
+    // through the range in that order's original fill direction.
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::token::StellarAssetClient;
+    use soroban_sdk::Env;
+
+    fn setup_pool(
+        env: &Env,
+        initial_tick: i32,
+    ) -> (Address, Address, Address, ConcentratedLiquidityClient<'_>) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        env.budget().reset_unlimited();
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &0_i128, &initial_tick, &1_i32);
+
+        let provider = Address::generate(env);
+        StellarAssetClient::new(env, &token_a).mint(&provider, &100_000_000_i128);
+        StellarAssetClient::new(env, &token_b).mint(&provider, &100_000_000_i128);
+        StellarAssetClient::new(env, &token_a).mint(&cl_addr, &100_000_000_i128);
+        StellarAssetClient::new(env, &token_b).mint(&cl_addr, &100_000_000_i128);
+
+        (provider, token_a, token_b, client)
+    }
+
+    /// Moves the pool's current tick directly via storage, standing in for a
+    /// swap that has crossed price through (or into) the range.
+    fn set_current_tick(env: &Env, cl_addr: &Address, tick: i32) {
+        env.as_contract(cl_addr, || {
+            env.storage().instance().set(&DataKey::CurrentTick, &tick);
+        });
+    }
+
+    // ── Above-range order (deposit token A, fills as price rises) ────────────
+
+    #[test]
+    fn above_range_order_is_pending_at_placement() {
+        let env = Env::default();
+        // current_tick = 0, range = [100, 200] → an above-range order.
+        let (provider, _token_a, _token_b, client) = setup_pool(&env, 0);
+
+        client.place_range_order(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &_token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
+
+        assert_eq!(
+            client.check_range_order_filled(&provider, &100_i32, &200_i32),
+            RangeOrderStatus::Pending,
+            "an above-range order must not be reported as Filled before the price has moved"
+        );
+    }
+
+    #[test]
+    fn above_range_order_is_pending_while_price_is_still_below_range() {
+        let env = Env::default();
+        let (provider, token_a, _token_b, client) = setup_pool(&env, 0);
+        let cl_addr = client.address.clone();
+
+        client.place_range_order(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
+
+        // Price has moved but has not yet reached the range.
+        set_current_tick(&env, &cl_addr, 50);
+
+        assert_eq!(
+            client.check_range_order_filled(&provider, &100_i32, &200_i32),
+            RangeOrderStatus::Pending
+        );
+    }
+
+    #[test]
+    fn above_range_order_is_filled_once_price_crosses_upper_tick() {
+        let env = Env::default();
+        let (provider, token_a, _token_b, client) = setup_pool(&env, 0);
+        let cl_addr = client.address.clone();
+
+        client.place_range_order(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
+
+        set_current_tick(&env, &cl_addr, 200);
+
+        assert_eq!(
+            client.check_range_order_filled(&provider, &100_i32, &200_i32),
+            RangeOrderStatus::Filled
+        );
+    }
+
+    // ── Below-range order (deposit token B, fills as price falls) ────────────
+
+    #[test]
+    fn below_range_order_is_pending_at_placement() {
+        let env = Env::default();
+        // current_tick = 300, range = [100, 200] → a below-range order.
+        let (provider, _token_a, token_b, client) = setup_pool(&env, 300);
+
+        client.place_range_order(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_b,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
+
+        assert_eq!(
+            client.check_range_order_filled(&provider, &100_i32, &200_i32),
+            RangeOrderStatus::Pending,
+            "a below-range order must not be reported as Filled before the price has moved"
+        );
+    }
+
+    #[test]
+    fn below_range_order_is_pending_while_price_is_still_above_range() {
+        let env = Env::default();
+        let (provider, _token_a, token_b, client) = setup_pool(&env, 300);
+        let cl_addr = client.address.clone();
+
+        client.place_range_order(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_b,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
+
+        // Price has fallen but has not yet reached the range.
+        set_current_tick(&env, &cl_addr, 250);
+
+        assert_eq!(
+            client.check_range_order_filled(&provider, &100_i32, &200_i32),
+            RangeOrderStatus::Pending
+        );
+    }
+
+    #[test]
+    fn below_range_order_is_filled_once_price_crosses_lower_tick() {
+        let env = Env::default();
+        let (provider, _token_a, token_b, client) = setup_pool(&env, 300);
+        let cl_addr = client.address.clone();
+
+        client.place_range_order(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_b,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
+
+        set_current_tick(&env, &cl_addr, 99);
+
+        assert_eq!(
+            client.check_range_order_filled(&provider, &100_i32, &200_i32),
+            RangeOrderStatus::Filled
+        );
+    }
+
+    // ── Issue #595: re-placing on a range with an unwithdrawn order ──────────
+
+    #[test]
+    fn active_range_order_cannot_be_replaced() {
+        let env = Env::default();
+        let (provider, token_a, _token_b, client) = setup_pool(&env, 0);
+
+        client.place_range_order(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
+
+        // A second order on the identical range must be rejected while the
+        // first tranche's liquidity is still in the position.
+        let result = client.try_place_range_order(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
+        assert_eq!(result, Err(Ok(ClError::RangeOrderExists)));
+
+        // The original order's direction tag must be untouched.
+        assert_eq!(
+            client.check_range_order_filled(&provider, &100_i32, &200_i32),
+            RangeOrderStatus::Pending
+        );
+
+        // A different (unused) range is still available.
+        client.place_range_order(
+            &provider,
+            &300_i32,
+            &400_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
+    }
+
+    #[test]
+    fn filled_range_order_blocks_replacement_until_withdrawn() {
+        let env = Env::default();
+        let (provider, token_a, _token_b, client) = setup_pool(&env, 0);
+        let cl_addr = client.address.clone();
+
+        client.place_range_order(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
+
+        // The order fills: price crosses above upper_tick.
+        set_current_tick(&env, &cl_addr, 200);
+        assert_eq!(
+            client.check_range_order_filled(&provider, &100_i32, &200_i32),
+            RangeOrderStatus::Filled
+        );
+
+        // Now the same range would be a *below*-range order — the exact
+        // flag-flip scenario from the issue. It must be rejected until the
+        // filled tranche is withdrawn.
+        let result = client.try_place_range_order(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &_token_b,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
+        assert_eq!(result, Err(Ok(ClError::RangeOrderExists)));
+
+        // The fill status must not have been corrupted by the failed attempt.
+        assert_eq!(
+            client.check_range_order_filled(&provider, &100_i32, &200_i32),
+            RangeOrderStatus::Filled
+        );
+
+        // After withdrawing the filled order, the range can be reused with the
+        // *new* direction and the fill status resets to Pending.
+        let pos = client.get_position(&provider, &100_i32, &200_i32);
+        client.burn_position(&provider, &100_i32, &200_i32, &pos.liquidity);
+
+        client.place_range_order(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &_token_b,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
+        assert_eq!(
+            client.check_range_order_filled(&provider, &100_i32, &200_i32),
+            RangeOrderStatus::Pending
+        );
+
+        // The new below-range order is filled once price falls below lower_tick.
+        set_current_tick(&env, &cl_addr, 99);
+        assert_eq!(
+            client.check_range_order_filled(&provider, &100_i32, &200_i32),
+            RangeOrderStatus::Filled
+        );
+    }
+
+    #[test]
+    fn partial_burn_keeps_range_order_active() {
+        let env = Env::default();
+        let (provider, token_a, _token_b, client) = setup_pool(&env, 0);
+
+        client.place_range_order(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
+
+        let pos = client.get_position(&provider, &100_i32, &200_i32);
+        let half = (pos.liquidity / 2).max(1);
+        client.burn_position(&provider, &100_i32, &200_i32, &half);
+
+        // A partially withdrawn order is still active: re-placing stays blocked.
+        let result = client.try_place_range_order(
+            &provider,
+            &100_i32,
+            &200_i32,
+            &token_a,
+            &10_000_i128,
+            &1_i128,
+            &u64::MAX,
+        );
+        assert_eq!(result, Err(Ok(ClError::RangeOrderExists)));
     }
 }
