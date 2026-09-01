@@ -1,219 +1,161 @@
-import { Account, Address, Contract, Keypair, TransactionBuilder, scValToNative, rpc, xdr } from '@stellar/stellar-sdk';
-
 /**
- * Typed Client for the Soroban AMM router contract.
+ * RouterClient — typed client for the multi-hop swap router contract.
  *
- * @remarks
- * - Read methods simulate and do not require a signer.
- * - Write methods take a source account (a keypair) and return the submitted transaction result.
- * - [128] values are ``bigint` throughout.
+ * Covers the public interface of contracts/router/src/lib.rs.
  */
 
-export interface RouterClientOptions {
-  rpcUrl: string;
-  networkPassphrase: string;
-  contractId: string;
+import {
+  Contract,
+  rpc as StellarRpc,
+  nativeToScVal,
+  scValToNative,
+  xdr,
+  Address,
+} from "@stellar/stellar-sdk";
+import type { NetworkConfig } from "./types.js";
+import { simulateRead } from "./internal/simulate.js";
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+function addr(address: string): xdr.ScVal {
+  return nativeToScVal(Address.fromString(address));
 }
 
-/**
- * Input arguments for `this.swapExactIn`(`)`.
- * See contracts/router/src/lib.rs:16 "swap_exact_in"
- */
+function i128(value: bigint): xdr.ScVal {
+  return nativeToScVal(value, { type: "i128" });
+}
+
+function u64(value: bigint): xdr.ScVal {
+  return nativeToScVal(value, { type: "u64" });
+}
+
+/** Encode a swap path as the `Vec<Address>` the router expects. */
+function addressVec(path: string[]): xdr.ScVal {
+  return xdr.ScVal.scvVec(path.map(addr));
+}
+
+// ── Types ──────────────────────────────────────────────────────────────────────
+
+/** Input for `swap_exact_in`. */
 export interface SwapExactInInput {
+  /** Address whose funds are swapped. The contract calls `require_auth` on it. */
+  trader: string;
+  /** Swap path, from input token to output token. Must contain >= 2 tokens. */
   path: string[];
+  /** Exact amount of `path[0]` to send in. Must be positive. */
   amountIn: bigint;
-  amountOutMin: bigint;
-  to: string;
-  deadlineSeconds?: number;
+  /** Minimum acceptable amount of the final token (slippage guard). */
+  minAmountOut: bigint;
+  /** Unix timestamp after which the contract rejects the swap. */
+  deadline: bigint;
 }
 
-/**
- * Input arguments for `this.swapExactOut()`,
- * See contracts/router/src/lib.rs:22 "swap_exact_out"
- */
+/** Input for `swap_exact_out`. */
 export interface SwapExactOutInput {
+  /** Address whose funds are swapped. The contract calls `require_auth` on it. */
+  trader: string;
+  /** Swap path, from input token to output token. Must contain >= 2 tokens. */
   path: string[];
+  /** Exact amount of the final token to receive. Must be positive. */
   amountOut: bigint;
-  amountInMax: bigint;
-  to: string;
-  deadlineSeconds?: number;
+  /** Maximum acceptable amount of `path[0]` to spend (slippage guard). */
+  maxIn: bigint;
+  /** Unix timestamp after which the contract rejects the swap. */
+  deadline: bigint;
 }
 
-/** Converts an array of Stellar public keys to a ScVal vector of addresses. */
-function addressVecToScVal(addresses: string[]): xdr.ScVal {
-  return xdr.ScVal.scvVec(addresses.map(a => Address.fromString(a).toScVal()));
-}
+// ── RouterClient ──────────────────────────────────────────────────────────────
 
-/** Converts i128 value to `ScVal`. */
-function i128ToScVal(value: bigint): xdr.ScVal {
-  const lo: bigint = BigInt.asUintN(64, value);
-  const hi: bigint = BigInt.asUintN(64, value >> 64n);
-  return xdr.ScVal.scvI128(
-    new xdr.Int128Parts({
-      lo: xdr.Uint64.fromString(lo.toString()),
-      hi: xdr.Uint64.fromString(hi.toString()),
-    })
-  );
-}
-
-/** Converts u64 value to `ScVal`. */
-function u64ToScVal(value: bigint): xdr.ScVal {
-  return xdr.ScVal.scvU64(xdr.Uint64.fromString(value.toString()));
-}
-
-/**
- * Client for the Soroban AMM router contract.
- *
- * Usage:
- * ```tr
- * const client = new RouterClient({ rpcUrl, networkPassphrase, contractId });
- * const amountOut = await client.getAmountOutPath(1000n, [path]);
- * `token`)
- */
 export class RouterClient {
-  private rpcUrl: string;
-  private networkPassphrase: string;
-  private contractId: string;
-  private server: rpc.Server;
-  private contract: Contract;
-  private static dummyAccount = new Account(
-    'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWWF',
-    '0'
-  );
+  private readonly server: StellarRpc.Server;
+  private readonly contract: Contract;
+  private readonly networkPassphrase: string;
 
-  constructor(options: RouterClientOptions) {
-    this.rpcUrl = options.rpcUrl;
-    this.networkPassphrase = options.networkPassphrase;
-    this.contractId = options.contractId;
-    this.server = new rpc.Server(options.rpcUrl, { allowHttp: true });
-    this.contract = new Contract(options.contractId);
+  constructor(config: NetworkConfig) {
+    this.server = new StellarRpc.Server(config.rpcUrl);
+    this.contract = new Contract(config.contractId);
+    this.networkPassphrase = config.networkPassphrase;
   }
 
+  get contractId(): string {
+    return this.contract.contractId();
+  }
+
+  private async simulate(method: string, ...args: xdr.ScVal[]): Promise<xdr.ScVal> {
+    return simulateRead(this.server, this.contract, this.networkPassphrase, method, args);
+  }
+
+  // ── Read-only methods ──────────────────────────────────────────────────────
+
   /**
-   * Return the factory address used by the router.
-   * See contracts/router/src/lib.rs:8 "get_factory"
+   * Quote the output of a multi-hop swap without executing it.
+   *
+   * Mirrors `Router::get_amount_out_path` — contracts/router/src/lib.rs:155
+   * `(path: Vec<Address>, amount_in: i128)`
+   *
+   * Note the argument order: the path comes first, then the amount. Returns
+   * `0` when any hop in the path has no registered pool.
    */
+  async getAmountOutPath(path: string[], amountIn: bigint): Promise<bigint> {
+    const raw = await this.simulate(
+      "get_amount_out_path",
+      addressVec(path),
+      i128(amountIn)
+    );
+    return BigInt(String(scValToNative(raw)));
+  }
+
+  /** Returns the factory address this router resolves pools through. */
   async getFactory(): Promise<string> {
-    return this.simulateRead('get_factory', []);
+    const raw = await this.simulate("get_factory");
+    return String(scValToNative(raw));
+  }
+
+  // ── Write-method parameter types ───────────────────────────────────────────
+  //
+  // These methods require a signed transaction envelope. The parameter types
+  // are provided here to support typed integration layers; submitting the
+  // transaction is the caller's responsibility using the Stellar SDK.
+
+  /**
+   * Parameters for `swap_exact_in`.
+   *
+   * Mirrors `Router::swap_exact_in` — contracts/router/src/lib.rs:34
+   * `(trader: Address, path: Vec<Address>, amount_in: i128,
+   *   min_amount_out: i128, deadline: u64)`
+   *
+   * `trader` must be passed explicitly: the contract calls
+   * `trader.require_auth()` and moves that address's tokens, so signing the
+   * envelope alone is not enough. The contract has no recipient parameter —
+   * output is always credited to `trader`.
+   */
+  swapExactInParams(input: SwapExactInInput): xdr.ScVal[] {
+    return [
+      addr(input.trader),
+      addressVec(input.path),
+      i128(input.amountIn),
+      i128(input.minAmountOut),
+      u64(input.deadline),
+    ];
   }
 
   /**
-   * Return the output amount for a given input amount and path.
-   * See contracts/router/src/lib.rs:12 "get_amount_out_path"
+   * Parameters for `swap_exact_out`.
+   *
+   * Mirrors `Router::swap_exact_out` — contracts/router/src/lib.rs:84
+   * `(trader: Address, path: Vec<Address>, amount_out: i128,
+   *   max_in: i128, deadline: u64)`
+   *
+   * As with `swap_exact_in`, `trader` is a real contract argument and output is
+   * always credited to `trader`.
    */
-  async getAmountOutPath(amountIn: bigint, path: string[]): Promise<bigint> {
-    return this.simulateRead(
-      'get_amount_out_path',
-      [i128ToScVal(amountIn), addressVecToScVal(path)]
-    );
-  }
-
-  /**
-   * Swap tokens with an exact input amount.
-   * `srcInput` contains `deadlineSeconds` optionally, defaulting to ledger time + 300.
-   * See contracts/router/src/lib.rs:16 "swap_exact_in"
-   */
-  async swapExactIn(input: SwapExactInInput, source: Keypair, fee?: string): Promise<rpc.Api.SendTransactionResponse> {
-    const deadline = await this.resolveDeadline(input.deadlineSeconds);
-    return this.submitContractCall(
-      'swap_exact_in',
-      [
-        addressVecToScVal(input.path),
-        i128ToScVal(input.amountIn),
-        i128ToScVal(input.amountOutMin),
-        Address.fromString(input.to).toScVal(),
-        u64ToScVal(deadline),
-      ],
-      source,
-      fee
-    );
-  }
-
-  /**
-   * Swap tokens with an exact output amount.
-   * `srcInput` contains `deadlineSeconds` optionally, defaulting to ledger time + 300.
-   * See contracts/router/src/lib.rs:22 "swap_exact_out"
-   */
-  async swapExactOut(input: SwapExactOutInput, source: Keypair, fee?: string): Promise<rpc.Api.SendTransactionResponse> {
-    const deadline = await this.resolveDeadline(input.deadlineSeconds);
-    return this.submitContractCall(
-      'swap_exact_out',
-      [
-        addressVecToScVal(input.path),
-        i128ToScVal(input.amountOut),
-        i128ToScVal(input.amountInMax),
-        Address.fromString(input.to).toScVal(),
-        u64ToScVal(deadline),
-      ],
-      source,
-      fee
-    );
-  }
-
-  private async simulateRead(method: string, params: xdr.ScVal[]): Promise<any> {
-    const op = this.contract.call(method, ...params);
-    const tx = new TransactionBuilder(
-      RouterClient.dummyAccount,
-      { fee: '100', networkPassphrase: this.networkPassphrase }
-    )
-      .addOperation(op)
-      .setTimeout(0)
-      .build();
-    const sim = await this.server.simulateTransaction(tx);
-    if ((sim as any).error) {
-      throw this.decodeError((sim as any).error);
-    }
-    const retval = (sim as any).result?.retval ?? (sim as any).result;
-    if (!retval) throw new Error('No result from simulation');
-    return scValToNative(retval as xdr.ScVal);
-  }
-
-  private async submitContractCall(
-    method: string,
-    params: xdr.ScVal[],
-    source: Keypair,
-    fee?: string
-  ): Promise<rpc.Api.SendTransactionResponse> {
-    if (!source) throw new Error('Source account required');
-    const publicKey = source.publicKey();
-    const account = await this.server.getAccount(publicKey);
-    const op = this.contract.call(method, ...params);
-    const tx = new TransactionBuilder(account, {
-      fee: fee ?? '100',
-      networkPassphrase: this.networkPassphrase
-    })
-      .addOperation(op)
-      .setTimeout(0)
-      .build();
-
-    // Simulate first to catch contract reverts.
-    const sim = await this.server.simulateTransaction(tx);
-    if ((sim as any).error) {
-      throw this.decodeError((sim as any).error);
-    }
-
-    tx.sign(source);
-    const sendResponse = await this.server.sendTransaction(tx);
-    if (sendResponse.status === 'ERROR') {
-      throw this.decodeError(sendResponse.errorResult ?? sendResponse);
-    }
-    return sendResponse;
-  }
-
-  private async resolveDeadline(deadlineSeconds?: number): Promise<bigint> {
-    if (deadlineSeconds !== undefined) {
-      return BigInt(deadlineSeconds);
-    }
-    await this.server.getLatestLedger();
-    // SDK v13 exposes ledger sequence but not close time; Soroban deadlines use Unix seconds.
-    return BigInt(Math.floor(Date.now() / 1000)) + 300n;
-  }
-
-  private decodeError(error: unknown): Error {
-    const message = (error as { message?: unknown })?.message;
-    if (typeof message === 'string') {
-      return new Error(message);
-    }
-    return new Error(String(error));
+  swapExactOutParams(input: SwapExactOutInput): xdr.ScVal[] {
+    return [
+      addr(input.trader),
+      addressVec(input.path),
+      i128(input.amountOut),
+      i128(input.maxIn),
+      u64(input.deadline),
+    ];
   }
 }

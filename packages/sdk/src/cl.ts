@@ -13,6 +13,7 @@ import {
   Address,
 } from "@stellar/stellar-sdk";
 import type { NetworkConfig } from "./types.js";
+import { simulateRead } from "./internal/simulate.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -30,6 +31,10 @@ function i32(value: number): xdr.ScVal {
 
 function u64(value: bigint): xdr.ScVal {
   return nativeToScVal(value, { type: "u64" });
+}
+
+function u128(value: bigint): xdr.ScVal {
+  return nativeToScVal(value, { type: "u128" });
 }
 
 // ── Types ──────────────────────────────────────────────────────────────────────
@@ -95,19 +100,7 @@ export class ConcentratedLiquidityClient {
   }
 
   private async simulate(method: string, ...args: xdr.ScVal[]): Promise<xdr.ScVal> {
-    const op = this.contract.call(method, ...args);
-    const tx = new (await import("@stellar/stellar-sdk")).TransactionBuilder(
-      await this.server.getAccount("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"),
-      { fee: "100", networkPassphrase: this.networkPassphrase }
-    )
-      .addOperation(op)
-      .setTimeout(30)
-      .build();
-    const result = await this.server.simulateTransaction(tx);
-    if (StellarRpc.Api.isSimulationError(result)) {
-      throw new Error(result.error);
-    }
-    return (result as StellarRpc.Api.SimulateTransactionSuccessResponse).result!.retval;
+    return simulateRead(this.server, this.contract, this.networkPassphrase, method, args);
   }
 
   // ── Read-only methods ──────────────────────────────────────────────────────
@@ -272,32 +265,45 @@ export class ConcentratedLiquidityClient {
   // ── Write-method parameter types ───────────────────────────────────────────
 
   /**
-   * Parameters for `mint_position(provider, lower_tick, upper_tick,
-   * amount_a, amount_b, min_liquidity, deadline)`.
+   * Parameters for `mint_position`.
+   *
+   * Mirrors `ConcentratedLiquidity::mint_position` —
+   * contracts/concentrated_liquidity/src/lib.rs:407
+   * `(provider: Address, lower_tick: i32, upper_tick: i32,
+   *   amount_a_desired: i128, amount_b_desired: i128, min_a: i128, min_b: i128)`
+   *
+   * Note there is no `deadline` argument: `mint_position` has no deadline
+   * guard. `minA`/`minB` are independent per-token slippage floors, not a
+   * single combined minimum-liquidity bound.
    */
   mintPositionParams(
     provider: string,
     lowerTick: number,
     upperTick: number,
-    amountA: bigint,
-    amountB: bigint,
-    minLiquidity: bigint,
-    deadline: bigint
+    amountADesired: bigint,
+    amountBDesired: bigint,
+    minA: bigint,
+    minB: bigint
   ): xdr.ScVal[] {
     return [
       addr(provider),
       i32(lowerTick),
       i32(upperTick),
-      i128(amountA),
-      i128(amountB),
-      i128(minLiquidity),
-      u64(deadline),
+      i128(amountADesired),
+      i128(amountBDesired),
+      i128(minA),
+      i128(minB),
     ];
   }
 
   /**
-   * Parameters for `modify_position(provider, lower_tick, upper_tick,
-   * liquidity_delta, min_a, min_b, deadline)`.
+   * Parameters for `modify_position`.
+   *
+   * Mirrors `ConcentratedLiquidity::modify_position` —
+   * contracts/concentrated_liquidity/src/lib.rs:540
+   * `(provider: Address, lower_tick: i32, upper_tick: i32,
+   *   liquidity_delta: i128, min_a: i128, min_b: i128, deadline: u64)`
+   *
    * Returns `(amount_a, amount_b)`.
    */
   modifyPositionParams(
@@ -313,15 +319,33 @@ export class ConcentratedLiquidityClient {
   }
 
   /**
-   * Parameters for `burn_position(provider, lower_tick, upper_tick)`.
+   * Parameters for `burn_position`.
+   *
+   * Mirrors `ConcentratedLiquidity::burn_position` —
+   * contracts/concentrated_liquidity/src/lib.rs:1118
+   * `(provider: Address, lower_tick: i32, upper_tick: i32, liquidity: i128)`
+   *
+   * `liquidity` specifies how much of the position to burn and must be
+   * positive; the contract rejects non-positive values with `ZeroLiquidity`.
+   *
    * Returns `(amount_a, amount_b)` of tokens sent back to the provider.
    */
-  burnPositionParams(provider: string, lowerTick: number, upperTick: number): xdr.ScVal[] {
-    return [addr(provider), i32(lowerTick), i32(upperTick)];
+  burnPositionParams(
+    provider: string,
+    lowerTick: number,
+    upperTick: number,
+    liquidity: bigint
+  ): xdr.ScVal[] {
+    return [addr(provider), i32(lowerTick), i32(upperTick), i128(liquidity)];
   }
 
   /**
-   * Parameters for `collect_fees(provider, lower_tick, upper_tick)`.
+   * Parameters for `collect_fees`.
+   *
+   * Mirrors `ConcentratedLiquidity::collect_fees` —
+   * contracts/concentrated_liquidity/src/lib.rs:1229
+   * `(provider: Address, lower_tick: i32, upper_tick: i32)`
+   *
    * Returns `(fee_a, fee_b)`.
    */
   collectFeesParams(provider: string, lowerTick: number, upperTick: number): xdr.ScVal[] {
@@ -329,24 +353,33 @@ export class ConcentratedLiquidityClient {
   }
 
   /**
-   * Parameters for `swap(trader, token_in, amount_in, min_out, deadline,
-   * sqrt_price_limit)`.
+   * Parameters for `swap`.
+   *
+   * Mirrors `ConcentratedLiquidity::swap` —
+   * contracts/concentrated_liquidity/src/lib.rs:1437
+   * `(sender: Address, zero_for_one: bool, amount_in: i128,
+   *   sqrt_price_limit_x96: u128, min_amount_out: i128, deadline: u64)`
+   *
+   * Direction is expressed as `zeroForOne` (true = swapping token A in for
+   * token B out), not as an input-token address — the contract takes a `bool`
+   * in that position. `sqrtPriceLimitX96` is an unsigned Q64.96 value and must
+   * be encoded as `u128`, not `i128`.
    */
   swapParams(
-    trader: string,
-    tokenIn: string,
+    sender: string,
+    zeroForOne: boolean,
     amountIn: bigint,
-    minOut: bigint,
-    deadline: bigint,
-    sqrtPriceLimit: bigint
+    sqrtPriceLimitX96: bigint,
+    minAmountOut: bigint,
+    deadline: bigint
   ): xdr.ScVal[] {
     return [
-      addr(trader),
-      addr(tokenIn),
+      addr(sender),
+      nativeToScVal(zeroForOne, { type: "bool" }),
       i128(amountIn),
-      i128(minOut),
+      u128(sqrtPriceLimitX96),
+      i128(minAmountOut),
       u64(deadline),
-      i128(sqrtPriceLimit),
     ];
   }
 }

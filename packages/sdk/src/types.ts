@@ -79,15 +79,63 @@ export interface FlashLoanParams {
   tokenB: bigint;
 }
 
-/** Well-known AMM error strings surfaced by the contract. */
+/**
+ * Every variant of `AmmError` in contracts/amm/src/lib.rs, keyed by the numeric
+ * discriminant the contract assigns it — Issue #831.
+ *
+ * Soroban RPC reports contract-returned errors in the numeric-coded form
+ * `Error(Contract, #6)`, never as descriptive English text, so the discriminant
+ * is the only reliable join key between an RPC error and a friendly message.
+ *
+ * Keep in sync with `AmmError` — a variant added there must be added here.
+ */
 export const AmmErrors = {
-  PAUSED: "contract is paused",
-  DEADLINE_PASSED: "deadline passed",
-  SLIPPAGE: "slippage",
-  ZERO_LIQUIDITY: "zero liquidity",
-  INSUFFICIENT_LIQUIDITY: "insufficient liquidity",
-  INVALID_TOKEN: "invalid token",
-  NOT_ADMIN: "not admin",
+  1: "already initialized",
+  2: "invalid fee bps",
+  3: "insufficient shares",
+  4: "deadline exceeded",
+  5: "slippage exceeded",
+  6: "contract is paused",
+  7: "unauthorized",
+  8: "zero amount",
+  9: "invalid token",
+  10: "empty pool",
+  11: "insufficient liquidity",
+  12: "no pending admin",
+  13: "wrong admin",
+  14: "reentrant call detected",
+  15: "circuit breaker tripped",
+  16: "fee-on-transfer slippage",
+  17: "oracle deviation exceeded",
+  18: "flash loan repayment failed",
 } as const;
 
-export type AmmErrorKey = keyof typeof AmmErrors;
+/** Numeric discriminant of an `AmmError` variant. */
+export type AmmErrorCode = keyof typeof AmmErrors;
+
+/**
+ * Symbolic names for each `AmmError` discriminant, mirroring the Rust variant
+ * identifiers so callers can branch on a stable name rather than a magic number.
+ */
+export const AmmErrorNames = {
+  1: "AlreadyInitialized",
+  2: "InvalidFeeBps",
+  3: "InsufficientShares",
+  4: "DeadlineExceeded",
+  5: "SlippageExceeded",
+  6: "Paused",
+  7: "Unauthorized",
+  8: "ZeroAmount",
+  9: "InvalidToken",
+  10: "EmptyPool",
+  11: "InsufficientLiquidity",
+  12: "NoPendingAdmin",
+  13: "WrongAdmin",
+  14: "Reentrant",
+  15: "CircuitBreaker",
+  16: "FotSlippage",
+  17: "OracleDeviationExceeded",
+  18: "FlashLoanRepaymentFailed",
+} as const;
+
+export type AmmErrorKey = (typeof AmmErrorNames)[AmmErrorCode];

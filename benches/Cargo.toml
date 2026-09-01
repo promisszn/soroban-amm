@@ -11,6 +11,7 @@ concentrated_liquidity = { path = "../contracts/concentrated_liquidity", feature
 token = { path = "../contracts/token", features = ["testutils"] }
 governance = { path = "../contracts/governance", features = ["testutils"] }
 staking = { path = "../contracts/staking", features = ["testutils"] }
+incentive_campaigns = { path = "../contracts/incentive_campaigns", features = ["testutils"] }
 cl_position_nft = { path = "../contracts/cl_position_nft", features = ["testutils"] }
 factory = { path = "../contracts/factory", features = ["testutils"] }
 router = { path = "../contracts/router", features = ["testutils"] }

@@ -3,12 +3,15 @@ use std::{env as std_env, fs, process};
 use amm::{AmmPool, AmmPoolClient};
 use batch_auction::{BatchAuction, BatchAuctionClient};
 use concentrated_liquidity::{ConcentratedLiquidity, ConcentratedLiquidityClient};
+use governance::{Governance, GovernanceClient, ProposalKind, Vote};
+use incentive_campaigns::{IncentiveCampaigns, IncentiveCampaignsClient};
 use soroban_sdk::{
     contract, contractimpl, contracttype,
     testutils::{Address as _, Ledger},
     token::{StellarAssetClient, TokenClient as StellarTokenClient},
     Address, Bytes, Env, String as SorobanString,
 };
+use staking::{Staking, StakingClient};
 use token::{LpToken, LpTokenClient};
 
 const REGRESSION_BPS: u128 = 500;
@@ -128,6 +131,15 @@ fn run_all() -> Vec<Metric> {
         measure("cl.mint_position", bench_cl_mint_position),
         measure("cl.swap", bench_cl_swap),
         measure("batch.settle_batch", bench_batch_settle),
+        measure("governance.propose", bench_governance_propose),
+        measure("governance.vote", bench_governance_vote),
+        measure("governance.execute", bench_governance_execute),
+        measure("staking.stake", bench_staking_stake),
+        measure("staking.claim", bench_staking_claim),
+        measure(
+            "incentive_campaigns.claim_rewards",
+            bench_incentive_claim_rewards,
+        ),
     ]
 }
 
@@ -247,6 +259,183 @@ fn bench_cl_swap(env: &Env) {
     StellarAssetClient::new(env, &token_a).mint(&provider, &100);
     env.budget().reset_default();
     client.swap(&provider, &true, &100, &0, &0, &u64::MAX);
+}
+
+// ── Governance ────────────────────────────────────────────────────────────────
+
+/// Deploy governance over a backing AMM pool, seed two LP holders, and open a
+/// proposal. Returns `(governance client, proposal id, lp1, lp2)`.
+fn setup_governance(env: &Env) -> (GovernanceClient<'_>, u32, Address, Address) {
+    env.ledger().set_timestamp(1_000_000);
+    let admin = Address::generate(env);
+
+    let lp = env.register_contract(None, LpToken);
+    LpTokenClient::new(env, &lp).initialize(
+        &admin,
+        &SorobanString::from_str(env, "LP"),
+        &SorobanString::from_str(env, "LP"),
+        &7,
+    );
+
+    let token_a = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let gov_addr = env.register_contract(None, Governance);
+    let amm = env.register_contract(None, AmmPool);
+    AmmPoolClient::new(env, &amm).initialize(&gov_addr, &token_a, &token_b, &lp, &30, &admin, &0);
+
+    let gov = GovernanceClient::new(env, &gov_addr);
+    gov.initialize(
+        &admin,
+        &amm,
+        &lp,
+        &(7 * 24 * 60 * 60_u64), // voting_period_secs
+        &(2 * 24 * 60 * 60_u64), // timelock_secs
+        &1_000_i128,             // quorum_bps
+        &100_i128,               // min_proposer_stake_bps
+    );
+    LpTokenClient::new(env, &lp).set_locker(&gov_addr);
+
+    // Seed voting weight.
+    let lp1 = Address::generate(env);
+    let lp2 = Address::generate(env);
+    LpTokenClient::new(env, &lp).mint(&lp1, &600);
+    LpTokenClient::new(env, &lp).mint(&lp2, &400);
+
+    let proposal_id = gov.propose(&lp1, &ProposalKind::UpdateFee(50));
+    (gov, proposal_id, lp1, lp2)
+}
+
+fn bench_governance_propose(env: &Env) {
+    let (gov, _, lp1, _) = setup_governance(env);
+    env.budget().reset_default();
+    gov.propose(&lp1, &ProposalKind::UpdateFee(60));
+}
+
+fn bench_governance_vote(env: &Env) {
+    let (gov, pid, lp1, _) = setup_governance(env);
+    env.budget().reset_default();
+    gov.vote(&lp1, &pid, &Vote::For);
+}
+
+fn bench_governance_execute(env: &Env) {
+    let (gov, pid, lp1, lp2) = setup_governance(env);
+    gov.vote(&lp1, &pid, &Vote::For);
+    gov.vote(&lp2, &pid, &Vote::For);
+
+    // Advance past the voting period and the timelock.
+    let proposal = gov.get_proposal(&pid);
+    env.ledger().set_timestamp(proposal.execute_after + 1);
+
+    env.budget().reset_default();
+    gov.execute(&pid);
+}
+
+// ── Staking ───────────────────────────────────────────────────────────────────
+
+/// Deploy staking over an LP token and a reward token, fund the reward pool,
+/// and mint LP to a staker. Returns `(staking client, staker, admin)`.
+fn setup_staking(env: &Env) -> (StakingClient<'_>, Address, Address) {
+    let admin = Address::generate(env);
+
+    let lp = env.register_contract(None, LpToken);
+    LpTokenClient::new(env, &lp).initialize(
+        &admin,
+        &SorobanString::from_str(env, "LP"),
+        &SorobanString::from_str(env, "LP"),
+        &7,
+    );
+
+    let reward_token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+
+    let staking_addr = env.register_contract(None, Staking);
+    let staking = StakingClient::new(env, &staking_addr);
+    staking.initialize(&lp, &reward_token, &admin);
+
+    // Fund the reward pool so `claim` has something to pay out.
+    StellarAssetClient::new(env, &reward_token).mint(&admin, &1_000_000);
+    staking.add_rewards(&admin, &1_000_000);
+
+    let staker = Address::generate(env);
+    LpTokenClient::new(env, &lp).mint(&staker, &1_000_000);
+    (staking, staker, admin)
+}
+
+fn bench_staking_stake(env: &Env) {
+    let (staking, staker, _) = setup_staking(env);
+    env.budget().reset_default();
+    staking.stake(&staker, &500_000);
+}
+
+fn bench_staking_claim(env: &Env) {
+    let (staking, staker, admin) = setup_staking(env);
+    staking.stake(&staker, &500_000);
+    // `update_rewards` divides across current stakers, so it must run after the
+    // stake for the staker to have a non-zero claimable balance.
+    staking.update_rewards(&admin, &100_000);
+    env.budget().reset_default();
+    staking.claim(&staker);
+}
+
+// ── Incentive campaigns ───────────────────────────────────────────────────────
+
+/// Deploy incentive_campaigns with a funded campaign over a backing pool, and
+/// give a provider an LP balance to accrue against.
+/// Returns `(client, campaign id, provider)`.
+fn setup_incentive_campaigns(env: &Env) -> (IncentiveCampaignsClient<'_>, u64, Address) {
+    env.ledger().set_timestamp(1_000);
+    let governance = Address::generate(env);
+    let admin = Address::generate(env);
+
+    let reward_token = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let pool = Address::generate(env);
+
+    // `create_campaign` requires the LP token's admin to be the backing pool.
+    let lp = env.register_contract(None, LpToken);
+    LpTokenClient::new(env, &lp).initialize(
+        &pool,
+        &SorobanString::from_str(env, "LP"),
+        &SorobanString::from_str(env, "LP"),
+        &7,
+    );
+
+    let campaigns_addr = env.register_contract(None, IncentiveCampaigns);
+    let campaigns = IncentiveCampaignsClient::new(env, &campaigns_addr);
+    campaigns.initialize(&governance);
+
+    // Governance funds the campaign out of its own reward-token balance.
+    StellarAssetClient::new(env, &reward_token).mint(&governance, &10_000_000);
+    let campaign_id = campaigns.create_campaign(
+        &governance,
+        &pool,
+        &lp,
+        &reward_token,
+        &1_000_u64,     // start_time
+        &1_000_000_u64, // end_time
+        &10_i128,       // reward_rate
+        &10_000_000_i128,
+    );
+
+    let provider = Address::generate(env);
+    LpTokenClient::new(env, &lp).mint(&provider, &1_000);
+
+    // Advance so rewards have accrued for the provider to claim.
+    env.ledger().set_timestamp(2_000);
+    (campaigns, campaign_id, provider)
+}
+
+fn bench_incentive_claim_rewards(env: &Env) {
+    let (campaigns, campaign_id, provider) = setup_incentive_campaigns(env);
+    env.budget().reset_default();
+    campaigns.claim_rewards(&provider, &campaign_id);
 }
 
 fn bench_batch_settle(env: &Env) {

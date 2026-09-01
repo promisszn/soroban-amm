@@ -13,6 +13,7 @@ import {
   Address,
 } from "@stellar/stellar-sdk";
 import type { NetworkConfig } from "./types.js";
+import { simulateRead } from "./internal/simulate.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -98,19 +99,7 @@ export class GovernanceClient {
   }
 
   private async simulate(method: string, ...args: xdr.ScVal[]): Promise<xdr.ScVal> {
-    const op = this.contract.call(method, ...args);
-    const tx = new (await import("@stellar/stellar-sdk")).TransactionBuilder(
-      await this.server.getAccount("GAAZI4TCR3TY5OJHCTJC2A4QSY6CJWJH5IAJTGKIN2ER7LBNVKOCCWN"),
-      { fee: "100", networkPassphrase: this.networkPassphrase }
-    )
-      .addOperation(op)
-      .setTimeout(30)
-      .build();
-    const result = await this.server.simulateTransaction(tx);
-    if (StellarRpc.Api.isSimulationError(result)) {
-      throw new Error(result.error);
-    }
-    return (result as StellarRpc.Api.SimulateTransactionSuccessResponse).result!.retval;
+    return simulateRead(this.server, this.contract, this.networkPassphrase, method, args);
   }
 
   private proposalFromNative(native: Record<string, unknown>, fallbackId?: number): Proposal {
