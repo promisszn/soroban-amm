@@ -914,6 +914,7 @@ mod stateful {
                 &amount_b,
                 &0,
                 &0,
+                &u64::MAX,
             );
             let Ok(Ok((aa, ab))) = res else {
                 return false;

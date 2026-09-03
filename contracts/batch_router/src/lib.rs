@@ -584,6 +584,7 @@ mod tests {
             &50_000_000_i128,
             &0_i128,
             &0_i128,
+            &u64::MAX,
         );
 
         // Register the pool with the factory so `is_cl_pool` finds it, without

@@ -172,6 +172,7 @@ mod tests {
             &10_000_i128,
             &0_i128,
             &0_i128,
+            &u64::MAX,
         );
         assert!(dep_a > 0 || dep_b > 0, "should deposit at least one token");
 
@@ -420,6 +421,7 @@ mod tests {
             &10_000_i128,
             &0_i128,
             &0_i128,
+            &u64::MAX,
         );
         // Position 2: [0, 200] — lower boundary is tick 0.
         cl.mint_position(
@@ -430,6 +432,7 @@ mod tests {
             &10_000_i128,
             &0_i128,
             &0_i128,
+            &u64::MAX,
         );
 
         // Tick 0 is shared by both positions: upper for p1, lower for p2.
