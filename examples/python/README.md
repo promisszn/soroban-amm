@@ -34,6 +34,7 @@ export SOURCE_SECRET=<secret key for the transaction source and LP/trader>
 export TOKEN_IN_CONTRACT_ID=<token A or token B contract id>
 export SWAP_AMOUNT_IN=100000
 export SWAP_MIN_OUT=0
+export SWAP_DEADLINE_SECONDS=300 # Optional, deadline window in seconds (defaults to 300)
 ```
 
 ### Run

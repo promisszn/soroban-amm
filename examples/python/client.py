@@ -1,15 +1,61 @@
 #!/usr/bin/env python3
 import argparse
-
 import os
 import sys
+import time
+from typing import Any
 
 from stellar_sdk import Keypair, Network, scval
 from stellar_sdk.contract import ContractClient
-from common import format_json, parse_i128, required_env, simulate_contract_call, submit_contract_call
+
+from common import (
+    format_json,
+    parse_i128,
+    required_env,
+    simulate_contract_call,
+    submit_contract_call,
+)
 
 I128_MIN = -(2**127)
 I128_MAX = 2**127 - 1
+DEFAULT_SWAP_DEADLINE_SECONDS = 300
+
+
+def get_swap_deadline_seconds() -> int:
+    """Return the configured swap deadline window, rejecting past deadlines."""
+    deadline_seconds = int(
+        os.getenv("SWAP_DEADLINE_SECONDS", str(DEFAULT_SWAP_DEADLINE_SECONDS))
+    )
+    if deadline_seconds < 0:
+        raise ValueError("SWAP_DEADLINE_SECONDS must be zero or greater")
+    return deadline_seconds
+
+
+def swap(
+    client: ContractClient,
+    source_kp: Keypair,
+    trader: str,
+    token_in: str,
+    amount_in: int,
+    min_out: int,
+    deadline_seconds: int,
+) -> int:
+    """Submit a swap with a wall-clock deadline encoded as a Soroban u64."""
+    if deadline_seconds < 0:
+        raise ValueError("SWAP_DEADLINE_SECONDS must be zero or greater")
+
+    deadline = int(time.time()) + deadline_seconds
+    result: Any = submit_contract_call(
+        client,
+        source_kp,
+        "swap",
+        scval.to_address(trader),
+        scval.to_address(token_in),
+        scval.to_int128(amount_in),
+        scval.to_int128(min_out),
+        scval.to_uint64(deadline),
+    )
+    return result
 
 
 def main() -> int:
@@ -26,6 +72,7 @@ def main() -> int:
 
     swap_amount_in = parse_i128(os.getenv("SWAP_AMOUNT_IN", "100000"))
     swap_min_out = parse_i128(os.getenv("SWAP_MIN_OUT", "0"))
+    swap_deadline_seconds = get_swap_deadline_seconds()
 
     source_keypair = Keypair.from_secret(source_secret)
     trader_address = source_keypair.public_key
@@ -76,14 +123,14 @@ def main() -> int:
         )
     )
 
-    swap_result = submit_contract_call(
+    swap_result = swap(
         client,
         source_keypair,
-        "swap",
-        scval.to_address(trader_address),
-        scval.to_address(token_in_contract_id),
-        scval.to_int128(swap_amount_in),
-        scval.to_int128(swap_min_out),
+        trader_address,
+        token_in_contract_id,
+        swap_amount_in,
+        swap_min_out,
+        swap_deadline_seconds,
     )
     print("Swap submitted:")
     print(
