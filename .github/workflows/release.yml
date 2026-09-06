@@ -1,4 +1,5 @@
 name: Release contracts
+
 on:
   push:
     tags:
@@ -12,14 +13,17 @@ jobs:
     name: Build and publish contract artifacts
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+        with:
+          # `Update changelog` walks the tag history to build the release notes,
+          # so the default depth-1 checkout is not enough.
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32v1-none
       # The list of crates excluded from the wasm build lives in
-      # scripts/build_workspace.sh, which is shared with .github/workflows/ci.yml.
-      # If you need to change which crates are excluded, edit that script and
-      # keep it in sync with ci.yml's usage (both call the same script).
+      # scripts/build_workspace.sh, which is shared with .github/workflows/ci.yml
+      # and the Makefile. Change the exclusions there, not here.
       - name: Build contracts
         run: bash scripts/build_workspace.sh
       - name: Check contract sizes
@@ -34,13 +38,18 @@ jobs:
           while IFS= read -r wasm; do
             name=$(basename "$wasm")
             stellar contract optimize --wasm "$wasm" --output "release-artifacts/$name"
-          done < <(find target/wasm32v1-none/release -maxdepth 1 -name '*.wasm' -type f |\n          shell: bash
+          done < <(find target/wasm32v1-none/release -maxdepth 1 -name '*.wasm' -type f | sort)
+      - name: Generate checksums
+        working-directory: release-artifacts
+        run: sha256sum *.wasm > sha256sums.txt
+      - name: Update changelog
+        shell: bash
         run: |
           set -euo pipefail
           previous=$(git tag --sort=-creatordate | sed -n '2p' || true)
-          range="${previous:+$previous..}..HEAD"
+          range="${previous:+$previous..}HEAD"
           {
-            echo "## ${GITHUB-REF_NAME} (${GITHUB-SHA:}--012)"
+            echo "## ${GITHUB_REF_NAME} (${GITHUB_SHA:0:12})"
             git log --pretty='- %s' $range
             echo
             cat CHANGELOG.md 2>/dev/null || true

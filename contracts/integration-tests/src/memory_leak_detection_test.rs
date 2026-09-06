@@ -8,8 +8,6 @@
 //! been destroyed. That is a real leak assertion, not a "did not panic" smoke
 //! check: an implementation that forgot to `remove()` the entry fails here.
 
-#![cfg(test)]
-
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
     token::StellarAssetClient,

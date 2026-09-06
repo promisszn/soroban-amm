@@ -93,7 +93,9 @@ impl ClPoolState {
         let pool = Self {
             token_a: token_a.into(),
             token_b: token_b.into(),
-            sqrt_price_x96: 1_u128.checked_shl(96).ok_or(SimulationError::PriceOverflow)? as i128,
+            sqrt_price_x96: 1_u128
+                .checked_shl(96)
+                .ok_or(SimulationError::PriceOverflow)? as i128,
             current_tick: 0,
             liquidity: 0,
             fee_growth_global_a: 0,
@@ -168,15 +170,10 @@ impl ClPoolState {
 
     /// Register a tick in the pool (if it's not already initialized).
     pub fn initialize_tick(&mut self, tick: i32) {
-        if !self.ticks.contains_key(&tick) {
-            self.ticks.insert(
-                tick,
-                Tick {
-                    liquidity_net: 0,
-                    fee_growth_outside_a: 0,
-                    fee_growth_outside_b: 0,
-                },
-            );
-        }
+        self.ticks.entry(tick).or_insert(Tick {
+            liquidity_net: 0,
+            fee_growth_outside_a: 0,
+            fee_growth_outside_b: 0,
+        });
     }
 }

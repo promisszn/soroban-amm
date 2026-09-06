@@ -1190,7 +1190,7 @@ impl Staking {
         // but pool is empty); updating acc_per_share by zero is harmless.
         if distributable > 0 {
             let rewards_increase = distributable * SCALE_FACTOR / total_effective;
-            acc_per_share = acc_per_share + rewards_increase;
+            acc_per_share += rewards_increase;
             env.storage()
                 .instance()
                 .set(&DataKey::AccumulatedRewardsPerShare, &acc_per_share);

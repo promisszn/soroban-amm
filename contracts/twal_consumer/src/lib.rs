@@ -670,7 +670,7 @@ impl TwalConsumer {
     ///
     /// - [`TwalError::ZeroWindow`] — `window_seconds == 0`.
     /// - [`TwalError::WindowTooLarge`] — `window_seconds` exceeds
-    ///   [`Self::MAX_WINDOW_SECONDS`].
+    ///   [`TwalConsumer::MAX_WINDOW_SECONDS`].
     /// - [`TwalError::InsufficientHistory`] — the ledger clock predates the
     ///   window, or no snapshot exists at or before the window start.
     /// - [`TwalError::NoSnapshotFound`] — the snapshot the timestamp index

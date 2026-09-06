@@ -246,8 +246,10 @@ main() {
       require_cmd cargo
       log "building release WASM artifacts (target ${WASM_TARGET})"
       CURRENT_CONTRACT="build"
-      CURRENT_STEP="cargo build --release --target ${WASM_TARGET}"
-      (cd "$ROOT_DIR" && cargo build --release --target "${WASM_TARGET}") || die "cargo build failed"
+      # Shared with ci.yml, release.yml and the Makefile so the crates that
+      # produce no deployable wasm are excluded here too.
+      CURRENT_STEP="bash scripts/build_workspace.sh"
+      (cd "$ROOT_DIR" && bash scripts/build_workspace.sh) || die "cargo build failed"
     fi
   else
     log "WASM artifacts already present — skipping build (use --force to rebuild)"

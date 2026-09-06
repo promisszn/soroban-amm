@@ -83,10 +83,12 @@ impl AmmSimulator {
                 amount_in,
                 min_out,
             } => {
-                let quote = self.pool.execute_swap_exact_in(&token_in, amount_in, min_out)?;
-                self.total_amount_in = self.total_amount_in + amount_in;
-                self.total_amount_out = self.total_amount_out + quote.amount_out;
-                self.total_fees = self.total_fees + quote.fee_amount;
+                let quote = self
+                    .pool
+                    .execute_swap_exact_in(&token_in, amount_in, min_out)?;
+                self.total_amount_in += amount_in;
+                self.total_amount_out += quote.amount_out;
+                self.total_fees += quote.fee_amount;
                 Ok(ActionOutcome {
                     swap: Some(quote),
                     exact_out: None,
@@ -98,12 +100,14 @@ impl AmmSimulator {
                 amount_out,
                 max_in,
             } => {
-                let quote = self
-                    .pool
-                    .execute_swap_exact_out(&token_out, amount_out, max_in.unwrap_or(i128::MAX))?;
-                self.total_amount_in = self.total_amount_in + quote.amount_in;
-                self.total_amount_out = self.total_amount_out + amount_out;
-                self.total_fees = self.total_fees + quote.fee_amount;
+                let quote = self.pool.execute_swap_exact_out(
+                    &token_out,
+                    amount_out,
+                    max_in.unwrap_or(i128::MAX),
+                )?;
+                self.total_amount_in += quote.amount_in;
+                self.total_amount_out += amount_out;
+                self.total_fees += quote.fee_amount;
                 Ok(ActionOutcome {
                     swap: None,
                     exact_out: Some(quote),
@@ -115,7 +119,9 @@ impl AmmSimulator {
                 amount_b,
                 min_shares,
             } => {
-                let quote = self.pool.execute_add_liquidity(amount_a, amount_b, min_shares)?;
+                let quote = self
+                    .pool
+                    .execute_add_liquidity(amount_a, amount_b, min_shares)?;
                 Ok(ActionOutcome {
                     swap: None,
                     exact_out: None,

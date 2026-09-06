@@ -1,6 +1,6 @@
 use crate::error::{Result, SimulationError};
 use crate::pool::PoolState;
-use crate::replay::{TradeAction, TradeRecord};
+use crate::replay::{FlatTradeRecord, TradeRecord};
 use serde::Serialize;
 use std::fs;
 use std::path::Path;
@@ -11,17 +11,22 @@ pub fn load_pool_state(path: impl AsRef<Path>) -> Result<PoolState> {
         path: path.display().to_string(),
         source,
     })?;
-    let pool: PoolState = serde_json::from_str(&contents).map_err(|source| SimulationError::Json {
-        path: path.display().to_string(),
-        source,
-    })?;
+    let pool: PoolState =
+        serde_json::from_str(&contents).map_err(|source| SimulationError::Json {
+            path: path.display().to_string(),
+            source,
+        })?;
     pool.validate()?;
     Ok(pool)
 }
 
 pub fn load_trade_records(path: impl AsRef<Path>) -> Result<Vec<TradeRecord>> {
     let path = path.as_ref();
-    match path.extension().and_then(|ext| ext.to_str()).unwrap_or_default() {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+    {
         "csv" => load_trade_records_csv(path),
         _ => load_trade_records_json(path),
     }
@@ -63,69 +68,23 @@ fn load_trade_records_json(path: &Path) -> Result<Vec<TradeRecord>> {
 }
 
 fn load_trade_records_csv(path: &Path) -> Result<Vec<TradeRecord>> {
-    #[derive(serde::Deserialize)]
-    struct Row {
-        timestamp: u64,
-        kind: String,
-        label: Option<String>,
-        token_in: Option<String>,
-        token_out: Option<String>,
-        amount_in: Option<i128>,
-        amount_out: Option<i128>,
-        amount_a: Option<i128>,
-        amount_b: Option<i128>,
-        shares: Option<i128>,
-        min_out: Option<i128>,
-        max_in: Option<i128>,
-        min_shares: Option<i128>,
-        min_a: Option<i128>,
-        min_b: Option<i128>,
-    }
-
     let mut reader = csv::Reader::from_path(path).map_err(|source| SimulationError::Csv {
         path: path.display().to_string(),
         source,
     })?;
     let mut records = Vec::new();
 
-    for row in reader.deserialize::<Row>() {
+    // A CSV row carries the same field names as the flat JSON record, so both
+    // formats share one representation and one `kind` -> `TradeAction` mapping.
+    for row in reader.deserialize::<FlatTradeRecord>() {
         let row = row.map_err(|source| SimulationError::Csv {
             path: path.display().to_string(),
             source,
         })?;
-        let action = match row.kind.as_str() {
-            "swap_exact_in" => TradeAction::SwapExactIn {
-                token_in: row.token_in.unwrap_or_default(),
-                amount_in: row.amount_in.unwrap_or_default(),
-                min_out: row.min_out.unwrap_or_default(),
-            },
-            "swap_exact_out" => TradeAction::SwapExactOut {
-                token_out: row.token_out.unwrap_or_default(),
-                amount_out: row.amount_out.unwrap_or_default(),
-                max_in: row.max_in,
-            },
-            "add_liquidity" => TradeAction::AddLiquidity {
-                amount_a: row.amount_a.unwrap_or_default(),
-                amount_b: row.amount_b.unwrap_or_default(),
-                min_shares: row.min_shares.unwrap_or_default(),
-            },
-            "remove_liquidity" => TradeAction::RemoveLiquidity {
-                shares: row.shares.unwrap_or_default(),
-                min_a: row.min_a.unwrap_or_default(),
-                min_b: row.min_b.unwrap_or_default(),
-            },
-            other => {
-                return Err(SimulationError::InvalidInput(format!(
-                    "unknown trade kind `{other}`"
-                )))
-            }
-        };
 
-        records.push(TradeRecord {
-            timestamp: row.timestamp,
-            label: row.label,
-            action,
-        });
+        records.push(row.into_record().map_err(|kind| {
+            SimulationError::InvalidInput(format!("unknown trade kind `{kind}`"))
+        })?);
     }
 
     Ok(records)
@@ -135,18 +94,20 @@ fn load_trade_records_csv(path: &Path) -> Result<Vec<TradeRecord>> {
 mod tests {
     use super::*;
     use crate::replay::TradeAction;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn temp_file(extension: &str) -> std::path::PathBuf {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock should be after UNIX epoch")
-            .as_nanos();
+        // These tests run as parallel threads of a single process and finish in
+        // well under a millisecond, so a wall-clock timestamp is not unique
+        // enough: two tests could be handed the same path, then read and delete
+        // each other's fixture. A process-wide counter cannot collide, and the
+        // pid still separates concurrent `cargo test` invocations.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
 
         std::env::temp_dir().join(format!(
             "amm-simulator-io-test-{}-{}.{}",
             std::process::id(),
-            timestamp,
+            COUNTER.fetch_add(1, Ordering::Relaxed),
             extension
         ))
     }
@@ -166,7 +127,7 @@ mod tests {
         let path = write_temp_file(
             "csv",
             "timestamp,kind,label,token_in,token_out,amount_in,amount_out,amount_a,amount_b,shares,min_out,max_in,min_shares,min_a,min_b\n\
-             100,swap_exact_in,swap-a,XLM,USDC,5000,, , , ,4900,,,,\n",
+             100,swap_exact_in,swap-a,XLM,USDC,5000,,,,,4900,,,,\n",
         );
 
         let result = load_trade_records_csv(&path);
@@ -197,7 +158,7 @@ mod tests {
         let path = write_temp_file(
             "csv",
             "timestamp,kind,label,token_in,token_out,amount_in,amount_out,amount_a,amount_b,shares,min_out,max_in,min_shares,min_a,min_b\n\
-             200,swap_exact_out,swap-b,,USDC,,3000,,,,,3200,,,,\n",
+             200,swap_exact_out,swap-b,,USDC,,3000,,,,,3200,,,\n",
         );
 
         let result = load_trade_records_csv(&path);
@@ -226,7 +187,7 @@ mod tests {
         let path = write_temp_file(
             "csv",
             "timestamp,kind,label,token_in,token_out,amount_in,amount_out,amount_a,amount_b,shares,min_out,max_in,min_shares,min_a,min_b\n\
-             300,add_liquidity,deposit,,,,,10000,20000,, , ,9000,,\n",
+             300,add_liquidity,deposit,,,,,10000,20000,,,,9000,,\n",
         );
 
         let result = load_trade_records_csv(&path);
@@ -255,7 +216,7 @@ mod tests {
         let path = write_temp_file(
             "csv",
             "timestamp,kind,label,token_in,token_out,amount_in,amount_out,amount_a,amount_b,shares,min_out,max_in,min_shares,min_a,min_b\n\
-             400,remove_liquidity,withdraw,,,,,,,2500,,, ,2000,3000\n",
+             400,remove_liquidity,withdraw,,,,,,,2500,,,,2000,3000\n",
         );
 
         let result = load_trade_records_csv(&path);
@@ -305,7 +266,7 @@ mod tests {
             "csv",
             "timestamp,kind,label,token_in,token_out,amount_in,amount_out,amount_a,amount_b,shares,min_out,max_in,min_shares,min_a,min_b\n\
              600,swap_exact_in,,,,,,,,,,,,,\n\
-             601,swap_exact_out,, ,USDC,,,,,,,,,,,\n\
+             601,swap_exact_out,, ,USDC,,,,,,,,,,\n\
              602,add_liquidity,,,,,,1000,2000,,,,,,\n\
              603,remove_liquidity,,,,,,,,500,,,,,\n",
         );
@@ -378,13 +339,10 @@ mod tests {
                 {
                     "timestamp": 1000,
                     "label": "json-array",
-                    "action": {
-                        "SwapExactIn": {
-                            "token_in": "XLM",
-                            "amount_in": 5000,
-                            "min_out": 4500
-                        }
-                    }
+                    "kind": "swap_exact_in",
+                    "token_in": "XLM",
+                    "amount_in": 5000,
+                    "min_out": 4500
                 }
             ]"#,
         );
@@ -421,13 +379,10 @@ mod tests {
                     {
                         "timestamp": 2000,
                         "label": "json-wrapper",
-                        "action": {
-                            "RemoveLiquidity": {
-                                "shares": 2500,
-                                "min_a": 1000,
-                                "min_b": 1500
-                            }
-                        }
+                        "kind": "remove_liquidity",
+                        "shares": 2500,
+                        "min_a": 1000,
+                        "min_b": 1500
                     }
                 ]
             }"#,
@@ -475,10 +430,65 @@ mod tests {
         cleanup(&path);
 
         match result {
-            Err(SimulationError::Json { path: error_path, .. }) => {
+            Err(SimulationError::Json {
+                path: error_path, ..
+            }) => {
                 assert!(error_path.ends_with(".json"));
             }
             other => panic!("expected JSON error, got {other:?}"),
         }
+    }
+
+    /// Every `TradeAction` variant must survive `save_json_pretty` ->
+    /// `load_trade_records`. `TradeRecord` serializes through a derived
+    /// `#[serde(flatten)]` impl but deserializes through `FlatTradeRecord`, so
+    /// this is what keeps the two halves of the format in agreement.
+    #[test]
+    fn trade_records_round_trip_through_json() {
+        let records = vec![
+            TradeRecord {
+                timestamp: 1,
+                label: Some("swap-in".into()),
+                action: TradeAction::SwapExactIn {
+                    token_in: "XLM".into(),
+                    amount_in: 5_000,
+                    min_out: 4_900,
+                },
+            },
+            TradeRecord {
+                timestamp: 2,
+                label: None,
+                action: TradeAction::SwapExactOut {
+                    token_out: "USDC".into(),
+                    amount_out: 3_000,
+                    max_in: Some(3_200),
+                },
+            },
+            TradeRecord {
+                timestamp: 3,
+                label: Some("deposit".into()),
+                action: TradeAction::AddLiquidity {
+                    amount_a: 10_000,
+                    amount_b: 20_000,
+                    min_shares: 9_000,
+                },
+            },
+            TradeRecord {
+                timestamp: 4,
+                label: None,
+                action: TradeAction::RemoveLiquidity {
+                    shares: 2_500,
+                    min_a: 2_000,
+                    min_b: 3_000,
+                },
+            },
+        ];
+
+        let path = temp_file("json");
+        save_json_pretty(&path, &records).expect("records should serialize");
+        let loaded = load_trade_records(&path);
+        cleanup(&path);
+
+        assert_eq!(loaded.expect("round trip should parse"), records);
     }
 }

@@ -1,6 +1,5 @@
 use crate::error::{Result, SimulationError};
 use serde::{Deserialize, Serialize};
-use std::convert::TryFrom;
 
 const BPS_DENOMINATOR: i128 = 10_000;
 const PRICE_SCALE: i128 = 1_000_000;
@@ -127,8 +126,7 @@ impl PoolState {
 
             if self.total_shares < MINIMUM_LIQUIDITY {
                 return Err(SimulationError::InvalidInput(
-                    "total_shares cannot be below MINIMUM_LIQUIDITY when the lock is active"
-                        .into(),
+                    "total_shares cannot be below MINIMUM_LIQUIDITY when the lock is active".into(),
                 ));
             }
         } else {
@@ -193,8 +191,7 @@ impl PoolState {
         if !self.is_empty() {
             let spot_a = self.spot_price_a();
             let spot_b = self.spot_price_b();
-            let delta_i128 =
-                i128::try_from(delta).map_err(|_| SimulationError::Overflow)?;
+            let delta_i128 = i128::from(delta);
 
             self.price_cumulative_a = self
                 .price_cumulative_a
@@ -219,11 +216,7 @@ impl PoolState {
         Ok(())
     }
 
-    pub fn quote_swap_exact_in(
-        &self,
-        token_in: &str,
-        amount_in: i128,
-    ) -> Result<SwapQuote> {
+    pub fn quote_swap_exact_in(&self, token_in: &str, amount_in: i128) -> Result<SwapQuote> {
         if amount_in <= 0 {
             return Err(SimulationError::ZeroAmount);
         }
@@ -277,11 +270,7 @@ impl PoolState {
         })
     }
 
-    pub fn quote_swap_exact_out(
-        &self,
-        token_out: &str,
-        amount_out: i128,
-    ) -> Result<SwapResult> {
+    pub fn quote_swap_exact_out(&self, token_out: &str, amount_out: i128) -> Result<SwapResult> {
         if amount_out <= 0 {
             return Err(SimulationError::ZeroAmount);
         }
@@ -330,11 +319,7 @@ impl PoolState {
         })
     }
 
-    pub fn quote_add_liquidity(
-        &self,
-        amount_a: i128,
-        amount_b: i128,
-    ) -> Result<LiquidityQuote> {
+    pub fn quote_add_liquidity(&self, amount_a: i128, amount_b: i128) -> Result<LiquidityQuote> {
         if amount_a <= 0 || amount_b <= 0 {
             return Err(SimulationError::ZeroAmount);
         }
@@ -387,10 +372,7 @@ impl PoolState {
         })
     }
 
-    pub fn quote_remove_liquidity(
-        &self,
-        shares: i128,
-    ) -> Result<LiquidityQuote> {
+    pub fn quote_remove_liquidity(&self, shares: i128) -> Result<LiquidityQuote> {
         if shares <= 0 {
             return Err(SimulationError::ZeroAmount);
         }
@@ -672,17 +654,9 @@ impl PoolState {
 
     fn token_pair(&self, token_in: &str) -> Result<(i128, i128, String)> {
         if token_in == self.token_a {
-            Ok((
-                self.reserve_a,
-                self.reserve_b,
-                self.token_b.clone(),
-            ))
+            Ok((self.reserve_a, self.reserve_b, self.token_b.clone()))
         } else if token_in == self.token_b {
-            Ok((
-                self.reserve_b,
-                self.reserve_a,
-                self.token_a.clone(),
-            ))
+            Ok((self.reserve_b, self.reserve_a, self.token_a.clone()))
         } else {
             Err(SimulationError::InvalidToken {
                 token: token_in.to_string(),
@@ -692,17 +666,9 @@ impl PoolState {
 
     fn reverse_pair(&self, token_out: &str) -> Result<(i128, i128, String)> {
         if token_out == self.token_a {
-            Ok((
-                self.reserve_b,
-                self.reserve_a,
-                self.token_b.clone(),
-            ))
+            Ok((self.reserve_b, self.reserve_a, self.token_b.clone()))
         } else if token_out == self.token_b {
-            Ok((
-                self.reserve_a,
-                self.reserve_b,
-                self.token_a.clone(),
-            ))
+            Ok((self.reserve_a, self.reserve_b, self.token_a.clone()))
         } else {
             Err(SimulationError::InvalidToken {
                 token: token_out.to_string(),
@@ -762,8 +728,7 @@ mod tests {
     use super::*;
 
     fn pool_with_liquidity() -> PoolState {
-        let mut pool =
-            PoolState::new("TOKEN_A", "TOKEN_B", 30).expect("pool should be valid");
+        let mut pool = PoolState::new("TOKEN_A", "TOKEN_B", 30).expect("pool should be valid");
 
         pool.execute_add_liquidity(100_000, 100_000, 0)
             .expect("initial liquidity should succeed");
@@ -773,21 +738,16 @@ mod tests {
 
     #[test]
     fn first_deposit_below_minimum_liquidity_returns_insufficient_shares() {
-        let pool =
-            PoolState::new("TOKEN_A", "TOKEN_B", 30).expect("pool should be valid");
+        let pool = PoolState::new("TOKEN_A", "TOKEN_B", 30).expect("pool should be valid");
 
         let result = pool.quote_add_liquidity(1_000, 1_000);
 
-        assert_eq!(
-            result,
-            Err(SimulationError::InsufficientShares)
-        );
+        assert!(matches!(result, Err(SimulationError::InsufficientShares)));
     }
 
     #[test]
     fn first_deposit_mints_sqrt_product_minus_minimum_liquidity() {
-        let mut pool =
-            PoolState::new("TOKEN_A", "TOKEN_B", 30).expect("pool should be valid");
+        let mut pool = PoolState::new("TOKEN_A", "TOKEN_B", 30).expect("pool should be valid");
 
         let quote = pool
             .execute_add_liquidity(2_000, 2_000, 1_000)
@@ -816,8 +776,7 @@ mod tests {
 
     #[test]
     fn second_deposit_is_unaffected_by_minimum_liquidity_lock() {
-        let mut pool =
-            PoolState::new("TOKEN_A", "TOKEN_B", 30).expect("pool should be valid");
+        let mut pool = PoolState::new("TOKEN_A", "TOKEN_B", 30).expect("pool should be valid");
 
         pool.execute_add_liquidity(2_000, 2_000, 1_000)
             .expect("first deposit should succeed");
@@ -859,10 +818,7 @@ mod tests {
 
         // The 15-token LP rebate remains in the reserve, so the reserve
         // increases by amount_in - net_protocol_fee.
-        assert_eq!(
-            pool.reserve_a,
-            initial_reserve_a + 10_000 - 15
-        );
+        assert_eq!(pool.reserve_a, initial_reserve_a + 10_000 - 15);
 
         assert!(quote.amount_out > 0);
     }
@@ -882,10 +838,7 @@ mod tests {
         // With no LP rebate, the entire protocol fee is accrued.
         assert_eq!(pool.accrued_fee_a, 30);
 
-        assert_eq!(
-            pool.reserve_a,
-            initial_reserve_a + 10_000 - 30
-        );
+        assert_eq!(pool.reserve_a, initial_reserve_a + 10_000 - 30);
     }
 
     #[test]
@@ -899,11 +852,9 @@ mod tests {
             .quote_swap_exact_out("TOKEN_B", 1_000)
             .expect("exact-out quote should succeed");
 
-        let protocol_fee =
-            quote.amount_in * pool.protocol_fee_bps / BPS_DENOMINATOR;
+        let protocol_fee = quote.amount_in * pool.protocol_fee_bps / BPS_DENOMINATOR;
 
-        let expected_rebate =
-            protocol_fee * pool.lp_rebate_bps / BPS_DENOMINATOR;
+        let expected_rebate = protocol_fee * pool.lp_rebate_bps / BPS_DENOMINATOR;
 
         let expected_net_fee = protocol_fee - expected_rebate;
 
@@ -915,23 +866,20 @@ mod tests {
 
     #[test]
     fn validate_rejects_invalid_lp_rebate_bps() {
-        let mut pool =
-            PoolState::new("TOKEN_A", "TOKEN_B", 30).expect("pool should be valid");
+        let mut pool = PoolState::new("TOKEN_A", "TOKEN_B", 30).expect("pool should be valid");
 
         pool.lp_rebate_bps = BPS_DENOMINATOR + 1;
 
-        assert_eq!(
+        assert!(matches!(
             pool.validate(),
-            Err(SimulationError::InvalidFeeBps {
-                fee_bps: BPS_DENOMINATOR + 1,
-            })
-        );
+            Err(SimulationError::InvalidFeeBps { fee_bps })
+                if fee_bps == BPS_DENOMINATOR + 1
+        ));
     }
 
     #[test]
     fn validate_accepts_valid_lp_rebate_bps_and_locked_state() {
-        let mut pool =
-            PoolState::new("TOKEN_A", "TOKEN_B", 30).expect("pool should be valid");
+        let mut pool = PoolState::new("TOKEN_A", "TOKEN_B", 30).expect("pool should be valid");
 
         pool.lp_rebate_bps = 5_000;
         pool.total_shares = 2_000;
@@ -943,8 +891,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_populated_pool_without_minimum_liquidity_lock() {
-        let mut pool =
-            PoolState::new("TOKEN_A", "TOKEN_B", 30).expect("pool should be valid");
+        let mut pool = PoolState::new("TOKEN_A", "TOKEN_B", 30).expect("pool should be valid");
 
         pool.total_shares = MINIMUM_LIQUIDITY + 1;
 
@@ -956,23 +903,18 @@ mod tests {
 
     #[test]
     fn first_deposit_exactly_at_minimum_liquidity_is_rejected() {
-        let pool =
-            PoolState::new("TOKEN_A", "TOKEN_B", 30).expect("pool should be valid");
+        let pool = PoolState::new("TOKEN_A", "TOKEN_B", 30).expect("pool should be valid");
 
         // sqrt(1,000 * 1,000) = 1,000, so the provider would receive
         // zero shares after the mandatory 1,000-share lock.
         let result = pool.quote_add_liquidity(1_000, 1_000);
 
-        assert_eq!(
-            result,
-            Err(SimulationError::InsufficientShares)
-        );
+        assert!(matches!(result, Err(SimulationError::InsufficientShares)));
     }
 
     #[test]
     fn provider_cannot_withdraw_permanently_locked_liquidity() {
-        let mut pool =
-            PoolState::new("TOKEN_A", "TOKEN_B", 30).expect("pool should be valid");
+        let mut pool = PoolState::new("TOKEN_A", "TOKEN_B", 30).expect("pool should be valid");
 
         pool.execute_add_liquidity(2_000, 2_000, 1_000)
             .expect("first deposit should succeed");
@@ -981,10 +923,7 @@ mod tests {
         // Only the provider's 1,000 shares can be withdrawn.
         let result = pool.quote_remove_liquidity(1_001);
 
-        assert_eq!(
-            result,
-            Err(SimulationError::SlippageExceeded)
-        );
+        assert!(matches!(result, Err(SimulationError::SlippageExceeded)));
 
         let quote = pool
             .quote_remove_liquidity(1_000)

@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-
 import pytest
 
 from common import (
-    ConfigError,
     I128_MAX,
     I128_MIN,
+    ConfigError,
     decode_scval,
     encode_address,
     encode_bool,

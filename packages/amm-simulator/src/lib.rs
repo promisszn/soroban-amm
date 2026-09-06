@@ -33,7 +33,7 @@ mod tests {
     #[test]
     fn swap_quote_matches_on_chain_formula() {
         let pool = PoolState::new("A", "B", 30).unwrap();
-        let mut pool = PoolState {
+        let pool = PoolState {
             reserve_a: 1_000_000,
             reserve_b: 1_000_000,
             total_shares: 1_000_000,
@@ -48,20 +48,14 @@ mod tests {
 
     #[test]
     fn replay_tracks_success_and_failure() {
+        // Build on `PoolState::new`, which already supplies the zero/false
+        // defaults for every other field, so adding a field to `PoolState`
+        // does not break this test.
         let pool = PoolState {
-            token_a: "A".into(),
-            token_b: "B".into(),
             reserve_a: 1_000_000,
             reserve_b: 1_000_000,
             total_shares: 1_000_000,
-            fee_bps: 30,
-            protocol_fee_bps: 0,
-            accrued_fee_a: 0,
-            accrued_fee_b: 0,
-            price_cumulative_a: 0,
-            price_cumulative_b: 0,
-            last_timestamp: 0,
-            paused: false,
+            ..PoolState::new("A", "B", 30).unwrap()
         };
         let trades = vec![
             TradeRecord {

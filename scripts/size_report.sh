@@ -28,7 +28,9 @@ status=0
 for wasm in "${artifacts[@]}"; do
   size=$(wc -c < "$wasm")
   human=$(numfmt --to=iec-i --suffix=B --format='%.1f' "$size" 2>/dev/null || printf '%sB' "$size")
-  relative=$(realpath --relative-to="$ROOT_DIR" "$wasm")
+  # Plain prefix strip rather than `realpath --relative-to`, which is GNU-only
+  # and aborts this script on macOS/BSD.
+  relative="${wasm#"$ROOT_DIR"/}"
   if (( size > MAX_BYTES )); then
     printf '%s: %s (%s bytes) EXCEEDS LIMIT (%s bytes)\n' "$relative" "$human" "$size" "$MAX_BYTES"
     status=1

@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 import argparse
-
 import os
 import sys
-from typing import List, Optional, Tuple
 
 from stellar_sdk import Keypair, Network, scval
 from stellar_sdk.address import Address
 from stellar_sdk.contract import ContractClient
-from common import format_json, required_env, simulate_contract_call, submit_contract_call
+
+from common import (
+    format_json,
+    required_env,
+    simulate_contract_call,
+    submit_contract_call,
+)
+
 
 def main() -> int:
     argparse.ArgumentParser(description="Soroban AMM integration example").parse_args()
@@ -73,8 +78,8 @@ def create_pool(
     token_a: str,
     token_b: str,
     fee_bps: int,
-    governance_wasm_hash: Optional[bytes] = None,
-) -> Tuple[str, Optional[str]]:
+    governance_wasm_hash: bytes | None = None,
+) -> tuple[str, str | None]:
     result = submit_contract_call(
         client,
         source_kp,
@@ -89,7 +94,7 @@ def create_pool(
     pool_result, governance_result = result
 
     pool_address = pool_result.address if isinstance(pool_result, Address) else str(pool_result)
-    governance_address: Optional[str] = None
+    governance_address: str | None = None
     if isinstance(governance_result, Address):
         governance_address = governance_result.address
     elif governance_result is not None:
@@ -98,7 +103,7 @@ def create_pool(
     return pool_address, governance_address
 
 
-def get_pool(client: ContractClient, token_a: str, token_b: str) -> Optional[str]:
+def get_pool(client: ContractClient, token_a: str, token_b: str) -> str | None:
     result = simulate_contract_call(
         client,
         "get_pool",
@@ -112,7 +117,7 @@ def get_pool(client: ContractClient, token_a: str, token_b: str) -> Optional[str
     return str(result)
 
 
-def all_pools(client: ContractClient) -> List[str]:
+def all_pools(client: ContractClient) -> list[str]:
     result = simulate_contract_call(client, "all_pools")
     if not result:
         return []

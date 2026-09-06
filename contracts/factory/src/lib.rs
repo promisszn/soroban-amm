@@ -784,7 +784,7 @@ impl Factory {
     }
 
     /// Return **AMM** pool addresses, oldest first, capped at
-    /// [`Self::MAX_UNBOUNDED_PAGE`].
+    /// [`Factory::MAX_UNBOUNDED_PAGE`].
     ///
     /// Never includes CL pools (issue #493) — callers that treat every entry
     /// as an AMM pool (e.g. anything calling the AMM-only `get_info()`) can
@@ -831,7 +831,7 @@ impl Factory {
     }
 
     /// Return **CL** (concentrated-liquidity) pool addresses, oldest first,
-    /// capped at [`Self::MAX_UNBOUNDED_PAGE`]. Mirrors `all_pools()` but for
+    /// capped at [`Factory::MAX_UNBOUNDED_PAGE`]. Mirrors `all_pools()` but for
     /// the separately indexed CL pool sequence (issue #493), and is bounded
     /// for the same reason (issue #790) — see `all_pools()` for how to detect
     /// truncation and page past it with `get_cl_pools(offset, limit)`.

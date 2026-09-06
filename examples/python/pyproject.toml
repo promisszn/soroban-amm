@@ -3,3 +3,14 @@
 # Target Python and line length chosen to match CI environment
 line-length = 88
 target-version = "py311"
+
+[tool.ruff.lint.per-file-ignores]
+# These are runnable demo scripts, not library code. Each network/contract call
+# is wrapped so that any failure — RPC transport error, SDK exception, or a
+# contract error — prints an explanation the reader can act on and then exits
+# or moves on to the next step. Enumerating concrete exception types here would
+# make the examples brittle without making them any safer.
+"client.py" = ["BLE001"]
+"factory_client.py" = ["BLE001"]
+"governance_client.py" = ["BLE001"]
+"twap_client.py" = ["BLE001"]

@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 //! Factory → pool → LP token lifecycle tests.
 //!
 //! Tests verify that the factory correctly deploys pools and configures them

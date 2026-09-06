@@ -12,7 +12,9 @@ OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/optimized-artifacts}"
 
 cd "$ROOT_DIR"
 printf '[optimize] Building workspace for %s\n' "$TARGET"
-cargo build --workspace --release --target "$TARGET"
+# Shared with ci.yml, release.yml and the Makefile; it knows which crates have
+# no deployable wasm artifact and must be excluded from this target.
+bash "$ROOT_DIR/scripts/build_workspace.sh"
 
 shopt -s nullglob
 artifacts=("$WASM_DIR"/*.wasm)

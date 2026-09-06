@@ -34,10 +34,11 @@ jobs:
             # exports of its own. All four now depend on that instead of on the
             # real contract crates (which remain dev-dependencies for their own
             # tests), so there is nothing left to collide with at link time.
-            # `amm-fuzz`, `integration-tests`, and `benches` are not deployable
-            # contracts, so they never produce wasm to build or size-check here.
+            # Which crates are excluded from the wasm build is decided in
+            # scripts/build_workspace.sh, shared with release.yml and the
+            # Makefile so the three cannot drift apart. Change exclusions there.
             - name: Build WASM artifacts
-              run: cargo build --release --target wasm32v1-none --workspace --exclude amm_fuzz --exclude integration_tests --exclude benches
+              run: bash scripts/build_workspace.sh
             - name: Check WASM binary sizes
               run: bash scripts/size_report.sh --fail-on-limit
             # All six crates that were previously excluded here
@@ -56,11 +57,11 @@ jobs:
             - name: Run hot-path benchmarks
               run: cargo run -p benches -- --check
             - name: Clippy
-              run: cargo clippy --workspace --all-targets --exclude amm-fuzz -- -D warnings
+              run: cargo clippy --workspace --all-targets --exclude amm_fuzz -- -D warnings
             - name: Format check
               run: cargo fmt --all -- --check
             - name: Check docs
-              run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --exclude amm-fuzz
+              run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --exclude amm_fuzz
             - name: Check error docs sync
               run: make check-docs
 

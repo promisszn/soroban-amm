@@ -4005,8 +4005,16 @@ mod tests {
         let env = Env::default();
         let te = setup_test_env(&env, 30, 0); // 0.3% fee, start at tick 0
 
-        te.client
-            .mint_position(&te.provider, &-100, &100, &100_000, &100_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &te.provider,
+            &-100,
+            &100,
+            &100_000,
+            &100_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         let out = te.client.swap(&te.provider, &true, &1000, &0, &0, &10000);
         assert!(out > 0);
@@ -4020,8 +4028,16 @@ mod tests {
         let env = Env::default();
         let te = setup_test_env(&env, 0, 10); // 0% fee, start at tick 10
 
-        te.client
-            .mint_position(&te.provider, &-50, &0, &100_000, &100_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &te.provider,
+            &-50,
+            &0,
+            &100_000,
+            &100_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         let state_before = te.client.get_pool_state();
         assert_eq!(state_before.active_liquidity, 0); // outside range
@@ -4040,8 +4056,16 @@ mod tests {
         // Use all-negative ticks to avoid broken positive-tick sqrt math.
         let te = setup_test_env(&env, 30, -150);
 
-        te.client
-            .mint_position(&te.provider, &-200, &-100, &100_000, &100_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &te.provider,
+            &-200,
+            &-100,
+            &100_000,
+            &100_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         let quote = te.client.estimate_price_impact(&true, &1_000_i128, &0_u128);
         let out = te.client.swap(
@@ -4074,10 +4098,26 @@ mod tests {
             .mint_position(&te.provider, &-400, &-300, &0, &80_000, &0, &0, &u64::MAX);
         te.client
             .mint_position(&te.provider, &-300, &-200, &0, &90_000, &0, &0, &u64::MAX);
-        te.client
-            .mint_position(&te.provider, &-200, &-100, &100_000, &100_000, &0, &0, &u64::MAX);
-        te.client
-            .mint_position(&te.provider, &-100, &-1, &100_000, &100_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &te.provider,
+            &-200,
+            &-100,
+            &100_000,
+            &100_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
+        te.client.mint_position(
+            &te.provider,
+            &-100,
+            &-1,
+            &100_000,
+            &100_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         let quote = te
             .client
@@ -4105,8 +4145,16 @@ mod tests {
         let env = Env::default();
         let te = setup_test_env(&env, 0, 0);
 
-        te.client
-            .mint_position(&te.provider, &-100, &100, &100_000, &100_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &te.provider,
+            &-100,
+            &100,
+            &100_000,
+            &100_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         let limit = (1u128 << 96) - 1_000_000;
         let out = te
@@ -4195,8 +4243,16 @@ mod tests {
             .mint_position(&provider1, &0, &50, &100_000, &100_000, &0, &0, &u64::MAX);
         te.client
             .mint_position(&provider2, &50, &100, &100_000, &100_000, &0, &0, &u64::MAX);
-        te.client
-            .mint_position(&provider3, &100, &150, &100_000, &100_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &provider3,
+            &100,
+            &150,
+            &100_000,
+            &100_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         // Sell A for B (price decreasing) far enough to cross both the 100
         // and 50 boundaries, starting from tick 140 (inside position 3).
@@ -4299,9 +4355,16 @@ mod tests {
         te.client.pause(&te.admin);
         assert!(te.client.is_paused());
 
-        let result =
-            te.client
-                .try_mint_position(&te.provider, &-100, &100, &10_000, &10_000, &0, &0, &u64::MAX);
+        let result = te.client.try_mint_position(
+            &te.provider,
+            &-100,
+            &100,
+            &10_000,
+            &10_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
         assert_eq!(result, Err(Ok(ClError::Paused)));
     }
 
@@ -4310,8 +4373,16 @@ mod tests {
         let env = Env::default();
         let te = setup_test_env(&env, 30, 0);
 
-        te.client
-            .mint_position(&te.provider, &-100, &100, &10_000, &10_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &te.provider,
+            &-100,
+            &100,
+            &10_000,
+            &10_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
         te.client.pause(&te.admin);
 
         let result = te
@@ -4369,8 +4440,16 @@ mod tests {
         assert!(!te.client.is_paused());
 
         // Should now succeed
-        te.client
-            .mint_position(&te.provider, &-100, &100, &10_000, &10_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &te.provider,
+            &-100,
+            &100,
+            &10_000,
+            &10_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
     }
 
     #[test]
@@ -4379,8 +4458,16 @@ mod tests {
         let te = setup_test_env(&env, 1000, 100);
         let cl_addr = te.cl_addr.clone();
 
-        te.client
-            .mint_position(&te.provider, &0, &150, &100_000, &100_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &te.provider,
+            &0,
+            &150,
+            &100_000,
+            &100_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
         te.client
             .swap(&te.provider, &true, &2_000, &0, &0, &u64::MAX);
 
@@ -4409,8 +4496,16 @@ mod tests {
         let te = setup_test_env(&env, 30, 0);
         let cl_addr = te.cl_addr.clone();
 
-        te.client
-            .mint_position(&te.provider, &-100, &100, &100_000, &100_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &te.provider,
+            &-100,
+            &100,
+            &100_000,
+            &100_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         // zero_for_one = true → token_in = token_a, token_out = token_b.
         let amount_out = te
@@ -4452,8 +4547,16 @@ mod tests {
         let env = Env::default();
         let te = setup_test_env(&env, 30, 0);
 
-        te.client
-            .mint_position(&te.provider, &-100, &100, &100_000, &100_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &te.provider,
+            &-100,
+            &100,
+            &100_000,
+            &100_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         let state_before = te.client.get_pool_state();
 
@@ -4481,8 +4584,16 @@ mod tests {
         let env = Env::default();
         let te = setup_test_env(&env, 1000, 100);
 
-        te.client
-            .mint_position(&te.provider, &0, &150, &100_000, &100_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &te.provider,
+            &0,
+            &150,
+            &100_000,
+            &100_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
         te.client
             .swap(&te.provider, &true, &2_000, &0, &0, &u64::MAX);
 
@@ -4498,8 +4609,16 @@ mod tests {
         let env = Env::default();
         let te = setup_test_env(&env, 1000, 100);
 
-        te.client
-            .mint_position(&te.provider, &0, &150, &100_000, &100_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &te.provider,
+            &0,
+            &150,
+            &100_000,
+            &100_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
         let liq_before = te.client.get_position(&te.provider, &0, &150).liquidity;
 
         te.client
@@ -4519,8 +4638,16 @@ mod tests {
         te.sac_a.mint(&out_of_range, &1_000_000);
         te.sac_b.mint(&out_of_range, &1_000_000);
 
-        te.client
-            .mint_position(&te.provider, &0, &150, &100_000, &100_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &te.provider,
+            &0,
+            &150,
+            &100_000,
+            &100_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
         te.client
             .mint_position(&out_of_range, &300, &400, &100_000, &0, &0, &0, &u64::MAX);
         te.client
@@ -4537,8 +4664,16 @@ mod tests {
         let env = Env::default();
         let te = setup_test_env(&env, 1000, 100);
 
-        te.client
-            .mint_position(&te.provider, &0, &150, &100_000, &100_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &te.provider,
+            &0,
+            &150,
+            &100_000,
+            &100_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
         let liq = te.client.get_position(&te.provider, &0, &150).liquidity;
 
         te.client
@@ -4563,8 +4698,16 @@ mod tests {
         te.sac_a.mint(&p2, &1_000_000);
         te.sac_b.mint(&p2, &1_000_000);
 
-        te.client
-            .mint_position(&te.provider, &0, &150, &100_000, &100_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &te.provider,
+            &0,
+            &150,
+            &100_000,
+            &100_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
         te.client
             .mint_position(&p2, &0, &150, &100_000, &100_000, &0, &0, &u64::MAX);
         te.client
@@ -4584,8 +4727,16 @@ mod tests {
         let env = Env::default();
         let te = setup_test_env(&env, 1000, 100);
 
-        te.client
-            .mint_position(&te.provider, &0, &150, &100_000, &100_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &te.provider,
+            &0,
+            &150,
+            &100_000,
+            &100_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
         te.client
             .swap(&te.provider, &true, &2_000, &0, &0, &u64::MAX);
         let (first_a, first_b) = te.client.collect_fees(&te.provider, &0, &150);
@@ -4605,8 +4756,16 @@ mod tests {
         let env = Env::default();
         let te = setup_test_env(&env, 1000, 100);
 
-        te.client
-            .mint_position(&te.provider, &0, &150, &100_000, &100_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &te.provider,
+            &0,
+            &150,
+            &100_000,
+            &100_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
         te.client
             .swap(&te.provider, &true, &2_000, &0, &0, &u64::MAX);
         te.client.collect_fees(&te.provider, &0, &150);
@@ -4637,8 +4796,16 @@ mod tests {
         let env = Env::default();
         let te = setup_test_env(&env, 1000, 100);
 
-        te.client
-            .mint_position(&te.provider, &0, &150, &100_000, &100_000, &0, &0, &u64::MAX);
+        te.client.mint_position(
+            &te.provider,
+            &0,
+            &150,
+            &100_000,
+            &100_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
         let liq = te.client.get_position(&te.provider, &0, &150).liquidity;
 
         te.client
@@ -4698,18 +4865,16 @@ mod tests {
     fn mint_position_far_future_deadline_behaves_identically() {
         let env = Env::default();
         let te = setup_test_env(&env, 30, 0);
-        let (a, b) = te
-            .client
-            .mint_position(
-                &te.provider,
-                &-100_i32,
-                &100_i32,
-                &10_000_i128,
-                &10_000_i128,
-                &0_i128,
-                &0_i128,
-                &u64::MAX,
-            );
+        let (a, b) = te.client.mint_position(
+            &te.provider,
+            &-100_i32,
+            &100_i32,
+            &10_000_i128,
+            &10_000_i128,
+            &0_i128,
+            &0_i128,
+            &u64::MAX,
+        );
         assert!(a >= 0);
         assert!(b >= 0);
         let pos = te.client.get_position(&te.provider, &-100_i32, &100_i32);
@@ -4739,11 +4904,19 @@ mod tests {
         assert_eq!(result, Err(Ok(ClError::DeadlineExpired)));
 
         // Token balances unchanged
-        assert_eq!(TokenClient::new(&env, &te.token_a).balance(&te.provider), bal_a_before);
-        assert_eq!(TokenClient::new(&env, &te.token_b).balance(&te.provider), bal_b_before);
+        assert_eq!(
+            TokenClient::new(&env, &te.token_a).balance(&te.provider),
+            bal_a_before
+        );
+        assert_eq!(
+            TokenClient::new(&env, &te.token_b).balance(&te.provider),
+            bal_b_before
+        );
 
         // No Position entry created — get_position should return NotFound
-        let pos_result = te.client.try_get_position(&te.provider, &-100_i32, &100_i32);
+        let pos_result = te
+            .client
+            .try_get_position(&te.provider, &-100_i32, &100_i32);
         assert_eq!(pos_result, Err(Ok(ClError::PositionNotFound)));
     }
 
@@ -4751,18 +4924,16 @@ mod tests {
     fn mint_position_happy_path_with_deadline() {
         let env = Env::default();
         let te = setup_test_env(&env, 30, 0);
-        let (a, b) = te
-            .client
-            .mint_position(
-                &te.provider,
-                &-100_i32,
-                &100_i32,
-                &10_000_i128,
-                &10_000_i128,
-                &0_i128,
-                &0_i128,
-                &u64::MAX,
-            );
+        let (a, b) = te.client.mint_position(
+            &te.provider,
+            &-100_i32,
+            &100_i32,
+            &10_000_i128,
+            &10_000_i128,
+            &0_i128,
+            &0_i128,
+            &u64::MAX,
+        );
         assert!(a > 0 || b > 0);
         let pos = te.client.get_position(&te.provider, &-100_i32, &100_i32);
         assert!(pos.liquidity > 0);
@@ -5130,7 +5301,13 @@ mod test_new_features {
 
         // mint_position with the same range should consume approximately (qa, qb)
         let (ma, mb) = client.mint_position(
-            &provider, &100_i32, &200_i32, &qa, &0_i128, &0_i128, &0_i128,
+            &provider,
+            &100_i32,
+            &200_i32,
+            &qa,
+            &0_i128,
+            &0_i128,
+            &0_i128,
             &u64::MAX,
         );
         // Due to rounding, amounts may differ slightly
@@ -7582,7 +7759,16 @@ mod test_single_token_deposit {
         StellarAssetClient::new(&env, &token_a).mint(&alice, &1_000_000_i128);
         StellarAssetClient::new(&env, &token_b).mint(&alice, &1_000_000_i128);
 
-        client.mint_position(&alice, &-100, &100, &100_000_i128, &100_000_i128, &0, &0, &u64::MAX);
+        client.mint_position(
+            &alice,
+            &-100,
+            &100,
+            &100_000_i128,
+            &100_000_i128,
+            &0,
+            &0,
+            &u64::MAX,
+        );
         assert_eq!(client.position_token_id(&alice, &-100, &100), Some(0_u64));
 
         // Attempt to change to NFT contract v2 — must be rejected.
@@ -7781,8 +7967,16 @@ mod test_swap_exact_out {
     fn swap_exact_out_normal_path_zero_for_one() {
         let env = Env::default();
         let f = setup_exact_out(&env, 30, 0);
-        f.client
-            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0, &u64::MAX);
+        f.client.mint_position(
+            &f.provider,
+            &-1000,
+            &1000,
+            &10_000_000,
+            &10_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         let b_before = StellarTokenClient::new(&env, &f.token_b).balance(&f.provider);
         let amount_out = 1_000_i128;
@@ -7807,8 +8001,16 @@ mod test_swap_exact_out {
     fn swap_exact_out_normal_path_one_for_zero() {
         let env = Env::default();
         let f = setup_exact_out(&env, 30, 0);
-        f.client
-            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0, &u64::MAX);
+        f.client.mint_position(
+            &f.provider,
+            &-1000,
+            &1000,
+            &10_000_000,
+            &10_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         let a_before = StellarTokenClient::new(&env, &f.token_a).balance(&f.provider);
         let amount_out = 1_000_i128;
@@ -7830,8 +8032,16 @@ mod test_swap_exact_out {
     fn quote_exact_out_matches_input_actually_consumed() {
         let env = Env::default();
         let f = setup_exact_out(&env, 30, 0);
-        f.client
-            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0, &u64::MAX);
+        f.client.mint_position(
+            &f.provider,
+            &-1000,
+            &1000,
+            &10_000_000,
+            &10_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         let amount_out = 2_500_i128;
         let quoted = f.client.quote_exact_out(&true, &amount_out, &0_u128);
@@ -7853,8 +8063,16 @@ mod test_swap_exact_out {
     fn quote_exact_out_does_not_mutate_state() {
         let env = Env::default();
         let f = setup_exact_out(&env, 30, 0);
-        f.client
-            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0, &u64::MAX);
+        f.client.mint_position(
+            &f.provider,
+            &-1000,
+            &1000,
+            &10_000_000,
+            &10_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         let state_before = f.client.get_pool_state();
         let balances_before = balances(&f);
@@ -7891,8 +8109,16 @@ mod test_swap_exact_out {
     fn invariant_holds_after_100_randomized_exact_out_swaps() {
         let env = Env::default();
         let f = setup_exact_out(&env, 30, 0);
-        f.client
-            .mint_position(&f.provider, &-5000, &5000, &50_000_000, &50_000_000, &0, &0, &u64::MAX);
+        f.client.mint_position(
+            &f.provider,
+            &-5000,
+            &5000,
+            &50_000_000,
+            &50_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         let (initial_a, initial_b) = balances(&f);
         let mut net_a = initial_a; // running expected balance
@@ -7953,14 +8179,46 @@ mod test_swap_exact_out {
         // deposited amounts into different liquidity, so the hand-computed
         // check below reads each position's actual `liquidity` back via
         // `get_position` rather than assuming it equals the deposited amount.
-        f.client
-            .mint_position(&f.provider, &100, &10_000, &2_000_000, &2_000_000, &0, &0, &u64::MAX);
-        f.client
-            .mint_position(&f.provider, &-100, &100, &2_000_000, &2_000_000, &0, &0, &u64::MAX);
-        f.client
-            .mint_position(&f.provider, &-200, &-100, &2_000_000, &2_000_000, &0, &0, &u64::MAX);
-        f.client
-            .mint_position(&f.provider, &-300, &-200, &2_000_000, &2_000_000, &0, &0, &u64::MAX);
+        f.client.mint_position(
+            &f.provider,
+            &100,
+            &10_000,
+            &2_000_000,
+            &2_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
+        f.client.mint_position(
+            &f.provider,
+            &-100,
+            &100,
+            &2_000_000,
+            &2_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
+        f.client.mint_position(
+            &f.provider,
+            &-200,
+            &-100,
+            &2_000_000,
+            &2_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
+        f.client.mint_position(
+            &f.provider,
+            &-300,
+            &-200,
+            &2_000_000,
+            &2_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         let ranges = [
             (
@@ -8038,14 +8296,46 @@ mod test_swap_exact_out {
         // above (the swap's direction, so it has enough liquidity to absorb
         // a large exact-out request) so the swap moving price *up* must
         // cross at least the 100 and 200 boundaries.
-        f.client
-            .mint_position(&f.provider, &-100, &100, &2_000_000, &2_000_000, &0, &0, &u64::MAX);
-        f.client
-            .mint_position(&f.provider, &100, &200, &2_000_000, &2_000_000, &0, &0, &u64::MAX);
-        f.client
-            .mint_position(&f.provider, &200, &300, &2_000_000, &2_000_000, &0, &0, &u64::MAX);
-        f.client
-            .mint_position(&f.provider, &300, &10_000, &2_000_000, &2_000_000, &0, &0, &u64::MAX);
+        f.client.mint_position(
+            &f.provider,
+            &-100,
+            &100,
+            &2_000_000,
+            &2_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
+        f.client.mint_position(
+            &f.provider,
+            &100,
+            &200,
+            &2_000_000,
+            &2_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
+        f.client.mint_position(
+            &f.provider,
+            &200,
+            &300,
+            &2_000_000,
+            &2_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
+        f.client.mint_position(
+            &f.provider,
+            &300,
+            &10_000,
+            &2_000_000,
+            &2_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         let ranges = [
             (
@@ -8107,8 +8397,16 @@ mod test_swap_exact_out {
     fn exceeding_max_amount_in_reverts_with_zero_state_change() {
         let env = Env::default();
         let f = setup_exact_out(&env, 30, 0);
-        f.client
-            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0, &u64::MAX);
+        f.client.mint_position(
+            &f.provider,
+            &-1000,
+            &1000,
+            &10_000_000,
+            &10_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         let state_before = f.client.get_pool_state();
         let balances_before = balances(&f);
@@ -8158,8 +8456,16 @@ mod test_swap_exact_out {
     fn hitting_price_limit_before_filling_amount_out_reverts() {
         let env = Env::default();
         let f = setup_exact_out(&env, 30, 0);
-        f.client
-            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0, &u64::MAX);
+        f.client.mint_position(
+            &f.provider,
+            &-1000,
+            &1000,
+            &10_000_000,
+            &10_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         let state_before = f.client.get_pool_state();
         let balances_before = balances(&f);
@@ -8204,8 +8510,16 @@ mod test_swap_exact_out {
     fn zero_amount_out_is_rejected() {
         let env = Env::default();
         let f = setup_exact_out(&env, 30, 0);
-        f.client
-            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0, &u64::MAX);
+        f.client.mint_position(
+            &f.provider,
+            &-1000,
+            &1000,
+            &10_000_000,
+            &10_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
         let result =
             f.client
                 .try_swap_exact_out(&f.provider, &true, &0_i128, &0_u128, &i128::MAX, &10_000);
@@ -8221,8 +8535,16 @@ mod test_swap_exact_out {
 
         let env = Env::default();
         let f = setup_exact_out(&env, 30, 0);
-        f.client
-            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0, &u64::MAX);
+        f.client.mint_position(
+            &f.provider,
+            &-1000,
+            &1000,
+            &10_000_000,
+            &10_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
         env.ledger().with_mut(|li| li.timestamp = 500);
 
         let result = f.client.try_swap_exact_out(
@@ -8339,8 +8661,16 @@ mod test_swap_exact_out {
 
         let env = Env::default();
         let f = setup_exact_out(&env, 30, 0);
-        f.client
-            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0, &u64::MAX);
+        f.client.mint_position(
+            &f.provider,
+            &-1000,
+            &1000,
+            &10_000_000,
+            &10_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         // Move current_tick away from 0 first — the accumulator's per-second
         // contribution is `current_tick * elapsed`, so at tick 0 it would
@@ -8383,8 +8713,16 @@ mod test_swap_exact_out {
     fn two_sequential_exact_out_swaps_both_succeed() {
         let env = Env::default();
         let f = setup_exact_out(&env, 30, 0);
-        f.client
-            .mint_position(&f.provider, &-2000, &2000, &10_000_000, &10_000_000, &0, &0, &u64::MAX);
+        f.client.mint_position(
+            &f.provider,
+            &-2000,
+            &2000,
+            &10_000_000,
+            &10_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         let in1 =
             f.client
@@ -8413,8 +8751,16 @@ mod test_swap_exact_out {
                 .set(&DataKey::ProtocolFeeBps, &2000_i128);
         });
         let _ = admin;
-        f.client
-            .mint_position(&f.provider, &-1000, &1000, &10_000_000, &10_000_000, &0, &0, &u64::MAX);
+        f.client.mint_position(
+            &f.provider,
+            &-1000,
+            &1000,
+            &10_000_000,
+            &10_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
 
         f.client.swap_exact_out(
             &f.provider,
@@ -8779,5 +9125,4 @@ mod test_range_order_fill_status {
         );
         assert_eq!(result, Err(Ok(ClError::RangeOrderExists)));
     }
-
 }
