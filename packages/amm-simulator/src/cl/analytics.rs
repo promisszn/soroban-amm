@@ -132,7 +132,6 @@ pub struct ComparisonResult {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn position_outcome_computation() {

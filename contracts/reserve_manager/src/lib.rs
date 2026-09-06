@@ -359,7 +359,8 @@ impl ReserveManager {
     /// Return the minimum reserve requirement for a pair, or (0, 0) if none.
     ///
     /// The value is keyed by token pair and is independent of which pool kind
-    /// will eventually be checked against it — see [`Self::set_min_reserve`].
+    /// will eventually be checked against it — see
+    /// [`ReserveManager::set_min_reserve`].
     pub fn get_min_reserve(env: Env, token_a: Address, token_b: Address) -> ReserveRequirement {
         let (ta, tb) = Self::normalize(token_a, token_b);
         env.storage()

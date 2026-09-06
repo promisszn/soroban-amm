@@ -101,21 +101,17 @@ impl MonteCarloReport {
         reserve_a_samples.sort_unstable();
         reserve_b_samples.sort_unstable();
 
-        let mean_final_reserve_a =
-            reserve_a_samples.iter().map(|v| *v as f64).sum::<f64>()
-                / reserve_a_samples.len() as f64;
+        let mean_final_reserve_a = reserve_a_samples.iter().map(|v| *v as f64).sum::<f64>()
+            / reserve_a_samples.len() as f64;
 
-        let mean_final_reserve_b =
-            reserve_b_samples.iter().map(|v| *v as f64).sum::<f64>()
-                / reserve_b_samples.len() as f64;
+        let mean_final_reserve_b = reserve_b_samples.iter().map(|v| *v as f64).sum::<f64>()
+            / reserve_b_samples.len() as f64;
 
-        let mean_final_price =
-            price_samples.iter().sum::<f64>() / price_samples.len() as f64;
+        let mean_final_price = price_samples.iter().sum::<f64>() / price_samples.len() as f64;
 
         let median_index = reserve_a_samples.len() / 2;
 
-        let p95_index =
-            ((reserve_a_samples.len() as f64) * 0.95).floor() as usize;
+        let p95_index = ((reserve_a_samples.len() as f64) * 0.95).floor() as usize;
 
         let p95_index = p95_index.min(reserve_a_samples.len() - 1);
 
@@ -200,13 +196,8 @@ fn perturb_trades(
         .collect()
 }
 
-fn shock_amount(
-    amount: i128,
-    shock_bps: u32,
-    rng: &mut SmallRng,
-) -> i128 {
-    let shock =
-        rng.gen_range(-(shock_bps as i128)..=(shock_bps as i128));
+fn shock_amount(amount: i128, shock_bps: u32, rng: &mut SmallRng) -> i128 {
+    let shock = rng.gen_range(-(shock_bps as i128)..=(shock_bps as i128));
 
     let perturbed = amount + amount * shock / 10_000;
 
@@ -264,54 +255,25 @@ mod tests {
             seed: 42,
         };
 
-        let first =
-            MonteCarloReport::run(&pool, &trades, config.clone()).unwrap();
+        let first = MonteCarloReport::run(&pool, &trades, config.clone()).unwrap();
 
-        let second =
-            MonteCarloReport::run(&pool, &trades, config).unwrap();
+        let second = MonteCarloReport::run(&pool, &trades, config).unwrap();
 
-        assert_eq!(
-            first.successful_paths,
-            second.successful_paths
-        );
+        assert_eq!(first.successful_paths, second.successful_paths);
         assert_eq!(first.failed_paths, second.failed_paths);
 
-        assert_eq!(
-            first.mean_final_reserve_a,
-            second.mean_final_reserve_a
-        );
-        assert_eq!(
-            first.mean_final_reserve_b,
-            second.mean_final_reserve_b
-        );
+        assert_eq!(first.mean_final_reserve_a, second.mean_final_reserve_a);
+        assert_eq!(first.mean_final_reserve_b, second.mean_final_reserve_b);
         assert_eq!(first.mean_final_price, second.mean_final_price);
 
-        assert_eq!(
-            first.median_final_reserve_a,
-            second.median_final_reserve_a
-        );
-        assert_eq!(
-            first.median_final_reserve_b,
-            second.median_final_reserve_b
-        );
+        assert_eq!(first.median_final_reserve_a, second.median_final_reserve_a);
+        assert_eq!(first.median_final_reserve_b, second.median_final_reserve_b);
 
-        assert_eq!(
-            first.p95_final_reserve_a,
-            second.p95_final_reserve_a
-        );
-        assert_eq!(
-            first.p95_final_reserve_b,
-            second.p95_final_reserve_b
-        );
+        assert_eq!(first.p95_final_reserve_a, second.p95_final_reserve_a);
+        assert_eq!(first.p95_final_reserve_b, second.p95_final_reserve_b);
 
-        assert_eq!(
-            first.min_final_reserve_a,
-            second.min_final_reserve_a
-        );
-        assert_eq!(
-            first.max_final_reserve_a,
-            second.max_final_reserve_a
-        );
+        assert_eq!(first.min_final_reserve_a, second.min_final_reserve_a);
+        assert_eq!(first.max_final_reserve_a, second.max_final_reserve_a);
     }
 
     #[test]
@@ -326,8 +288,7 @@ mod tests {
             seed: 7,
         };
 
-        let report =
-            MonteCarloReport::run(&pool, &trades, config).unwrap();
+        let report = MonteCarloReport::run(&pool, &trades, config).unwrap();
 
         assert_eq!(report.successful_paths, 0);
         assert_eq!(report.failed_paths, 10);
@@ -360,8 +321,7 @@ mod tests {
                 seed: 123,
             };
 
-            let report =
-                MonteCarloReport::run(&pool, &trades, config).unwrap();
+            let report = MonteCarloReport::run(&pool, &trades, config).unwrap();
 
             assert!(
                 report.successful_paths > 0,

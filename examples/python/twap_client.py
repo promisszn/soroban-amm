@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 import argparse
-
 import os
 import sys
-from typing import Any, Dict
+from typing import Any
 
 from stellar_sdk import Keypair, Network, scval
 from stellar_sdk.contract import ContractClient
-from common import format_json, required_env, simulate_contract_call, submit_contract_call
+
+from common import (
+    format_json,
+    required_env,
+    simulate_contract_call,
+    submit_contract_call,
+)
 
 # Prices returned by the TWAP consumer use the same fixed-point scale as the
 # AMM spot price. See the "Use the TWAP Oracle" section of the README.
@@ -150,7 +155,7 @@ def validate_price_against_twap(
     window_seconds: int,
     spot_price: int,
     max_deviation_bps: int,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     return simulate_contract_call(
         client,
         "validate_price_against_twap",

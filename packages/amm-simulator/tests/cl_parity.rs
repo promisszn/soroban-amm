@@ -22,7 +22,11 @@ fn cl_pool_initialization() {
 fn tick_to_price_conversion() {
     // Tick 0 should map to price 1.0 (sqrt_price = 2^96)
     let sqrt_price = math::tick_to_sqrt_price_x96(0).expect("tick conversion");
-    assert_eq!(sqrt_price, 1_u128.checked_shl(96).unwrap() as i128, "Tick 0 = price 1.0");
+    assert_eq!(
+        sqrt_price,
+        1_u128.checked_shl(96).unwrap() as i128,
+        "Tick 0 = price 1.0"
+    );
 }
 
 #[test]
@@ -49,12 +53,8 @@ fn get_amount_delta_positive() {
 #[test]
 fn position_outcome_scenario() {
     // Test LP outcome analytics with a hand-computed scenario
-    let outcome = analytics::compute_position_outcome(
-        "pos-1".to_string(),
-        1_000_000i128,
-        -100i32,
-        100i32,
-    );
+    let outcome =
+        analytics::compute_position_outcome("pos-1".to_string(), 1_000_000i128, -100i32, 100i32);
 
     assert_eq!(outcome.position_id, "pos-1");
     assert_eq!(outcome.liquidity, 1_000_000);
@@ -70,7 +70,7 @@ fn swap_across_ticks_parity() {
 }
 
 #[test]
-#[ignore] // Requires full contract integration  
+#[ignore] // Requires full contract integration
 fn collect_fees_parity() {
     // Verify that collected fees match the on-chain contract exactly
 }

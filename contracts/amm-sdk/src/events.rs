@@ -270,6 +270,29 @@ pub enum AmmEvent {
 ///
 /// In practice you would obtain the data from `stellar-sdk-rs` or the
 /// Soroban RPC `getEvents` endpoint and pass the decoded XDR values here.
+/// Decode an event payload into the tuple `T`, rejecting a payload that is not
+/// a vector of exactly `arity` elements.
+///
+/// The SDK's tuple `TryFromVal` unpacks through the host's
+/// `vec_unpack_to_slice`, which **traps** when the vector length does not match
+/// the tuple's arity instead of returning an error — so `.ok()?` on its own
+/// cannot keep `decode_amm_event` total. Event data reaching that function is
+/// untrusted (it comes from RPC), so the length is checked up front and a
+/// malformed payload yields `None` rather than panicking the caller.
+fn decode_payload<T>(env: &soroban_sdk::Env, payload: soroban_sdk::Val, arity: u32) -> Option<T>
+where
+    T: soroban_sdk::TryFromVal<soroban_sdk::Env, soroban_sdk::Val>,
+{
+    use soroban_sdk::TryFromVal;
+
+    let items: soroban_sdk::Vec<soroban_sdk::Val> =
+        soroban_sdk::Vec::try_from_val(env, &payload).ok()?;
+    if items.len() != arity {
+        return None;
+    }
+    T::try_from_val(env, &payload).ok()
+}
+
 pub fn decode_amm_event(
     env: &soroban_sdk::Env,
     topics: soroban_sdk::Vec<soroban_sdk::Val>,
@@ -298,7 +321,7 @@ pub fn decode_amm_event(
             Address,
             i128,
             Option<Address>,
-        ) = TryFromVal::try_from_val(env, &payload_val).ok()?;
+        ) = decode_payload(env, payload_val, 5)?;
         Some(AmmEvent::Swap(SwapEvent {
             trader,
             token_in,
@@ -310,7 +333,7 @@ pub fn decode_amm_event(
     } else if symbol == Symbol::new(env, symbols::ADD_LIQUIDITY) {
         let provider: Address = topics.get(1)?.try_into_val(env).ok()?;
         let (amount_a, amount_b, shares_minted): (i128, i128, i128) =
-            TryFromVal::try_from_val(env, &payload_val).ok()?;
+            decode_payload(env, payload_val, 3)?;
         Some(AmmEvent::AddLiquidity(AddLiquidityEvent {
             provider,
             amount_a,
@@ -319,7 +342,7 @@ pub fn decode_amm_event(
         }))
     } else if symbol == Symbol::new(env, symbols::REMOVE_LIQUIDITY) {
         let (provider, shares_burned, amount_a, amount_b): (Address, i128, i128, i128) =
-            TryFromVal::try_from_val(env, &payload_val).ok()?;
+            decode_payload(env, payload_val, 4)?;
         Some(AmmEvent::RemoveLiquidity(RemoveLiquidityEvent {
             provider,
             shares_burned,
@@ -328,7 +351,7 @@ pub fn decode_amm_event(
         }))
     } else if symbol == Symbol::new(env, symbols::REMOVE_LIQUIDITY_ONE_SIDED) {
         let (provider, shares_burned, token_out, total_out): (Address, i128, Address, i128) =
-            TryFromVal::try_from_val(env, &payload_val).ok()?;
+            decode_payload(env, payload_val, 4)?;
         Some(AmmEvent::RemoveLiquidityOneSided(
             RemoveLiquidityOneSidedEvent {
                 provider,
@@ -339,8 +362,7 @@ pub fn decode_amm_event(
         ))
     } else if symbol == Symbol::new(env, symbols::FLASH_LOAN) {
         let receiver: Address = topics.get(1)?.try_into_val(env).ok()?;
-        let (token, amount, fee): (Address, i128, i128) =
-            TryFromVal::try_from_val(env, &payload_val).ok()?;
+        let (token, amount, fee): (Address, i128, i128) = decode_payload(env, payload_val, 3)?;
         Some(AmmEvent::FlashLoan(FlashLoanEvent {
             receiver,
             token,
@@ -349,31 +371,30 @@ pub fn decode_amm_event(
         }))
     } else if symbol == Symbol::new(env, symbols::FEE_UPDATED) {
         let admin: Address = topics.get(1)?.try_into_val(env).ok()?;
-        let (new_fee_bps,): (i128,) = TryFromVal::try_from_val(env, &payload_val).ok()?;
+        let (new_fee_bps,): (i128,) = decode_payload(env, payload_val, 1)?;
         Some(AmmEvent::FeeUpdated(FeeUpdatedEvent { admin, new_fee_bps }))
     } else if symbol == Symbol::new(env, symbols::FLASH_FEE_UPDATED) {
         let admin: Address = topics.get(1)?.try_into_val(env).ok()?;
-        let (new_fee_bps,): (i128,) = TryFromVal::try_from_val(env, &payload_val).ok()?;
+        let (new_fee_bps,): (i128,) = decode_payload(env, payload_val, 1)?;
         Some(AmmEvent::FlashFeeUpdated(FlashFeeUpdatedEvent {
             admin,
             new_fee_bps,
         }))
     } else if symbol == Symbol::new(env, symbols::ADMIN_NOMINATED) {
-        let (current_admin, new_admin): (Address, Address) =
-            TryFromVal::try_from_val(env, &payload_val).ok()?;
+        let (current_admin, new_admin): (Address, Address) = decode_payload(env, payload_val, 2)?;
         Some(AmmEvent::AdminNominated(AdminNominatedEvent {
             current_admin,
             new_admin,
         }))
     } else if symbol == Symbol::new(env, symbols::ADMIN_CHANGED) {
-        let (new_admin,): (Address,) = TryFromVal::try_from_val(env, &payload_val).ok()?;
+        let (new_admin,): (Address,) = decode_payload(env, payload_val, 1)?;
         Some(AmmEvent::AdminChanged(AdminChangedEvent { new_admin }))
     } else if symbol == Symbol::new(env, symbols::UPGRADED) {
-        let (new_wasm_hash,): (BytesN<32>,) = TryFromVal::try_from_val(env, &payload_val).ok()?;
+        let (new_wasm_hash,): (BytesN<32>,) = decode_payload(env, payload_val, 1)?;
         Some(AmmEvent::Upgraded(UpgradedEvent { new_wasm_hash }))
     } else if symbol == Symbol::new(env, symbols::CL_POOL_REGISTERED) {
         let (token_a, token_b, fee_bps, pool): (Address, Address, i128, Address) =
-            TryFromVal::try_from_val(env, &payload_val).ok()?;
+            decode_payload(env, payload_val, 4)?;
         Some(AmmEvent::ClPoolRegistered(ClPoolRegisteredEvent {
             token_a,
             token_b,
@@ -382,7 +403,7 @@ pub fn decode_amm_event(
         }))
     } else if symbol == Symbol::new(env, symbols::ROUTE_SELECTED) {
         let (venue, venue_kind, amount_in, amount_out): (Address, RouteVenueKind, i128, i128) =
-            TryFromVal::try_from_val(env, &payload_val).ok()?;
+            decode_payload(env, payload_val, 4)?;
         Some(AmmEvent::RouteSelected(RouteSelectedEvent {
             venue,
             venue_kind,
@@ -396,7 +417,7 @@ pub fn decode_amm_event(
             Address,
             RouteVenueKind,
             i128,
-        ) = TryFromVal::try_from_val(env, &payload_val).ok()?;
+        ) = decode_payload(env, payload_val, 5)?;
         Some(AmmEvent::RouteAlternative(RouteAlternativeEvent {
             venue,
             amount_out,
@@ -412,7 +433,7 @@ pub fn decode_amm_event(
             i128,
             i128,
             Address,
-        ) = TryFromVal::try_from_val(env, &payload_val).ok()?;
+        ) = decode_payload(env, payload_val, 6)?;
         Some(AmmEvent::RouteExecuted(RouteExecutedEvent {
             trader,
             token_in,
@@ -423,7 +444,7 @@ pub fn decode_amm_event(
         }))
     } else if symbol == Symbol::new(env, symbols::TOLERANCE_FAILED) {
         let (pool, observed_bps, tolerance_bps): (Address, i128, i128) =
-            TryFromVal::try_from_val(env, &payload_val).ok()?;
+            decode_payload(env, payload_val, 3)?;
         Some(AmmEvent::ToleranceFailed(ToleranceFailedEvent {
             pool,
             observed_bps,
@@ -431,7 +452,7 @@ pub fn decode_amm_event(
         }))
     } else if symbol == Symbol::new(env, symbols::CIRCUIT_BREAKER) {
         let (price_before, price_after, deviation_bps, threshold_bps): (i128, i128, i128, i128) =
-            TryFromVal::try_from_val(env, &payload_val).ok()?;
+            decode_payload(env, payload_val, 4)?;
         Some(AmmEvent::CircuitBreaker(CircuitBreakerEvent {
             price_before,
             price_after,
@@ -446,9 +467,7 @@ pub fn decode_amm_event(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::{
-        testutils::Address as _, vec, BytesN, Env, IntoVal, Symbol, Val, Vec,
-    };
+    use soroban_sdk::{testutils::Address as _, vec, BytesN, Env, IntoVal, Symbol, Val, Vec};
 
     fn address(env: &Env) -> Address {
         Address::generate(env)

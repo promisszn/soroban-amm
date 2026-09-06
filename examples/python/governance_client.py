@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 import argparse
-
 import os
 import sys
-from typing import Any, Dict
+from typing import Any
 
 from stellar_sdk import Keypair, Network, scval
 from stellar_sdk.contract import ContractClient
-from common import format_json, required_env, simulate_contract_call, submit_contract_call
+
+from common import (
+    format_json,
+    required_env,
+    simulate_contract_call,
+    submit_contract_call,
+)
+
 
 def main() -> int:
     argparse.ArgumentParser(description="Soroban AMM integration example").parse_args()
@@ -20,7 +26,7 @@ def main() -> int:
     gov_contract_id = required_env("GOV_CONTRACT_ID")
     source_secret = required_env("SOURCE_SECRET")
     proposal_fee_bps = int(os.getenv("PROPOSAL_FEE_BPS", "50"))
-    proposal_id = os.getenv("PROPOSAL_ID")
+    existing_proposal_id = os.getenv("PROPOSAL_ID")
 
     source_keypair = Keypair.from_secret(source_secret)
 
@@ -34,17 +40,17 @@ def main() -> int:
     print(f"Governance contract: {gov_contract_id}")
 
     # 1. Propose fee change
-    if not proposal_id:
+    proposal_id: int
+    if not existing_proposal_id:
         print(f"\n1. Submitting new proposal to change fee to {proposal_fee_bps} bps...")
         try:
-            pid = propose(client, source_keypair, proposal_fee_bps)
-            print(f"Proposal created with ID: {pid}")
-            proposal_id = pid
+            proposal_id = propose(client, source_keypair, proposal_fee_bps)
+            print(f"Proposal created with ID: {proposal_id}")
         except Exception as e:
             print(f"Failed to submit proposal (make sure proposer has enough LP stake): {e}")
             return 1
     else:
-        proposal_id = int(proposal_id)
+        proposal_id = int(existing_proposal_id)
         print(f"\n1. Using existing proposal ID: {proposal_id}")
 
     # 2. Query proposal status
@@ -103,7 +109,7 @@ def vote(client: ContractClient, voter_kp: Keypair, proposal_id: int, choice: st
     )
 
 
-def get_proposal(client: ContractClient, proposal_id: int) -> Dict[str, Any]:
+def get_proposal(client: ContractClient, proposal_id: int) -> dict[str, Any]:
     result = simulate_contract_call(
         client,
         "get_proposal",

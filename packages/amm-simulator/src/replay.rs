@@ -31,13 +31,105 @@ pub enum TradeAction {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct TradeRecord {
     pub timestamp: u64,
     #[serde(default)]
     pub label: Option<String>,
     #[serde(flatten)]
     pub action: TradeAction,
+}
+
+/// The flat on-disk shape of a [`TradeRecord`]: `timestamp`/`label` alongside a
+/// `kind` discriminator and that kind's own fields, as documented in the
+/// crate README.
+///
+/// `TradeRecord` cannot simply derive `Deserialize` over a `#[serde(flatten)]`
+/// internally tagged `TradeAction`. Both `flatten` and `tag = "..."` route the
+/// value through serde's private `Content` buffer, which rejects 128-bit
+/// integers, so every `i128` amount fails with "i128 is not supported"
+/// (serde-rs/serde#1183) and no trade file could be loaded at all.
+/// Deserializing through this explicit struct keeps the documented format while
+/// bypassing that buffer. Serialization is unaffected and still derived.
+///
+/// The CSV loader reads the same field names, one row per record.
+#[derive(Deserialize)]
+pub(crate) struct FlatTradeRecord {
+    pub timestamp: u64,
+    #[serde(default)]
+    pub label: Option<String>,
+    pub kind: String,
+    #[serde(default)]
+    pub token_in: Option<String>,
+    #[serde(default)]
+    pub token_out: Option<String>,
+    #[serde(default)]
+    pub amount_in: Option<i128>,
+    #[serde(default)]
+    pub amount_out: Option<i128>,
+    #[serde(default)]
+    pub amount_a: Option<i128>,
+    #[serde(default)]
+    pub amount_b: Option<i128>,
+    #[serde(default)]
+    pub shares: Option<i128>,
+    #[serde(default)]
+    pub min_out: Option<i128>,
+    #[serde(default)]
+    pub max_in: Option<i128>,
+    #[serde(default)]
+    pub min_shares: Option<i128>,
+    #[serde(default)]
+    pub min_a: Option<i128>,
+    #[serde(default)]
+    pub min_b: Option<i128>,
+}
+
+impl FlatTradeRecord {
+    /// Returns `Err` with the offending discriminator if `kind` is not one of
+    /// the four supported trade kinds.
+    pub(crate) fn into_record(self) -> std::result::Result<TradeRecord, String> {
+        let action = match self.kind.as_str() {
+            "swap_exact_in" => TradeAction::SwapExactIn {
+                token_in: self.token_in.unwrap_or_default(),
+                amount_in: self.amount_in.unwrap_or_default(),
+                min_out: self.min_out.unwrap_or_default(),
+            },
+            "swap_exact_out" => TradeAction::SwapExactOut {
+                token_out: self.token_out.unwrap_or_default(),
+                amount_out: self.amount_out.unwrap_or_default(),
+                max_in: self.max_in,
+            },
+            "add_liquidity" => TradeAction::AddLiquidity {
+                amount_a: self.amount_a.unwrap_or_default(),
+                amount_b: self.amount_b.unwrap_or_default(),
+                min_shares: self.min_shares.unwrap_or_default(),
+            },
+            "remove_liquidity" => TradeAction::RemoveLiquidity {
+                shares: self.shares.unwrap_or_default(),
+                min_a: self.min_a.unwrap_or_default(),
+                min_b: self.min_b.unwrap_or_default(),
+            },
+            other => return Err(other.to_string()),
+        };
+
+        Ok(TradeRecord {
+            timestamp: self.timestamp,
+            label: self.label,
+            action,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for TradeRecord {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        FlatTradeRecord::deserialize(deserializer)?
+            .into_record()
+            .map_err(|kind| serde::de::Error::custom(format!("unknown trade kind `{kind}`")))
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]

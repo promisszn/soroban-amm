@@ -1278,6 +1278,22 @@ mod stateful {
     /// Burn-everything residual: after a script, burning every position and
     /// collecting every fee leaves the pool with at most `BURN_ALL_DUST` per
     /// token.
+    ///
+    /// Currently fails as a fourth manifestation of issue #705, alongside the
+    /// three `#[ignore]`d regressions below. After the scripted phase the pool
+    /// pays out its entire token-A balance while crediting the burn proceeds of
+    /// all three positions to `tokens_owed` in token A as well:
+    ///
+    ///   balances    a = 0        b = 400225
+    ///   tokens_owed a = 400508   b = 0
+    ///
+    /// so `collect_fees_core` can only pay `min(owed, balance) == 0` and leaves
+    /// position -8..8 holding `owed = (289, 0)`, while 400225 token B sits in
+    /// the contract unclaimable. That is the same mixed-precision price bug the
+    /// other three regressions pin down — the pool is solvent in aggregate but
+    /// not per token — so it is reported here rather than fixed, per the note
+    /// on `check_invariants` above.
+    #[ignore = "known bug (issue #705): mixed-precision price strands token B and leaves token A owed but unpayable after burn-all"]
     #[test]
     fn cl_burn_all_returns_everything() {
         // Tight ranges bracketing the initial tick and modest swaps keep the

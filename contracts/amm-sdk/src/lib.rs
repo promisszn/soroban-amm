@@ -139,7 +139,14 @@ mod events_test {
         let result = decode_published(
             &env,
             Symbol::new(&env, "add_liquidity"),
-            (user.clone(), token_a.clone(), token_b.clone(), 100_i128, 200_i128, 300_i128),
+            (
+                user.clone(),
+                token_a.clone(),
+                token_b.clone(),
+                100_i128,
+                200_i128,
+                300_i128,
+            ),
         );
         assert!(matches!(result, Some(AmmEvent::AddLiquidity(..))));
     }
@@ -168,7 +175,10 @@ mod events_test {
             Symbol::new(&env, "remove_liquidity_one_sided"),
             (user, token, 500_i128, 200_i128),
         );
-        assert!(matches!(result, Some(AmmEvent::RemoveLiquidityOneSided(..))));
+        assert!(matches!(
+            result,
+            Some(AmmEvent::RemoveLiquidityOneSided(..))
+        ));
     }
 
     #[test]
@@ -230,11 +240,7 @@ mod events_test {
     fn test_upgraded_event_round_trip() {
         let env = Env::default();
         let new_contract = Bytes::from_slice(&env, &[1, 2, 3]);
-        let result = decode_published(
-            &env,
-            symbol_short!("upgraded"),
-            (new_contract.clone(),),
-        );
+        let result = decode_published(&env, symbol_short!("upgraded"), (new_contract.clone(),));
         match result {
             Some(AmmEvent::Upgraded(contract)) => assert_eq!(contract, new_contract),
             _ => panic!("expected upgraded event"),
@@ -272,7 +278,8 @@ mod events_test {
     fn test_wrong_version_returns_none() {
         let env = Env::default();
         let topic = symbol_short!("swap");
-        env.events().publish((topic,), (EVENT_SCHEMA_VERSION + 1, (1_i128,)));
+        env.events()
+            .publish((topic,), (EVENT_SCHEMA_VERSION + 1, (1_i128,)));
         let events = env.events().all();
         let event = events.get(0).unwrap();
         assert!(events::decode_amm_event(event.topics, event.data).is_none());
@@ -282,7 +289,8 @@ mod events_test {
     fn test_unrecognized_symbol_returns_none() {
         let env = Env::default();
         let topic = symbol_short!("unknown");
-        env.events().publish((topic,), (EVENT_SCHEMA_VERSION, (1_i128,)));
+        env.events()
+            .publish((topic,), (EVENT_SCHEMA_VERSION, (1_i128,)));
         let events = env.events().all();
         let event = events.get(0).unwrap();
         assert!(events::decode_amm_event(event.topics, event.data).is_none());
@@ -293,7 +301,8 @@ mod events_test {
         let env = Env::default();
         let topic = symbol_short!("swap");
         // swap expects 6 fields, this provides only 1
-        env.events().publish((topic,), (EVENT_SCHEMA_VERSION, (1_i128,)));
+        env.events()
+            .publish((topic,), (EVENT_SCHEMA_VERSION, (1_i128,)));
         let events = env.events().all();
         let event = events.get(0).unwrap();
         assert!(events::decode_amm_event(event.topics, event.data).is_none());

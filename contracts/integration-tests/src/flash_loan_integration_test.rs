@@ -1,8 +1,6 @@
 //! Tests for flash-loan interactions across contracts.
 //! Covers a flash loan that repays principal + fee via a simple receiver.
 
-#![cfg(test)]
-
 use soroban_sdk::{
     contract, contractimpl, contracttype,
     testutils::Address as _,
