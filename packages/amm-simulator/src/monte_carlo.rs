@@ -2,7 +2,13 @@ use crate::engine::AmmSimulator;
 use crate::error::Result;
 use crate::pool::PoolState;
 use crate::replay::{TradeAction, TradeRecord};
-use rand::{rngs::SmallRng, seq::SliceRandom, Rng, SeedableRng};
+// `Pcg64` is a portable, fixed-algorithm PRNG, so a seeded Monte Carlo run
+// reproduces on any machine and across `rand` releases. `SmallRng` was
+// neither: rand documents it as non-portable, and it selects a different
+// algorithm on 32- and 64-bit targets. The golden-value tests at the bottom
+// of this file pin the resulting output.
+use rand::{seq::SliceRandom, Rng, SeedableRng};
+use rand_pcg::Pcg64;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -42,7 +48,7 @@ impl MonteCarloReport {
         trades: &[TradeRecord],
         config: MonteCarloConfig,
     ) -> Result<Self> {
-        let mut rng = SmallRng::seed_from_u64(config.seed);
+        let mut rng = Pcg64::seed_from_u64(config.seed);
         let mut reserve_a_samples = Vec::with_capacity(config.iterations);
         let mut reserve_b_samples = Vec::with_capacity(config.iterations);
         let mut price_samples = Vec::with_capacity(config.iterations);
@@ -139,7 +145,7 @@ impl MonteCarloReport {
 fn perturb_trades(
     trades: &[TradeRecord],
     amount_shock_bps: u32,
-    rng: &mut SmallRng,
+    rng: &mut Pcg64,
 ) -> Vec<TradeRecord> {
     if amount_shock_bps == 0 {
         return trades.to_vec();
@@ -196,7 +202,7 @@ fn perturb_trades(
         .collect()
 }
 
-fn shock_amount(amount: i128, shock_bps: u32, rng: &mut SmallRng) -> i128 {
+fn shock_amount(amount: i128, shock_bps: u32, rng: &mut Pcg64) -> i128 {
     let shock = rng.random_range(-(shock_bps as i128)..=(shock_bps as i128));
 
     let perturbed = amount + amount * shock / 10_000;
@@ -346,7 +352,7 @@ mod tests {
 
     #[test]
     fn shock_amount_never_returns_less_than_one() {
-        let mut rng = SmallRng::seed_from_u64(99);
+        let mut rng = Pcg64::seed_from_u64(99);
 
         for _ in 0..1_000 {
             let shocked = shock_amount(1, 100_000, &mut rng);
@@ -399,7 +405,7 @@ mod tests {
             },
         ];
 
-        let mut rng = SmallRng::seed_from_u64(11);
+        let mut rng = Pcg64::seed_from_u64(11);
         let perturbed = perturb_trades(&trades, 500, &mut rng);
 
         assert_eq!(perturbed.len(), trades.len());
@@ -479,5 +485,56 @@ mod tests {
                 _ => panic!("trade action variant changed during perturbation"),
             }
         }
+    }
+
+    /// Pins the exact output of a seeded run.
+    ///
+    /// `Pcg64` is a fixed algorithm and portable across platforms, so these
+    /// numbers should hold on any machine and across `rand` upgrades. What
+    /// this test really guards is the rest of the pipeline: `random_range`
+    /// and `shuffle` live in `rand` and carry no cross-major value-stability
+    /// guarantee, so if a future bump changes how randomness is consumed,
+    /// this fails loudly instead of silently moving everyone's backtests.
+    ///
+    /// If it fails after a dependency bump, that is a real change in reported
+    /// output: confirm it is only resampling noise, then re-baseline these
+    /// constants in the same PR and call it out in the CHANGELOG.
+    #[test]
+    fn seeded_run_matches_golden_values() {
+        let report = MonteCarloReport::run(
+            &funded_pool(),
+            &successful_trades(),
+            MonteCarloConfig {
+                iterations: 20,
+                amount_shock_bps: 500,
+                shuffle_trades: true,
+                seed: 42,
+            },
+        )
+        .expect("seeded run should succeed");
+
+        assert_eq!(report.successful_paths, 20);
+        assert_eq!(report.failed_paths, 0);
+        assert_eq!(report.mean_final_reserve_a, 1009922.7);
+        assert_eq!(report.mean_final_reserve_b, 1980408.55);
+        assert_eq!(report.median_final_reserve_a, 1009940);
+        assert_eq!(report.median_final_reserve_b, 1980392);
+        assert_eq!(report.p95_final_reserve_a, 1010429);
+        assert_eq!(report.p95_final_reserve_b, 1981227);
+        assert_eq!(report.min_final_reserve_a, 1009504);
+        assert_eq!(report.max_final_reserve_a, 1010429);
+    }
+
+    /// Pins the raw draw sequence, so a failure in the test above can be told
+    /// apart at a glance: if this one still passes, the generator is fine and
+    /// something downstream of it changed.
+    #[test]
+    fn seeded_rng_draw_sequence_is_stable() {
+        let mut rng = Pcg64::seed_from_u64(7);
+        let draws: Vec<i128> = (0..6)
+            .map(|_| rng.random_range(-500i128..=500i128))
+            .collect();
+
+        assert_eq!(draws, vec![-269, 335, 92, -176, 68, 272]);
     }
 }
