@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- `soroban_amm_simulator` now builds against `rand` 0.9 (`Rng::gen_range` is renamed to `random_range`; that single call in `monte_carlo.rs` is the whole migration). Note that `SmallRng` draws differently in 0.9, so a Monte Carlo run re-executed with the **same seed** after this upgrade produces different sample statistics than it did on 0.8 — the distributions are equivalent, but the individual numbers move. Nothing in the crate promised seeded output to be stable across `rand` versions (`monte_carlo_same_seed_produces_reproducible_statistics` pins same-build determinism only), but anyone comparing against a stored report should re-baseline it.
+
 ### Fixed
 - `concentrated_liquidity`: the swap engine priced every step in a
   3-significant-digit scale (`p_c = (sqrt_price_x96 * 1000) >> 96`) while
