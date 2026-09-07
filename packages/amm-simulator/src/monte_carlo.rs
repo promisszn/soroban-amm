@@ -197,7 +197,7 @@ fn perturb_trades(
 }
 
 fn shock_amount(amount: i128, shock_bps: u32, rng: &mut SmallRng) -> i128 {
-    let shock = rng.gen_range(-(shock_bps as i128)..=(shock_bps as i128));
+    let shock = rng.random_range(-(shock_bps as i128)..=(shock_bps as i128));
 
     let perturbed = amount + amount * shock / 10_000;
 
