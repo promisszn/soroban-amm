@@ -382,7 +382,7 @@ pub fn mul_div(a: u128, b: u128, d: u128) -> Option<u128> {
     let (hi, lo) = mul_wide(a, b);
     if hi == 0 {
         // Fast path: the product fits in 128 bits.
-        return if d == 0 { None } else { Some(lo / d) };
+        return lo.checked_div(d);
     }
     div_wide(hi, lo, d)
 }
