@@ -16,10 +16,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Install Rust stable with wasm32 target
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32v1-none
+      # Channel and target come from rust-toolchain.toml.
+      - name: Setup Rust
+        run: rustup show
 
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2

@@ -13,14 +13,13 @@ jobs:
         steps:
             - name: Checkout
               uses: actions/checkout@v7
+            # Channel, components and targets all come from
+            # rust-toolchain.toml, so CI cannot drift onto a newer stable than
+            # contributors are running; `rustup show` installs what it asks
+            # for. This also drops the unmaintained actions-rs/toolchain,
+            # which pinned every run to the deprecated Node 20 runtime.
             - name: Setup Rust
-              uses: actions-rs/toolchain@v1
-              with:
-                  profile: minimal
-                  toolchain: stable
-                  components: clippy, rustfmt
-            - name: Add wasm target
-              run: rustup target add wasm32v1-none
+              run: rustup show
             - name: Cache Cargo dependencies
               uses: Swatinem/rust-cache@v2
             # `router`, `dex-aggregator`, `batch_router`, and `batch_auction` used to
@@ -78,13 +77,13 @@ jobs:
         steps:
             - name: Checkout
               uses: actions/checkout@v7
+            # Channel, components and targets all come from
+            # rust-toolchain.toml, so CI cannot drift onto a newer stable than
+            # contributors are running; `rustup show` installs what it asks
+            # for. This also drops the unmaintained actions-rs/toolchain,
+            # which pinned every run to the deprecated Node 20 runtime.
             - name: Setup Rust
-              uses: actions-rs/toolchain@v1
-              with:
-                  profile: minimal
-                  toolchain: stable
-            - name: Add wasm target
-              run: rustup target add wasm32v1-none
+              run: rustup show
             - name: Cache Cargo dependencies
               uses: Swatinem/rust-cache@v2
             - name: Run the full amm-fuzz suite (incl. CL stateful properties)

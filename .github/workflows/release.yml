@@ -18,9 +18,10 @@ jobs:
           # `Update changelog` walks the tag history to build the release notes,
           # so the default depth-1 checkout is not enough.
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32v1-none
+      # Channel and target come from rust-toolchain.toml, so a release is built
+      # with the same toolchain CI tested the commit on.
+      - name: Setup Rust
+        run: rustup show
       # The list of crates excluded from the wasm build lives in
       # scripts/build_workspace.sh, which is shared with .github/workflows/ci.yml
       # and the Makefile. Change the exclusions there, not here.
