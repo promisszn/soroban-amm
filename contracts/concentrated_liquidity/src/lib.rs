@@ -285,6 +285,13 @@ impl ConcentratedLiquidity {
         env.storage()
             .instance()
             .set(&DataKey::CurrentTick, &initial_tick);
+        // Record the matching sqrt price up front. It used to be written only
+        // by swaps, so an untraded pool had no stored price at all and every
+        // reader had to reconstruct one from the tick.
+        env.storage().instance().set(
+            &DataKey::SqrtPriceX96,
+            &Self::tick_to_sqrt_price_x96(initial_tick),
+        );
         env.storage()
             .instance()
             .set(&DataKey::TickSpacing, &tick_spacing);
@@ -650,18 +657,25 @@ impl ConcentratedLiquidity {
         // deposited for it, which then surfaced as later withdrawals wanting
         // more of a token than the pool actually held (issue exposed by
         // `full_burn_via_token_id_does_not_leak_fees_to_provider`).
+        let sqrt_price_now = Self::current_sqrt_price(&env, current_tick);
         let liquidity = Self::liquidity_from_amounts(
             current_tick,
             lower_tick,
             upper_tick,
             amount_a_desired,
             amount_b_desired,
+            sqrt_price_now,
         );
         if liquidity <= 0 {
             return Err(ClError::ZeroLiquidity);
         }
-        let (amount_a, amount_b) =
-            Self::amounts_for_liquidity_to_burn(current_tick, lower_tick, upper_tick, liquidity);
+        let (amount_a, amount_b) = Self::amounts_for_liquidity_to_burn(
+            current_tick,
+            lower_tick,
+            upper_tick,
+            liquidity,
+            sqrt_price_now,
+        );
         if amount_a < 0 || amount_b < 0 {
             return Err(ClError::ZeroAmounts);
         }
@@ -816,11 +830,13 @@ impl ConcentratedLiquidity {
             .get(&pos_key)
             .ok_or(ClError::PositionNotFound)?;
 
+        let sqrt_price_now = Self::current_sqrt_price(&env, current_tick);
         let (amount_a, amount_b) = Self::amounts_for_liquidity_to_burn(
             current_tick,
             lower_tick,
             upper_tick,
             liquidity_delta,
+            sqrt_price_now,
         );
         if amount_a <= 0 && amount_b <= 0 {
             return Err(ClError::ZeroLiquidity);
@@ -1531,8 +1547,14 @@ impl ConcentratedLiquidity {
         pos.tokens_owed = (pos.tokens_owed.0 + oa, pos.tokens_owed.1 + ob);
         pos.fee_growth_inside_a = fg_inside_a;
         pos.fee_growth_inside_b = fg_inside_b;
-        let (amount_a, amount_b) =
-            Self::amounts_for_liquidity_to_burn(current_tick, lower_tick, upper_tick, liquidity);
+        let sqrt_price_now = Self::current_sqrt_price(env, current_tick);
+        let (amount_a, amount_b) = Self::amounts_for_liquidity_to_burn(
+            current_tick,
+            lower_tick,
+            upper_tick,
+            liquidity,
+            sqrt_price_now,
+        );
         pos.liquidity -= liquidity;
 
         // The principal recomputed above from the current tick can, due to a
@@ -2446,26 +2468,21 @@ impl ConcentratedLiquidity {
 
     /// Reverse of `compute_final_price_and_output`: given a fixed *output*
     /// amount, solves for the price the step must land on and the input that
-    /// price requires, in the same `p = (sqrt_price_x96 * 1000) >> 96`
-    /// representation `compute_step` uses.
+    /// price requires — in full Q64.96 precision, like the rest of the swap
+    /// math. (Both previously worked in a `p = (sqrt_price_x96 * 1000) >> 96`
+    /// scale that quantised the price to roughly 20-tick steps.)
     ///
-    /// Rounding (stated explicitly per the four quantities this issue asks
-    /// about, and covered by the `compute_final_price_and_input_*` tests
-    /// below):
-    /// - `sqrt_price_next` (`p_t` here): the intermediate `drop` /
-    ///   `denom`-based quotient rounds **up** (`ceil_div`) in both branches,
-    ///   so the price is always moved *at least* as far as the exact
-    ///   real-valued solution requires. Rounding the other way (floor, tried
-    ///   first and reverted — see the regression test
+    /// Rounding, per quantity:
+    /// - `sqrt_price_next`: rounds **up** in magnitude of movement, so the
+    ///   price always moves *at least* as far as the exact real-valued
+    ///   solution requires. Rounding the other way (floor, tried first and
+    ///   reverted — see the regression test
     ///   `compute_final_price_and_input_does_not_undercharge_small_amount_out`)
     ///   lets the price move truncate to zero whenever `amount_out` is small
     ///   relative to `liquidity`, which then computes `amount_in == 0` for a
-    ///   nonzero `amount_out` — a free drain of the pool. Moving the price
-    ///   at least far enough, even if slightly further than the bare
-    ///   minimum, is the pool-favourable direction.
-    /// - `amount_in`: rounded **up** (`ceil_div`) from that price — the
-    ///   caller must pay at least as much as the (already pool-favourable)
-    ///   price move implies.
+    ///   nonzero `amount_out` — a free drain of the pool.
+    /// - `amount_in`: rounded **up** from that price — the caller must pay at
+    ///   least as much as the (already pool-favourable) price move implies.
     /// - `amount_out`: not computed here — it is the caller-supplied,
     ///   already-fixed target for this step, never rounded.
     /// - `fee_amount`: computed by the caller from `amount_in` (already
@@ -2477,51 +2494,45 @@ impl ConcentratedLiquidity {
         amount_out_needed: i128,
         zero_for_one: bool,
     ) -> (u128, i128) {
-        let p_c = (((sqrt_price_current_x96 * 1000) >> 96) as i128).max(1);
+        if liquidity <= 0 || amount_out_needed <= 0 {
+            return (sqrt_price_current_x96, 0);
+        }
+        let liq = liquidity.unsigned_abs();
+        let out = amount_out_needed.unsigned_abs();
 
         if zero_for_one {
-            // amount_out = liquidity * (p_c - p_t) / 1000
-            //   => p_t = p_c - amount_out * 1000 / liquidity
-            //
-            // `drop` (= p_c - p_t) rounds UP: a floor here would let `drop`
-            // truncate to 0 whenever amount_out is small relative to
-            // liquidity (exactly the common case), landing p_t == p_c and
-            // computing amount_in == 0 for a nonzero amount_out — a free
-            // drain of the pool. Rounding the price move up always moves at
-            // least as far as the exact solution requires, so the input
-            // computed from it is never less than truly owed.
-            let drop = if liquidity > 0 {
-                Self::ceil_div(amount_out_needed * 1000, liquidity)
-            } else {
-                0
-            };
-            let p_t = (p_c - drop).max(1);
-            let amount_in = if p_t > 0 {
-                Self::ceil_div(liquidity * 1000 * (p_c - p_t), p_c * p_t)
-            } else {
-                0
-            };
-            let sqrt_price_target_x96 = ((p_t as u128) * (1 << 96)) / 1000;
-            (sqrt_price_target_x96, amount_in.max(0))
+            // token1 out, token0 in: price falls. The drop rounds up, so the
+            // price always moves at least as far as the requested output
+            // requires and the input derived from it is never understated.
+            let next =
+                match math::next_sqrt_price_from_amount1_out(sqrt_price_current_x96, liq, out) {
+                    Some(p) if p < sqrt_price_current_x96 => p,
+                    _ => return (sqrt_price_current_x96, 0),
+                };
+            let amount_in = Self::u128_to_i128_saturating(math::amount0_delta_exact(
+                next,
+                sqrt_price_current_x96,
+                liq,
+                true,
+            ));
+            (next, amount_in)
         } else {
-            // amount_out = liquidity * 1000 * (p_t - p_c) / (p_c * p_t)
-            //   => p_t = liquidity * 1000 * p_c / (liquidity * 1000 - amount_out * p_c)
-            //
-            // `p_t` rounds UP for the same reason as `drop` above: price
-            // must rise *at least* as far as the exact solution, never less.
-            let denom = liquidity * 1000 - amount_out_needed * p_c;
-            let p_t = if denom > 0 {
-                Self::ceil_div(liquidity * 1000 * p_c, denom)
-            } else {
-                // The requested output exceeds what this range can ever
-                // supply (would require price -> infinity); the caller
-                // clamps `amount_out_needed` to the step's own capacity
-                // before calling this, so this is a defensive fallback only.
-                p_c
-            };
-            let amount_in = Self::ceil_div(liquidity * (p_t - p_c), 1000);
-            let sqrt_price_target_x96 = ((p_t as u128) * (1 << 96)) / 1000;
-            (sqrt_price_target_x96, amount_in.max(0))
+            // token0 out, token1 in: price rises.
+            let next =
+                match math::next_sqrt_price_from_amount0_out(sqrt_price_current_x96, liq, out) {
+                    Some(p) if p > sqrt_price_current_x96 => p,
+                    // The requested output exceeds what this range can supply
+                    // at any price; the caller clamps `amount_out_needed` to
+                    // the step's capacity first, so this is defensive only.
+                    _ => return (sqrt_price_current_x96, 0),
+                };
+            let amount_in = Self::u128_to_i128_saturating(math::amount1_delta_exact(
+                sqrt_price_current_x96,
+                next,
+                liq,
+                true,
+            ));
+            (next, amount_in)
         }
     }
 
@@ -3270,11 +3281,13 @@ impl ConcentratedLiquidity {
             .instance()
             .get(&DataKey::CurrentTick)
             .unwrap_or(0);
+        let sqrt_price_now = Self::current_sqrt_price(&env, current_tick);
         Ok(Self::amounts_for_liquidity_to_burn(
             current_tick,
             lower_tick,
             upper_tick,
             liquidity,
+            sqrt_price_now,
         ))
     }
 
@@ -3359,7 +3372,36 @@ impl ConcentratedLiquidity {
 
     /// Compute token amounts needed to burn `liquidity` from a position.
     /// Returns (amount_a, amount_b) based on current tick position.
-    fn amounts_for_liquidity_to_burn(ct: i32, lt: i32, ut: i32, liquidity: i128) -> (i128, i128) {
+    /// The pool's live sqrt price.
+    ///
+    /// `SqrtPriceX96` is written by `initialize` and by every swap. Pools
+    /// deployed before it was set at initialize have no stored value until
+    /// their first trade, so fall back to the price at the current tick --
+    /// which is exactly what the pool price was at initialization.
+    fn current_sqrt_price(env: &Env, current_tick: i32) -> u128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::SqrtPriceX96)
+            .unwrap_or_else(|| Self::tick_to_sqrt_price_x96(current_tick))
+    }
+
+    /// Token amounts an in-range position is worth at the pool's *current*
+    /// price.
+    ///
+    /// `sqrt_current_x96` must be the pool's live `SqrtPriceX96`, not
+    /// `tick_to_sqrt_price_x96(ct)`. A tick spans a whole price band and every
+    /// swap moves the price inside it, so valuing an in-range position at the
+    /// tick's lower edge splits it between the two tokens at a price the pool
+    /// is not actually at. The position then redeems for more of one token
+    /// than the pool holds and leaves the other stranded — the residual
+    /// per-token shortfall left over after the swap-price fix in this change.
+    fn amounts_for_liquidity_to_burn(
+        ct: i32,
+        lt: i32,
+        ut: i32,
+        liquidity: i128,
+        sqrt_current_x96: u128,
+    ) -> (i128, i128) {
         if ct < lt {
             let sqrt_lower = Self::tick_to_sqrt_price_x96(lt);
             let sqrt_upper = Self::tick_to_sqrt_price_x96(ut);
@@ -3373,10 +3415,12 @@ impl ConcentratedLiquidity {
             return (0, amount_b);
         }
 
-        // In-range: use proper sqrtPriceX96 formulas
+        // In-range: split at the live price, clamped into the position's own
+        // band so a price that has drifted outside it cannot produce a
+        // negative leg.
         let sqrt_lower = Self::tick_to_sqrt_price_x96(lt);
         let sqrt_upper = Self::tick_to_sqrt_price_x96(ut);
-        let sqrt_current = Self::tick_to_sqrt_price_x96(ct);
+        let sqrt_current = sqrt_current_x96.clamp(sqrt_lower, sqrt_upper);
 
         // Token A covers [current, upper], Token B covers [lower, current]
         let amount_a = math::get_amount0_delta(sqrt_current, sqrt_upper, liquidity);
@@ -3384,7 +3428,17 @@ impl ConcentratedLiquidity {
         (amount_a, amount_b)
     }
 
-    fn liquidity_from_amounts(ct: i32, lt: i32, ut: i32, a: i128, b: i128) -> i128 {
+    /// Inverse of [`Self::amounts_for_liquidity_to_burn`]; takes the live
+    /// `sqrt_current_x96` for the same reason, so a deposit and the withdrawal
+    /// that undoes it are priced identically.
+    fn liquidity_from_amounts(
+        ct: i32,
+        lt: i32,
+        ut: i32,
+        a: i128,
+        b: i128,
+        sqrt_current_x96: u128,
+    ) -> i128 {
         if ct < lt {
             let sqrt_lower = Self::tick_to_sqrt_price_x96(lt);
             let sqrt_upper = Self::tick_to_sqrt_price_x96(ut);
@@ -3396,7 +3450,7 @@ impl ConcentratedLiquidity {
         } else {
             let sqrt_lower = Self::tick_to_sqrt_price_x96(lt);
             let sqrt_upper = Self::tick_to_sqrt_price_x96(ut);
-            let sqrt_current = Self::tick_to_sqrt_price_x96(ct);
+            let sqrt_current = sqrt_current_x96.clamp(sqrt_lower, sqrt_upper);
             let liquidity_from_amount0 =
                 math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, a);
             let liquidity_from_amount1 =
@@ -3780,87 +3834,123 @@ impl ConcentratedLiquidity {
         )
     }
 
+    /// Amounts required to move the price from `sqrt_price_current_x96` all the
+    /// way to `sqrt_price_target_x96` (normally the next initialized tick).
+    ///
+    /// Evaluated in full Q64.96 precision. The previous implementation reduced
+    /// both prices to a 3-significant-digit scale (`sqrt_price * 1000`), whose
+    /// granularity is roughly 20 ticks: any target nearer than that collapsed
+    /// to `diff == 0` and reported that the boundary could be reached for zero
+    /// input, letting a swap cross ticks it never paid for.
+    ///
+    /// Input rounds up and output rounds down, both in the pool's favour.
     fn compute_step(
         liquidity: i128,
         sqrt_price_current_x96: u128,
         sqrt_price_target_x96: u128,
         zero_for_one: bool,
     ) -> (i128, i128) {
-        let p_c = (((sqrt_price_current_x96 * 1000) >> 96) as i128).max(1);
-        let p_t = (((sqrt_price_target_x96 * 1000) >> 96) as i128).max(1);
+        if liquidity <= 0 || sqrt_price_current_x96 == sqrt_price_target_x96 {
+            return (0, 0);
+        }
+        let liq = liquidity.unsigned_abs();
 
-        if zero_for_one {
-            let diff = p_c - p_t;
-            if diff <= 0 {
+        let (lo, hi) = if zero_for_one {
+            if sqrt_price_target_x96 >= sqrt_price_current_x96 {
                 return (0, 0);
             }
-            let amount_in = liquidity * 1000 * diff / (p_c * p_t);
-            let amount_out = liquidity * diff / 1000;
-            (amount_in, amount_out)
+            (sqrt_price_target_x96, sqrt_price_current_x96)
         } else {
-            let diff = p_t - p_c;
-            if diff <= 0 {
+            if sqrt_price_target_x96 <= sqrt_price_current_x96 {
                 return (0, 0);
             }
-            let amount_in = liquidity * diff / 1000;
-            let amount_out = liquidity * 1000 * diff / (p_c * p_t);
-            (amount_in, amount_out)
+            (sqrt_price_current_x96, sqrt_price_target_x96)
+        };
+
+        // zero_for_one: token0 in, token1 out. Otherwise the reverse.
+        let (amount_in, amount_out) = if zero_for_one {
+            (
+                math::amount0_delta_exact(lo, hi, liq, true),
+                math::amount1_delta_exact(lo, hi, liq, false),
+            )
+        } else {
+            (
+                math::amount1_delta_exact(lo, hi, liq, true),
+                math::amount0_delta_exact(lo, hi, liq, false),
+            )
+        };
+
+        (
+            Self::u128_to_i128_saturating(amount_in),
+            Self::u128_to_i128_saturating(amount_out),
+        )
+    }
+
+    /// Clamp an optional wide result into the `i128` the contract's amount
+    /// types use. `None` (overflow) and out-of-range values become 0 so a
+    /// step reports "nothing tradeable" rather than wrapping to a bogus amount.
+    fn u128_to_i128_saturating(v: Option<u128>) -> i128 {
+        match v {
+            Some(x) if x <= i128::MAX as u128 => x as i128,
+            _ => 0,
         }
     }
 
+    /// Landing price and output for a swap step that consumes
+    /// `amount_in_after_fee` without reaching the next tick.
+    ///
+    /// Full Q64.96 precision. The previous implementation worked in a
+    /// 3-significant-digit price scale (`p_c = sqrt_price * 1000`) whose
+    /// granularity is about 20 ticks, so a single small trade against deep
+    /// liquidity moved the pool price ~20 ticks instead of a fraction of one.
+    /// The price then ran away from the price the trades had actually paid
+    /// for, crossing out of live position ranges; at burn time every position
+    /// was valued on the wrong side of its range, which is what produced the
+    /// per-token insolvency (token A owed but absent, token B stranded).
+    ///
+    /// The price rounds against the trader and the output rounds down, so a
+    /// step can never move the price further, or pay out more, than the input
+    /// justifies.
     fn compute_final_price_and_output(
         liquidity: i128,
         sqrt_price_current_x96: u128,
         amount_in_after_fee: i128,
         zero_for_one: bool,
     ) -> (u128, i128) {
-        let p_c = (((sqrt_price_current_x96 * 1000) >> 96) as i128).max(1);
+        if liquidity <= 0 || amount_in_after_fee <= 0 {
+            return (sqrt_price_current_x96, 0);
+        }
+        let liq = liquidity.unsigned_abs();
+        let amt = amount_in_after_fee.unsigned_abs();
 
         if zero_for_one {
-            let denom = amount_in_after_fee * p_c + liquidity * 1000;
-            let p_t = if denom > 0 {
-                liquidity * 1000 * p_c / denom
-            } else {
-                p_c
+            let next = match math::next_sqrt_price_from_amount0_in(sqrt_price_current_x96, liq, amt)
+            {
+                Some(p) if p <= sqrt_price_current_x96 => p,
+                // Overflow, or rounding that would move the price the wrong
+                // way: leave the price where it is and trade nothing this step.
+                _ => return (sqrt_price_current_x96, 0),
             };
-            // amount_out = liquidity * (p_c - p_t) / 1000. Computed via the
-            // algebraically-equivalent `liquidity * p_c^2 * amount_in_after_fee
-            // / (1000 * denom)` instead of subtracting p_c - p_t directly:
-            // for a small trade against deep liquidity, p_t rounds to the same
-            // integer as p_c at this fixed-point scale, which would silently
-            // zero out amount_out even though the trade is real.
-            let amount_out = liquidity * p_c * p_c * amount_in_after_fee / (1000 * denom);
-            let mut sqrt_price_target_x96 = ((p_t as u128) * (1 << 96)) / 1000;
-            // `p_t` is rounded to a 3-significant-digit scale, so a small
-            // trade against deep liquidity can round to the same integer as
-            // `p_c`, leaving the returned Q96 price bit-identical to the
-            // input even though a real, nonzero trade happened. Nudge it by
-            // the smallest representable Q96 step so price always moves in
-            // the traded direction rather than silently freezing.
-            if amount_out > 0 && sqrt_price_target_x96 >= sqrt_price_current_x96 {
-                sqrt_price_target_x96 = sqrt_price_current_x96.saturating_sub(1);
-            }
-            (sqrt_price_target_x96, amount_out)
+            let amount_out = Self::u128_to_i128_saturating(math::amount1_delta_exact(
+                next,
+                sqrt_price_current_x96,
+                liq,
+                false,
+            ));
+            (next, amount_out)
         } else {
-            let p_t = p_c + amount_in_after_fee * 1000 / liquidity;
-            // amount_out = liquidity * 1000 * (p_t - p_c) / (p_c * p_t), with
-            // (p_t - p_c) substituted by its exact value `amount_in_after_fee *
-            // 1000 / liquidity` before any rounding, for the same reason as
-            // the zero_for_one branch above.
-            let denom = p_c * (p_c * liquidity + amount_in_after_fee * 1000);
-            let amount_out = if denom > 0 {
-                1_000_000 * amount_in_after_fee * liquidity / denom
-            } else {
-                0
+            let next = match math::next_sqrt_price_from_amount1_in(sqrt_price_current_x96, liq, amt)
+            {
+                Some(p) if p >= sqrt_price_current_x96 => p,
+                _ => return (sqrt_price_current_x96, 0),
             };
-            let mut sqrt_price_target_x96 = ((p_t as u128) * (1 << 96)) / 1000;
-            // See the zero_for_one comment above: nudge upward by one Q96
-            // unit when rounding would otherwise leave the price unchanged
-            // despite a real trade.
-            if amount_out > 0 && sqrt_price_target_x96 <= sqrt_price_current_x96 {
-                sqrt_price_target_x96 = sqrt_price_current_x96.saturating_add(1);
-            }
-            (sqrt_price_target_x96, amount_out)
+            let amount_out = Self::u128_to_i128_saturating(math::amount0_delta_exact(
+                sqrt_price_current_x96,
+                next,
+                liq,
+                false,
+            ));
+            (next, amount_out)
         }
     }
 }
@@ -4156,7 +4246,16 @@ mod tests {
             &u64::MAX,
         );
 
-        let limit = (1u128 << 96) - 1_000_000;
+        // A limit 0.1% below the current sqrt price. The previous limit here
+        // was `Q96 - 1_000_000`, i.e. a relative move of ~1.3e-23, which no
+        // real trade can produce: `amount1_out = L * (Q96 - limit) / Q96`
+        // floors to 0 at this pool's liquidity (L ~ 2.0e7). It only appeared
+        // to trade because the old 3-significant-digit price scale moved the
+        // price in ~20-tick jumps regardless of the amount swapped.
+        let q96 = 1u128 << 96;
+        let limit = q96 - q96 / 1000;
+        // Reaching that limit takes ~20_071 of token0, so 50_000 overshoots
+        // and the swap must stop exactly at the limit.
         let out = te
             .client
             .swap(&te.provider, &true, &50_000, &limit, &0, &10000);
@@ -4164,6 +4263,64 @@ mod tests {
 
         let state = te.client.get_pool_state();
         assert_eq!(state.sqrt_price, limit);
+    }
+
+    /// A small swap must move the price by what the trade actually justifies,
+    /// not by the resolution of an internal fixed-point scale.
+    ///
+    /// The swap engine used to reduce the price to a three-significant-digit
+    /// scale, `p = (sqrt_price * 1000) >> 96`, a resolution of ~20 ticks.
+    /// One unit of `p` *is* a ~20-tick move, so any trade large enough to
+    /// change `p` at all moved the pool ~20 ticks regardless of its size,
+    /// and the pool price ran away from the price its trades had paid for.
+    /// Once the price left a position's range, burning valued that position
+    /// entirely in the wrong token: the pool owed token A it did not hold
+    /// while stranding token B it could not pay out. That is the per-token
+    /// insolvency this test guards against at its source.
+    #[test]
+    fn small_swap_moves_price_by_trade_size_not_scale_granularity() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 0, 0); // zero fee keeps the arithmetic exact
+
+        te.client.mint_position(
+            &te.provider,
+            &-1_000,
+            &1_000,
+            &1_000_000,
+            &1_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
+        let liquidity = te.client.active_liquidity();
+        assert!(liquidity > 0);
+
+        let before = te.client.get_pool_state().sqrt_price;
+        te.client
+            .swap(&te.provider, &true, &100_i128, &0_u128, &0_i128, &u64::MAX);
+        let after = te.client.get_pool_state().sqrt_price;
+
+        // Canonical Uniswap V3 result for token0 in:
+        //   sqrt_next = L * sqrt_p / (L + amount0 * sqrt_p / Q96)
+        let q96 = math::Q96;
+        let term = (100u128 * q96) / q96;
+        let expected = (liquidity as u128 * q96).div_ceil(liquidity as u128 + term);
+        assert_eq!(after, expected, "swap must land on the canonical price");
+
+        // 100 tokens against this liquidity is a fraction of one tick. The old
+        // 3-significant-digit scale landed near tick -20 instead.
+        assert!(after < before, "a token0-in swap must lower the price");
+        assert!(
+            after > math::tick_to_sqrt_price_x96(-1),
+            "a 100-token swap must not move the price a full tick \
+             (got {} which is at or below tick -1)",
+            after
+        );
+        assert!(
+            te.client.current_tick() >= -1,
+            "tick moved {} on a 100-token trade",
+            te.client.current_tick()
+        );
     }
 
     #[test]
@@ -6052,7 +6209,15 @@ mod test_new_tick_features {
         );
 
         // Perform a downward swap to cross below tick 0.
-        client.swap(&provider, &true, &5_000_i128, &0_u128, &0_i128, &u64::MAX);
+        //
+        // Crossing from tick 10 down to tick 0 against this pool's active
+        // liquidity (~5.0e7) takes about 25,055 of token A:
+        //   amount0 = L * Q96 * (sqrt(10) - sqrt(0)) / (sqrt(10) * sqrt(0))
+        // The 5,000 this used to swap moves the price barely two ticks (to
+        // tick 8). It only appeared to cross because the old 3-significant-
+        // digit price scale jumped the price ~20 ticks per step regardless of
+        // size. 40,000 crosses tick 0 for real, landing around tick -6.
+        client.swap(&provider, &true, &40_000_i128, &0_u128, &0_i128, &u64::MAX);
         let tick_after = client.current_tick();
         assert!(tick_after < 0, "swap should push price below tick 0");
         // After crossing tick 0 downward, the active liquidity of the lower range activates.
@@ -7872,20 +8037,30 @@ mod test_swap_exact_out {
     #[test]
     fn compute_final_price_and_input_one_for_zero_hand_computed() {
         let liquidity = 1_000_000_i128;
-        let sqrt_price_current = 1u128 << 96; // p_c = 1000
+        let sqrt_price_current = 1u128 << 96; // sqrt(price) = 1
         let amount_out = 100_000_i128;
-        // denom = 1_000_000*1000 - 100_000*1000 = 900_000_000
-        // p_t = ceil(1_000_000*1000*1000 / 900_000_000) = ceil(1111.11..) = 1112
-        // amount_in = ceil(1_000_000*(1112-1000)/1000) = ceil(112_000_000/1000) = 112_000 (exact)
+        // token0 out, token1 in, so the price rises:
+        //   sqrt_next = L * sqrt_p / (L - amount0 * sqrt_p / Q96)
+        //             = 1_000_000 / (1_000_000 - 100_000) = 10/9
+        //   amount_in = ceil(L * (sqrt_next - sqrt_p) / Q96)
+        //             = ceil(1_000_000 * 1/9) = ceil(111_111.11..) = 111_112
+        //
+        // The previous 3-significant-digit price scale rounded sqrt_next from
+        // 1.1111.. up to 1.112 and charged 112_000 — a 0.8% overcharge that
+        // came purely from the quantisation, not from pool-favourable rounding.
         let (price_next, amount_in) = ConcentratedLiquidity::compute_final_price_and_input(
             liquidity,
             sqrt_price_current,
             amount_out,
             false,
         );
-        assert_eq!(amount_in, 112_000);
-        let expected_price = (1112u128 * (1u128 << 96)) / 1000;
+        assert_eq!(amount_in, 111_112);
+
+        let q96 = 1u128 << 96;
+        let expected_price = (10 * q96).div_ceil(9);
         assert_eq!(price_next, expected_price);
+        // And the input really does cover the requested output at that price.
+        assert!(amount_in as u128 * q96 >= liquidity as u128 * (price_next - sqrt_price_current));
     }
 
     #[test]

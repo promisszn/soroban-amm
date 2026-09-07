@@ -316,12 +316,371 @@ fn mul_u128_u96(a: u128, b: u128) -> u128 {
 }
 
 // ---------------------------------------------------------------------------
+// Wide (256-bit intermediate) helpers
+// ---------------------------------------------------------------------------
+
+const MASK64: u128 = 0xFFFF_FFFF_FFFF_FFFF;
+
+/// Full-width `a * b` as a 256-bit value, returned as `(hi, lo)` 128-bit halves.
+///
+/// Each partial product is a `u64 * u64`, so nothing overflows on the way.
+#[inline(always)]
+fn mul_wide(a: u128, b: u128) -> (u128, u128) {
+    let (a_hi, a_lo) = (a >> 64, a & MASK64);
+    let (b_hi, b_lo) = (b >> 64, b & MASK64);
+
+    let ll = a_lo * b_lo;
+    let lh = a_lo * b_hi;
+    let hl = a_hi * b_lo;
+    let hh = a_hi * b_hi;
+
+    // Middle column: the high half of `ll` plus the low halves of both
+    // cross terms. This sum can carry into the high word.
+    let mid = (ll >> 64) + (lh & MASK64) + (hl & MASK64);
+
+    let lo = (ll & MASK64) | (mid << 64);
+    let hi = hh + (lh >> 64) + (hl >> 64) + (mid >> 64);
+    (hi, lo)
+}
+
+/// `floor((hi:lo) / d)` by shift-and-subtract long division.
+///
+/// Returns `None` when `d == 0` or when the quotient would not fit in a `u128`
+/// (which is exactly the case `hi >= d`).
+fn div_wide(hi: u128, lo: u128, d: u128) -> Option<u128> {
+    if d == 0 || hi >= d {
+        return None;
+    }
+
+    let mut rem = hi;
+    let mut quo: u128 = 0;
+
+    for i in (0..128).rev() {
+        // `rem` is always < d here, so shifting left can only lose a bit that
+        // we must remember: the true remainder is `carry * 2^128 + rem`.
+        let carry = rem >> 127;
+        rem = (rem << 1) | ((lo >> i) & 1);
+        quo <<= 1;
+        // carry == 1 means the true value is >= 2^128 > d, so it must be
+        // reduced; the wrapping subtraction produces the correct low 128 bits.
+        if carry == 1 || rem >= d {
+            rem = rem.wrapping_sub(d);
+            quo |= 1;
+        }
+    }
+
+    Some(quo)
+}
+
+/// `floor(a * b / d)` evaluated over a full 256-bit intermediate.
+///
+/// This is the building block the Q64.96 swap math needs: products such as
+/// `liquidity * sqrt_price` routinely exceed `u128` even though the final
+/// quotient fits comfortably. Returns `None` if `d == 0` or the quotient
+/// overflows `u128`.
+pub fn mul_div(a: u128, b: u128, d: u128) -> Option<u128> {
+    let (hi, lo) = mul_wide(a, b);
+    if hi == 0 {
+        // Fast path: the product fits in 128 bits.
+        return if d == 0 { None } else { Some(lo / d) };
+    }
+    div_wide(hi, lo, d)
+}
+
+/// `ceil(a * b / d)` over the same 256-bit intermediate.
+///
+/// Used wherever rounding must favour the pool (charging input, or moving the
+/// price at least as far as the exact solution requires).
+pub fn mul_div_ceil(a: u128, b: u128, d: u128) -> Option<u128> {
+    let q = mul_div(a, b, d)?;
+    // The division was exact iff `q * d` reproduces `a * b` exactly; both are
+    // 256-bit quantities, so compare both halves.
+    if mul_wide(q, d) == mul_wide(a, b) {
+        Some(q)
+    } else {
+        q.checked_add(1)
+    }
+}
+
+/// Exact `amount0` between two sqrt prices, in full Q64.96 precision.
+///
+/// `amount0 = L * Q96 * (sqrt_b - sqrt_a) / (sqrt_a * sqrt_b)`, evaluated in
+/// two `mul_div` stages so the `L * Q96 * delta` numerator never has to fit in
+/// a `u128`. `round_up` rounds toward the pool.
+///
+/// This is the swap path's counterpart to [`get_amount0_delta`], which still
+/// routes through the wrapping `mul_u128_u96` and is inaccurate for wide or
+/// high-magnitude tick ranges (tracked separately).
+pub fn amount0_delta_exact(
+    mut sqrt_a: u128,
+    mut sqrt_b: u128,
+    liquidity: u128,
+    round_up: bool,
+) -> Option<u128> {
+    if sqrt_a > sqrt_b {
+        core::mem::swap(&mut sqrt_a, &mut sqrt_b);
+    }
+    if sqrt_a == 0 || sqrt_a == sqrt_b || liquidity == 0 {
+        return Some(0);
+    }
+    let delta = sqrt_b - sqrt_a;
+    if round_up {
+        let t = mul_div_ceil(liquidity, Q96, sqrt_a)?;
+        mul_div_ceil(t, delta, sqrt_b)
+    } else {
+        let t = mul_div(liquidity, Q96, sqrt_a)?;
+        mul_div(t, delta, sqrt_b)
+    }
+}
+
+/// Exact `amount1` between two sqrt prices: `L * (sqrt_b - sqrt_a) / Q96`.
+///
+/// `round_up` rounds toward the pool.
+pub fn amount1_delta_exact(
+    mut sqrt_a: u128,
+    mut sqrt_b: u128,
+    liquidity: u128,
+    round_up: bool,
+) -> Option<u128> {
+    if sqrt_a > sqrt_b {
+        core::mem::swap(&mut sqrt_a, &mut sqrt_b);
+    }
+    if sqrt_a == sqrt_b || liquidity == 0 {
+        return Some(0);
+    }
+    let delta = sqrt_b - sqrt_a;
+    if round_up {
+        mul_div_ceil(liquidity, delta, Q96)
+    } else {
+        mul_div(liquidity, delta, Q96)
+    }
+}
+
+/// Next sqrt price when `amount0` is added to the pool (price falls).
+///
+/// `sqrt_next = L * sqrt_p / (L + amount0 * sqrt_p / Q96)`, which is the
+/// canonical `L * Q96 * sqrt_p / (L * Q96 + amount0 * sqrt_p)` rearranged so
+/// that no intermediate needs more than the 256 bits `mul_div` already gives
+/// us. Rounds the resulting price **up**, so the pool never moves further than
+/// the input paid for.
+pub fn next_sqrt_price_from_amount0_in(
+    sqrt_p: u128,
+    liquidity: u128,
+    amount0: u128,
+) -> Option<u128> {
+    if amount0 == 0 {
+        return Some(sqrt_p);
+    }
+    if liquidity == 0 {
+        return None;
+    }
+    // Round the denominator term down so the quotient (the price) rounds up.
+    let term = mul_div(amount0, sqrt_p, Q96)?;
+    let denom = liquidity.checked_add(term)?;
+    mul_div_ceil(liquidity, sqrt_p, denom)
+}
+
+/// Next sqrt price when `amount1` is added to the pool (price rises).
+///
+/// `sqrt_next = sqrt_p + amount1 * Q96 / L`, rounded **down** so the price
+/// never moves further than the input paid for.
+pub fn next_sqrt_price_from_amount1_in(
+    sqrt_p: u128,
+    liquidity: u128,
+    amount1: u128,
+) -> Option<u128> {
+    if amount1 == 0 {
+        return Some(sqrt_p);
+    }
+    if liquidity == 0 {
+        return None;
+    }
+    let rise = mul_div(amount1, Q96, liquidity)?;
+    sqrt_p.checked_add(rise)
+}
+
+/// Next sqrt price when `amount1` is removed from the pool (price falls).
+///
+/// `sqrt_next = sqrt_p - ceil(amount1 * Q96 / L)`: the drop rounds **up** so
+/// the price always moves at least as far as the requested output requires,
+/// and the input computed from it is never less than truly owed. Returns
+/// `None` if the output would drive the price to or below zero.
+pub fn next_sqrt_price_from_amount1_out(
+    sqrt_p: u128,
+    liquidity: u128,
+    amount1: u128,
+) -> Option<u128> {
+    if amount1 == 0 {
+        return Some(sqrt_p);
+    }
+    if liquidity == 0 {
+        return None;
+    }
+    let drop = mul_div_ceil(amount1, Q96, liquidity)?;
+    if drop >= sqrt_p {
+        return None;
+    }
+    Some(sqrt_p - drop)
+}
+
+/// Next sqrt price when `amount0` is removed from the pool (price rises).
+///
+/// `sqrt_next = L * sqrt_p / (L - amount0 * sqrt_p / Q96)`, rounded **up** for
+/// the same reason as above. Returns `None` when the requested output exceeds
+/// what this range can supply at any price.
+pub fn next_sqrt_price_from_amount0_out(
+    sqrt_p: u128,
+    liquidity: u128,
+    amount0: u128,
+) -> Option<u128> {
+    if amount0 == 0 {
+        return Some(sqrt_p);
+    }
+    if liquidity == 0 {
+        return None;
+    }
+    // Round the subtracted term up so the denominator is smaller and the
+    // resulting price is not understated.
+    let term = mul_div_ceil(amount0, sqrt_p, Q96)?;
+    if term >= liquidity {
+        // Would need an infinite price to supply this much token0.
+        return None;
+    }
+    mul_div_ceil(liquidity, sqrt_p, liquidity - term)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Wide (256-bit intermediate) helpers ──────────────────────────────────
+
+    /// `mul_div` must agree with exact arithmetic even when `a * b` overflows
+    /// `u128` — which is the normal case for `liquidity * sqrt_price`.
+    #[test]
+    fn mul_div_matches_exact_arithmetic_across_the_u128_range() {
+        // Deterministic xorshift; no rand dependency in a no_std contract crate.
+        let mut st: u128 = 0x243F_6A88_85A3_08D3;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+
+        for _ in 0..2_000 {
+            let a = next();
+            let b = next();
+            let d = next().max(1);
+
+            // Reference: long-hand 256-bit product, then compare by
+            // reconstructing q*d + r == a*b with the same wide helpers.
+            match mul_div(a, b, d) {
+                Some(q) => {
+                    let (phi, plo) = mul_wide(a, b);
+                    let (qhi, qlo) = mul_wide(q, d);
+                    // q*d <= a*b
+                    assert!(
+                        (qhi, qlo) <= (phi, plo),
+                        "q*d exceeded a*b for {a} * {b} / {d}"
+                    );
+                    // and (q+1)*d > a*b, i.e. the quotient is maximal
+                    if let Some(q1) = q.checked_add(1) {
+                        let (q1hi, q1lo) = mul_wide(q1, d);
+                        assert!(
+                            (q1hi, q1lo) > (phi, plo),
+                            "quotient not maximal for {a} * {b} / {d}"
+                        );
+                    }
+                }
+                None => {
+                    // Only legitimate when the quotient genuinely overflows.
+                    let (phi, _) = mul_wide(a, b);
+                    assert!(phi >= d, "mul_div gave up on a representable quotient");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mul_div_handles_extremes() {
+        assert_eq!(mul_div(u128::MAX, u128::MAX, u128::MAX), Some(u128::MAX));
+        assert_eq!(mul_div(u128::MAX, 1, 1), Some(u128::MAX));
+        assert_eq!(mul_div(0, 12_345, 7), Some(0));
+        assert_eq!(mul_div(5, 5, 0), None);
+        // Quotient would not fit in u128.
+        assert_eq!(mul_div(u128::MAX, u128::MAX, 1), None);
+    }
+
+    #[test]
+    fn mul_div_ceil_rounds_up_only_on_a_remainder() {
+        assert_eq!(mul_div_ceil(10, 10, 5), Some(20)); // exact
+        assert_eq!(mul_div_ceil(10, 10, 3), Some(34)); // 33.33 -> 34
+        assert_eq!(mul_div(10, 10, 3), Some(33));
+        // Exactness must be judged on the full 256-bit product, not its low word.
+        assert_eq!(mul_div_ceil(Q96, Q96, Q96), Some(Q96));
+    }
+
+    /// The swap math's price step must be exactly invertible against the
+    /// amount deltas: putting `amount0` in and then reading the resulting
+    /// amount0 delta back must not manufacture value.
+    #[test]
+    fn next_sqrt_price_from_amount0_in_is_consistent_with_the_delta() {
+        let liquidity = 500_000_000u128;
+        let sqrt_p = Q96;
+        for amount in [1u128, 7, 100, 3_900, 1_000_000] {
+            let next = next_sqrt_price_from_amount0_in(sqrt_p, liquidity, amount).unwrap();
+            assert!(next <= sqrt_p, "token0 in must not raise the price");
+            // The amount0 the price move implies never exceeds what was paid.
+            let implied = amount0_delta_exact(next, sqrt_p, liquidity, false).unwrap();
+            assert!(
+                implied <= amount,
+                "price moved further than {amount} paid for (implied {implied})"
+            );
+        }
+    }
+
+    #[test]
+    fn next_sqrt_price_from_amount1_in_raises_price_proportionally() {
+        let liquidity = 500_000_000u128;
+        let sqrt_p = Q96;
+        for amount in [1u128, 7, 100, 3_900, 1_000_000] {
+            let next = next_sqrt_price_from_amount1_in(sqrt_p, liquidity, amount).unwrap();
+            assert!(next >= sqrt_p, "token1 in must not lower the price");
+            let implied = amount1_delta_exact(sqrt_p, next, liquidity, false).unwrap();
+            assert!(
+                implied <= amount,
+                "price moved further than {amount} paid for (implied {implied})"
+            );
+        }
+    }
+
+    /// A small trade against deep liquidity must move the price by a fraction
+    /// of a tick. The previous `sqrt_price * 1000` scale had a resolution of
+    /// roughly 20 ticks, so this moved ~20 ticks regardless of size.
+    #[test]
+    fn a_small_trade_moves_the_price_far_less_than_one_tick() {
+        let liquidity = 498_753_117u128;
+        let next = next_sqrt_price_from_amount0_in(Q96, liquidity, 3_900).unwrap();
+        // Starting exactly on tick 0's boundary, any downward move lands in
+        // tick -1's band, so -1 is correct; what matters is that the price
+        // stays inside that one band instead of jumping ~20 ticks.
+        assert_eq!(sqrt_price_x96_to_tick(next), -1);
+        assert!(
+            next > tick_to_sqrt_price_x96(-1),
+            "3,900 against L=5e8 must not move a full tick"
+        );
+        // The old 3-significant-digit scale landed here instead:
+        let legacy = (999u128 * Q96) / 1000;
+        assert!(
+            sqrt_price_x96_to_tick(legacy) <= -20,
+            "one unit of the old p_c scale was a ~20-tick move"
+        );
+    }
 
     #[test]
     fn tick_zero_is_q96() {
