@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- `concentrated_liquidity`: the swap engine priced every step in a
+  3-significant-digit scale (`p_c = (sqrt_price_x96 * 1000) >> 96`) while
+  minting, burning and quoting priced at the full `sqrt_price_x96`. One unit of
+  that scale is a ~20-tick move, so any trade large enough to change it at all
+  moved the pool ~20 ticks regardless of size — a 3,900-token swap against
+  L = 5e8 moved the price 20 ticks where the correct answer is a fraction of
+  one. The pool price therefore ran away from the price its trades had actually
+  paid for and crossed out of live position ranges without the volume to
+  justify it. Positions then redeemed against a price the pool had never been
+  at: in the reproducer all three positions were valued entirely in token A,
+  leaving the pool holding `(a = 0, b = 400225)` against `tokens_owed`
+  `(a = 400508, b = 0)` — solvent in aggregate, insolvent per token, with token
+  B stranded and unclaimable. `compute_step`, `compute_final_price_and_output`
+  and `compute_final_price_and_input` now work entirely in Q64.96 using the
+  canonical Uniswap V3 formulas, evaluated through a new 256-bit-intermediate
+  `mul_div`/`mul_div_ceil` so products like `liquidity * sqrt_price` no longer
+  have to fit in a `u128`. Input rounds up and output rounds down, so a step can
+  never move the price further, or pay out more, than the input justifies.
+- `concentrated_liquidity`: `amounts_for_liquidity_to_burn` and
+  `liquidity_from_amounts` valued in-range positions at
+  `tick_to_sqrt_price_x96(current_tick)` — the price at the tick's lower edge —
+  rather than the pool's live `SqrtPriceX96`. A tick spans a whole price band
+  and every swap moves the price inside it, so an in-range position was split
+  between the two tokens at a price the pool was not at, redeeming for more of
+  one token than the pool held. This was the residual per-token shortfall left
+  after the swap-price fix above (171 units on ~400,000 in the reproducer).
+  Both now take the live price, clamped into the position's own band.
+- `concentrated_liquidity`: `initialize` never wrote `SqrtPriceX96` — only
+  swaps did — so an untraded pool had no stored price and every reader had to
+  reconstruct one from the tick. It is now set at initialization; readers keep
+  a tick-derived fallback so pools deployed before this change still work.
+- `amm-fuzz`: the CL stateful suite now asserts per-token solvency on every
+  step (the pool's balances cover every position's burn proceeds plus its
+  uncollected fees). The four regression tests that documented the bugs above
+  — `cl_burn_all_returns_everything`, `cl_solvency_per_token_regression`,
+  `cl_solvency_total_value_regression` and `cl_active_liquidity_regression` —
+  were `#[ignore]`d as known failures and now run as ordinary tests.
 - CI has been red on `main` since 2026-08-30. The WASM build pulled the off-chain `soroban_amm_simulator` CLI into `cargo build --workspace --target wasm32v1-none`, where its host-only dependencies (clap, csv, rand/getrandom) cannot compile — breaking `build-and-test`, `fuzz` and `release.yml` alike. Which crates are excluded now lives in a single `scripts/build_workspace.sh`, shared by `ci.yml`, `release.yml`, the `Makefile`, `deploy.sh` and `optimize_contracts.sh` (the last two carried the same latent bug), so the five cannot drift apart again.
 - The `Makefile` was corrupted by 5529cc1: literal `\t` sequences in place of tabs made it unparseable (`Makefile:37: *** missing separator`), which is why the `fuzz` job died two seconds in. The same commit renamed the target to `fzzz-cl` and broke `MAKEFILE_LIST`, `RUSTDOCFLAGS`, the `*.wasm` glob, and the `optimize`/`audit` recipes. Restored, keeping the intended `release-build` alias.
 - `release.yml` was corrupted by the same PR: a step truncated mid-command with a literal `\n` swallowed the `Generate checksums` and `Update changelog` steps, so the workflow failed to parse and every tag push failed instantly. Restored, and given `fetch-depth: 0` since the changelog walks tag history.

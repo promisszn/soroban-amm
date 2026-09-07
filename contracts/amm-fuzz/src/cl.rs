@@ -895,6 +895,28 @@ mod stateful {
             (a, b)
         }
 
+        /// Total each token the pool currently owes: every position's burn
+        /// proceeds at the live price, plus its uncollected fees.
+        fn total_claimable(&self) -> (i128, i128) {
+            let client = self.client();
+            let (mut a, mut b) = (0i128, 0i128);
+            for p in &self.positions {
+                if let Ok(Ok(pos)) = client.try_get_position(&self.provider, &p.lower, &p.upper) {
+                    if pos.liquidity > 0 {
+                        if let Ok(Ok((qa, qb))) =
+                            client.try_quote_position(&p.lower, &p.upper, &pos.liquidity)
+                        {
+                            a += qa;
+                            b += qb;
+                        }
+                    }
+                    a += pos.tokens_owed.0;
+                    b += pos.tokens_owed.1;
+                }
+            }
+            (a, b)
+        }
+
         // ── Operations ─────────────────────────────────────────────────────────
 
         /// Mint a position. Returns `true` when liquidity was actually added.
@@ -1078,14 +1100,15 @@ mod stateful {
     /// Run the per-op invariant checks. Returns `Err` (failing the property)
     /// when any invariant breaks.
     ///
-    /// Note: solvency (pool balances covering every position's burn + owed
-    /// fees) is **not** checked here. The swap loop prices in a coarse
-    /// ~3-significant-digit representation while burn/quote price at the fine
-    /// `tick_to_sqrt_price_x96`, so after a price move the fine per-token (and
-    /// even total-value) claims can exceed the pool's actual balances. That is
-    /// a real contract inconsistency, reported as issue #705 and reproduced by
-    /// the two `#[ignore]`d regression tests below; per the issue's instruction
-    /// it is reported, not fixed, in this PR.
+    /// Invariant 5 is per-token solvency: the pool's balances cover every
+    /// position's burn proceeds plus its uncollected fees. It used to be
+    /// omitted here, because the swap loop priced steps in a coarse
+    /// ~3-significant-digit representation while burn and quote priced at the
+    /// fine `tick_to_sqrt_price_x96`, so after a price move the per-token
+    /// (and even total-value) claims exceeded the pool's actual balances.
+    /// The swap engine now works entirely in Q64.96, so the property holds and
+    /// is asserted on every step; the four regression tests below, previously
+    /// `#[ignore]`d as known failures, run as ordinary tests.
     fn check_invariants(
         ctx: &Ctx,
         step: usize,
@@ -1157,6 +1180,34 @@ mod stateful {
             accrued_b
         );
         *last_accrued = (accrued_a, accrued_b);
+
+        // 5. Per-token solvency: the pool's real balances cover everything it
+        //    owes — every position's burn proceeds at the live price plus its
+        //    uncollected fees.
+        //
+        //    This is the invariant the swap engine used to violate. It priced
+        //    steps in a ~3-significant-digit scale (`sqrt_price * 1000`, a
+        //    granularity of about 20 ticks) while burn and quote priced at the
+        //    fine `sqrt_price_x96`, so the pool price drifted away from the
+        //    price trades had actually paid for and positions redeemed against
+        //    a price the pool was never at.
+        let (claim_a, claim_b) = ctx.total_claimable();
+        prop_assert!(
+            ba >= claim_a,
+            "token A insolvency after {} (step {}): balance {} < claimable {}",
+            op,
+            step,
+            ba,
+            claim_a
+        );
+        prop_assert!(
+            bb >= claim_b,
+            "token B insolvency after {} (step {}): balance {} < claimable {}",
+            op,
+            step,
+            bb,
+            claim_b
+        );
         Ok(())
     }
 
@@ -1279,27 +1330,24 @@ mod stateful {
     /// collecting every fee leaves the pool with at most `BURN_ALL_DUST` per
     /// token.
     ///
-    /// Currently fails as a fourth manifestation of issue #705, alongside the
-    /// three `#[ignore]`d regressions below. After the scripted phase the pool
-    /// pays out its entire token-A balance while crediting the burn proceeds of
-    /// all three positions to `tokens_owed` in token A as well:
+    /// This used to be the fourth manifestation of the coarse-swap-price bug,
+    /// alongside the three regressions below. The scripted swaps walked the
+    /// pool price ~20 ticks per step regardless of size, out of every
+    /// position's range, so all three positions were then valued entirely in
+    /// token A:
     ///
     ///   balances    a = 0        b = 400225
     ///   tokens_owed a = 400508   b = 0
     ///
-    /// so `collect_fees_core` can only pay `min(owed, balance) == 0` and leaves
-    /// position -8..8 holding `owed = (289, 0)`, while 400225 token B sits in
-    /// the contract unclaimable. That is the same mixed-precision price bug the
-    /// other three regressions pin down — the pool is solvent in aggregate but
-    /// not per token — so it is reported here rather than fixed, per the note
-    /// on `check_invariants` above.
-    #[ignore = "known bug (issue #705): mixed-precision price strands token B and leaves token A owed but unpayable after burn-all"]
+    /// `collect_fees_core` could only pay `min(owed, balance) == 0`, leaving
+    /// position -8..8 holding `owed = (289, 0)` while 400225 token B sat in
+    /// the contract unclaimable — solvent in aggregate, insolvent per token.
+    /// The swap engine now prices in full Q64.96, so the pool fully
+    /// liquidates.
     #[test]
     fn cl_burn_all_returns_everything() {
         // Tight ranges bracketing the initial tick and modest swaps keep the
-        // price near the initial tick, so the fine burn price stays consistent
-        // with the coarse swap price and the pool remains fully liquidatable
-        // (the general-case inconsistency is tracked in issue #705).
+        // price near the initial tick.
         let script: Vec<(u8, i32, i32, i128, u8)> = (0..12)
             .map(|i| {
                 (
@@ -1326,8 +1374,8 @@ mod stateful {
         let (ctx, _max_crossings) = run_script(params).expect("script must pass invariants");
 
         // Burn everything, then collect every remaining fee. A bounded loop so
-        // a transfer failure (per-token insolvency, issue #705) cannot spin
-        // forever; any remaining position afterwards fails the assertion below.
+        // a transfer failure (per-token insolvency) cannot spin forever; any
+        // remaining position afterwards fails the assertion below.
         let client = ctx.client();
         for _round in 0..100 {
             let mut progress = false;
@@ -1385,7 +1433,8 @@ mod stateful {
         );
     }
 
-    /// Per-token solvency regression (see issue #705).
+    /// Per-token solvency regression: the pool's balances must cover what
+    /// every position can withdraw, token by token.
     ///
     /// The swap loop prices in a coarse ~3-significant-digit representation
     /// while `quote_position` / `burn_position` price at the fine
@@ -1394,7 +1443,6 @@ mod stateful {
     /// is conserved, so burning every position can fail for lack of a single
     /// token. Not fixed in this PR, per the issue's instruction to report
     /// rather than repair contract bugs.
-    #[ignore = "known bug (issue #705): mixed-precision price causes per-token solvency violations after swaps"]
     #[test]
     fn cl_solvency_per_token_regression() {
         let mut ctx = deploy(30_i128, 0_i32, 1_i32);
@@ -1416,12 +1464,12 @@ mod stateful {
         );
     }
 
-    /// Total-value solvency regression (see issue #705).
+    /// Total-value solvency regression: the pool's balances must cover the
+    /// aggregate value of every position's claim.
     ///
     /// Same root cause as the per-token case: the coarse swap price vs the fine
     /// burn price are inconsistent, so even the sum of all positions' burn
     /// claims can exceed the pool's combined balance after a price move.
-    #[ignore = "known bug (issue #705): mixed-precision price causes total-value solvency violations after swaps"]
     #[test]
     fn cl_solvency_total_value_regression() {
         let mut ctx = deploy(30_i128, 0_i32, 1_i32);
@@ -1444,13 +1492,14 @@ mod stateful {
         );
     }
 
-    /// `active_liquidity()` consistency regression (see issue #705).
+    /// `active_liquidity()` consistency regression: it must equal the sum of
+    /// liquidity for every position whose range brackets the current tick,
+    /// including after a swap crosses out of all of them.
     ///
     /// After a swap that moves the current tick out of every open range, the
     /// stored `active_liquidity()` still reports the pre-swap in-range
     /// liquidity instead of `0`, so the tick-crossing active-liquidity
     /// bookkeeping in `swap` is stale.
-    #[ignore = "known bug (issue #705): active_liquidity() is stale after a swap crosses out of all ranges"]
     #[test]
     fn cl_active_liquidity_regression() {
         let mut ctx = deploy(30_i128, 0_i32, 1_i32);
