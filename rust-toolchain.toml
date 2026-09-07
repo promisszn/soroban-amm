@@ -1,0 +1,16 @@
+# Pins the exact toolchain CI and contributors both use.
+#
+# The workflows previously asked for `stable`, which silently tracks whatever
+# Rust released that day. A new stable can then fail a green PR without
+# anything in the repo changing: #898 passed locally on 1.93.1 and failed in
+# CI on 1.98.1, because a clippy lint added in between (`manual_checked_ops`)
+# is an error under `-D warnings`.
+#
+# Bumping this file is how the toolchain moves now — a normal PR that runs the
+# full suite, rather than a surprise on an unrelated change. Dependabot does
+# not track this file, so it needs doing by hand every few releases.
+[toolchain]
+channel = "1.98.1"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32v1-none"]
+profile = "minimal"

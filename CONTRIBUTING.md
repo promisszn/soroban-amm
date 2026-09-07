@@ -53,12 +53,14 @@ you'd like to work on and we'll help you find a starting point.
 
 ## Prerequisites
 
-- **Rust** (stable toolchain) — install via [rustup](https://rustup.rs/).
-- **wasm32v1-none** target:
+- **Rust** — install via [rustup](https://rustup.rs/). Nothing else to do: the
+  exact version, the `wasm32v1-none` target and the `clippy`/`rustfmt`
+  components are all pinned in `rust-toolchain.toml`, and rustup installs them
+  on your first `cargo` command in this repo. CI reads the same file, so a
+  green run locally means the same compiler ran in CI.
 
-    ```bash
-    rustup target add wasm32v1-none
-    ```
+    To move the toolchain, bump `channel` in that file in its own PR rather
+    than upgrading locally — otherwise your build and CI's diverge.
 
 - **Stellar CLI** (for building optimized WASM and deploying) — see the
   [Stellar CLI install guide](https://developers.stellar.org/docs/tools/developer-tools/cli/install-cli).
