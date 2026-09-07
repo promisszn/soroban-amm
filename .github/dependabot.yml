@@ -9,6 +9,12 @@ updates:
       # Env methods) - needs a deliberate migration, not an automatic PR.
       - dependency-name: "soroban-sdk"
         update-types: ["version-update:semver-major"]
+      # 0.9 renames `Rng::gen_range` to `random_range`; the old name is only
+      # deprecated, but clippy runs with `-D warnings`, so the deprecation is a
+      # hard build failure in packages/amm-simulator/src/monte_carlo.rs. Drop
+      # this entry once that call is migrated (verified: it is the only one).
+      - dependency-name: "rand"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: npm
     directory: "/packages/sdk"
     schedule: { interval: weekly }
