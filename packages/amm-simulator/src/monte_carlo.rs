@@ -7,7 +7,7 @@ use crate::replay::{TradeAction, TradeRecord};
 // neither: rand documents it as non-portable, and it selects a different
 // algorithm on 32- and 64-bit targets. The golden-value tests at the bottom
 // of this file pin the resulting output.
-use rand::{seq::SliceRandom, Rng, SeedableRng};
+use rand::{seq::SliceRandom, RngExt, SeedableRng};
 use rand_pcg::Pcg64;
 use serde::{Deserialize, Serialize};
 
