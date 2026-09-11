@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Changed
-- `soroban_amm_simulator` now builds against `rand` 0.9 (`Rng::gen_range` is renamed to `random_range`; that single call in `monte_carlo.rs` is the whole migration).
+- `soroban_amm_simulator` now builds against `rand` 0.10 and `rand_pcg` 0.10. The migration is two renames in `monte_carlo.rs`: `Rng::gen_range` became `random_range` in 0.9, and the `Rng` extension trait became `RngExt` in 0.10. The 0.10 bump does not move seeded output — the golden-value tests described in the next entry pass unchanged — so it adds nothing to the re-baseline note below.
 - `soroban_amm_simulator` Monte Carlo runs are now reproducible. The generator was `SmallRng`, which `rand` documents as non-portable *and* platform-dependent — it selects Xoshiro256 on 64-bit targets and Xoshiro128 on 32-bit ones, so the same seed already produced different results on different machines, and any `rand` release was free to change the algorithm again. It is now `rand_pcg::Pcg64`, a fixed, portable algorithm, and two golden-value tests pin both the raw draw sequence and the full report for a known seed so any future drift fails the build instead of silently moving reported numbers.
 - **Re-baseline stored Monte Carlo reports.** Changing the generator changes the draws, so a seeded run produces different sample statistics than it did on the previous release (the distributions are equivalent; the individual numbers move). This is a one-time shift — the point of the change is that it will not happen again unnoticed.
 
