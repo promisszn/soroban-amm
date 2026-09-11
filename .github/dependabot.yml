@@ -3,7 +3,13 @@ updates:
   - package-ecosystem: cargo
     directory: "/"
     schedule: { interval: weekly }
-    groups: { patch-updates: { update-types: [patch] } }
+    groups:
+      patch-updates: { update-types: [patch] }
+      # rand and rand_pcg each implement the rand_core traits of their own
+      # release line, so bumping one without the other does not compile
+      # (#975, #977). Keep them in one PR.
+      rand:
+        patterns: ["rand", "rand_pcg"]
     ignore:
       # Major bumps have broken the build (events API redesign, deprecated
       # Env methods) - needs a deliberate migration, not an automatic PR.
@@ -21,6 +27,11 @@ updates:
       # v17 introduces ScValType changes that break src/governance.ts.
       - dependency-name: "@stellar/stellar-sdk"
         update-types: ["version-update:semver-major"]
+      # A major @types/node bump should move with node-version in ci.yml,
+      # not arrive on its own - types for a newer Node type-check APIs the
+      # CI runtime does not have (#976).
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: npm
     directory: "/packages/ui-components"
     schedule: { interval: weekly }
@@ -28,9 +39,16 @@ updates:
       patch-updates: { update-types: [patch] }
       react:
         patterns: ["react", "react-dom", "@types/react", "@types/react-dom"]
+      # @vitest/coverage-v8 pins an exact vitest peer, so neither installs
+      # without the other (#974, #978). Keep them in one PR.
+      vitest:
+        patterns: ["vitest", "@vitest/*"]
     ignore:
       # TypeScript 7's stricter cast checking breaks GovernanceForum.tsx.
       - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
+      # Same @types/node rule as packages/sdk.
+      - dependency-name: "@types/node"
         update-types: ["version-update:semver-major"]
   - package-ecosystem: npm
     directory: "/packages/ts-advanced-client"
@@ -47,10 +65,22 @@ updates:
       patch-updates: { update-types: [patch] }
       graphql:
         patterns: ["graphql", "@apollo/server"]
+    ignore:
+      # @apollo/server 5.x peers graphql ^16.11.0, so graphql 17 cannot
+      # install (#965). Remove once an @apollo/server release accepts 17.
+      - dependency-name: "graphql"
+        update-types: ["version-update:semver-major"]
+      # Same @types/node rule as packages/sdk.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: npm
     directory: "/services/webhook-streamer"
     schedule: { interval: weekly }
     groups: { patch-updates: { update-types: [patch] } }
+    ignore:
+      # Same @types/node rule as packages/sdk.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: npm
     directory: "/services/health-dashboard"
     schedule: { interval: weekly }
@@ -59,6 +89,10 @@ updates:
     directory: "/examples/client"
     schedule: { interval: weekly }
     groups: { patch-updates: { update-types: [patch] } }
+    ignore:
+      # Same @types/node rule as packages/sdk.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: gomod
     directory: "/packages/go-sdk"
     schedule: { interval: weekly }
