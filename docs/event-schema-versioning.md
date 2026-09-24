@@ -168,10 +168,23 @@ contract.
 | `ms_proposed` | `signer` | `(recipient: Address, approvals: u32)` |
 | `ms_ew` | `signer` | `(to: Address, reserve_a: i128, reserve_b: i128)` |
 | `force_unlock` | — | `(timestamp: u64)` |
+| `fee_upd` | `admin` | `(new_fee_bps: i128)` |
+| `protocol_fee_set` | — | `(protocol_fee_bps: i128, recipient: Address)` |
+| `cb_recovered` | — | `(timestamp: u64)` |
+| `upgraded` | — | `(new_wasm_hash: BytesN<32>)` |
 
 The two swap payload variants and all configuration payloads above are emitted
 by the current source. Consumers should use the event topic and the global
 schema version together when selecting a decoder.
+
+The migration is complete for the constant-product AMM (#921): every emit site
+in `contracts/amm/src/lib.rs` now uses `emit_versioned_event!`. The last four
+raw `env.events().publish(...)` sites — `fee_upd`, `protocol_fee_set`,
+`cb_recovered`, and `upgraded` — were converted, so no unversioned event
+remains outside test modules. A regression guard
+(`test_every_emitted_event_carries_version_stamp`) walks the full event log for
+a representative call sequence and asserts every pool event carries the leading
+`EVENT_SCHEMA_VERSION` stamp, rather than checking one topic at a time.
 
 ### Concentrated-liquidity AMM — `contracts/concentrated_liquidity/src/lib.rs`
 

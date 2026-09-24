@@ -414,56 +414,65 @@ Defined in [contracts/reserve_manager/src/lib.rs](../contracts/reserve_manager/s
 
 ## Router (`contracts/router`)
 
-Uses runtime `panic!` and `assert!` preconditions (defined in [contracts/router/src/lib.rs](../contracts/router/src/lib.rs)).
+Defined in [contracts/router/src/lib.rs](../contracts/router/src/lib.rs) as `RouterError`.
 
-| Panic / Assert Message | Cause | Remedy |
-|-----------------------|-------|--------|
-| `already initialized` | `initialize` called twice (`DataKey::Factory` exists). | Initialize router contract once. |
-| `path must have at least 2 tokens` | `path.len() < 2` in swap/quote functions. | Pass path array containing ≥ 2 token addresses. |
-| `amount_in must be positive` | `amount_in <= 0` in `swap_exact_in`, `get_amount_out_path` or `get_amounts_out_path`. | Pass strictly positive input amount. |
-| `amount_out must be positive` | `amount_out <= 0` in `swap_exact_out`, `get_amount_in_path` or `get_amounts_in_path`. | Pass strictly positive output amount. |
-| `DuplicateAdjacentToken at hop {i}` | `path[i] == path[i + 1]`, which resolves to a pool that cannot exist. | Remove the repeated token from the path. |
-| `DeadlineExpired` | `env.ledger().timestamp() > deadline`. | Re-submit swap with future deadline. |
-| `no pool for hop {i}` | Factory returned no pool for token pair at hop `i`. | Ensure liquidity pool exists for every adjacent pair in path; call `is_path_routable` to check before quoting. |
-| `Slippage exceeded` | Output `< min_amount_out` or input `> max_in`. | Widen slippage bounds or recalculate path quote. |
+| Code | Symbol | Cause | Remedy |
+|------|--------|-------|--------|
+| 1 | `AlreadyInitialized` | `initialize` was called twice (`DataKey::Factory` already exists). | Initialize the router contract once. |
+| 2 | `NotInitialized` | A function was called before `initialize` (the factory address is unset). | Call `initialize` first. |
+| 3 | `InvalidPath` | `path.len() < 2` in a swap or quote function. | Pass a path containing at least two token addresses. |
+| 4 | `DuplicateAdjacentToken` | `path[i] == path[i + 1]`, which resolves to a pool that cannot exist. | Remove the repeated token from the path. |
+| 5 | `InvalidAmount` | An input or output amount was zero or negative. | Pass a strictly positive amount. |
+| 6 | `DeadlineExceeded` | `env.ledger().timestamp() > deadline`. | Re-submit the swap with a future deadline. |
+| 7 | `PoolNotFound` | The factory returned no pool for the token pair at some hop. | Ensure a pool exists for every adjacent pair; call `is_path_routable` to check before quoting. |
+| 8 | `SlippageExceeded` | Realized output `< min_amount_out`, or required input `> max_in`. | Widen the slippage bounds or recalculate the path quote. |
 
 ---
 
 ## Staking (`contracts/staking`)
 
-Uses runtime `panic!` and `assert!` preconditions (defined in [contracts/staking/src/lib.rs](../contracts/staking/src/lib.rs)).
+Defined in [contracts/staking/src/lib.rs](../contracts/staking/src/lib.rs) as `StakingError`.
 
-| Panic / Assert Message | Cause | Remedy |
-|-----------------------|-------|--------|
-| `already initialized` | Contract initialized twice. | Initialize contract once. |
-| `contract is paused` | Action attempted while contract paused. | Wait for admin to unpause contract. |
-| `not admin` | Restricted function called by non-admin. | Call from stored admin address. |
-| `nothing staked` | Action attempted by user with 0 staked balance. | Stake tokens before withdrawing/claiming. |
-| `amount must be positive` | Amount supplied is zero or negative. | Provide strictly positive token amount. |
-| `insufficient staked amount` | Withdrawal requested exceeds user staked balance. | Withdraw ≤ staked balance. |
-| `tokens are still locked` | Unstake called before lock duration expires (`now < lock_expiry`). | Wait for lock duration to elapse. |
-| `no active lock to extend` | `extend_lock` called with no active lock. | Stake with lock duration first. |
-| `duration must be positive` | Lock duration set to 0. | Specify positive lock duration seconds. |
-| `no pending rewards` | Claim attempted with 0 pending rewards. | Allow rewards to accrue over time. |
-| `batch too large: settle_boost_batch is capped at MAX_BATCH_SIZE entries per call` | `settle_boost_batch` called with more than `MAX_BATCH_SIZE` (50) addresses. | Split the batch into chunks of ≤ 50 addresses per call. |
-| `batch too large: register_existing_stakers is capped at MAX_BATCH_SIZE entries per call` | `register_existing_stakers` migration call given more than `MAX_BATCH_SIZE` (50) addresses. | Split the backfill list into chunks of ≤ 50 addresses per call. |
+| Code | Symbol | Cause | Remedy |
+|------|--------|-------|--------|
+| 1 | `AlreadyInitialized` | `initialize` (or `initialize_with_boost_config`) was called on a pool that is already set up. | Initialize the contract once. |
+| 2 | `NotInitialized` | A function was called before `initialize` (the LP token / admin is unset). | Call `initialize` first. |
+| 3 | `Unauthorized` | A restricted function was called by an address other than the stored admin. | Call from the stored admin address. |
+| 4 | `Paused` | `stake`, `stake_locked`, `claim`, or `extend_lock` was attempted while paused. | Wait for the admin to `unpause`. |
+| 5 | `InvalidAmount` | An amount argument was zero or negative where a positive value is required. | Provide a strictly positive amount. |
+| 6 | `NothingStaked` | An action was attempted by an address with a zero staked balance. | Stake tokens before withdrawing, unlocking, or emergency-withdrawing. |
+| 7 | `InsufficientStaked` | An unstake requested more than the staker's staked balance. | Unstake an amount no greater than the staked balance. |
+| 8 | `StillLocked` | `unstake` was called before the lock expired (`now < lock_expiry`). | Wait for the lock duration to elapse. |
+| 9 | `NoPendingRewards` | `claim` was attempted with zero pending rewards. | Allow rewards to accrue before claiming. |
+| 10 | `EmergencyModeNotActive` | `emergency_withdraw` was called while emergency mode is off. | Wait for the admin to enable emergency mode. |
+| 11 | `NoActiveLock` | `extend_lock` was called on a position with no active lock. | Stake with a lock duration first. |
+| 12 | `InvalidDuration` | A lock duration argument was zero where a positive value is required. | Specify a positive lock duration in seconds. |
+| 13 | `NothingToStake` | A stake call supplied neither a positive amount nor a lock duration. | Pass a positive amount, a lock duration, or both. |
+| 14 | `InvalidBoostConfig` | The boost bounds were non-positive, or the max was below the min. | Pass `0 < min_boost <= max_boost`. |
+| 15 | `InvalidLockDuration` | The lock-duration bounds were non-positive, or the max was below the min. | Pass `0 < min_lock_duration <= max_lock_duration`. |
+| 16 | `MaxRewardPoolExceeded` | `add_rewards` would push the pool balance above the configured cap. | Lower the amount added, or raise the cap with `set_max_reward_pool_balance`. |
+| 17 | `InvalidMaxBalance` | A new max-balance cap was set below the current pool balance. | Use a cap of `0` (no cap) or one at least the current balance. |
+| 18 | `NoStakers` | `update_rewards` was called while the pool has no effective stake. | Wait until at least one address has staked. |
+| 19 | `BatchTooLarge` | `settle_boost_batch` or `register_existing_stakers` was given more than `MAX_BATCH_SIZE` (50) addresses. | Split the list into chunks of at most 50 addresses per call. |
 
 ---
 
 ## Token (`contracts/token`)
 
-Uses runtime `panic!` and `assert!` preconditions (defined in [contracts/token/src/lib.rs](../contracts/token/src/lib.rs)).
+Defined in [contracts/token/src/lib.rs](../contracts/token/src/lib.rs) as `TokenError`.
 
-| Panic / Assert Message | Cause | Remedy |
-|-----------------------|-------|--------|
-| `already initialized` | Token contract initialized twice. | Initialize once upon deployment. |
-| `amount must be positive` | Amount specified is zero or negative (`amount <= 0`). | Pass strictly positive amount. |
-| `amount must be non-negative` | Allowance amount negative (`amount < 0`). | Pass non-negative allowance. |
-| `insufficient balance` | Transfer or burn amount exceeds account balance. | Transfer/burn ≤ available balance. |
-| `insufficient allowance` | `transfer_from` or `burn_from` exceeds approved allowance. | Approve sufficient allowance prior to transfer. |
-| `current_admin is not admin` | Admin transfer called by unauthorized address. | Call from current admin account. |
-| `not pending admin` | `claim_admin` called by non-nominee. | Call from nominated pending admin address. |
-| `migrate amount exceeds total locked` | Migration amount exceeds total locked token balance. | Migrate amount ≤ total locked tokens. |
+| Code | Symbol | Cause | Remedy |
+|------|--------|-------|--------|
+| 1 | `AlreadyInitialized` | The token contract was initialized twice. | Initialize once upon deployment. |
+| 2 | `NotInitialized` | A function was called before `initialize` (the admin is unset). | Initialize the token first. |
+| 3 | `InvalidAmount` | An amount was zero or negative where a positive value is required, or negative where a non-negative value is required. | Pass a valid amount. |
+| 4 | `InsufficientBalance` | A transfer, burn, or lock exceeded the account's unlocked balance. | Operate on no more than the available unlocked balance. |
+| 5 | `InsufficientAllowance` | `transfer_from` exceeded the spender's approved allowance. | Approve a sufficient allowance before transferring. |
+| 6 | `InvalidExpiry` | `approve` was given a `live_until_ledger` before the current ledger for a non-zero amount. | Pass a `live_until_ledger` at or after the current ledger. |
+| 7 | `Unauthorized` | `propose_admin` was called by a non-admin, or `accept_admin` by a non-nominee. | Call from the correct admin or nominated pending-admin address. |
+| 8 | `InsufficientLocked` | An unlock exceeded the locker's entry for the holder, or the holder's total locked balance. | Unlock no more than the locker locked for the holder. |
+| 9 | `MigrationOverflow` | A legacy-lock migration would allocate more than the holder's recorded total locked balance. | Migrate an amount within the total locked balance. |
+| 10 | `BalanceUnavailable` | `balance_at` was queried for a ledger whose covering checkpoint has been evicted. | Query a ledger within the retained checkpoint window. |
 
 ---
 

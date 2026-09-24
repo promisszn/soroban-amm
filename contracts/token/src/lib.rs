@@ -3,8 +3,49 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec,
 };
+
+// ── Typed errors ─────────────────────────────────────────────────────────────
+
+/// Errors surfaced by the LP token.
+///
+/// Every caller-triggerable failure path returns one of these discriminants
+/// instead of trapping, so SEP-41 clients can distinguish, for example, an
+/// insufficient balance from an unauthorized caller. Discriminants 1 and 2
+/// follow the workspace-wide convention (`AlreadyInitialized` /
+/// `NotInitialized`); see `contracts/amm/src/lib.rs` `AmmError` for the
+/// reference enum.
+#[contracterror]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum TokenError {
+    /// `initialize` was called on a token that is already set up.
+    AlreadyInitialized = 1,
+    /// A function was called before `initialize`.
+    NotInitialized = 2,
+    /// An amount argument was zero or negative where a positive value is
+    /// required (or negative where a non-negative value is required).
+    InvalidAmount = 3,
+    /// The account's unlocked balance is smaller than the requested amount.
+    InsufficientBalance = 4,
+    /// The spender's allowance is smaller than the requested amount.
+    InsufficientAllowance = 5,
+    /// `approve` was given a `live_until_ledger` earlier than the current
+    /// ledger for a non-zero amount.
+    InvalidExpiry = 6,
+    /// The caller is not the address the operation requires (admin, pending
+    /// admin, or the recorded locker).
+    Unauthorized = 7,
+    /// An unlock exceeded the amount the given locker had locked for the
+    /// holder, or exceeded the holder's total locked balance.
+    InsufficientLocked = 8,
+    /// A legacy-lock migration would allocate more than the holder's recorded
+    /// total locked balance.
+    MigrationOverflow = 9,
+    /// `balance_at` was queried for a ledger whose covering checkpoint has been
+    /// evicted; the historical balance is no longer recoverable.
+    BalanceUnavailable = 10,
+}
 
 // Export compiled WASM for tests/dev usage when the `testutils` feature is enabled.
 #[cfg(feature = "testutils")]
@@ -67,12 +108,15 @@ impl LpToken {
     ///
     /// `admin` is the only address authorized to call `mint` and `burn`.
     /// Panics if the contract has already been initialized.
-    pub fn initialize(env: Env, admin: Address, name: String, symbol: String, decimals: u32) {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        name: String,
+        symbol: String,
+        decimals: u32,
+    ) -> Result<(), TokenError> {
         if env.storage().instance().has(&DataKey::Admin) {
-            panic!(
-                "already initialized: contract {:?}",
-                env.current_contract_address()
-            );
+            return Err(TokenError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Locker, &admin);
@@ -80,6 +124,7 @@ impl LpToken {
         env.storage().instance().set(&DataKey::Symbol, &symbol);
         env.storage().instance().set(&DataKey::Decimals, &decimals);
         env.storage().instance().set(&DataKey::TotalSupply, &0_i128);
+        Ok(())
     }
 
     // ── Read ──────────────────────────────────────────────────────────────────
@@ -122,7 +167,7 @@ impl LpToken {
     /// true balance at that ledger is no longer recoverable, so erroring is
     /// preferred over silently returning an incorrect (possibly zero) value
     /// that would corrupt governance snapshots.
-    pub fn balance_at(env: Env, id: Address, ledger: u32) -> i128 {
+    pub fn balance_at(env: Env, id: Address, ledger: u32) -> Result<i128, TokenError> {
         let key = DataKey::Checkpoints(id.clone());
         let checkpoints: Vec<Checkpoint> = env
             .storage()
@@ -131,7 +176,7 @@ impl LpToken {
             .unwrap_or_else(|| Vec::new(&env));
         let len = checkpoints.len();
         if len == 0 {
-            return 0;
+            return Ok(0);
         }
         env.storage()
             .persistent()
@@ -174,14 +219,11 @@ impl LpToken {
             // covered `ledger` may have been evicted — we cannot honestly
             // answer, so error instead of returning a bogus 0.
             if truncated {
-                panic!(
-                    "balance_at: ledger {ledger} predates retained checkpoint history \
-                     (evicted at MAX_CHECKPOINTS); balance unavailable"
-                );
+                return Err(TokenError::BalanceUnavailable);
             }
-            0
+            Ok(0)
         } else {
-            checkpoints.get(low - 1).unwrap().balance
+            Ok(checkpoints.get(low - 1).unwrap().balance)
         }
     }
 
@@ -213,10 +255,12 @@ impl LpToken {
     ///
     /// Requires authorization from `from`.
     /// Panics if `from` has insufficient balance.
-    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
-        assert!(amount > 0, "amount must be positive");
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) -> Result<(), TokenError> {
+        if amount <= 0 {
+            return Err(TokenError::InvalidAmount);
+        }
         from.require_auth();
-        Self::_transfer(&env, &from, &to, amount);
+        Self::_transfer(&env, &from, &to, amount)
     }
 
     /// Transfer `amount` tokens from `from` to `to` using a pre-approved allowance.
@@ -224,15 +268,21 @@ impl LpToken {
     /// Requires authorization from `spender`.
     /// Panics if the current allowance of `spender` over `from` is less than `amount`.
     /// Panics if `from` has insufficient balance.
-    pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
-        assert!(amount > 0, "amount must be positive");
+    pub fn transfer_from(
+        env: Env,
+        spender: Address,
+        from: Address,
+        to: Address,
+        amount: i128,
+    ) -> Result<(), TokenError> {
+        if amount <= 0 {
+            return Err(TokenError::InvalidAmount);
+        }
         spender.require_auth();
         let allowance = Self::allowance(env.clone(), from.clone(), spender.clone());
-        assert!(
-            allowance.amount >= amount,
-            "insufficient allowance: available={}, requested={amount}",
-            allowance.amount
-        );
+        if allowance.amount < amount {
+            return Err(TokenError::InsufficientAllowance);
+        }
         env.storage().persistent().set(
             &DataKey::Allowance(from.clone(), spender),
             &AllowanceValue {
@@ -240,7 +290,7 @@ impl LpToken {
                 live_until_ledger: allowance.live_until_ledger,
             },
         );
-        Self::_transfer(&env, &from, &to, amount);
+        Self::_transfer(&env, &from, &to, amount)
     }
 
     /// Approve `spender` to transfer up to `amount` tokens on behalf of `from`.
@@ -254,14 +304,13 @@ impl LpToken {
         spender: Address,
         amount: i128,
         live_until_ledger: u32,
-    ) {
+    ) -> Result<(), TokenError> {
         from.require_auth();
-        assert!(amount >= 0, "amount must be non-negative");
-        if amount > 0 {
-            assert!(
-                live_until_ledger >= env.ledger().sequence(),
-                "live_until_ledger must be >= current ledger"
-            );
+        if amount < 0 {
+            return Err(TokenError::InvalidAmount);
+        }
+        if amount > 0 && live_until_ledger < env.ledger().sequence() {
+            return Err(TokenError::InvalidExpiry);
         }
         env.storage().persistent().set(
             &DataKey::Allowance(from, spender),
@@ -270,12 +319,19 @@ impl LpToken {
                 live_until_ledger,
             },
         );
+        Ok(())
     }
 
     /// Mint new tokens — admin only (called by the AMM contract).
-    pub fn mint(env: Env, to: Address, amount: i128) {
-        assert!(amount > 0, "amount must be positive");
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    pub fn mint(env: Env, to: Address, amount: i128) -> Result<(), TokenError> {
+        if amount <= 0 {
+            return Err(TokenError::InvalidAmount);
+        }
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(TokenError::NotInitialized)?;
         admin.require_auth();
         let supply: i128 = Self::total_supply(env.clone());
         env.storage()
@@ -286,20 +342,25 @@ impl LpToken {
             .persistent()
             .set(&DataKey::Balance(to.clone()), &(bal + amount));
         Self::write_checkpoint(&env, &to);
+        Ok(())
     }
 
     /// Burn tokens — admin only (called by the AMM contract).
-    pub fn burn(env: Env, from: Address, amount: i128) {
-        assert!(amount > 0, "amount must be positive");
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    pub fn burn(env: Env, from: Address, amount: i128) -> Result<(), TokenError> {
+        if amount <= 0 {
+            return Err(TokenError::InvalidAmount);
+        }
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(TokenError::NotInitialized)?;
         admin.require_auth();
         let bal = Self::balance(env.clone(), from.clone());
         let locked = Self::locked_balance(env.clone(), from.clone());
-        assert!(
-            bal - locked >= amount,
-            "insufficient unlocked balance: available={}, requested={amount}",
-            bal - locked
-        );
+        if bal - locked < amount {
+            return Err(TokenError::InsufficientBalance);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from.clone()), &(bal - amount));
@@ -308,6 +369,7 @@ impl LpToken {
             .instance()
             .set(&DataKey::TotalSupply, &(supply - amount));
         Self::write_checkpoint(&env, &from);
+        Ok(())
     }
 
     // ── Internal ──────────────────────────────────────────────────────────────
@@ -323,9 +385,19 @@ impl LpToken {
     }
 
     /// Nominate a new admin. The nominee must call `accept_admin` to complete rotation.
-    pub fn propose_admin(env: Env, current_admin: Address, new_admin: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        assert!(admin == current_admin, "current_admin is not admin");
+    pub fn propose_admin(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), TokenError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(TokenError::NotInitialized)?;
+        if admin != current_admin {
+            return Err(TokenError::Unauthorized);
+        }
         current_admin.require_auth();
         env.storage()
             .instance()
@@ -334,43 +406,57 @@ impl LpToken {
             (Symbol::new(&env, "admin_nominated"),),
             (current_admin, new_admin),
         );
+        Ok(())
     }
 
     /// Accept a pending admin nomination.
-    pub fn accept_admin(env: Env, new_admin: Address) {
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), TokenError> {
         new_admin.require_auth();
         let pending: Option<Address> = env
             .storage()
             .instance()
             .get(&DataKey::PendingAdmin)
             .unwrap_or(None);
-        assert!(pending == Some(new_admin.clone()), "not pending admin");
+        if pending != Some(new_admin.clone()) {
+            return Err(TokenError::Unauthorized);
+        }
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &Option::<Address>::None);
         env.events()
             .publish((Symbol::new(&env, "admin_transferred"),), (new_admin,));
+        Ok(())
     }
 
     /// Replace the contract WASM with a new version. Admin-only.
     ///
     /// The new WASM must already be uploaded to the network.
     /// State is preserved; only bytecode is replaced.
-    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), TokenError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(TokenError::NotInitialized)?;
         admin.require_auth();
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
         env.events()
             .publish((Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
+        Ok(())
     }
 
     /// Admin-only locker update.
-    pub fn set_locker(env: Env, locker: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    pub fn set_locker(env: Env, locker: Address) -> Result<(), TokenError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(TokenError::NotInitialized)?;
         admin.require_auth();
         env.storage().instance().set(&DataKey::Locker, &locker);
+        Ok(())
     }
 
     /// Returns currently locked balance for `id`.
@@ -386,16 +472,21 @@ impl LpToken {
     /// Each lock is recorded against the *currently configured* locker so that an
     /// unlock can be authorised by the same locker later, even if `set_locker` has
     /// rotated the active locker in the meantime.
-    pub fn lock(env: Env, holder: Address, amount: i128) {
-        assert!(amount > 0, "amount must be positive");
-        let locker: Address = env.storage().instance().get(&DataKey::Locker).unwrap();
+    pub fn lock(env: Env, holder: Address, amount: i128) -> Result<(), TokenError> {
+        if amount <= 0 {
+            return Err(TokenError::InvalidAmount);
+        }
+        let locker: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Locker)
+            .ok_or(TokenError::NotInitialized)?;
         locker.require_auth();
         let bal = Self::balance(env.clone(), holder.clone());
         let locked = Self::locked_balance(env.clone(), holder.clone());
-        assert!(
-            bal - locked >= amount,
-            "insufficient unlocked balance to lock"
-        );
+        if bal - locked < amount {
+            return Err(TokenError::InsufficientBalance);
+        }
 
         let entry_key = DataKey::LockEntry(holder.clone(), locker.clone());
         let entry: i128 = env.storage().persistent().get(&entry_key).unwrap_or(0);
@@ -409,6 +500,7 @@ impl LpToken {
         env.storage()
             .persistent()
             .set(&DataKey::Locked(holder), &(locked + amount));
+        Ok(())
     }
 
     /// Unlock previously locked balance.
@@ -418,18 +510,26 @@ impl LpToken {
     /// the fix for issue #556: rotating the active locker via `set_locker` no longer
     /// orphans previous locks, because each locker retains authority over the
     /// contribution it made.
-    pub fn unlock(env: Env, holder: Address, locker: Address, amount: i128) {
-        assert!(amount > 0, "amount must be positive");
+    pub fn unlock(
+        env: Env,
+        holder: Address,
+        locker: Address,
+        amount: i128,
+    ) -> Result<(), TokenError> {
+        if amount <= 0 {
+            return Err(TokenError::InvalidAmount);
+        }
         locker.require_auth();
 
         let entry_key = DataKey::LockEntry(holder.clone(), locker.clone());
         let entry: i128 = env.storage().persistent().get(&entry_key).unwrap_or(0);
-        assert!(
-            entry >= amount,
-            "unlock exceeds locker's entry for this holder"
-        );
+        if entry < amount {
+            return Err(TokenError::InsufficientLocked);
+        }
         let locked = Self::locked_balance(env.clone(), holder.clone());
-        assert!(locked >= amount, "unlock exceeds total locked balance");
+        if locked < amount {
+            return Err(TokenError::InsufficientLocked);
+        }
 
         env.storage()
             .persistent()
@@ -441,6 +541,7 @@ impl LpToken {
         if entry - amount == 0 {
             Self::remove_lock_holder(&env, &holder, &locker);
         }
+        Ok(())
     }
 
     /// Admin-only: migrate a holder's legacy `Locked(holder)` balance into a per-locker
@@ -453,30 +554,39 @@ impl LpToken {
     /// (post-migration) is asserted to remain within `Locked(holder)`, so admin can
     /// safely split the legacy balance across the historical lockers that originally
     /// contributed without ever over-allocating.
-    pub fn migrate_legacy_lock(env: Env, holder: Address, locker: Address, amount: i128) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    pub fn migrate_legacy_lock(
+        env: Env,
+        holder: Address,
+        locker: Address,
+        amount: i128,
+    ) -> Result<(), TokenError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(TokenError::NotInitialized)?;
         admin.require_auth();
-        assert!(amount > 0, "amount must be positive");
+        if amount <= 0 {
+            return Err(TokenError::InvalidAmount);
+        }
 
         let total_locked: i128 = env
             .storage()
             .persistent()
             .get(&DataKey::Locked(holder.clone()))
             .unwrap_or(0);
-        assert!(
-            amount <= total_locked,
-            "migrate amount exceeds total locked"
-        );
+        if amount > total_locked {
+            return Err(TokenError::MigrationOverflow);
+        }
 
         let entry_key = DataKey::LockEntry(holder.clone(), locker.clone());
         let existing: i128 = env.storage().persistent().get(&entry_key).unwrap_or(0);
         let other_lockers_sum: i128 =
             Self::sum_lock_entry_values(&env, &holder).saturating_sub(existing);
         let grand_total = other_lockers_sum + existing + amount;
-        assert!(
-            grand_total <= total_locked,
-            "migration would exceed total locked across all lockers"
-        );
+        if grand_total > total_locked {
+            return Err(TokenError::MigrationOverflow);
+        }
 
         env.storage()
             .persistent()
@@ -484,6 +594,7 @@ impl LpToken {
         if existing == 0 {
             Self::add_lock_holder(&env, &holder, &locker);
         }
+        Ok(())
     }
 
     fn sum_lock_entry_values(env: &Env, holder: &Address) -> i128 {
@@ -540,15 +651,15 @@ impl LpToken {
         env.storage().persistent().set(&key, &new_holders);
     }
 
-    fn _transfer(env: &Env, from: &Address, to: &Address, amount: i128) {
-        assert!(amount > 0, "amount must be positive");
+    fn _transfer(env: &Env, from: &Address, to: &Address, amount: i128) -> Result<(), TokenError> {
+        if amount <= 0 {
+            return Err(TokenError::InvalidAmount);
+        }
         let from_bal = Self::balance(env.clone(), from.clone());
         let locked = Self::locked_balance(env.clone(), from.clone());
-        assert!(
-            from_bal - locked >= amount,
-            "insufficient unlocked balance: available={}, requested={amount}",
-            from_bal - locked
-        );
+        if from_bal - locked < amount {
+            return Err(TokenError::InsufficientBalance);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::Balance(from.clone()), &(from_bal - amount));
@@ -562,6 +673,7 @@ impl LpToken {
             (Symbol::new(env, "transfer"), from.clone()),
             (to.clone(), amount),
         );
+        Ok(())
     }
 
     fn write_checkpoint(env: &Env, account: &Address) {
@@ -679,7 +791,20 @@ mod tests {
             &String::from_str(&ts.env, "X"),
             &7u32,
         );
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(TokenError::AlreadyInitialized)));
+    }
+
+    #[test]
+    fn test_calls_before_initialize_report_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_addr = env.register_contract(None, LpToken);
+        let client = LpTokenClient::new(&env, &contract_addr);
+        let user = Address::generate(&env);
+        assert_eq!(
+            client.try_mint(&user, &100_i128),
+            Err(Ok(TokenError::NotInitialized))
+        );
     }
 
     #[test]
@@ -704,7 +829,7 @@ mod tests {
         let user = Address::generate(&ts.env);
         client.mint(&user, &100_i128);
         let result = client.try_burn(&user, &200_i128);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(TokenError::InsufficientBalance)));
     }
 
     #[test]
@@ -730,7 +855,7 @@ mod tests {
         let bob = Address::generate(&ts.env);
         client.mint(&alice, &100_i128);
         let result = client.try_transfer(&alice, &bob, &200_i128);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(TokenError::InsufficientBalance)));
     }
 
     #[test]
@@ -780,7 +905,10 @@ mod tests {
         // Advance past genesis so `past` is genuinely an earlier ledger than the current one.
         ts.env.ledger().with_mut(|l| l.sequence_number = 100);
         let past = ts.env.ledger().sequence() - 1;
-        assert!(client.try_approve(&alice, &bob, &100_i128, &past).is_err());
+        assert_eq!(
+            client.try_approve(&alice, &bob, &100_i128, &past),
+            Err(Ok(TokenError::InvalidExpiry))
+        );
     }
 
     #[test]
@@ -790,9 +918,10 @@ mod tests {
         let alice = Address::generate(&ts.env);
         let bob = Address::generate(&ts.env);
         let live_until = ts.env.ledger().sequence() + 100;
-        assert!(client
-            .try_approve(&alice, &bob, &-100_i128, &live_until)
-            .is_err());
+        assert_eq!(
+            client.try_approve(&alice, &bob, &-100_i128, &live_until),
+            Err(Ok(TokenError::InvalidAmount))
+        );
     }
 
     #[test]
@@ -807,7 +936,7 @@ mod tests {
         let live_until = ts.env.ledger().sequence() + 100;
         client.approve(&alice, &bob, &50_i128, &live_until);
         let result = client.try_transfer_from(&bob, &alice, &carol, &100_i128);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(TokenError::InsufficientAllowance)));
     }
 
     #[test]
@@ -877,7 +1006,10 @@ mod tests {
         // The checkpoint recording alice's balance at ledger 100 has been
         // evicted. Querying it must error instead of silently returning 0,
         // which would zero out her governance snapshot voting power.
-        assert!(client.try_balance_at(&alice, &100_u32).is_err());
+        assert_eq!(
+            client.try_balance_at(&alice, &100_u32),
+            Err(Ok(TokenError::BalanceUnavailable))
+        );
     }
 
     #[test]
@@ -919,7 +1051,10 @@ mod tests {
 
         client.propose_admin(&ts.admin, &nominee);
         assert_eq!(client.admin(), ts.admin);
-        assert!(client.try_accept_admin(&stranger).is_err());
+        assert_eq!(
+            client.try_accept_admin(&stranger),
+            Err(Ok(TokenError::Unauthorized))
+        );
 
         client.accept_admin(&nominee);
         assert_eq!(client.admin(), nominee);
@@ -938,7 +1073,10 @@ mod tests {
         client.lock(&alice, &700_i128);
         assert_eq!(client.locked_balance(&alice), 700);
 
-        assert!(client.try_transfer(&alice, &bob, &400_i128).is_err());
+        assert_eq!(
+            client.try_transfer(&alice, &bob, &400_i128),
+            Err(Ok(TokenError::InsufficientBalance))
+        );
         client.transfer(&alice, &bob, &300_i128);
 
         client.unlock(&alice, &locker, &700_i128);
@@ -986,8 +1124,11 @@ mod tests {
 
         client.set_locker(&new_locker);
 
-        // `try_*` variants expose the underlying error/panic to the caller.
-        assert!(client.try_unlock(&alice, &new_locker, &100_i128).is_err());
+        // `try_*` variants expose the underlying error to the caller.
+        assert_eq!(
+            client.try_unlock(&alice, &new_locker, &100_i128),
+            Err(Ok(TokenError::InsufficientLocked))
+        );
         // The full balance must remain locked.
         assert_eq!(client.locked_balance(&alice), 600);
 
@@ -1014,12 +1155,21 @@ mod tests {
         assert_eq!(client.locked_balance(&alice), 700);
 
         // locker_b must not be able to consume locker_a's contribution.
-        assert!(client.try_unlock(&alice, &locker_b, &400_i128).is_err());
-        assert!(client.try_unlock(&alice, &locker_b, &301_i128).is_err());
+        assert_eq!(
+            client.try_unlock(&alice, &locker_b, &400_i128),
+            Err(Ok(TokenError::InsufficientLocked))
+        );
+        assert_eq!(
+            client.try_unlock(&alice, &locker_b, &301_i128),
+            Err(Ok(TokenError::InsufficientLocked))
+        );
         assert_eq!(client.locked_balance(&alice), 700);
 
         // locker_a can only unlock up to its own 400 entry.
-        assert!(client.try_unlock(&alice, &locker_a, &401_i128).is_err());
+        assert_eq!(
+            client.try_unlock(&alice, &locker_a, &401_i128),
+            Err(Ok(TokenError::InsufficientLocked))
+        );
         client.unlock(&alice, &locker_a, &400_i128);
         assert_eq!(client.locked_balance(&alice), 300);
 
@@ -1041,7 +1191,10 @@ mod tests {
         client.lock(&alice, &500_i128);
 
         // An address that never locked anything cannot unlock.
-        assert!(client.try_unlock(&alice, &impostor, &1_i128).is_err());
+        assert_eq!(
+            client.try_unlock(&alice, &impostor, &1_i128),
+            Err(Ok(TokenError::InsufficientLocked))
+        );
         assert_eq!(client.locked_balance(&alice), 500);
 
         client.unlock(&alice, &locker, &500_i128);
@@ -1119,7 +1272,10 @@ mod tests {
         client.unlock(&alice, &locker, &400_i128);
         assert_eq!(client.locked_balance(&alice), 0);
         // Attempting to unlock with that locker again must now fail (entry == 0).
-        assert!(client.try_unlock(&alice, &locker, &1_i128).is_err());
+        assert_eq!(
+            client.try_unlock(&alice, &locker, &1_i128),
+            Err(Ok(TokenError::InsufficientLocked))
+        );
     }
 
     #[test]
@@ -1136,7 +1292,10 @@ mod tests {
 
         // Burning more than the unlocked (300) portion must fail, even though
         // the gross balance (1000) would otherwise cover it.
-        assert!(client.try_burn(&alice, &400_i128).is_err());
+        assert_eq!(
+            client.try_burn(&alice, &400_i128),
+            Err(Ok(TokenError::InsufficientBalance))
+        );
         assert_eq!(client.balance(&alice), 1_000);
 
         // Burning up to the unlocked amount still works.
@@ -1210,15 +1369,17 @@ mod tests {
 
         // 100 fits; 101 must be rejected.
         client.migrate_legacy_lock(&alice, &locker, &100_i128);
-        assert!(client
-            .try_migrate_legacy_lock(&alice, &locker, &1_i128)
-            .is_err());
+        assert_eq!(
+            client.try_migrate_legacy_lock(&alice, &locker, &1_i128),
+            Err(Ok(TokenError::MigrationOverflow))
+        );
         // 100 + any additional amount (here against a different locker) must
         // be rejected when the sum exceeds the legacy total.
         let locker_b = Address::generate(&ts.env);
-        assert!(client
-            .try_migrate_legacy_lock(&alice, &locker_b, &1_i128)
-            .is_err());
+        assert_eq!(
+            client.try_migrate_legacy_lock(&alice, &locker_b, &1_i128),
+            Err(Ok(TokenError::MigrationOverflow))
+        );
     }
 
     #[test]
@@ -1232,9 +1393,10 @@ mod tests {
         client.migrate_legacy_lock(&alice, &locker, &250_i128);
         // Repeating adds zero (would overshoot). Idempotent re-call must NOT
         // bloat LockEntry nor LockHolders; it must error because it'd overshoot.
-        assert!(client
-            .try_migrate_legacy_lock(&alice, &locker, &250_i128)
-            .is_err());
+        assert_eq!(
+            client.try_migrate_legacy_lock(&alice, &locker, &250_i128),
+            Err(Ok(TokenError::MigrationOverflow))
+        );
 
         // And the original migration's values are intact.
         client.unlock(&alice, &locker, &250_i128);

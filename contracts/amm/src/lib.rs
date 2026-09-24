@@ -761,8 +761,7 @@ impl AmmPool {
             .instance()
             .set(&DataKey::CircuitBreakerTriggeredAt, &0_u64);
 
-        env.events()
-            .publish((Symbol::new(&env, "cb_recovered"),), (now,));
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "cb_recovered"),), (now,));
 
         Ok(true)
     }
@@ -875,9 +874,10 @@ impl AmmPool {
             .instance()
             .set(&DataKey::ProtocolFeeBps, &protocol_fee_bps);
         // Emit an event so LPs and indexers can monitor protocol-fee changes.
-        env.events().publish(
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
             (Symbol::new(&env, "protocol_fee_set"),),
-            (protocol_fee_bps, recipient),
+            (protocol_fee_bps, recipient)
         );
         Ok(())
     }
@@ -1289,8 +1289,11 @@ impl AmmPool {
             return Err(AmmError::InvalidFeeBps);
         }
         env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
-        env.events()
-            .publish((symbol_short!("fee_upd"), admin.clone()), (new_fee_bps,));
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (symbol_short!("fee_upd"), admin.clone()),
+            (new_fee_bps,)
+        );
         Ok(())
     }
 
@@ -1373,8 +1376,11 @@ impl AmmPool {
         admin.require_auth();
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
-        env.events()
-            .publish((Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "upgraded"),),
+            (new_wasm_hash,)
+        );
         Ok(())
     }
 
