@@ -1,7 +1,8 @@
 # Event schema versioning (#302)
 
-Every event emitted by the AMM, CL, governance, factory (and any future
-contract that adopts the pattern) carries a `schema_version: u32`
+Every event emitted by the AMM, CL, governance, factory, token,
+reserve_manager (and any future contract that adopts the pattern) carries
+a `schema_version: u32`
 field. Off-chain consumers (GraphQL indexer, health dashboard, any
 WebSocket subscriber) read this field before decoding the rest of
 the payload so an unexpected version can be quarantined rather than
@@ -195,6 +196,8 @@ schema version together when selecting a decoder.
 | `pool_created` | `(token_a: Address, token_b: Address, pool: Address, fee_bps: u32, lp_token: Address, ...)` |
 | `cl_pool_created` | `(token_a: Address, token_b: Address, fee_bps: u32, pool: Address)` |
 | `wasm_updated` | `(amm_wasm_hash: BytesN<32>, token_wasm_hash: BytesN<32>)` |
+| `default_fee_tier_updated` | `(fee_tier: i128)` |
+| `upgraded` | `(new_wasm_hash: BytesN<32>)` |
 | `creation_paused` / `creation_unpaused` | `(admin: Address)` |
 | `mode_changed` | `(enabled: bool)` |
 | `creation_fee_set` | `(fee_token: Address, fee_amount: i128)` |
@@ -217,6 +220,23 @@ schema version together when selecting a decoder.
 | `vote_unlocked` | `(proposal_id: u64, locked: i128)` |
 | `vetoed` | `(proposal_id: u64, multisig: Address, now: u64, discussion_end: u64)` |
 
+### Token (SEP-41 LP token) — `contracts/token/src/lib.rs`
+
+| Event | Topics | Payload |
+|---|---|---|
+| `transfer` | `from` | `(to: Address, amount: i128)` |
+| `admin_nominated` | — | `(current_admin: Address, new_admin: Address)` |
+| `admin_transferred` | — | `(new_admin: Address)` |
+| `upgraded` | — | `(new_wasm_hash: BytesN<32>)` |
+
+### Reserve Manager — `contracts/reserve_manager/src/lib.rs`
+
+| Event | Topics | Payload |
+|---|---|---|
+| `governance_proposed` | — | `(current_governance: Address, new_governance: Address)` |
+| `governance_transferred` | — | `(new_governance: Address)` |
+| `res_warn` | — | `(unhealthy: Vec<Address>)` |
+
 ### BatchRouter — `contracts/batch_router/src/lib.rs`
 
 | Event | Payload |
@@ -233,10 +253,15 @@ schema version together when selecting a decoder.
 | `order_expired` | `trader` | `(order_id: u64)` |
 | `order_failed` | `trader` | `(order_id: u64)` |
 | `order_refund_failed` | `trader` | `(order_id: u64)` |
+| `order_venue_removed` | `trader` | `(order_id: u64)` |
 | `order_settled` | `trader` | `(order_id: u64, amount_out: i128)` |
+| `refund_claimed` | `trader` | `(order_id: u64, amount: i128)` |
 | `settled` | — | `(process_count: u32)` |
 | `window_updated` | — | `(batch_window_secs: u64)` |
 | `max_orders_updated` | — | `(max_orders: u32)` |
+| `factory_updated` | — | `(factory: Address)` |
+| `venue_added` | `pool` | `(pool_type: PoolType)` |
+| `venue_removed` | `pool` | `()` |
 | `admin_nominated` | — | `(current_admin: Address, new_admin: Address)` |
 | `admin_changed` | — | `(new_admin: Address)` |
 
@@ -361,3 +386,30 @@ and `contracts/v2_to_v3_migration/src/lib.rs` have all migrated from raw
 `env.events().publish()` calls to `emit_versioned_event!`. All event rows for
 these three contracts are now listed in the event catalogue above under the
 BatchRouter, Batch Auction, and V2→V3 Migration sections respectively.
+
+## Update (#917 #918 #922 #923)
+
+The event-schema migration is now complete for four more contracts. No raw
+`env.events().publish(...)` call remains in any of their `src/` trees outside
+test modules.
+
+- `contracts/batch_auction/src/lib.rs` (#922) was half-migrated: the remaining
+  raw publish sites (`order_venue_removed`, `order_refund_failed`,
+  `order_expired`, `refund_claimed`, `factory_updated`, `venue_added`,
+  `venue_removed`) now emit through `emit_versioned_event!`. A single guard
+  test walks the whole event log for a representative call sequence and asserts
+  every payload this contract emits begins with `EVENT_SCHEMA_VERSION`, so the
+  half-migrated state cannot recur.
+- `contracts/factory/src/lib.rs` (#923) was half-migrated: the remaining raw
+  publish sites (`default_fee_tier_updated`, `upgraded`) now emit through
+  `emit_versioned_event!`, guarded by the same whole-log walk.
+- `contracts/token/src/lib.rs` (#917), the SEP-41 LP token, emitted its entire
+  event surface (`transfer`, `admin_nominated`, `admin_transferred`,
+  `upgraded`) through raw publish calls and is now fully versioned, with one
+  test per topic decoding the payload as a `(u32, T)` pair.
+- `contracts/reserve_manager/src/lib.rs` (#918) emitted its entire event
+  surface (`governance_proposed`, `governance_transferred`, `res_warn`) through
+  raw publish calls and is now fully versioned, with a per-topic test for each.
+
+All event rows for these contracts are listed in the catalogue above under the
+Factory, Token, Reserve Manager, and Batch Auction sections.

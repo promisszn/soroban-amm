@@ -2,6 +2,7 @@
 
 #![no_std]
 
+use soroban_amm_sdk::emit_versioned_event;
 use soroban_sdk::{
     contract, contractimpl, contracttype, Address, BytesN, Env, String, Symbol, Vec,
 };
@@ -330,9 +331,10 @@ impl LpToken {
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &Some(new_admin.clone()));
-        env.events().publish(
+        emit_versioned_event!(
+            env,
             (Symbol::new(&env, "admin_nominated"),),
-            (current_admin, new_admin),
+            (current_admin, new_admin)
         );
     }
 
@@ -349,8 +351,7 @@ impl LpToken {
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &Option::<Address>::None);
-        env.events()
-            .publish((Symbol::new(&env, "admin_transferred"),), (new_admin,));
+        emit_versioned_event!(env, (Symbol::new(&env, "admin_transferred"),), (new_admin,));
     }
 
     /// Replace the contract WASM with a new version. Admin-only.
@@ -362,8 +363,7 @@ impl LpToken {
         admin.require_auth();
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
-        env.events()
-            .publish((Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
+        emit_versioned_event!(env, (Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
     }
 
     /// Admin-only locker update.
@@ -558,9 +558,10 @@ impl LpToken {
             .persistent()
             .set(&DataKey::Balance(to.clone()), &(to_bal + amount));
         Self::write_checkpoint(env, to);
-        env.events().publish(
+        emit_versioned_event!(
+            env,
             (Symbol::new(env, "transfer"), from.clone()),
-            (to.clone(), amount),
+            (to.clone(), amount)
         );
     }
 
@@ -1280,5 +1281,103 @@ mod tests {
                 .persistent()
                 .set(&DataKey::Locked(holder.clone()), &amount);
         });
+    }
+
+    // ── Issue #917: every token event carries EVENT_SCHEMA_VERSION ────────────
+    //
+    // `transfer`, `admin_nominated`, `admin_transferred` and `upgraded` used to
+    // call `env.events().publish(...)` directly, so their payloads were not
+    // version-stamped and an indexer reading `(version, ...rest)` would have
+    // decoded the first real field as the version number. These tests pin the
+    // stamp in place for every topic this contract emits.
+
+    /// Fetch the payload of the most recent event this contract published under
+    /// `topic`, decoded as a version-stamped `(u32, T)` pair.
+    fn last_versioned_event<T>(ts: &TestSetup, topic: &str) -> (u32, T)
+    where
+        T: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>,
+    {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::{IntoVal, TryFromVal};
+
+        let wanted = Symbol::new(&ts.env, topic);
+        let evt = ts
+            .env
+            .events()
+            .all()
+            .iter()
+            .rfind(|e| {
+                e.0 == ts.contract_addr
+                    && e.1
+                        .get(0)
+                        .map(|t| Symbol::try_from_val(&ts.env, &t) == Ok(wanted.clone()))
+                        .unwrap_or(false)
+            })
+            .unwrap_or_else(|| panic!("no `{topic}` event found"));
+        evt.2.into_val(&ts.env)
+    }
+
+    #[test]
+    fn test_transfer_emits_versioned_event() {
+        let ts = setup();
+        let client = LpTokenClient::new(&ts.env, &ts.contract_addr);
+        let alice = Address::generate(&ts.env);
+        let bob = Address::generate(&ts.env);
+
+        client.mint(&alice, &1_000_i128);
+        client.transfer(&alice, &bob, &250_i128);
+
+        let (version, data): (u32, (Address, i128)) = last_versioned_event(&ts, "transfer");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(version, 1);
+        assert_eq!(data, (bob, 250_i128));
+    }
+
+    #[test]
+    fn test_admin_nominated_emits_versioned_event() {
+        let ts = setup();
+        let client = LpTokenClient::new(&ts.env, &ts.contract_addr);
+        let new_admin = Address::generate(&ts.env);
+
+        client.propose_admin(&ts.admin, &new_admin);
+
+        let (version, data): (u32, (Address, Address)) =
+            last_versioned_event(&ts, "admin_nominated");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(data, (ts.admin.clone(), new_admin));
+    }
+
+    #[test]
+    fn test_admin_transferred_emits_versioned_event() {
+        let ts = setup();
+        let client = LpTokenClient::new(&ts.env, &ts.contract_addr);
+        let new_admin = Address::generate(&ts.env);
+
+        client.propose_admin(&ts.admin, &new_admin);
+        client.accept_admin(&new_admin);
+
+        let (version, data): (u32, (Address,)) = last_versioned_event(&ts, "admin_transferred");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(data, (new_admin,));
+    }
+
+    // `upgrade` calls `update_current_contract_wasm`, which the host rejects
+    // unless the target hash is already uploaded. The `WASM` export is only
+    // available under the `testutils` feature (it embeds the compiled artifact),
+    // so this topic's test is gated on that feature the same way. Workspace
+    // feature unification enables it during `cargo test --workspace`, because
+    // `reserve_manager` depends on `token` with `testutils`.
+    #[cfg(feature = "testutils")]
+    #[test]
+    fn test_upgraded_emits_versioned_event() {
+        let ts = setup();
+        let client = LpTokenClient::new(&ts.env, &ts.contract_addr);
+
+        let new_hash = ts.env.deployer().upload_contract_wasm(WASM);
+        client.upgrade(&new_hash);
+
+        let (version, data): (u32, (BytesN<32>,)) = last_versioned_event(&ts, "upgraded");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(data, (new_hash,));
     }
 }

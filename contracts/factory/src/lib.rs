@@ -452,9 +452,10 @@ impl Factory {
         env.storage()
             .instance()
             .set(&DataKey::DefaultFeeTier, &fee_tier);
-        env.events().publish(
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
             (Symbol::new(&env, "default_fee_tier_updated"),),
-            (fee_tier,),
+            (fee_tier,)
         );
         Ok(())
     }
@@ -468,8 +469,11 @@ impl Factory {
         admin.require_auth();
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
-        env.events()
-            .publish((Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "upgraded"),),
+            (new_wasm_hash,)
+        );
         Ok(())
     }
 
@@ -2955,5 +2959,72 @@ mod tests {
         assert_eq!(all, expected);
         assert_eq!(all, factory.get_pools(&0, &(total as u32)));
         assert_eq!(factory.all_pools(), factory.get_pools(&0, &u32::MAX));
+    }
+
+    // ── Issue #923: no event escapes the version stamp ────────────────────────
+    //
+    // Rather than one assertion per topic, this walks the whole event log for a
+    // representative call sequence and asserts every payload this contract
+    // emitted begins with `EVENT_SCHEMA_VERSION`. A newly added raw
+    // `env.events().publish(...)` reachable from the sequence regresses this
+    // test, which is the guard the half-migrated state lacked.
+    #[test]
+    fn test_every_emitted_event_carries_version_stamp() {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::{TryFromVal, Val};
+
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+
+        // Pool creation: pool_created.
+        let ta = Address::generate(&env);
+        let tb = Address::generate(&env);
+        factory.create_pool_with_fee_bps(&admin, &ta, &tb, &30_i128, &None);
+
+        // Admin-config surface: default_fee_tier_updated, creation_paused,
+        // creation_unpaused, mode_changed.
+        factory.set_default_fee_tier(&2_i128);
+        factory.pause_creation(&admin);
+        factory.unpause_creation(&admin);
+        factory.set_permissionless_mode(&true);
+
+        // WASM rotation last, since it points the contract at new bytecode:
+        // upgraded.
+        factory.upgrade(&token_hash);
+
+        // Every event this contract published must decode as `(u32, _)` with the
+        // leading `u32` equal to the current schema version. Events emitted by
+        // the deployed pool/token contracts are filtered out by address.
+        let mut checked = 0u32;
+        for event in env.events().all().iter() {
+            if event.0 != factory_addr {
+                continue;
+            }
+            let payload: soroban_sdk::Vec<Val> = soroban_sdk::Vec::try_from_val(&env, &event.2)
+                .expect("every factory event payload is a versioned tuple");
+            let head = payload.get(0).expect("versioned payload is never empty");
+            let version = u32::try_from_val(&env, &head)
+                .expect("leading element of every factory event is the u32 version");
+            assert_eq!(
+                version,
+                soroban_amm_sdk::EVENT_SCHEMA_VERSION,
+                "event with topics {:?} is missing the schema version stamp",
+                event.1
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 5,
+            "representative sequence should emit several factory events, saw {checked}"
+        );
     }
 }

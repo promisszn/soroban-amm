@@ -37,6 +37,7 @@
 
 #![no_std]
 
+use soroban_amm_sdk::emit_versioned_event;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
     Env, Symbol, Vec,
@@ -219,9 +220,10 @@ impl ReserveManager {
         env.storage()
             .instance()
             .set(&DataKey::PendingGovernance, &Some(new_governance.clone()));
-        env.events().publish(
+        emit_versioned_event!(
+            env,
             (Symbol::new(&env, "governance_proposed"),),
-            (current_governance, new_governance),
+            (current_governance, new_governance)
         );
         Ok(())
     }
@@ -248,9 +250,10 @@ impl ReserveManager {
         env.storage()
             .instance()
             .set(&DataKey::PendingGovernance, &Option::<Address>::None);
-        env.events().publish(
+        emit_versioned_event!(
+            env,
             (Symbol::new(&env, "governance_transferred"),),
-            (new_governance,),
+            (new_governance,)
         );
         Ok(())
     }
@@ -495,8 +498,7 @@ impl ReserveManager {
         }
 
         if !unhealthy.is_empty() {
-            env.events()
-                .publish((symbol_short!("res_warn"),), (unhealthy,));
+            emit_versioned_event!(env, (symbol_short!("res_warn"),), (unhealthy,));
         }
 
         Ok(reports)
@@ -1218,7 +1220,8 @@ mod tests {
             topics,
             soroban_sdk::vec![&s.env, symbol_short!("res_warn").into_val(&s.env)]
         );
-        let (unhealthy,): (soroban_sdk::Vec<Address>,) = data.into_val(&s.env);
+        let (version, (unhealthy,)): (u32, (soroban_sdk::Vec<Address>,)) = data.into_val(&s.env);
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
         assert_eq!(unhealthy, soroban_sdk::vec![&s.env, s.pool.clone()]);
     }
 
@@ -1255,5 +1258,60 @@ mod tests {
         let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
         let reports = rm.check_reserves_batch(&soroban_sdk::Vec::new(&s.env));
         assert_eq!(reports.len(), 0);
+    }
+
+    // ── Issue #918: every reserve_manager event carries EVENT_SCHEMA_VERSION ──
+    //
+    // `governance_proposed`, `governance_transferred` and `res_warn` used to
+    // call `env.events().publish(...)` directly, so their payloads were not
+    // version-stamped and an indexer reading `(version, ...rest)` would have
+    // decoded the first real field as the version number. These tests pin the
+    // stamp in place for every topic this contract emits.
+
+    /// Fetch the payload of the most recent event this contract published under
+    /// `topic`, decoded as a version-stamped `(u32, T)` pair.
+    fn last_versioned_event<T>(s: &Setup, topic: &str) -> (u32, T)
+    where
+        T: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>,
+    {
+        let wanted: soroban_sdk::Vec<soroban_sdk::Val> =
+            (Symbol::new(&s.env, topic),).into_val(&s.env);
+        let evt = s
+            .env
+            .events()
+            .all()
+            .iter()
+            .rfind(|e| e.0 == s.rm_addr && e.1 == wanted)
+            .unwrap_or_else(|| panic!("no `{topic}` event found"));
+        evt.2.into_val(&s.env)
+    }
+
+    #[test]
+    fn test_governance_proposed_emits_versioned_event() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let new_gov = Address::generate(&s.env);
+
+        rm.propose_governance(&s.governance, &new_gov);
+
+        let (version, data): (u32, (Address, Address)) =
+            last_versioned_event(&s, "governance_proposed");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(version, 1);
+        assert_eq!(data, (s.governance.clone(), new_gov));
+    }
+
+    #[test]
+    fn test_governance_transferred_emits_versioned_event() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let new_gov = Address::generate(&s.env);
+
+        rm.propose_governance(&s.governance, &new_gov);
+        rm.accept_governance(&new_gov);
+
+        let (version, data): (u32, (Address,)) = last_versioned_event(&s, "governance_transferred");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(data, (new_gov,));
     }
 }

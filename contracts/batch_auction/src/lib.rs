@@ -532,12 +532,13 @@ impl BatchAuction {
                     &order.token_in,
                     order.amount_in,
                 );
-                env.events().publish(
+                emit_versioned_event!(
+                    env,
                     (
                         Symbol::new(&env, "order_venue_removed"),
                         order.trader.clone(),
                     ),
-                    (order_id,),
+                    (order_id,)
                 );
                 env.storage().instance().remove(&DataKey::Order(order_id));
                 continue;
@@ -640,9 +641,10 @@ impl BatchAuction {
                 &DataKey::Claimable(order_id),
                 &(trader.clone(), token.clone(), amount),
             );
-            env.events().publish(
+            emit_versioned_event!(
+                env,
                 (Symbol::new(env, "order_refund_failed"), trader.clone()),
-                (order_id,),
+                (order_id,)
             );
         }
         ok
@@ -685,9 +687,10 @@ impl BatchAuction {
         env.storage()
             .instance()
             .set(&DataKey::PendingOrders, &updated);
-        env.events().publish(
+        emit_versioned_event!(
+            env,
             (Symbol::new(&env, "order_expired"), order.trader),
-            (order_id,),
+            (order_id,)
         );
         Ok(())
     }
@@ -737,9 +740,10 @@ impl BatchAuction {
             &trader,
             &amount,
         );
-        env.events().publish(
+        emit_versioned_event!(
+            env,
             (Symbol::new(&env, "refund_claimed"), trader),
-            (order_id, amount),
+            (order_id, amount)
         );
         Ok(amount)
     }
@@ -1096,8 +1100,7 @@ impl BatchAuction {
         }
         admin.require_auth();
         env.storage().instance().set(&DataKey::Factory, &factory);
-        env.events()
-            .publish((Symbol::new(&env, "factory_updated"),), (factory,));
+        emit_versioned_event!(env, (Symbol::new(&env, "factory_updated"),), (factory,));
         Ok(())
     }
 
@@ -1126,8 +1129,7 @@ impl BatchAuction {
         env.storage()
             .instance()
             .set(&DataKey::Venue(pool.clone()), &pool_type);
-        env.events()
-            .publish((Symbol::new(&env, "venue_added"), pool), (pool_type,));
+        emit_versioned_event!(env, (Symbol::new(&env, "venue_added"), pool), (pool_type,));
         Ok(())
     }
 
@@ -1155,8 +1157,7 @@ impl BatchAuction {
             }
         }
         env.storage().instance().set(&DataKey::VenueList, &updated);
-        env.events()
-            .publish((Symbol::new(&env, "venue_removed"), pool), ());
+        emit_versioned_event!(env, (Symbol::new(&env, "venue_removed"), pool), ());
         Ok(())
     }
 
@@ -3255,6 +3256,84 @@ mod tests {
             version,
             soroban_amm_sdk::EVENT_SCHEMA_VERSION,
             "event must have correct schema version"
+        );
+    }
+
+    // ── Issue #922: no event escapes the version stamp ────────────────────────
+    //
+    // Rather than one assertion per topic, this walks the whole event log for a
+    // representative call sequence and asserts every payload this contract
+    // emitted begins with `EVENT_SCHEMA_VERSION`. A newly added raw
+    // `env.events().publish(...)` reachable from the sequence regresses this
+    // test, which is the guard the half-migrated state lacked.
+    #[test]
+    fn test_every_emitted_event_carries_version_stamp() {
+        use soroban_sdk::Val;
+
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+
+        let (ta, tb, pool, admin) = setup(&env);
+
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+
+        // Admin-config surface: window_updated, max_orders_updated,
+        // factory_updated, venue_added.
+        client.set_batch_window(&45_u64);
+        client.set_max_orders(&admin, &50_u32);
+        let factory = Address::generate(&env);
+        client.set_factory(&admin, &factory);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
+
+        // Order lifecycle: order_submitted, order_settled, settled.
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader, &100_000_i128);
+        client.submit_order(
+            &trader,
+            &pool,
+            &ta,
+            &tb,
+            &10_000_i128,
+            &0_i128,
+            &far_future_deadline(&env),
+        );
+        env.ledger().set_timestamp(1046);
+        let _ = client.settle_batch();
+
+        // Teardown + admin rotation: venue_removed, admin_nominated,
+        // admin_changed.
+        client.remove_venue(&admin, &pool);
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&admin, &new_admin);
+        client.accept_admin(&new_admin);
+
+        // Every event this contract published must decode as `(u32, _)` with the
+        // leading `u32` equal to the current schema version. Events emitted by
+        // the pool/token contracts are filtered out by address.
+        let mut checked = 0u32;
+        for event in env.events().all().iter() {
+            if event.0 != auction_addr {
+                continue;
+            }
+            let payload: soroban_sdk::Vec<Val> = soroban_sdk::Vec::try_from_val(&env, &event.2)
+                .expect("every auction event payload is a versioned tuple");
+            let head = payload.get(0).expect("versioned payload is never empty");
+            let version = u32::try_from_val(&env, &head)
+                .expect("leading element of every auction event is the u32 version");
+            assert_eq!(
+                version,
+                soroban_amm_sdk::EVENT_SCHEMA_VERSION,
+                "event with topics {:?} is missing the schema version stamp",
+                event.1
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 7,
+            "representative sequence should emit several auction events, saw {checked}"
         );
     }
 }
