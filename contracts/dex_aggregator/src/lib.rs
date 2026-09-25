@@ -58,6 +58,9 @@ pub enum AggregatorError {
     UnregisteredPool = 3,
     InvalidMaxHops = 4,
     TooManyRoutingTokens = 5,
+    /// A function that reads the admin or factory was called before
+    /// `initialize`.
+    NotInitialized = 6,
 }
 
 #[contracttype]
@@ -133,7 +136,7 @@ impl DexAggregator {
     }
 
     pub fn set_max_hops(env: Env, max_hops: u32) -> Result<(), AggregatorError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
 
         if max_hops == 0 {
@@ -151,8 +154,8 @@ impl DexAggregator {
         token_a: Address,
         token_b: Address,
         fee_bps: i128,
-    ) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    ) -> Result<(), AggregatorError> {
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
 
         Self::extend_ttl(&env);
@@ -165,7 +168,7 @@ impl DexAggregator {
         for i in 0..count {
             let entry: ClPoolInfo = env.storage().instance().get(&DataKey::ClPool(i)).unwrap();
             if entry.pool == pool {
-                return;
+                return Ok(());
             }
         }
 
@@ -189,10 +192,11 @@ impl DexAggregator {
             (symbol_short!("cl_reg"),),
             (token_a, token_b, fee_bps, pool)
         );
+        Ok(())
     }
 
     pub fn set_routing_tokens(env: Env, tokens: Vec<Address>) -> Result<(), AggregatorError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
 
         if tokens.len() > Self::MAX_ROUTING_TOKENS {
@@ -206,8 +210,8 @@ impl DexAggregator {
         Ok(())
     }
 
-    pub fn remove_cl_pool(env: Env, pool: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    pub fn remove_cl_pool(env: Env, pool: Address) -> Result<(), AggregatorError> {
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
 
         Self::extend_ttl(&env);
@@ -232,9 +236,10 @@ impl DexAggregator {
                 env.storage()
                     .instance()
                     .set(&DataKey::ClPoolCount, &(count - 1));
-                return;
+                return Ok(());
             }
         }
+        Ok(())
     }
 
     /// Find the best route up to `max_hops` pools deep (#319).
@@ -245,6 +250,7 @@ impl DexAggregator {
         amount_in: i128,
         max_hops: u32,
     ) -> Result<RouteQuote, AggregatorError> {
+        let factory = Self::read_factory(&env)?;
         Self::extend_ttl(&env);
         assert!(token_in != token_out, "same token");
         assert!(amount_in > 0, "amount must be positive");
@@ -258,7 +264,7 @@ impl DexAggregator {
             return Err(AggregatorError::NoRouteFound);
         }
         let (quote, runner_up) =
-            Self::search_best_bfs(&env, &token_in, &token_out, amount_in, cap)?;
+            Self::search_best_bfs(&env, &factory, &token_in, &token_out, amount_in, cap)?;
 
         // The venue a route is *entered* through identifies the decision: it is
         // the pool the aggregator picked over every alternative first hop.
@@ -313,6 +319,7 @@ impl DexAggregator {
         min_out: i128,
         deadline: u64,
     ) -> Result<i128, AggregatorError> {
+        let factory = Self::read_factory(&env)?;
         Self::extend_ttl(&env);
         trader.require_auth();
         if route.hops.is_empty() || route.amount_out < min_out {
@@ -323,8 +330,15 @@ impl DexAggregator {
         }
         let entry = route.hops.get(0).unwrap();
         let exit = route.hops.get(route.hops.len() - 1).unwrap();
-        let amount_out =
-            Self::execute_hops(&env, &route.hops, &trader, amount_in, min_out, deadline)?;
+        let amount_out = Self::execute_hops(
+            &env,
+            &factory,
+            &route.hops,
+            &trader,
+            amount_in,
+            min_out,
+            deadline,
+        )?;
 
         // `amount_out` is what the pools actually returned, not `route.amount_out`,
         // which is only the quote the route was planned against.
@@ -431,13 +445,13 @@ impl DexAggregator {
     #[allow(clippy::type_complexity)]
     fn search_best_bfs(
         env: &Env,
+        factory: &Address,
         token_in: &Address,
         token_out: &Address,
         amount_in: i128,
         max_hops: u32,
     ) -> Result<(RouteQuote, Option<(Address, PoolKind, i128)>), AggregatorError> {
-        let factory: Address = env.storage().instance().get(&DataKey::Factory).unwrap();
-        let factory_client = FactoryClient::new(env, &factory);
+        let factory_client = FactoryClient::new(env, factory);
         let tokens = Self::discover_tokens(env, token_in, token_out);
 
         let mut best_out: i128 = 0;
@@ -567,14 +581,14 @@ impl DexAggregator {
 
     fn execute_hops(
         env: &Env,
+        factory: &Address,
         hops: &Vec<RouteHop>,
         trader: &Address,
         amount_in: i128,
         min_out: i128,
         deadline: u64,
     ) -> Result<i128, AggregatorError> {
-        let factory: Address = env.storage().instance().get(&DataKey::Factory).unwrap();
-        let factory_client = FactoryClient::new(env, &factory);
+        let factory_client = FactoryClient::new(env, factory);
 
         // Validate all hops up front before any token movement
         for hop in hops.iter() {
@@ -834,6 +848,20 @@ impl DexAggregator {
     fn extend_ttl(env: &Env) {
         env.storage().instance().extend_ttl(MIN_TTL, BUMP_TO);
     }
+
+    fn read_admin(env: &Env) -> Result<Address, AggregatorError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(AggregatorError::NotInitialized)
+    }
+
+    fn read_factory(env: &Env) -> Result<Address, AggregatorError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Factory)
+            .ok_or(AggregatorError::NotInitialized)
+    }
 }
 
 #[cfg(test)]
@@ -854,7 +882,65 @@ mod tests {
         let a = Address::generate(&env);
         let b = Address::generate(&env);
         let result = agg.try_find_best_route(&a, &b, &100_i128, &3u32);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(AggregatorError::NotInitialized)));
+    }
+
+    #[test]
+    fn test_pre_init_calls_return_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let agg_addr = env.register_contract(None, DexAggregator);
+        let agg = DexAggregatorClient::new(&env, &agg_addr);
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        let pool = Address::generate(&env);
+        let trader = Address::generate(&env);
+
+        assert_eq!(
+            agg.try_set_max_hops(&3u32),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+        assert_eq!(
+            agg.try_register_cl_pool(&pool, &a, &b, &30_i128),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+        assert_eq!(
+            agg.try_remove_cl_pool(&pool),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+        assert_eq!(
+            agg.try_set_routing_tokens(&vec![&env, a.clone()]),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+        assert_eq!(
+            agg.try_get_quote(&a, &b, &100_i128, &3u32),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+        assert_eq!(
+            agg.try_swap_best(&trader, &a, &b, &100_i128, &0_i128, &u64::MAX),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+
+        let route = RouteQuote {
+            amount_out: 100,
+            hops: vec![
+                &env,
+                RouteHop {
+                    pool: pool.clone(),
+                    pool_kind: PoolKind::Amm,
+                    token_in: a.clone(),
+                    token_out: b.clone(),
+                    zero_for_one: true,
+                },
+            ],
+        };
+        assert_eq!(
+            agg.try_execute_route(&route, &trader, &100_i128, &0_i128, &u64::MAX),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+
+        // A bool-returning query must degrade gracefully rather than trap.
+        assert!(!agg.is_price_within_tolerance(&a, &b, &100_i128, &1_i128));
     }
 
     #[test]
