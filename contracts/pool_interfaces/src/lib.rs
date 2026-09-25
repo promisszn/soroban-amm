@@ -46,6 +46,7 @@ pub enum AmmError {
     FlashLoanRepaymentFailed = 18,
     AlreadyExecuted = 19,
     ProposalExpired = 20,
+    NotInitialized = 21,
 }
 
 #[contracttype]
