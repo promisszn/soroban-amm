@@ -14,7 +14,9 @@
 //! | `admin_nominated`| `("admin_nominated",)`       | `(1, (current_admin, new_admin))`      |
 //! | `admin_changed` | `("admin_changed",)`          | `(1, (new_admin,))`                    |
 //! | `upgraded`      | `("upgraded",)`               | `(1, (new_wasm_hash,))`                |
+//! | `protocol_fee_set` | `("protocol_fee_set",)`    | `(1, (protocol_fee_bps, recipient))`   |
 //! | `circuit_break` | `("circuit_break",)`          | `(1, (price_before, price_after, deviation_bps, threshold_bps))` |
+//! | `cb_recovered`  | `("cb_recovered",)`           | `(1, (timestamp,))`                    |
 //!
 //! The DEX aggregator (`contracts/dex_aggregator`) adds:
 //!
@@ -120,6 +122,22 @@ pub struct UpgradedEvent {
     pub new_wasm_hash: BytesN<32>,
 }
 
+/// Emitted when the protocol fee split is changed.
+#[contracttype]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProtocolFeeSetEvent {
+    pub protocol_fee_bps: i128,
+    pub recipient: Address,
+}
+
+/// Emitted when the circuit breaker's cooldown elapses and the pool resumes
+/// normal operation.
+#[contracttype]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CbRecoveredEvent {
+    pub timestamp: u64,
+}
+
 /// Emitted when the circuit breaker auto-pauses the pool due to extreme price
 /// movement.
 #[contracttype]
@@ -217,6 +235,8 @@ pub mod symbols {
     pub const ADMIN_CHANGED: &str = "admin_changed";
     pub const UPGRADED: &str = "upgraded";
     pub const CIRCUIT_BREAKER: &str = "circuit_break";
+    pub const PROTOCOL_FEE_SET: &str = "protocol_fee_set";
+    pub const CB_RECOVERED: &str = "cb_recovered";
 
     // ── DEX aggregator (#685) ────────────────────────────────────────────────
     pub const CL_POOL_REGISTERED: &str = "cl_reg";
@@ -241,7 +261,9 @@ pub enum AmmEvent {
     AdminNominated(AdminNominatedEvent),
     AdminChanged(AdminChangedEvent),
     Upgraded(UpgradedEvent),
+    ProtocolFeeSet(ProtocolFeeSetEvent),
     CircuitBreaker(CircuitBreakerEvent),
+    CbRecovered(CbRecoveredEvent),
     ClPoolRegistered(ClPoolRegisteredEvent),
     RouteSelected(RouteSelectedEvent),
     RouteAlternative(RouteAlternativeEvent),
@@ -392,6 +414,12 @@ pub fn decode_amm_event(
     } else if symbol == Symbol::new(env, symbols::UPGRADED) {
         let (new_wasm_hash,): (BytesN<32>,) = decode_payload(env, payload_val, 1)?;
         Some(AmmEvent::Upgraded(UpgradedEvent { new_wasm_hash }))
+    } else if symbol == Symbol::new(env, symbols::PROTOCOL_FEE_SET) {
+        let (protocol_fee_bps, recipient): (i128, Address) = decode_payload(env, payload_val, 2)?;
+        Some(AmmEvent::ProtocolFeeSet(ProtocolFeeSetEvent {
+            protocol_fee_bps,
+            recipient,
+        }))
     } else if symbol == Symbol::new(env, symbols::CL_POOL_REGISTERED) {
         let (token_a, token_b, fee_bps, pool): (Address, Address, i128, Address) =
             decode_payload(env, payload_val, 4)?;
@@ -459,6 +487,9 @@ pub fn decode_amm_event(
             deviation_bps,
             threshold_bps,
         }))
+    } else if symbol == Symbol::new(env, symbols::CB_RECOVERED) {
+        let (timestamp,): (u64,) = decode_payload(env, payload_val, 1)?;
+        Some(AmmEvent::CbRecovered(CbRecoveredEvent { timestamp }))
     } else {
         None
     }
@@ -705,6 +736,24 @@ mod tests {
     }
 
     #[test]
+    fn decodes_protocol_fee_set() {
+        let env = Env::default();
+        let recipient = address(&env);
+
+        let topics = vec![&env, symbol(&env, symbols::PROTOCOL_FEE_SET)];
+        let payload: Val = (500i128, recipient.clone()).into_val(&env);
+        let data = make_data(&env, payload, crate::EVENT_SCHEMA_VERSION);
+
+        assert_eq!(
+            decode_amm_event(&env, topics, data),
+            Some(AmmEvent::ProtocolFeeSet(ProtocolFeeSetEvent {
+                protocol_fee_bps: 500,
+                recipient,
+            }))
+        );
+    }
+
+    #[test]
     fn decodes_circuit_breaker() {
         let env = Env::default();
 
@@ -721,6 +770,22 @@ mod tests {
                 price_after: 1_500_000,
                 deviation_bps: 400,
                 threshold_bps: 300,
+            }))
+        );
+    }
+
+    #[test]
+    fn decodes_cb_recovered() {
+        let env = Env::default();
+
+        let topics = vec![&env, symbol(&env, symbols::CB_RECOVERED)];
+        let payload: Val = (1_700_000_000u64,).into_val(&env);
+        let data = make_data(&env, payload, crate::EVENT_SCHEMA_VERSION);
+
+        assert_eq!(
+            decode_amm_event(&env, topics, data),
+            Some(AmmEvent::CbRecovered(CbRecoveredEvent {
+                timestamp: 1_700_000_000
             }))
         );
     }
