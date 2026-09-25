@@ -285,8 +285,11 @@ impl TwalConsumer {
             pool_type,
         });
         Self::store_tracked(env, &tracked);
-        env.events()
-            .publish((Symbol::new(env, "pool_add"),), pool.clone());
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(env, "pool_add"),),
+            pool.clone()
+        );
         Ok(())
     }
 
@@ -306,8 +309,11 @@ impl TwalConsumer {
         let idx = Self::first_tracked_index(&tracked, &pool).ok_or(TwalError::NotTracked)?;
         tracked.remove(idx);
         Self::store_tracked(&env, &tracked);
-        env.events()
-            .publish((Symbol::new(&env, "pool_remove"),), pool);
+        soroban_amm_sdk::emit_versioned_event!(
+            &env,
+            (Symbol::new(&env, "pool_remove"),),
+            pool
+        );
         Ok(())
     }
 
@@ -648,8 +654,11 @@ impl TwalConsumer {
         }
         env.storage().persistent().remove(&key);
         Self::remove_snapshot_timestamp(&env, &pool, ledger_ts);
-        env.events()
-            .publish((Symbol::new(&env, "snapshot_deleted"),), (pool, ledger_ts));
+        soroban_amm_sdk::emit_versioned_event!(
+            &env,
+            (Symbol::new(&env, "snapshot_deleted"),),
+            (pool, ledger_ts)
+        );
         Ok(())
     }
     /// Returns the time-weighted average active liquidity for a CL pool over
@@ -1688,5 +1697,118 @@ mod tests {
             consumer.try_get_cl_twal(&pool_addr, &600),
             Err(Ok(TwalError::MissingClAccumulator))
         );
+    }
+
+    // ── Issue #919: every twal_consumer event carries EVENT_SCHEMA_VERSION ────
+    //
+    // These publish sites used to call `env.events().publish(...)` directly, so
+    // their payloads were not version-stamped and an indexer reading
+    // `(version, ...rest)` would have decoded the first real field as the
+    // version number. Each test below pins the stamp for one topic.
+
+    /// Fetch the payload of the most recent event `contract` published under the
+    /// single-symbol `topic`, decoded as a version-stamped `(u32, T)` pair.
+    fn last_versioned_event<T>(env: &Env, contract: &Address, topic: &str) -> (u32, T)
+    where
+        T: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>,
+    {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::IntoVal;
+
+        let wanted: soroban_sdk::Vec<soroban_sdk::Val> =
+            (Symbol::new(env, topic),).into_val(env);
+        let evt = env
+            .events()
+            .all()
+            .iter()
+            .rfind(|e| &e.0 == contract && e.1 == wanted)
+            .unwrap_or_else(|| panic!("no `{topic}` event found"));
+        evt.2.into_val(env)
+    }
+
+    #[test]
+    fn test_pool_add_emits_versioned_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_keeper, consumer) = setup_consumer(&env);
+        let pool = Address::generate(&env);
+
+        consumer.add_tracked_pool(&pool, &PoolType::Amm);
+
+        let (version, data): (u32, Address) =
+            last_versioned_event(&env, &consumer.address, "pool_add");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(version, 1);
+        assert_eq!(data, pool);
+    }
+
+    #[test]
+    fn test_pool_remove_emits_versioned_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_keeper, consumer) = setup_consumer(&env);
+        let pool = Address::generate(&env);
+
+        consumer.add_tracked_pool(&pool, &PoolType::Amm);
+        consumer.remove_tracked_pool(&pool);
+
+        let (version, data): (u32, Address) =
+            last_versioned_event(&env, &consumer.address, "pool_remove");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(version, 1);
+        assert_eq!(data, pool);
+    }
+
+    #[test]
+    fn test_snapshot_deleted_emits_versioned_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+
+        let admin = Address::generate(&env);
+        let amm_addr = env.register_contract(None, AmmPool);
+        let lp_addr = env.register_contract(None, LpToken);
+        let consumer_addr = env.register_contract(None, TwalConsumer);
+
+        token::LpTokenClient::new(&env, &lp_addr).initialize(
+            &amm_addr,
+            &soroban_sdk::String::from_str(&env, "LP"),
+            &soroban_sdk::String::from_str(&env, "LP"),
+            &7u32,
+        );
+
+        let (ta, ta_sac) = create_sac(&env, &admin);
+        let (tb, tb_sac) = create_sac(&env, &admin);
+        AmmPoolClient::new(&env, &amm_addr).initialize(
+            &admin,
+            &ta.address,
+            &tb.address,
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &0_i128,
+        );
+
+        let provider = Address::generate(&env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        AmmPoolClient::new(&env, &amm_addr).add_liquidity(
+            &provider,
+            &1_000_000_i128,
+            &1_000_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+
+        let consumer = TwalConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&admin);
+        consumer.save_snapshot(&amm_addr);
+        consumer.delete_snapshot(&amm_addr, &10_000_u64);
+
+        let (version, data): (u32, (Address, u64)) =
+            last_versioned_event(&env, &consumer.address, "snapshot_deleted");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(version, 1);
+        assert_eq!(data, (amm_addr, 10_000_u64));
     }
 }

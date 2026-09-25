@@ -117,17 +117,15 @@ for consistency with the rest of the contract). A full migration of
 `staking` onto the versioned scheme is tracked separately and out of
 scope here.
 
-`contracts/twal_consumer/src/lib.rs` is intentionally out of scope. It
-already emitted an unversioned `snapshot_deleted` event before this
-migration, and the tracked-pool lifecycle events added in #695
-(`pool_add`, `pool_remove`) follow that same existing, unversioned
-convention rather than mixing versioning schemes within one contract.
-Migrating `twal_consumer` to `emit_versioned_event!` — all three event
-sites at once — is left as a follow-up.
+`contracts/twal_consumer/src/lib.rs` is now migrated (#919): its
+`snapshot_deleted` event and the tracked-pool lifecycle events added in #695
+(`pool_add`, `pool_remove`) all emit through `emit_versioned_event!`, so the
+whole contract carries `EVENT_SCHEMA_VERSION`. See the twal_consumer section in
+the catalogue below.
 
 Test files in each of those crates were updated to decode the
-versioned payload shape; see `__ver_N_locals+ assert_eq(!version,
-EVENT_SCHEMA_VERSION)` assertions added by `migrate_tests.py`.
+versioned payload shape and assert the leading field equals
+`EVENT_SCHEMA_VERSION`.
 
 ## New events in this change
 
@@ -249,6 +247,45 @@ a representative call sequence and asserts every pool event carries the leading
 | `governance_proposed` | — | `(current_governance: Address, new_governance: Address)` |
 | `governance_transferred` | — | `(new_governance: Address)` |
 | `res_warn` | — | `(unhealthy: Vec<Address>)` |
+
+### POL Vesting — `contracts/pol_vesting/src/lib.rs`
+
+| Event | Topics | Payload |
+|---|---|---|
+| `governance_proposed` | — | `(current_governance: Address, new_governance: Address)` |
+| `governance_transferred` | — | `(old_governance: Address, new_governance: Address)` |
+| `treasury_proposed` | — | `(governance: Address, new_treasury: Address)` |
+| `treasury_transferred` | — | `(old_treasury: Address, new_treasury: Address)` |
+| `vesting_created` | — | `(beneficiary: Address, schedule_id: u32, total: i128, start_ledger: u32, cliff_ledger: u32, end_ledger: u32)` |
+| `released` | — | `(beneficiary: Address, schedule_id: u32, amount: i128)` |
+| `beneficiary_changed` | — | `(old_beneficiary: Address, old_schedule_id: u32, new_beneficiary: Address, new_schedule_id: u32)` |
+| `vesting_revoked` | — | `(beneficiary: Address, schedule_id: u32, to_beneficiary: i128, to_treasury: i128)` |
+
+### Incentive Campaigns — `contracts/incentive_campaigns/src/lib.rs`
+
+| Event | Topics | Payload |
+|---|---|---|
+| `governance_proposed` | — | `(caller: Address, new_governance: Address)` |
+| `governance_transferred` | — | `(old_governance: Address, new_governance: Address)` |
+| `campaign_created` | — | `(id: u64, pool: Address, reward_token: Address, start_time: u64, end_time: u64, reward_rate: i128)` |
+| `rate_updated` | — | `(campaign_id: u64, new_rate: i128)` |
+| `leftover_recovered` | — | `(campaign_id: u64, recipient: Address, leftover: i128)` |
+| `reward_distributed` | — | `(campaign_id: u64, provider: Address, amount: i128, dist_id: u64)` |
+
+### TWAL consumer — `contracts/twal_consumer/src/lib.rs`
+
+| Event | Topics | Payload |
+|---|---|---|
+| `pool_add` | — | `pool: Address` |
+| `pool_remove` | — | `pool: Address` |
+| `snapshot_deleted` | — | `(pool: Address, ledger_ts: u64)` |
+
+### TWAP consumer — `contracts/twap_consumer/src/lib.rs`
+
+| Event | Topics | Payload |
+|---|---|---|
+| `snap_del` | `pool` | `ledger_ts: u64` |
+| `pruned` | `pool` | `(removed_count: u32, oldest_remaining_ts: u64)` |
 
 ### BatchRouter — `contracts/batch_router/src/lib.rs`
 
@@ -426,3 +463,23 @@ test modules.
 
 All event rows for these contracts are listed in the catalogue above under the
 Factory, Token, Reserve Manager, and Batch Auction sections.
+
+## Update (#913 #914 #919 #920)
+
+Four more contracts that emitted their entire event surface through raw
+`env.events().publish(...)` calls are now fully versioned. No raw publish call
+remains in any of their `src/` trees outside test modules, and each has one
+test per event topic decoding the payload as a `(u32, T)` pair and asserting the
+leading field equals `EVENT_SCHEMA_VERSION`.
+
+- `contracts/pol_vesting/src/lib.rs` (#913): eight events covering the
+  governance/treasury handover, schedule lifecycle, releases, and revocations.
+- `contracts/incentive_campaigns/src/lib.rs` (#914): six events covering
+  governance handover, campaign creation, rate updates, leftover recovery, and
+  reward distribution.
+- `contracts/twal_consumer/src/lib.rs` (#919): `pool_add`, `pool_remove`, and
+  `snapshot_deleted`.
+- `contracts/twap_consumer/src/lib.rs` (#920): `snap_del` and `pruned`.
+
+All event rows for these contracts are listed in the catalogue above under the
+POL Vesting, Incentive Campaigns, TWAL consumer, and TWAP consumer sections.

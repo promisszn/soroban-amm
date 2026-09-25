@@ -267,8 +267,11 @@ impl TwapConsumer {
         }
         env.storage().persistent().remove(&key);
         Self::remove_snapshot_timestamp(&env, &pool, ledger_ts);
-        env.events()
-            .publish((symbol_short!("snap_del"), pool), ledger_ts);
+        soroban_amm_sdk::emit_versioned_event!(
+            &env,
+            (symbol_short!("snap_del"), pool),
+            ledger_ts
+        );
         Ok(())
     }
 
@@ -320,9 +323,10 @@ impl TwapConsumer {
                 Self::SNAPSHOT_TTL_LEDGERS,
             );
             let oldest_remaining_ts = remaining_timestamps.first().unwrap_or(0);
-            env.events().publish(
+            soroban_amm_sdk::emit_versioned_event!(
+                env,
                 (symbol_short!("pruned"), pool.clone()),
-                (remove_count, oldest_remaining_ts),
+                (remove_count, oldest_remaining_ts)
             );
         }
 
@@ -1365,7 +1369,10 @@ mod tests {
         expected_topics.push_back(symbol_short!("snap_del").into_val(&env));
         expected_topics.push_back(pool.clone().into_val(&env));
         assert_eq!(topics, expected_topics);
-        let data_ts: u64 = data.into_val(&env);
+        // Issue #920: the payload is version-stamped as `(EVENT_SCHEMA_VERSION, T)`.
+        let (version, data_ts): (u32, u64) = data.into_val(&env);
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(version, 1);
         assert_eq!(data_ts, ledger_ts);
     }
 
@@ -1951,7 +1958,10 @@ mod tests {
         expected_topics.push_back(pool.clone().into_val(&env));
         assert_eq!(topics, expected_topics);
 
-        let (count_val, oldest_ts_val): (u32, u64) = data.into_val(&env);
+        // Issue #920: the payload is version-stamped as `(EVENT_SCHEMA_VERSION, T)`.
+        let (version, (count_val, oldest_ts_val)): (u32, (u32, u64)) = data.into_val(&env);
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(version, 1);
         assert_eq!(count_val, 2);
         assert_eq!(oldest_ts_val, 200_000);
     }
