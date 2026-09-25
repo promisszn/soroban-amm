@@ -65,6 +65,9 @@ pub enum ClError {
     /// partial fill — the caller asked for a specific output amount, so a
     /// shortfall is an error rather than a smaller-than-requested output.
     ExactOutNotFullyFilled = 23,
+    /// A function that depends on pool state (tokens, admin, current tick)
+    /// was called before `initialize`.
+    NotInitialized = 24,
 }
 
 /// Status of a range order (issue #295).
@@ -323,7 +326,7 @@ impl ConcentratedLiquidity {
 
     /// Admin: attach or remove the oracle aggregator for swap deviation checks (#318).
     pub fn set_oracle(env: Env, admin: Address, oracle: Option<Address>) -> Result<(), ClError> {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
         }
@@ -346,7 +349,7 @@ impl ConcentratedLiquidity {
     /// The NFT contract must be initialized with this pool's address as its
     /// `cl_pool`, otherwise mint/burn calls from the pool will be rejected.
     pub fn set_position_nft(env: Env, admin: Address, nft: Option<Address>) -> Result<(), ClError> {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
         }
@@ -407,7 +410,7 @@ impl ConcentratedLiquidity {
         admin: Address,
         max_deviation_bps: i128,
     ) -> Result<(), ClError> {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
         }
@@ -423,7 +426,7 @@ impl ConcentratedLiquidity {
 
     /// Pause all minting and swapping. Admin-only.
     pub fn pause(env: Env, admin: Address) -> Result<(), ClError> {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
         }
@@ -434,7 +437,7 @@ impl ConcentratedLiquidity {
 
     /// Resume minting and swapping. Admin-only.
     pub fn unpause(env: Env, admin: Address) -> Result<(), ClError> {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
         }
@@ -444,7 +447,7 @@ impl ConcentratedLiquidity {
     }
 
     pub fn propose_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), ClError> {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
         }
@@ -477,7 +480,7 @@ impl ConcentratedLiquidity {
         recipient: Address,
         bps: i128,
     ) -> Result<(), ClError> {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
         }
@@ -493,7 +496,7 @@ impl ConcentratedLiquidity {
     }
 
     pub fn withdraw_protocol_fees(env: Env, admin: Address) -> Result<(), ClError> {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
         }
@@ -510,7 +513,7 @@ impl ConcentratedLiquidity {
             .get(&DataKey::AccruedProtocolFeeA)
             .unwrap_or(0);
         if accrued_a > 0 {
-            let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
+            let token_a = Self::read_tokens(&env)?.0;
             TokenClient::new(&env, &token_a).transfer(
                 &env.current_contract_address(),
                 &recipient,
@@ -526,7 +529,7 @@ impl ConcentratedLiquidity {
             .get(&DataKey::AccruedProtocolFeeB)
             .unwrap_or(0);
         if accrued_b > 0 {
-            let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+            let token_b = Self::read_tokens(&env)?.1;
             TokenClient::new(&env, &token_b).transfer(
                 &env.current_contract_address(),
                 &recipient,
@@ -552,6 +555,37 @@ impl ConcentratedLiquidity {
     ///
     /// Must only be called for an entry that currently exists — i.e. right
     /// after writing it — because `extend_ttl` traps on a missing key.
+    fn require_initialized(env: &Env) -> Result<(), ClError> {
+        if env.storage().instance().has(&DataKey::TokenA) {
+            Ok(())
+        } else {
+            Err(ClError::NotInitialized)
+        }
+    }
+
+    fn read_admin(env: &Env) -> Result<Address, ClError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(ClError::NotInitialized)
+    }
+
+    fn read_tokens(env: &Env) -> Result<(Address, Address), ClError> {
+        let token_a = env.storage().instance().get(&DataKey::TokenA);
+        let token_b = env.storage().instance().get(&DataKey::TokenB);
+        match (token_a, token_b) {
+            (Some(a), Some(b)) => Ok((a, b)),
+            _ => Err(ClError::NotInitialized),
+        }
+    }
+
+    fn read_current_tick(env: &Env) -> Result<i32, ClError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CurrentTick)
+            .ok_or(ClError::NotInitialized)
+    }
+
     fn bump_position(env: &Env, key: &DataKey) {
         env.storage()
             .persistent()
@@ -614,6 +648,9 @@ impl ConcentratedLiquidity {
         min_b: i128,
         deadline: u64,
     ) -> Result<(i128, i128), ClError> {
+        // Reading the token pair first doubles as the initialization check,
+        // so this hot path pays for no extra storage lookup.
+        let (token_a, token_b) = Self::read_tokens(&env)?;
         if env.ledger().timestamp() > deadline {
             return Err(ClError::DeadlineExpired);
         }
@@ -643,9 +680,7 @@ impl ConcentratedLiquidity {
         if amount_a_desired < 0 || amount_b_desired < 0 {
             return Err(ClError::ZeroAmounts);
         }
-        let current_tick: i32 = env.storage().instance().get(&DataKey::CurrentTick).unwrap();
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let current_tick = Self::read_current_tick(&env)?;
         // Derive liquidity from the desired amounts using the same
         // sqrtPriceX96 math (`liquidity_from_amounts`) that burn/collect use
         // to convert liquidity back into amounts, then derive the *actual*
@@ -794,6 +829,7 @@ impl ConcentratedLiquidity {
         min_b: i128,
         deadline: u64,
     ) -> Result<(i128, i128), ClError> {
+        Self::require_initialized(&env)?;
         if env.ledger().timestamp() > deadline {
             return Err(ClError::DeadlineExpired);
         }
@@ -820,9 +856,8 @@ impl ConcentratedLiquidity {
             return Err(ClError::ZeroLiquidity);
         }
 
-        let current_tick: i32 = env.storage().instance().get(&DataKey::CurrentTick).unwrap();
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let current_tick = Self::read_current_tick(&env)?;
+        let (token_a, token_b) = Self::read_tokens(&env)?;
         let pos_key = DataKey::Position(provider.clone(), lower_tick, upper_tick);
         let mut pos: Position = env
             .storage()
@@ -958,6 +993,7 @@ impl ConcentratedLiquidity {
         min_liquidity: i128,
         deadline: u64,
     ) -> Result<SingleTokenDepositResult, ClError> {
+        Self::require_initialized(&env)?;
         if env.ledger().timestamp() > deadline {
             return Err(ClError::DeadlineExpired);
         }
@@ -987,14 +1023,13 @@ impl ConcentratedLiquidity {
         }
 
         // ── Identify which token was supplied ────────────────────────────────
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let (token_a, token_b) = Self::read_tokens(&env)?;
         let is_token_a = token_in == token_a;
         if !is_token_a && token_in != token_b {
             return Err(ClError::InvalidToken);
         }
 
-        let current_tick: i32 = env.storage().instance().get(&DataKey::CurrentTick).unwrap();
+        let current_tick = Self::read_current_tick(&env)?;
 
         // ── Compute (amount_a, amount_b, liquidity) from the single token ─────
         //
@@ -1202,6 +1237,7 @@ impl ConcentratedLiquidity {
         token_in: Address,
         amount_in: i128,
     ) -> Result<SingleTokenDepositResult, ClError> {
+        Self::require_initialized(&env)?;
         if lower_tick >= upper_tick {
             return Err(ClError::TickOutOfRange);
         }
@@ -1212,14 +1248,13 @@ impl ConcentratedLiquidity {
             return Err(ClError::ZeroAmounts);
         }
 
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let (token_a, token_b) = Self::read_tokens(&env)?;
         let is_token_a = token_in == token_a;
         if !is_token_a && token_in != token_b {
             return Err(ClError::InvalidToken);
         }
 
-        let current_tick: i32 = env.storage().instance().get(&DataKey::CurrentTick).unwrap();
+        let current_tick = Self::read_current_tick(&env)?;
 
         // Mirror the exact same logic as mint_position_single_token.
         let (liquidity, amount_used) = if current_tick < lower_tick {
@@ -1310,6 +1345,7 @@ impl ConcentratedLiquidity {
         min_liquidity: i128,
         deadline: u64,
     ) -> Result<SingleTokenDepositResult, ClError> {
+        Self::require_initialized(&env)?;
         let current_tick: i32 = env
             .storage()
             .instance()
@@ -1388,6 +1424,7 @@ impl ConcentratedLiquidity {
         lower_tick: i32,
         upper_tick: i32,
     ) -> Result<RangeOrderStatus, ClError> {
+        Self::require_initialized(&env)?;
         // Verify the position exists and is tagged as a range order.
         let _pos: Position = env
             .storage()
@@ -1440,6 +1477,7 @@ impl ConcentratedLiquidity {
         upper_tick: i32,
         liquidity: i128,
     ) -> Result<(i128, i128), ClError> {
+        Self::require_initialized(&env)?;
         // No pause guard — LPs must always be able to exit.
         provider.require_auth();
         Self::ensure_legacy_owner(&env, &provider, lower_tick, upper_tick)?;
@@ -1462,6 +1500,7 @@ impl ConcentratedLiquidity {
         token_id: u64,
         liquidity: i128,
     ) -> Result<(i128, i128), ClError> {
+        Self::require_initialized(&env)?;
         let (provider, lower_tick, upper_tick) =
             Self::resolve_token_owner(&env, &caller, token_id)?;
         caller.require_auth();
@@ -1495,6 +1534,7 @@ impl ConcentratedLiquidity {
         lower_tick: i32,
         upper_tick: i32,
     ) -> Result<(i128, i128), ClError> {
+        Self::require_initialized(&env)?;
         // No pause guard — LPs must always be able to collect fees.
         provider.require_auth();
         Self::ensure_legacy_owner(&env, &provider, lower_tick, upper_tick)?;
@@ -1508,6 +1548,7 @@ impl ConcentratedLiquidity {
         caller: Address,
         token_id: u64,
     ) -> Result<(i128, i128), ClError> {
+        Self::require_initialized(&env)?;
         let (provider, lower_tick, upper_tick) =
             Self::resolve_token_owner(&env, &caller, token_id)?;
         caller.require_auth();
@@ -1537,9 +1578,8 @@ impl ConcentratedLiquidity {
         if pos.liquidity < liquidity {
             return Err(ClError::InsufficientLiquidity);
         }
-        let current_tick: i32 = env.storage().instance().get(&DataKey::CurrentTick).unwrap();
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let current_tick = Self::read_current_tick(env)?;
+        let (token_a, token_b) = Self::read_tokens(env)?;
 
         let (fg_inside_a, fg_inside_b) =
             Self::fee_growth_inside(env.clone(), lower_tick, upper_tick);
@@ -1669,8 +1709,7 @@ impl ConcentratedLiquidity {
         let total_b = pos.tokens_owed.1 + nb;
         pos.fee_growth_inside_a = fg_inside_a;
         pos.fee_growth_inside_b = fg_inside_b;
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let (token_a, token_b) = Self::read_tokens(env)?;
 
         // As in burn_position_core: never transfer more than the contract
         // actually holds. Keep any shortfall recorded in `tokens_owed`
@@ -1821,8 +1860,8 @@ impl ConcentratedLiquidity {
             .ok_or(ClError::PositionNotFound)
     }
 
-    pub fn current_tick(env: Env) -> i32 {
-        env.storage().instance().get(&DataKey::CurrentTick).unwrap()
+    pub fn current_tick(env: Env) -> Result<i32, ClError> {
+        Self::read_current_tick(&env)
     }
 
     /// Returns the pool's token pair as `(token_a, token_b)` (issue #470).
@@ -1833,11 +1872,9 @@ impl ConcentratedLiquidity {
     /// `batch_auction` and other venue-agnostic callers validating an order's
     /// token pair — use this accessor.
     ///
-    /// Panics if the pool has not been initialized.
-    pub fn get_tokens(env: Env) -> (Address, Address) {
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
-        (token_a, token_b)
+    /// Returns `ClError::NotInitialized` if the pool has not been initialized.
+    pub fn get_tokens(env: Env) -> Result<(Address, Address), ClError> {
+        Self::read_tokens(&env)
     }
 
     pub fn active_liquidity(env: Env) -> i128 {
@@ -1885,8 +1922,11 @@ impl ConcentratedLiquidity {
     /// Lets a venue-agnostic caller (e.g. batch_auction's factory-backed venue
     /// registry) look this pool up via `Factory::get_cl_pool(token_a, token_b,
     /// fee_bps)` without needing the fee tier supplied out of band.
-    pub fn fee_bps(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::FeeBps).unwrap()
+    pub fn fee_bps(env: Env) -> Result<i128, ClError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .ok_or(ClError::NotInitialized)
     }
 
     // ── Issue #203: per-tick view functions ───────────────────────────────────
@@ -2002,6 +2042,9 @@ impl ConcentratedLiquidity {
         min_amount_out: i128,
         deadline: u64,
     ) -> Result<i128, ClError> {
+        // Reading the token pair first doubles as the initialization check,
+        // so this hot path pays for no extra storage lookup.
+        let (token_a, token_b) = Self::read_tokens(&env)?;
         if env.ledger().timestamp() > deadline {
             return Err(ClError::DeadlineExpired);
         }
@@ -2012,9 +2055,6 @@ impl ConcentratedLiquidity {
         if amount_in <= 0 {
             return Err(ClError::ZeroAmounts);
         }
-
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
 
         let protocol_fee_bps: i128 = env
             .storage()
@@ -2762,6 +2802,7 @@ impl ConcentratedLiquidity {
         max_amount_in: i128,
         deadline: u64,
     ) -> Result<i128, ClError> {
+        Self::require_initialized(&env)?;
         if env.ledger().timestamp() > deadline {
             return Err(ClError::DeadlineExpired);
         }
@@ -2773,8 +2814,7 @@ impl ConcentratedLiquidity {
             return Err(ClError::ZeroAmounts);
         }
 
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let (token_a, token_b) = Self::read_tokens(&env)?;
         let protocol_fee_bps: i128 = env
             .storage()
             .instance()
@@ -2988,6 +3028,7 @@ impl ConcentratedLiquidity {
         amount_out: i128,
         sqrt_price_limit_x96: u128,
     ) -> Result<i128, ClError> {
+        Self::require_initialized(&env)?;
         if amount_out <= 0 {
             return Err(ClError::ZeroAmounts);
         }
@@ -3050,6 +3091,7 @@ impl ConcentratedLiquidity {
         amount_in: i128,
         sqrt_price_limit_x96: u128,
     ) -> Result<PriceImpactEstimate, ClError> {
+        Self::require_initialized(&env)?;
         if amount_in <= 0 {
             return Err(ClError::ZeroAmounts);
         }
@@ -3267,6 +3309,7 @@ impl ConcentratedLiquidity {
         upper_tick: i32,
         liquidity: i128,
     ) -> Result<(i128, i128), ClError> {
+        Self::require_initialized(&env)?;
         if lower_tick >= upper_tick {
             return Err(ClError::TickOutOfRange);
         }
@@ -4012,6 +4055,123 @@ mod tests {
             sac_a,
             sac_b,
         }
+    }
+
+    #[test]
+    fn test_pre_init_calls_return_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Admin setters
+        assert_eq!(
+            client.try_set_oracle(&admin, &None),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_set_position_nft(&admin, &None),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_set_max_oracle_deviation_bps(&admin, &100),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(client.try_pause(&admin), Err(Ok(ClError::NotInitialized)));
+        assert_eq!(client.try_unpause(&admin), Err(Ok(ClError::NotInitialized)));
+        assert_eq!(
+            client.try_propose_admin(&admin, &provider),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_set_protocol_fee(&admin, &provider, &100),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_withdraw_protocol_fees(&admin),
+            Err(Ok(ClError::NotInitialized))
+        );
+
+        // Liquidity
+        assert_eq!(
+            client.try_mint_position(&provider, &-10, &10, &100, &100, &0, &0, &u64::MAX),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_modify_position(&provider, &-10, &10, &100, &0, &0, &u64::MAX),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_mint_position_single_token(
+                &provider,
+                &-10,
+                &10,
+                &token,
+                &100,
+                &0,
+                &u64::MAX
+            ),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_quote_single_token_deposit(&-10, &10, &token, &100),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_place_range_order(&provider, &10, &20, &token, &100, &0, &u64::MAX),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_check_range_order_filled(&provider, &10, &20),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_burn_position(&provider, &-10, &10, &1),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_burn_position_by_token_id(&provider, &0, &1),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_collect_fees(&provider, &-10, &10),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_collect_fees_by_token_id(&provider, &0),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_quote_position(&-10, &10, &100),
+            Err(Ok(ClError::NotInitialized))
+        );
+
+        // Swaps and quotes
+        let limit = ConcentratedLiquidity::tick_to_sqrt_price_x96(-100);
+        assert_eq!(
+            client.try_swap(&provider, &true, &100, &limit, &0, &u64::MAX),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_swap_exact_out(&provider, &true, &100, &limit, &1_000, &u64::MAX),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_quote_exact_out(&true, &100, &limit),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_estimate_price_impact(&true, &100, &limit),
+            Err(Ok(ClError::NotInitialized))
+        );
+
+        // Views that used to unwrap pool state
+        assert_eq!(client.try_current_tick(), Err(Ok(ClError::NotInitialized)));
+        assert_eq!(client.try_get_tokens(), Err(Ok(ClError::NotInitialized)));
+        assert_eq!(client.try_fee_bps(), Err(Ok(ClError::NotInitialized)));
     }
 
     #[test]

@@ -98,6 +98,9 @@ pub enum AmmError {
     AlreadyExecuted = 19,
     /// Multisig emergency withdrawal proposal has expired.
     ProposalExpired = 20,
+    /// A function that reads pool configuration (tokens, LP token, admin,
+    /// fee settings) was called before `initialize`.
+    NotInitialized = 21,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -455,7 +458,7 @@ impl AmmPool {
     /// Admin: attach or remove the oracle aggregator used for swap deviation checks.
     pub fn set_oracle(env: Env, admin: Address, oracle: Option<Address>) -> Result<(), AmmError> {
         Self::extend_ttl(&env);
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored_admin: Address = Self::read_admin(&env)?;
         if admin != stored_admin {
             return Err(AmmError::Unauthorized);
         }
@@ -473,7 +476,7 @@ impl AmmPool {
         max_deviation_bps: i128,
     ) -> Result<(), AmmError> {
         Self::extend_ttl(&env);
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored_admin: Address = Self::read_admin(&env)?;
         if admin != stored_admin {
             return Err(AmmError::Unauthorized);
         }
@@ -489,7 +492,7 @@ impl AmmPool {
 
     pub fn pause(env: Env) -> Result<(), AmmError> {
         Self::extend_ttl(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = Self::read_admin(&env)?;
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
         Ok(())
@@ -497,7 +500,7 @@ impl AmmPool {
 
     pub fn unpause(env: Env) -> Result<(), AmmError> {
         Self::extend_ttl(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = Self::read_admin(&env)?;
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
         Ok(())
@@ -516,7 +519,7 @@ impl AmmPool {
         Self::extend_ttl(&env);
         // Acquire the reentrancy lock before any external transfer below.
         let _guard = ReentrancyGuard::acquire(&env)?;
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = Self::read_admin(&env)?;
         admin.require_auth();
 
         // If a k-of-n multisig guard is configured, the single-admin path must
@@ -541,8 +544,8 @@ impl AmmPool {
             .set(&DataKey::EmergencyWithdrawRecipient, &to);
 
         // Get token addresses and reserves
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let token_a: Address = Self::read_token_a(&env)?;
+        let token_b: Address = Self::read_token_b(&env)?;
         let reserve_a = Self::get_reserve_a(env.clone());
         let reserve_b = Self::get_reserve_b(env.clone());
 
@@ -623,7 +626,7 @@ impl AmmPool {
             .get(&DataKey::MultisigQuorum)
             .unwrap_or(0);
         if quorum == 0 {
-            let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+            let admin: Address = Self::read_admin(&env)?;
             admin.require_auth();
         } else {
             let signers: soroban_sdk::Vec<Address> = env
@@ -669,7 +672,7 @@ impl AmmPool {
         cooldown_secs: u64,
     ) -> Result<(), AmmError> {
         Self::extend_ttl(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = Self::read_admin(&env)?;
         admin.require_auth();
 
         if threshold_bps <= 0 || threshold_bps > 10_000 {
@@ -851,12 +854,12 @@ impl AmmPool {
         protocol_fee_bps: i128,
     ) -> Result<(), AmmError> {
         Self::extend_ttl(&env);
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored_admin: Address = Self::read_admin(&env)?;
         if admin != stored_admin {
             return Err(AmmError::Unauthorized);
         }
         admin.require_auth();
-        let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
+        let fee_bps: i128 = Self::read_fee_bps(&env)?;
         // Fix M-02: protocol_fee_bps must be *strictly* less than fee_bps so LPs
         // always retain a portion of swap income. Allowing protocol_fee_bps == fee_bps
         // would route 100% of swap fees to the protocol, leaving LPs with nothing.
@@ -904,7 +907,7 @@ impl AmmPool {
     /// Must be in `[0, 10_000]`. Admin-only.
     pub fn set_lp_rebate(env: Env, admin: Address, lp_rebate_bps: i128) -> Result<(), AmmError> {
         Self::extend_ttl(&env);
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored_admin: Address = Self::read_admin(&env)?;
         if admin != stored_admin {
             return Err(AmmError::Unauthorized);
         }
@@ -945,7 +948,7 @@ impl AmmPool {
         quorum: u32,
     ) -> Result<(), AmmError> {
         Self::extend_ttl(&env);
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored_admin: Address = Self::read_admin(&env)?;
         if admin != stored_admin {
             return Err(AmmError::Unauthorized);
         }
@@ -1153,8 +1156,8 @@ impl AmmPool {
         if approvals.len() < quorum {
             return Err(AmmError::InsufficientShares);
         }
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let token_a: Address = Self::read_token_a(&env)?;
+        let token_b: Address = Self::read_token_b(&env)?;
         let reserve_a = Self::get_reserve_a(env.clone());
         let reserve_b = Self::get_reserve_b(env.clone());
         if reserve_a > 0 {
@@ -1262,6 +1265,41 @@ impl AmmPool {
         env.storage().instance().extend_ttl(172_800, 518_400);
     }
 
+    fn read_admin(env: &Env) -> Result<Address, AmmError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(AmmError::NotInitialized)
+    }
+
+    fn read_token_a(env: &Env) -> Result<Address, AmmError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::TokenA)
+            .ok_or(AmmError::NotInitialized)
+    }
+
+    fn read_token_b(env: &Env) -> Result<Address, AmmError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::TokenB)
+            .ok_or(AmmError::NotInitialized)
+    }
+
+    fn read_lp_token(env: &Env) -> Result<Address, AmmError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::LpToken)
+            .ok_or(AmmError::NotInitialized)
+    }
+
+    fn read_fee_bps(env: &Env) -> Result<i128, AmmError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .ok_or(AmmError::NotInitialized)
+    }
+
     /// Update the swap fee post-deployment. Admin-only.
     ///
     /// The new fee takes effect on the very next swap.
@@ -1277,7 +1315,7 @@ impl AmmPool {
     /// - If `new_fee_bps` is less than the current `protocol_fee_bps`.
     pub fn update_fee(env: Env, new_fee_bps: i128) -> Result<(), AmmError> {
         Self::extend_ttl(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = Self::read_admin(&env)?;
         admin.require_auth();
         Self::validate_fee_bps(new_fee_bps)?;
         let protocol_fee_bps: i128 = env
@@ -1300,7 +1338,7 @@ impl AmmPool {
     /// Update the flash loan fee post-deployment. Admin-only.
     pub fn update_flash_loan_fee(env: Env, new_fee_bps: i128) -> Result<(), AmmError> {
         Self::extend_ttl(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = Self::read_admin(&env)?;
         admin.require_auth();
         Self::validate_fee_bps(new_fee_bps)?;
         env.storage()
@@ -1325,7 +1363,7 @@ impl AmmPool {
         new_admin: Address,
     ) -> Result<(), AmmError> {
         Self::extend_ttl(&env);
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored: Address = Self::read_admin(&env)?;
         if current_admin != stored {
             return Err(AmmError::Unauthorized);
         }
@@ -1372,7 +1410,7 @@ impl AmmPool {
     /// State is preserved; only bytecode is replaced.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), AmmError> {
         Self::extend_ttl(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = Self::read_admin(&env)?;
         admin.require_auth();
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
@@ -1538,9 +1576,9 @@ impl AmmPool {
 
         let (reserve_a, reserve_b) = Self::checkpoint_oracles(&env);
 
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
-        let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
+        let token_a: Address = Self::read_token_a(&env)?;
+        let token_b: Address = Self::read_token_b(&env)?;
+        let lp_token: Address = Self::read_lp_token(&env)?;
         let total_shares: i128 = Self::get_total_shares(env.clone());
 
         // Compute shares to mint.
@@ -1671,14 +1709,14 @@ impl AmmPool {
 
         let (reserve_a, reserve_b) = Self::checkpoint_oracles(&env);
 
-        let owned = Self::shares_of(env.clone(), provider.clone());
+        let owned = Self::shares_of(env.clone(), provider.clone())?;
         if owned < shares {
             return Err(AmmError::InsufficientShares);
         }
 
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
-        let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
+        let token_a: Address = Self::read_token_a(&env)?;
+        let token_b: Address = Self::read_token_b(&env)?;
+        let lp_token: Address = Self::read_lp_token(&env)?;
 
         let total_shares = Self::get_total_shares(env.clone());
 
@@ -1775,14 +1813,14 @@ impl AmmPool {
         let (reserve_a, reserve_b) = Self::checkpoint_oracles(&env);
         Self::check_circuit_breaker(&env)?;
 
-        let owned = Self::shares_of(env.clone(), provider.clone());
+        let owned = Self::shares_of(env.clone(), provider.clone())?;
         if owned < shares {
             return Err(AmmError::InsufficientShares);
         }
 
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
-        let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
+        let token_a: Address = Self::read_token_a(&env)?;
+        let token_b: Address = Self::read_token_b(&env)?;
+        let lp_token: Address = Self::read_lp_token(&env)?;
 
         if token_out != token_a && token_out != token_b {
             return Err(AmmError::InvalidToken);
@@ -1828,7 +1866,7 @@ impl AmmPool {
             .set(&DataKey::TotalShares, &(total_shares - shares));
 
         // Internal swap: swap the "other" token for more of token_out.
-        let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
+        let fee_bps: i128 = Self::read_fee_bps(&env)?;
 
         // amount_swap after fee
         let amount_swap_with_fee = amount_swap * (10_000 - fee_bps);
@@ -1993,8 +2031,8 @@ impl AmmPool {
         // changes the reserves so the baseline is the pre-trade price.
         Self::check_circuit_breaker(&env)?;
 
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let token_a: Address = Self::read_token_a(&env)?;
+        let token_b: Address = Self::read_token_b(&env)?;
         let (reserve_in, reserve_out, token_out) = if token_in == token_a {
             (reserve_a, reserve_b, token_b.clone())
         } else if token_in == token_b {
@@ -2007,7 +2045,7 @@ impl AmmPool {
             return Err(AmmError::EmptyPool);
         }
 
-        let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
+        let fee_bps: i128 = Self::read_fee_bps(&env)?;
 
         // amount_in after fee
         let amount_in_with_fee = amount_in * (10_000 - fee_bps);
@@ -2154,8 +2192,8 @@ impl AmmPool {
         // Circuit breaker check before state mutation.
         Self::check_circuit_breaker(&env)?;
 
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let token_a: Address = Self::read_token_a(&env)?;
+        let token_b: Address = Self::read_token_b(&env)?;
 
         let token_in = if token_out == token_a {
             token_b.clone()
@@ -2270,11 +2308,11 @@ impl AmmPool {
             .storage()
             .instance()
             .get(&DataKey::FeeRecipient)
-            .unwrap();
+            .ok_or(AmmError::NotInitialized)?;
         fee_recipient.require_auth();
 
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let token_a: Address = Self::read_token_a(&env)?;
+        let token_b: Address = Self::read_token_b(&env)?;
 
         let fee_a: i128 = env
             .storage()
@@ -2345,8 +2383,8 @@ impl AmmPool {
         // Circuit breaker check before borrowing funds.
         Self::check_circuit_breaker(&env)?;
 
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let token_a: Address = Self::read_token_a(&env)?;
+        let token_b: Address = Self::read_token_b(&env)?;
         if reserve_a < amount_a || reserve_b < amount_b {
             return Err(AmmError::InsufficientLiquidity);
         }
@@ -2461,9 +2499,9 @@ impl AmmPool {
     /// # Panics
     /// - If `token_in` is not one of the two pool tokens.
     pub fn get_amount_out(env: Env, token_in: Address, amount_in: i128) -> Result<i128, AmmError> {
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
-        let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
+        let token_a: Address = Self::read_token_a(&env)?;
+        let token_b: Address = Self::read_token_b(&env)?;
+        let fee_bps: i128 = Self::read_fee_bps(&env)?;
 
         let (reserve_in, reserve_out) = if token_in == token_a {
             (
@@ -2499,9 +2537,9 @@ impl AmmPool {
         if amount_in <= 0 {
             return Err(AmmError::ZeroAmount);
         }
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
-        let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
+        let token_a: Address = Self::read_token_a(&env)?;
+        let token_b: Address = Self::read_token_b(&env)?;
+        let fee_bps: i128 = Self::read_fee_bps(&env)?;
         let (reserve_in, reserve_out) = if token_in == token_a {
             (
                 Self::get_reserve_a(env.clone()),
@@ -2546,9 +2584,9 @@ impl AmmPool {
     /// - Either reserve is zero (EmptyPool)
     /// - `amount_out` is >= the output reserve (InsufficientLiquidity)
     pub fn get_amount_in(env: Env, token_out: Address, amount_out: i128) -> Result<i128, AmmError> {
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
-        let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
+        let token_a: Address = Self::read_token_a(&env)?;
+        let token_b: Address = Self::read_token_b(&env)?;
+        let fee_bps: i128 = Self::read_fee_bps(&env)?;
         let (reserve_in, reserve_out) = if token_out == token_a {
             (
                 Self::get_reserve_b(env.clone()),
@@ -2586,8 +2624,8 @@ impl AmmPool {
     ///
     /// # Returns
     /// The pool's `fee_bps` as an `i128`. For the full pool state, see [`AmmPool::get_info`].
-    pub fn get_fee_info(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::FeeBps).unwrap()
+    pub fn get_fee_info(env: Env) -> Result<i128, AmmError> {
+        Self::read_fee_bps(&env)
     }
 
     /// Return full pool state.
@@ -2605,21 +2643,21 @@ impl AmmPool {
     /// - `admin` — the pool administrator.
     /// - `fee_recipient` — recipient of accrued protocol fees.
     /// - `protocol_fee_bps` — protocol fee in basis points (subset of `fee_bps`).
-    pub fn get_info(env: Env) -> PoolInfo {
-        PoolInfo {
-            token_a: env.storage().instance().get(&DataKey::TokenA).unwrap(),
-            token_b: env.storage().instance().get(&DataKey::TokenB).unwrap(),
+    pub fn get_info(env: Env) -> Result<PoolInfo, AmmError> {
+        Ok(PoolInfo {
+            token_a: Self::read_token_a(&env)?,
+            token_b: Self::read_token_b(&env)?,
             reserve_a: Self::get_reserve_a(env.clone()),
             reserve_b: Self::get_reserve_b(env.clone()),
             total_shares: Self::get_total_shares(env.clone()),
-            fee_bps: env.storage().instance().get(&DataKey::FeeBps).unwrap(),
+            fee_bps: Self::read_fee_bps(&env)?,
             flash_loan_fee_bps: Self::get_flash_loan_fee_bps(env.clone()),
-            admin: env.storage().instance().get(&DataKey::Admin).unwrap(),
+            admin: Self::read_admin(&env)?,
             fee_recipient: env
                 .storage()
                 .instance()
                 .get(&DataKey::FeeRecipient)
-                .unwrap(),
+                .ok_or(AmmError::NotInitialized)?,
             protocol_fee_bps: env
                 .storage()
                 .instance()
@@ -2630,7 +2668,7 @@ impl AmmPool {
                 .instance()
                 .get(&DataKey::LpRebateBps)
                 .unwrap_or(0),
-        }
+        })
     }
 
     /// Return the protocol fees accrued but not yet withdrawn, without moving funds.
@@ -2664,9 +2702,9 @@ impl AmmPool {
     /// # Returns
     /// The LP share balance of `provider`, or `0` if the address has never
     /// provided liquidity to this pool.
-    pub fn shares_of(env: Env, provider: Address) -> i128 {
-        let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
-        LpTokenClient::new(&env, &lp_token).balance(&provider)
+    pub fn shares_of(env: Env, provider: Address) -> Result<i128, AmmError> {
+        let lp_token: Address = Self::read_lp_token(&env)?;
+        Ok(LpTokenClient::new(&env, &lp_token).balance(&provider))
     }
 
     // ── Fee-on-transfer support ───────────────────────────────────────────────
@@ -2720,8 +2758,8 @@ impl AmmPool {
         Self::checkpoint_oracles(&env);
         Self::check_circuit_breaker(&env)?;
 
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let token_a: Address = Self::read_token_a(&env)?;
+        let token_b: Address = Self::read_token_b(&env)?;
 
         let (reserve_in, reserve_out, token_out) = if token_in == token_a {
             (
@@ -2757,7 +2795,7 @@ impl AmmPool {
             return Err(AmmError::FotSlippage);
         }
 
-        let fee_bps: i128 = env.storage().instance().get(&DataKey::FeeBps).unwrap();
+        let fee_bps: i128 = Self::read_fee_bps(&env)?;
         let amount_in_with_fee = actual_received * (10_000 - fee_bps);
         let amount_out =
             amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee);
@@ -2891,9 +2929,9 @@ impl AmmPool {
 
         Self::checkpoint_oracles(&env);
 
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
-        let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
+        let token_a: Address = Self::read_token_a(&env)?;
+        let token_b: Address = Self::read_token_b(&env)?;
+        let lp_token: Address = Self::read_lp_token(&env)?;
 
         let pool = env.current_contract_address();
         let client_a = SepTokenClient::new(&env, &token_a);

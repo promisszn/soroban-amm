@@ -2806,3 +2806,93 @@ fn test_every_emitted_event_carries_version_stamp() {
         "expected the call sequence to emit at least one pool event"
     );
 }
+
+// ── #928: typed NotInitialized instead of a host trap ─────────────────────────
+
+#[test]
+fn test_pre_init_calls_return_not_initialized() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let amm_addr = env.register_contract(None, AmmPool);
+    let client = AmmPoolClient::new(&env, &amm_addr);
+    let admin = Address::generate(&env);
+    let user = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    // Admin setters
+    assert_eq!(
+        client.try_set_oracle(&admin, &None),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_set_max_oracle_deviation_bps(&admin, &100),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(client.try_pause(), Err(Ok(AmmError::NotInitialized)));
+    assert_eq!(client.try_unpause(), Err(Ok(AmmError::NotInitialized)));
+    assert_eq!(
+        client.try_set_protocol_fee(&admin, &user, &10),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_set_lp_rebate(&admin, &100),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_update_fee(&30),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_update_flash_loan_fee(&9),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_propose_admin(&admin, &user),
+        Err(Ok(AmmError::NotInitialized))
+    );
+
+    // Liquidity and swaps
+    assert_eq!(
+        client.try_add_liquidity(&user, &1_000, &1_000, &0, &u64::MAX),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_remove_liquidity(&user, &100, &0, &0, &u64::MAX),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_swap(&user, &token, &100, &0, &u64::MAX),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_swap_exact_out(&user, &token, &100, &1_000, &u64::MAX),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_withdraw_protocol_fees(),
+        Err(Ok(AmmError::NotInitialized))
+    );
+
+    // Quotes and views
+    assert_eq!(
+        client.try_get_amount_out(&token, &100),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert_eq!(
+        client.try_get_amount_in(&token, &100),
+        Err(Ok(AmmError::NotInitialized))
+    );
+    assert!(matches!(
+        client.try_simulate_swap(&token, &100),
+        Err(Ok(AmmError::NotInitialized))
+    ));
+    assert_eq!(client.try_get_fee_info(), Err(Ok(AmmError::NotInitialized)));
+    assert!(matches!(
+        client.try_get_info(),
+        Err(Ok(AmmError::NotInitialized))
+    ));
+    assert_eq!(
+        client.try_shares_of(&user),
+        Err(Ok(AmmError::NotInitialized))
+    );
+}

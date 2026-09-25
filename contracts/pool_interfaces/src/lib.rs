@@ -46,6 +46,7 @@ pub enum AmmError {
     FlashLoanRepaymentFailed = 18,
     AlreadyExecuted = 19,
     ProposalExpired = 20,
+    NotInitialized = 21,
 }
 
 #[contracttype]
@@ -146,6 +147,7 @@ pub enum ClError {
     NftContractChangeBlocked = 21,
     RangeOrderExists = 22,
     ExactOutNotFullyFilled = 23,
+    NotInitialized = 24,
 }
 
 #[contracttype]

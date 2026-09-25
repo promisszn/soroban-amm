@@ -108,6 +108,9 @@ export const AmmErrors = {
   16: "fee-on-transfer slippage",
   17: "oracle deviation exceeded",
   18: "flash loan repayment failed",
+  19: "multisig proposal already executed",
+  20: "multisig proposal expired",
+  21: "pool not initialized",
 } as const;
 
 /** Numeric discriminant of an `AmmError` variant. */
@@ -136,6 +139,9 @@ export const AmmErrorNames = {
   16: "FotSlippage",
   17: "OracleDeviationExceeded",
   18: "FlashLoanRepaymentFailed",
+  19: "AlreadyExecuted",
+  20: "ProposalExpired",
+  21: "NotInitialized",
 } as const;
 
 export type AmmErrorKey = (typeof AmmErrorNames)[AmmErrorCode];

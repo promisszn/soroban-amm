@@ -31,6 +31,7 @@ use soroban_sdk::{contracterror, contracttype, Address};
 /// | 18   | FlashLoanRepaymentFailed | Receiver did not repay borrowed amounts + fees | Ensure `on_flash_loan` repays in full             |
 /// | 19   | AlreadyExecuted      | Multisig emergency withdrawal was already executed   | No action — proposal already carried out          |
 /// | 20   | ProposalExpired      | Multisig emergency withdrawal proposal has expired   | Submit a new proposal                             |
+/// | 21   | NotInitialized       | Pool config read before `initialize` was called      | Call `initialize` first                           |
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum SdkAmmError {
@@ -54,6 +55,7 @@ pub enum SdkAmmError {
     FlashLoanRepaymentFailed = 18,
     AlreadyExecuted = 19,
     ProposalExpired = 20,
+    NotInitialized = 21,
 }
 
 // ── Pool state ────────────────────────────────────────────────────────────────
