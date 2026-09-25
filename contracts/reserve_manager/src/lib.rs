@@ -149,6 +149,9 @@ pub struct ReserveReport {
 
 #[contracttype]
 pub enum DataKey {
+    Admin,
+    /// Pending admin nominee for two-step handover.
+    PendingAdmin,
     Governance,
     /// Pending governance nominee for two-step handover.
     PendingGovernance,
@@ -173,6 +176,10 @@ pub enum ReserveManagerError {
     NegativeReserveAmount = 4,
     /// A batch health check was handed more pools than `MAX_PAGE`.
     BatchTooLarge = 5,
+    /// `accept_admin` called without a prior `propose_admin`.
+    NoPendingAdmin = 6,
+    /// `accept_admin` called by an address other than the nominee.
+    WrongAdmin = 7,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -197,6 +204,7 @@ impl ReserveManager {
         env.storage()
             .instance()
             .set(&DataKey::Governance, &governance);
+        env.storage().instance().set(&DataKey::Admin, &governance);
         env.storage().instance().set(&DataKey::Factory, &factory);
         Ok(())
     }
@@ -263,6 +271,74 @@ impl ReserveManager {
         env.storage()
             .instance()
             .get(&DataKey::PendingGovernance)
+            .unwrap_or(None)
+    }
+
+    /// Nominate a new admin. The nominee must call `accept_admin` to complete the transfer.
+    pub fn propose_admin(
+        env: Env,
+        admin: Address,
+        new_admin: Address,
+    ) -> Result<(), ReserveManagerError> {
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .or_else(|| env.storage().instance().get(&DataKey::Governance))
+            .unwrap();
+        if admin != stored {
+            return Err(ReserveManagerError::Unauthorized);
+        }
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &Some(new_admin.clone()));
+        emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "admin_nominated"),),
+            (admin, new_admin)
+        );
+        Ok(())
+    }
+
+    /// Accept the pending admin nomination. Caller becomes the new admin.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), ReserveManagerError> {
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None);
+        let nominee = pending.ok_or(ReserveManagerError::NoPendingAdmin)?;
+        if new_admin != nominee {
+            return Err(ReserveManagerError::WrongAdmin);
+        }
+        new_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().set(&DataKey::Governance, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &Option::<Address>::None);
+        emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "admin_changed"),),
+            (new_admin,)
+        );
+        Ok(())
+    }
+
+    /// Return the active admin address.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .or_else(|| env.storage().instance().get(&DataKey::Governance))
+    }
+
+    /// Return the pending admin nominee, if any.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
             .unwrap_or(None)
     }
 
@@ -1313,5 +1389,72 @@ mod tests {
         let (version, data): (u32, (Address,)) = last_versioned_event(&s, "governance_transferred");
         assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
         assert_eq!(data, (new_gov,));
+    }
+
+    #[test]
+    fn test_admin_rotation_happy_path() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let new_admin = Address::generate(&s.env);
+
+        assert_eq!(rm.get_admin(), Some(s.governance.clone()));
+        assert_eq!(rm.get_pending_admin(), None);
+
+        // Propose admin
+        rm.propose_admin(&s.governance, &new_admin);
+        assert_eq!(rm.get_pending_admin(), Some(new_admin.clone()));
+        assert_eq!(rm.get_admin(), Some(s.governance.clone()));
+
+        // Accept admin
+        rm.accept_admin(&new_admin);
+        assert_eq!(rm.get_admin(), Some(new_admin.clone()));
+        assert_eq!(rm.get_pending_admin(), None);
+
+        let (version, data): (u32, (Address, Address)) = last_versioned_event(&s, "admin_nominated");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(data, (s.governance.clone(), new_admin.clone()));
+
+        let (version_changed, data_changed): (u32, (Address,)) = last_versioned_event(&s, "admin_changed");
+        assert_eq!(version_changed, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(data_changed, (new_admin,));
+    }
+
+    #[test]
+    fn test_propose_admin_unauthorized() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let rando = Address::generate(&s.env);
+        let new_admin = Address::generate(&s.env);
+
+        assert_eq!(
+            rm.try_propose_admin(&rando, &new_admin),
+            Err(Ok(ReserveManagerError::Unauthorized))
+        );
+        assert_eq!(rm.get_pending_admin(), None);
+        assert_eq!(rm.get_admin(), Some(s.governance));
+    }
+
+    #[test]
+    fn test_accept_admin_wrong_address_or_no_pending() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let rando = Address::generate(&s.env);
+        let new_admin = Address::generate(&s.env);
+
+        // Accept without prior proposal
+        assert_eq!(
+            rm.try_accept_admin(&new_admin),
+            Err(Ok(ReserveManagerError::NoPendingAdmin))
+        );
+
+        // Propose to new_admin
+        rm.propose_admin(&s.governance, &new_admin);
+
+        // Wrong address calling accept_admin
+        assert_eq!(
+            rm.try_accept_admin(&rando),
+            Err(Ok(ReserveManagerError::WrongAdmin))
+        );
+        assert_eq!(rm.get_admin(), Some(s.governance));
     }
 }
