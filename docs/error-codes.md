@@ -345,10 +345,31 @@ Defined in [contracts/governance/src/lib.rs](../contracts/governance/src/lib.rs)
 
 ## IncentiveCampaigns (`contracts/incentive_campaigns`)
 
-Uses runtime `panic!` and `assert!` preconditions (defined in [contracts/incentive_campaigns/src/lib.rs](../contracts/incentive_campaigns/src/lib.rs)).
+Defined in [contracts/incentive_campaigns/src/lib.rs](../contracts/incentive_campaigns/src/lib.rs) as `IncentiveError`.
 
-| Panic / Assert Message | Cause | Remedy |
-|-----------------------|-------|--------|
+| Code | Symbol | Cause | Remedy |
+|------|--------|-------|--------|
+| 1 | `AlreadyInitialized` | `initialize` was called on a contract that already has governance set. | Initialize once upon deployment. |
+| 2 | `NotInitialized` | A function was called before `initialize` (governance / id counters unset). | Call `initialize` first. |
+| 3 | `Unauthorized` | A governance-only function was called by another address. | Call using the governance address. |
+| 4 | `NoPendingGovernance` | `accept_governance` was called with no nomination outstanding. | Have governance call `propose_governance` first. |
+| 5 | `NotPendingGovernance` | `accept_governance` was called by an address other than the nominee. | Call from the nominated governance address. |
+| 6 | `InvalidCampaignWindow` | `create_campaign` was given `end_time <= start_time`. | Ensure `start_time < end_time`. |
+| 7 | `InvalidRewardRate` | `create_campaign` or `set_campaign_rate` was given a zero or negative rate. | Specify a reward rate > 0. |
+| 8 | `InvalidFundingAmount` | `create_campaign` was given a zero or negative funding amount. | Supply positive reward funding. |
+| 9 | `InsufficientFunding` | Funding is less than `reward_rate * (end_time - start_time)`. | Fund at least the campaign's maximum payout. |
+| 10 | `LpTokenMismatch` | The LP token's admin is not the given pool. | Pass the LP token that belongs to the pool. |
+| 11 | `CampaignNotFound` | No campaign exists with the given id. | Use an id returned by `create_campaign` / `list_campaigns_paginated`. |
+| 12 | `CampaignNotEnded` | `recover_leftover_funds` was called before `end_time`. | Wait for the campaign to end before recovering unallocated funds. |
+| 13 | `NoLeftoverFunds` | `recover_leftover_funds` found nothing left to recover. | No action needed; funds fully distributed. |
+| 14 | `CampaignInactive` | `claim_rewards` was called on a deactivated campaign (e.g. after leftover recovery). | No further claims are possible on this campaign. |
+| 15 | `CampaignNotStarted` | `claim_rewards` was called before `start_time`. | Wait for the campaign start timestamp. |
+| 16 | `NoLpBalance` | The claiming provider holds 0 LP tokens. | Deposit liquidity to earn LP tokens before claiming. |
+| 17 | `NoLpSupply` | The LP token's total supply is 0. | Seed the pool with liquidity. |
+| 18 | `NoPendingRewards` | The provider has no rewards accrued since their last claim. | Wait for rewards to accumulate over time. |
+| 19 | `RecordNotFound` | `get_distribution_record` was given an unknown id. | Use an id from `list_distribution_records` / `get_claim_history`. |
+
+-----------------------|-------|--------|
 | `already initialized` | Contract initialized twice. | Initialize once upon deployment. |
 | `not governance` | Restricted method called by non-governance account. | Call using governance credentials. |
 | `not pending governance` | `accept_governance` called by non-nominee. | Call from nominated governance address. |

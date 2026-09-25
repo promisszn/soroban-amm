@@ -33,9 +33,57 @@
 //! future seconds use the new rate.
 
 use soroban_sdk::{
-    contract, contractclient, contractimpl, contracttype, token::Client as TokenClient, Address,
-    Env, Symbol, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype,
+    token::Client as TokenClient, Address, Env, Symbol, Vec,
 };
+
+/// Typed failures for every caller-triggerable precondition in this contract.
+///
+/// Discriminants follow the workspace convention (`AlreadyInitialized = 1`,
+/// `NotInitialized = 2`) and are part of the ABI: never renumber, only append.
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum IncentiveError {
+    /// `initialize` was called on a contract that already has governance set.
+    AlreadyInitialized = 1,
+    /// A function was called before `initialize`.
+    NotInitialized = 2,
+    /// A governance-only function was called by another address.
+    Unauthorized = 3,
+    /// `accept_governance` was called with no nomination outstanding.
+    NoPendingGovernance = 4,
+    /// `accept_governance` was called by an address other than the nominee.
+    NotPendingGovernance = 5,
+    /// `create_campaign` was given `end_time <= start_time`.
+    InvalidCampaignWindow = 6,
+    /// A reward rate was zero or negative.
+    InvalidRewardRate = 7,
+    /// `create_campaign` was given a zero or negative funding amount.
+    InvalidFundingAmount = 8,
+    /// Funding does not cover `reward_rate * (end_time - start_time)`.
+    InsufficientFunding = 9,
+    /// The LP token's admin is not the given pool.
+    LpTokenMismatch = 10,
+    /// No campaign exists with the given id.
+    CampaignNotFound = 11,
+    /// `recover_leftover_funds` was called before the campaign's `end_time`.
+    CampaignNotEnded = 12,
+    /// `recover_leftover_funds` found nothing left to recover.
+    NoLeftoverFunds = 13,
+    /// The campaign has been deactivated (e.g. after leftover recovery).
+    CampaignInactive = 14,
+    /// `claim_rewards` was called before the campaign's `start_time`.
+    CampaignNotStarted = 15,
+    /// The claiming provider holds no LP tokens.
+    NoLpBalance = 16,
+    /// The LP token has zero total supply.
+    NoLpSupply = 17,
+    /// The provider has no rewards accrued since their last claim.
+    NoPendingRewards = 18,
+    /// No distribution record exists with the given id.
+    RecordNotFound = 19,
+}
 
 // ---------------------------------------------------------------------------
 // LP token interface (read-only)
@@ -193,11 +241,10 @@ pub struct IncentiveCampaigns;
 
 #[contractimpl]
 impl IncentiveCampaigns {
-    pub fn initialize(env: Env, governance: Address) {
-        assert!(
-            !env.storage().instance().has(&DataKey::Governance),
-            "already initialized"
-        );
+    pub fn initialize(env: Env, governance: Address) -> Result<(), IncentiveError> {
+        if env.storage().instance().has(&DataKey::Governance) {
+            return Err(IncentiveError::AlreadyInitialized);
+        }
         env.storage()
             .instance()
             .set(&DataKey::Governance, &governance);
@@ -208,16 +255,21 @@ impl IncentiveCampaigns {
             .instance()
             .set(&DataKey::NextDistributionId, &1u64);
         extend_instance_ttl(&env);
+        Ok(())
     }
 
     /// Nominate a new governance address. Current governance only.
     ///
     /// The nominee must call `accept_governance` to complete the handover, so a
     /// mistyped address cannot brick the governance-only entrypoints.
-    pub fn propose_governance(env: Env, caller: Address, new_governance: Address) {
+    pub fn propose_governance(
+        env: Env,
+        caller: Address,
+        new_governance: Address,
+    ) -> Result<(), IncentiveError> {
         extend_instance_ttl(&env);
         caller.require_auth();
-        Self::require_governance(&env, &caller);
+        Self::require_governance(&env, &caller)?;
 
         env.storage()
             .instance()
@@ -227,21 +279,24 @@ impl IncentiveCampaigns {
             (Symbol::new(&env, "governance_proposed"),),
             (caller, new_governance),
         );
+        Ok(())
     }
 
     /// Accept a pending governance nomination. Nominee only.
-    pub fn accept_governance(env: Env, new_governance: Address) {
+    pub fn accept_governance(env: Env, new_governance: Address) -> Result<(), IncentiveError> {
         extend_instance_ttl(&env);
         let pending: Option<Address> = env
             .storage()
             .instance()
             .get(&DataKey::PendingGovernance)
             .unwrap_or(None);
-        let nominee = pending.expect("no pending governance");
-        assert!(new_governance == nominee, "not pending governance");
+        let nominee = pending.ok_or(IncentiveError::NoPendingGovernance)?;
+        if new_governance != nominee {
+            return Err(IncentiveError::NotPendingGovernance);
+        }
         new_governance.require_auth();
 
-        let old_governance: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
+        let old_governance = Self::read_governance(&env)?;
         env.storage()
             .instance()
             .set(&DataKey::Governance, &new_governance);
@@ -253,11 +308,12 @@ impl IncentiveCampaigns {
             (Symbol::new(&env, "governance_transferred"),),
             (old_governance, new_governance),
         );
+        Ok(())
     }
 
     /// Return the active governance address.
-    pub fn get_governance(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::Governance).unwrap()
+    pub fn get_governance(env: Env) -> Result<Address, IncentiveError> {
+        Self::read_governance(&env)
     }
 
     /// Return the pending governance nominee, if any.
@@ -280,28 +336,35 @@ impl IncentiveCampaigns {
         end_time: u64,
         reward_rate: i128,
         funding_amount: i128,
-    ) -> u64 {
+    ) -> Result<u64, IncentiveError> {
         extend_instance_ttl(&env);
         caller.require_auth();
-        Self::require_governance(&env, &caller);
-        assert!(end_time > start_time, "invalid campaign window");
-        assert!(reward_rate > 0, "reward_rate must be positive");
-        assert!(funding_amount > 0, "funding required");
+        Self::require_governance(&env, &caller)?;
+        if end_time <= start_time {
+            return Err(IncentiveError::InvalidCampaignWindow);
+        }
+        if reward_rate <= 0 {
+            return Err(IncentiveError::InvalidRewardRate);
+        }
+        if funding_amount <= 0 {
+            return Err(IncentiveError::InvalidFundingAmount);
+        }
         let duration = (end_time - start_time) as i128;
         let max_payout = reward_rate * duration;
-        assert!(
-            funding_amount >= max_payout,
-            "funding must cover reward_rate * duration"
-        );
+        if funding_amount < max_payout {
+            return Err(IncentiveError::InsufficientFunding);
+        }
 
         let lp_admin = LpTokenClient::new(&env, &lp_token).admin();
-        assert!(lp_admin == pool, "lp_token does not match pool");
+        if lp_admin != pool {
+            return Err(IncentiveError::LpTokenMismatch);
+        }
 
         let id: u64 = env
             .storage()
             .instance()
             .get(&DataKey::NextCampaignId)
-            .unwrap();
+            .ok_or(IncentiveError::NotInitialized)?;
 
         let campaign = Campaign {
             id,
@@ -358,7 +421,7 @@ impl IncentiveCampaigns {
             (Symbol::new(&env, "campaign_created"),),
             (id, pool, reward_token, start_time, end_time, reward_rate),
         );
-        id
+        Ok(id)
     }
 
     /// Update the reward rate for an active campaign. Governance only.
@@ -367,18 +430,25 @@ impl IncentiveCampaigns {
     /// changes, so rewards already accrued at the old rate are locked in and
     /// only future seconds use the new rate.  This prevents retroactive reward
     /// manipulation via rate changes (part of bug #425).
-    pub fn set_campaign_rate(env: Env, caller: Address, campaign_id: u64, new_rate: i128) {
+    pub fn set_campaign_rate(
+        env: Env,
+        caller: Address,
+        campaign_id: u64,
+        new_rate: i128,
+    ) -> Result<(), IncentiveError> {
         extend_instance_ttl(&env);
         caller.require_auth();
-        Self::require_governance(&env, &caller);
-        assert!(new_rate > 0, "rate must be positive");
+        Self::require_governance(&env, &caller)?;
+        if new_rate <= 0 {
+            return Err(IncentiveError::InvalidRewardRate);
+        }
 
         let campaign_key = DataKey::Campaign(campaign_id);
         let mut campaign: Campaign = env
             .storage()
             .persistent()
             .get(&campaign_key)
-            .expect("campaign not found");
+            .ok_or(IncentiveError::CampaignNotFound)?;
         extend_persistent_ttl(&env, &campaign_key);
 
         // Flush the payout accumulator to now *before* the rate changes, so
@@ -405,6 +475,7 @@ impl IncentiveCampaigns {
             (Symbol::new(&env, "rate_updated"),),
             (campaign_id, new_rate),
         );
+        Ok(())
     }
 
     /// Recover undistributed reward tokens after a campaign has ended. Governance only.
@@ -420,25 +491,29 @@ impl IncentiveCampaigns {
         caller: Address,
         campaign_id: u64,
         recipient: Address,
-    ) -> i128 {
+    ) -> Result<i128, IncentiveError> {
         extend_instance_ttl(&env);
         caller.require_auth();
-        Self::require_governance(&env, &caller);
+        Self::require_governance(&env, &caller)?;
 
         let campaign_key = DataKey::Campaign(campaign_id);
         let mut campaign: Campaign = env
             .storage()
             .persistent()
             .get(&campaign_key)
-            .expect("campaign not found");
+            .ok_or(IncentiveError::CampaignNotFound)?;
         extend_persistent_ttl(&env, &campaign_key);
 
         let now = env.ledger().timestamp();
-        assert!(now > campaign.end_time, "campaign not yet ended");
+        if now <= campaign.end_time {
+            return Err(IncentiveError::CampaignNotEnded);
+        }
         Self::checkpoint_campaign_rewards(&env, campaign_id, &campaign, now);
 
         let leftover = campaign.funding_amount - campaign.total_distributed;
-        assert!(leftover > 0, "no leftover funds to recover");
+        if leftover <= 0 {
+            return Err(IncentiveError::NoLeftoverFunds);
+        }
 
         // Mark inactive so future claim_rewards calls revert, protecting the
         // recipient from having tokens transferred twice.
@@ -454,7 +529,7 @@ impl IncentiveCampaigns {
             (campaign_id, recipient.clone(), leftover),
         );
 
-        leftover
+        Ok(leftover)
     }
 
     /// Distribute accrued rewards to a provider proportional to their time-weighted
@@ -473,7 +548,11 @@ impl IncentiveCampaigns {
     /// so they earn rewards only from the moment they hold LP tokens forward.
     /// They cannot reach back to the campaign start and claim rewards from a window
     /// during which they held nothing.
-    pub fn claim_rewards(env: Env, provider: Address, campaign_id: u64) -> i128 {
+    pub fn claim_rewards(
+        env: Env,
+        provider: Address,
+        campaign_id: u64,
+    ) -> Result<i128, IncentiveError> {
         extend_instance_ttl(&env);
         provider.require_auth();
 
@@ -482,22 +561,30 @@ impl IncentiveCampaigns {
             .storage()
             .persistent()
             .get(&campaign_key)
-            .expect("campaign not found");
+            .ok_or(IncentiveError::CampaignNotFound)?;
         extend_persistent_ttl(&env, &campaign_key);
-        assert!(campaign.active, "campaign inactive");
+        if !campaign.active {
+            return Err(IncentiveError::CampaignInactive);
+        }
 
         let now = env.ledger().timestamp();
-        assert!(now >= campaign.start_time, "campaign not started");
+        if now < campaign.start_time {
+            return Err(IncentiveError::CampaignNotStarted);
+        }
 
         // Cap accrual at end_time so LPs can still claim earned rewards after the
         // campaign window closes without accruing phantom future rewards.
         let claim_time = now.min(campaign.end_time);
 
         let lp_balance = LpTokenClient::new(&env, &campaign.lp_token).balance(&provider);
-        assert!(lp_balance > 0, "no LP balance");
+        if lp_balance <= 0 {
+            return Err(IncentiveError::NoLpBalance);
+        }
 
         let total_supply = LpTokenClient::new(&env, &campaign.lp_token).total_supply();
-        assert!(total_supply > 0, "no LP supply");
+        if total_supply <= 0 {
+            return Err(IncentiveError::NoLpSupply);
+        }
 
         // ── Step 2: advance campaign accumulator to current time ─────────────────
 
@@ -536,12 +623,14 @@ impl IncentiveCampaigns {
                 // Persist the advanced accumulator even on init (no total_distributed change).
                 env.storage().persistent().set(&campaign_key, &campaign);
                 extend_persistent_ttl(&env, &campaign_key);
-                return 0;
+                return Ok(0);
             }
             Some(snap) => {
                 let acc_delta = campaign.acc_reward_per_share - snap.acc_at_snapshot;
                 let p = lp_balance * acc_delta / PRECISION;
-                assert!(p > 0, "no pending rewards");
+                if p <= 0 {
+                    return Err(IncentiveError::NoPendingRewards);
+                }
                 p
             }
         };
@@ -567,7 +656,7 @@ impl IncentiveCampaigns {
             .storage()
             .instance()
             .get(&DataKey::NextDistributionId)
-            .unwrap();
+            .ok_or(IncentiveError::NotInitialized)?;
         let record = DistributionRecord {
             id: dist_id,
             campaign_id,
@@ -613,23 +702,23 @@ impl IncentiveCampaigns {
             (Symbol::new(&env, "reward_distributed"),),
             (campaign_id, provider, pending, dist_id),
         );
-        pending
+        Ok(pending)
     }
 
     // -------------------------------------------------------------------------
     // Read-only helpers
     // -------------------------------------------------------------------------
 
-    pub fn get_campaign(env: Env, campaign_id: u64) -> Campaign {
+    pub fn get_campaign(env: Env, campaign_id: u64) -> Result<Campaign, IncentiveError> {
         extend_instance_ttl(&env);
         let campaign_key = DataKey::Campaign(campaign_id);
         let campaign: Campaign = env
             .storage()
             .persistent()
             .get(&campaign_key)
-            .expect("campaign not found");
+            .ok_or(IncentiveError::CampaignNotFound)?;
         extend_persistent_ttl(&env, &campaign_key);
-        campaign
+        Ok(campaign)
     }
 
     /// Return the campaign's accrual audit trail as
@@ -647,15 +736,16 @@ impl IncentiveCampaigns {
     /// `get_campaign_accrual(id).0 >= get_campaign(id).total_distributed` holds
     /// for any sequence of calls.
     ///
-    /// Panics if the campaign does not exist, matching `get_campaign`.
-    pub fn get_campaign_accrual(env: Env, campaign_id: u64) -> (i128, u64) {
+    /// Returns `IncentiveError::CampaignNotFound` if the campaign does not
+    /// exist, matching `get_campaign`.
+    pub fn get_campaign_accrual(env: Env, campaign_id: u64) -> Result<(i128, u64), IncentiveError> {
         extend_instance_ttl(&env);
         let campaign_key = DataKey::Campaign(campaign_id);
         let campaign: Campaign = env
             .storage()
             .persistent()
             .get(&campaign_key)
-            .expect("campaign not found");
+            .ok_or(IncentiveError::CampaignNotFound)?;
         extend_persistent_ttl(&env, &campaign_key);
 
         let accrued_key = DataKey::CampaignAccruedRewards(campaign_id);
@@ -676,7 +766,7 @@ impl IncentiveCampaigns {
         extend_persistent_ttl(&env, &accrued_key);
         extend_persistent_ttl(&env, &last_accrual_key);
 
-        (accrued, last_accrual)
+        Ok((accrued, last_accrual))
     }
 
     /// Every campaign id ever created, oldest first.
@@ -726,16 +816,19 @@ impl IncentiveCampaigns {
         page
     }
 
-    pub fn get_distribution_record(env: Env, record_id: u64) -> DistributionRecord {
+    pub fn get_distribution_record(
+        env: Env,
+        record_id: u64,
+    ) -> Result<DistributionRecord, IncentiveError> {
         extend_instance_ttl(&env);
         let record_key = DataKey::DistributionRecord(record_id);
         let record: DistributionRecord = env
             .storage()
             .persistent()
             .get(&record_key)
-            .expect("record not found");
+            .ok_or(IncentiveError::RecordNotFound)?;
         extend_persistent_ttl(&env, &record_key);
-        record
+        Ok(record)
     }
 
     /// Every currently active campaign.
@@ -1042,9 +1135,18 @@ impl IncentiveCampaigns {
         page
     }
 
-    fn require_governance(env: &Env, caller: &Address) {
-        let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
-        assert!(caller == &gov, "not governance");
+    fn read_governance(env: &Env) -> Result<Address, IncentiveError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Governance)
+            .ok_or(IncentiveError::NotInitialized)
+    }
+
+    fn require_governance(env: &Env, caller: &Address) -> Result<(), IncentiveError> {
+        if caller != &Self::read_governance(env)? {
+            return Err(IncentiveError::Unauthorized);
+        }
+        Ok(())
     }
 
     fn campaign_accrual_time(campaign: &Campaign, now: u64) -> u64 {
@@ -1420,9 +1522,10 @@ mod tests {
         );
 
         // Duplicate claim must fail.
-        assert!(
-            client.try_claim_rewards(&provider, &id).is_err(),
-            "second claim should fail with 'no pending rewards'"
+        assert_eq!(
+            client.try_claim_rewards(&provider, &id),
+            Err(Ok(IncentiveError::NoPendingRewards)),
+            "second claim should fail with NoPendingRewards"
         );
 
         // ── Partial claim then remainder after end ────────────────────────────────
@@ -1452,8 +1555,9 @@ mod tests {
         // 100 * 8_000 * 1e12 / 1_000_000 = 8e8; 999_000 * 8e8 / 1e12 = 799_200
         assert_eq!(remainder, 799_200, "remainder claim t=12_000..20_000");
 
-        assert!(
-            client.try_claim_rewards(&provider, &id2).is_err(),
+        assert_eq!(
+            client.try_claim_rewards(&provider, &id2),
+            Err(Ok(IncentiveError::NoPendingRewards)),
             "third claim should fail"
         );
     }
@@ -1488,8 +1592,9 @@ mod tests {
         );
 
         // Post-recovery claims must fail.
-        assert!(
-            client.try_claim_rewards(&provider, &id).is_err(),
+        assert_eq!(
+            client.try_claim_rewards(&provider, &id),
+            Err(Ok(IncentiveError::CampaignInactive)),
             "claim after recovery must fail (campaign inactive)"
         );
 
@@ -1506,10 +1611,9 @@ mod tests {
             &gov_addr, &pool, &lp, &reward, &1_000, &5_000, &100, &1_000_000,
         );
         env.ledger().with_mut(|l| l.timestamp = 3_000);
-        assert!(
-            client
-                .try_recover_leftover_funds(&gov_addr, &id3, &treasury)
-                .is_err(),
+        assert_eq!(
+            client.try_recover_leftover_funds(&gov_addr, &id3, &treasury),
+            Err(Ok(IncentiveError::CampaignNotEnded)),
             "recovery before end_time must be rejected"
         );
     }
@@ -2218,5 +2322,147 @@ mod tests {
         assert_eq!(accrued, rate * (end - start) as i128);
         assert_eq!(last, end);
         assert!(accrued >= client.get_campaign(&id).total_distributed);
+    }
+
+    // -------------------------------------------------------------------------
+    // #927: typed IncentiveError instead of opaque host traps
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_pre_init_calls_return_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let addr = env.register_contract(None, IncentiveCampaigns);
+        let client = IncentiveCampaignsClient::new(&env, &addr);
+        let caller = Address::generate(&env);
+        let other = Address::generate(&env);
+
+        assert_eq!(
+            client.try_get_governance(),
+            Err(Ok(IncentiveError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_propose_governance(&caller, &other),
+            Err(Ok(IncentiveError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_create_campaign(&caller, &other, &other, &other, &1_000, &2_000, &1, &1_000),
+            Err(Ok(IncentiveError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_set_campaign_rate(&caller, &1, &10),
+            Err(Ok(IncentiveError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_recover_leftover_funds(&caller, &1, &other),
+            Err(Ok(IncentiveError::NotInitialized))
+        );
+    }
+
+    #[test]
+    fn test_governance_errors_are_typed() {
+        let (env, incentives, _, _, _, _, gov) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+        let stranger = Address::generate(&env);
+        let nominee = Address::generate(&env);
+
+        assert_eq!(
+            client.try_initialize(&stranger),
+            Err(Ok(IncentiveError::AlreadyInitialized))
+        );
+        assert_eq!(
+            client.try_propose_governance(&stranger, &nominee),
+            Err(Ok(IncentiveError::Unauthorized))
+        );
+        assert_eq!(
+            client.try_accept_governance(&nominee),
+            Err(Ok(IncentiveError::NoPendingGovernance))
+        );
+        client.propose_governance(&gov, &nominee);
+        assert_eq!(
+            client.try_accept_governance(&stranger),
+            Err(Ok(IncentiveError::NotPendingGovernance))
+        );
+    }
+
+    #[test]
+    fn test_create_campaign_errors_are_typed() {
+        let (env, incentives, amm, lp, reward, _, gov) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+        let stranger = Address::generate(&env);
+
+        assert_eq!(
+            client.try_create_campaign(&stranger, &amm, &lp, &reward, &1_000, &2_000, &1, &1_000),
+            Err(Ok(IncentiveError::Unauthorized))
+        );
+        assert_eq!(
+            client.try_create_campaign(&gov, &amm, &lp, &reward, &2_000, &2_000, &1, &1_000),
+            Err(Ok(IncentiveError::InvalidCampaignWindow))
+        );
+        assert_eq!(
+            client.try_create_campaign(&gov, &amm, &lp, &reward, &1_000, &2_000, &0, &1_000),
+            Err(Ok(IncentiveError::InvalidRewardRate))
+        );
+        assert_eq!(
+            client.try_create_campaign(&gov, &amm, &lp, &reward, &1_000, &2_000, &1, &0),
+            Err(Ok(IncentiveError::InvalidFundingAmount))
+        );
+        assert_eq!(
+            client.try_create_campaign(&gov, &amm, &lp, &reward, &1_000, &2_000, &1, &999),
+            Err(Ok(IncentiveError::InsufficientFunding))
+        );
+        assert_eq!(
+            client.try_create_campaign(&gov, &stranger, &lp, &reward, &1_000, &2_000, &1, &1_000),
+            Err(Ok(IncentiveError::LpTokenMismatch))
+        );
+    }
+
+    #[test]
+    fn test_campaign_lookup_and_claim_errors_are_typed() {
+        let (env, incentives, amm, lp, reward, provider, gov) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+        let no_lp = Address::generate(&env);
+
+        assert_eq!(
+            client.try_get_campaign(&99),
+            Err(Ok(IncentiveError::CampaignNotFound))
+        );
+        assert_eq!(
+            client.try_get_campaign_accrual(&99),
+            Err(Ok(IncentiveError::CampaignNotFound))
+        );
+        assert_eq!(
+            client.try_claim_rewards(&provider, &99),
+            Err(Ok(IncentiveError::CampaignNotFound))
+        );
+        assert_eq!(
+            client.try_set_campaign_rate(&gov, &99, &10),
+            Err(Ok(IncentiveError::CampaignNotFound))
+        );
+        assert_eq!(
+            client.try_get_distribution_record(&99),
+            Err(Ok(IncentiveError::RecordNotFound))
+        );
+
+        // Campaign that starts in the future.
+        let id = client.create_campaign(&gov, &amm, &lp, &reward, &5_000, &6_000, &1, &1_000);
+        assert_eq!(
+            client.try_set_campaign_rate(&gov, &id, &0),
+            Err(Ok(IncentiveError::InvalidRewardRate))
+        );
+        assert_eq!(
+            client.try_claim_rewards(&provider, &id),
+            Err(Ok(IncentiveError::CampaignNotStarted))
+        );
+
+        env.ledger().set_timestamp(5_500);
+        assert_eq!(
+            client.try_claim_rewards(&no_lp, &id),
+            Err(Ok(IncentiveError::NoLpBalance))
+        );
+
+        // Nothing is ever claimed, so after the end every unit is left over.
+        env.ledger().set_timestamp(7_000);
+        assert_eq!(client.recover_leftover_funds(&gov, &id, &gov), 1_000);
     }
 }
