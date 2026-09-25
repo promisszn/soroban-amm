@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Re-baseline stored Monte Carlo reports.** Changing the generator changes the draws, so a seeded run produces different sample statistics than it did on the previous release (the distributions are equivalent; the individual numbers move). This is a one-time shift — the point of the change is that it will not happen again unnoticed.
 
 ### Fixed
+- `incentive_campaigns`: `recover_leftover_funds` could run more than once on the same campaign. Recovery marks the campaign inactive but leaves `funding_amount - total_distributed` unchanged, so every repeat call transferred the same leftover again, taken from the balance other campaigns hold in the same reward token. A campaign that is already inactive now returns `IncentiveError::CampaignInactive`.
 - `concentrated_liquidity`: the swap engine priced every step in a
   3-significant-digit scale (`p_c = (sqrt_price_x96 * 1000) >> 96`) while
   minting, burning and quoting priced at the full `sqrt_price_x96`. One unit of

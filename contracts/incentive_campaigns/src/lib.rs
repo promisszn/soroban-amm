@@ -504,6 +504,14 @@ impl IncentiveCampaigns {
             .ok_or(IncentiveError::CampaignNotFound)?;
         extend_persistent_ttl(&env, &campaign_key);
 
+        // Recovery is the only thing that deactivates a campaign, and it leaves
+        // `funding_amount - total_distributed` unchanged. Without this check a
+        // second call would transfer the same leftover again, paid out of the
+        // balance other campaigns hold in the same reward token.
+        if !campaign.active {
+            return Err(IncentiveError::CampaignInactive);
+        }
+
         let now = env.ledger().timestamp();
         if now <= campaign.end_time {
             return Err(IncentiveError::CampaignNotEnded);
@@ -2464,5 +2472,37 @@ mod tests {
         // Nothing is ever claimed, so after the end every unit is left over.
         env.ledger().set_timestamp(7_000);
         assert_eq!(client.recover_leftover_funds(&gov, &id, &gov), 1_000);
+    }
+
+    /// A second `recover_leftover_funds` on the same campaign must not pay out
+    /// again. The leftover is computed from `funding_amount - total_distributed`,
+    /// which recovery does not change, so without the inactive check the
+    /// second call would pull the same amount out of whatever other campaigns
+    /// hold in the shared reward token.
+    #[test]
+    fn test_recover_leftover_funds_cannot_run_twice() {
+        let (env, incentives, amm, lp, reward, _, gov) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+        let reward_client = soroban_sdk::token::Client::new(&env, &reward);
+        let treasury = Address::generate(&env);
+
+        let first = client.create_campaign(&gov, &amm, &lp, &reward, &1_000, &2_000, &1, &1_000);
+        // A second campaign funded in the same reward token, still running.
+        client.create_campaign(&gov, &amm, &lp, &reward, &1_000, &9_000, &1, &8_000);
+        assert_eq!(reward_client.balance(&incentives), 9_000);
+
+        env.ledger().set_timestamp(3_000);
+        assert_eq!(
+            client.recover_leftover_funds(&gov, &first, &treasury),
+            1_000
+        );
+        assert_eq!(
+            client.try_recover_leftover_funds(&gov, &first, &treasury),
+            Err(Ok(IncentiveError::CampaignInactive))
+        );
+
+        // The other campaign's funding is untouched.
+        assert_eq!(reward_client.balance(&treasury), 1_000);
+        assert_eq!(reward_client.balance(&incentives), 8_000);
     }
 }
