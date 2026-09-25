@@ -71,6 +71,10 @@ pub enum StakingError {
     NoStakers = 18,
     /// A batch call exceeded `MAX_BATCH_SIZE` entries.
     BatchTooLarge = 19,
+    /// `accept_admin` called without a prior `propose_admin`.
+    NoPendingAdmin = 20,
+    /// `accept_admin` called by an address other than the nominee.
+    WrongAdmin = 21,
 }
 
 // Ã¢â€â‚¬Ã¢â€â‚¬ Constants Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
@@ -144,6 +148,8 @@ pub enum DataKey {
     Paused,
     /// Emergency mode flag; when true stakers may reclaim LP without rewards (#359).
     EmergencyMode,
+    /// Pending admin nominee for two-step handover.
+    PendingAdmin,
     /// Registry of every address that has ever had a nonzero staked balance,
     /// maintained so keepers can enumerate stakers for `list_expired_boosts`
     /// / `settle_boost_batch` (#699). An address is added on its first stake
@@ -506,6 +512,68 @@ impl Staking {
         env.events()
             .publish((Symbol::new(&env, "unpaused"),), (admin,));
         Ok(())
+    }
+
+    /// Nominate a new admin. The nominee must call `accept_admin` to complete the transfer.
+    pub fn propose_admin(
+        env: Env,
+        admin: Address,
+        new_admin: Address,
+    ) -> Result<(), StakingError> {
+        Self::extend_instance_ttl(&env);
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(StakingError::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(StakingError::Unauthorized);
+        }
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &Some(new_admin.clone()));
+        env.events()
+            .publish((Symbol::new(&env, "admin_nominated"),), (admin, new_admin));
+        Ok(())
+    }
+
+    /// Accept the pending admin nomination. Caller becomes the new admin.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), StakingError> {
+        Self::extend_instance_ttl(&env);
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None);
+        let nominee = pending.ok_or(StakingError::NoPendingAdmin)?;
+        if new_admin != nominee {
+            return Err(StakingError::WrongAdmin);
+        }
+        new_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &Option::<Address>::None);
+        env.events()
+            .publish((Symbol::new(&env, "admin_changed"),), (new_admin,));
+        Ok(())
+    }
+
+    /// Return current admin address.
+    pub fn get_admin(env: Env) -> Result<Address, StakingError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(StakingError::NotInitialized)
+    }
+
+    /// Return pending admin nominee, if any.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None)
     }
 
     /// Whether the contract is currently paused (#360).
@@ -3234,5 +3302,69 @@ mod tests {
             staking.try_unlock(&staker),
             Err(Ok(StakingError::NothingStaked))
         );
+    }
+
+    #[test]
+    fn test_admin_rotation_happy_path() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, _staker, staking) = setup(&env);
+        let new_admin = Address::generate(&env);
+
+        assert_eq!(staking.get_admin(), admin);
+        assert_eq!(staking.get_pending_admin(), None);
+
+        // Propose admin
+        staking.propose_admin(&admin, &new_admin);
+        assert_eq!(staking.get_pending_admin(), Some(new_admin.clone()));
+        // Old admin retains control before acceptance
+        assert_eq!(staking.get_admin(), admin);
+
+        // Accept admin
+        staking.accept_admin(&new_admin);
+        assert_eq!(staking.get_admin(), new_admin);
+        assert_eq!(staking.get_pending_admin(), None);
+    }
+
+    #[test]
+    fn test_propose_admin_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staker, staking) = setup(&env);
+        let new_admin = Address::generate(&env);
+
+        // Non-admin propose_admin must fail
+        assert_eq!(
+            staking.try_propose_admin(&staker, &new_admin),
+            Err(Ok(StakingError::Unauthorized))
+        );
+        assert_eq!(staking.get_pending_admin(), None);
+        assert_eq!(staking.get_admin(), admin);
+    }
+
+    #[test]
+    fn test_accept_admin_wrong_address_or_no_pending() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staker, staking) = setup(&env);
+        let new_admin = Address::generate(&env);
+
+        // Accept without prior proposal
+        assert_eq!(
+            staking.try_accept_admin(&new_admin),
+            Err(Ok(StakingError::NoPendingAdmin))
+        );
+
+        // Propose to new_admin
+        staking.propose_admin(&admin, &new_admin);
+
+        // Wrong address calling accept_admin
+        assert_eq!(
+            staking.try_accept_admin(&staker),
+            Err(Ok(StakingError::WrongAdmin))
+        );
+
+        // Old admin still in control
+        assert_eq!(staking.get_admin(), admin);
     }
 }
