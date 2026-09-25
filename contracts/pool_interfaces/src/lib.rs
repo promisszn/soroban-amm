@@ -147,6 +147,7 @@ pub enum ClError {
     NftContractChangeBlocked = 21,
     RangeOrderExists = 22,
     ExactOutNotFullyFilled = 23,
+    NotInitialized = 24,
 }
 
 #[contracttype]
