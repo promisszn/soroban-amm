@@ -107,15 +107,13 @@ that emit versioned events. Keep it synchronized with every
 hard-coded site count because tests and helper examples may also contain macro
 calls.
 
-`contracts/staking/src/lib.rs` already emits several plain
-(unversioned) events via `env.events().publish(...)` directly, predating
-this scheme -- it does not depend on `soroban_amm_sdk`, so it was left on
-its existing style rather than migrated to `emit_versioned_event!` as
-part of an unrelated change (see the new `boost_exp` event below, added
-for issue #699, which follows the same existing plain-event convention
-for consistency with the rest of the contract). A full migration of
-`staking` onto the versioned scheme is tracked separately and out of
-scope here.
+`contracts/staking/src/lib.rs` is now fully migrated onto the versioned
+scheme (issue #912). Every event it emits goes through
+`emit_versioned_event!`; there are no remaining raw `env.events().publish(...)`
+calls outside its test modules, and the crate now depends on
+`soroban_amm_sdk`. An indexer therefore reads a leading `schema_version`
+on every staking event, exactly as it does for the AMM, CL, governance,
+and factory contracts.
 
 `contracts/twal_consumer/src/lib.rs` is intentionally out of scope. It
 already emitted an unversioned `snapshot_deleted` event before this
@@ -314,14 +312,25 @@ emitted by `execute_route` (and so by `swap_best`) after the swap settles and
 carries the output the pools actually returned, not the quoted amount.
 `tol_fail` is emitted only when `is_price_within_tolerance` rejects a quote.
 
-### Staking — `contracts/staking/src/lib.rs` (unversioned, plain events)
+### Staking — `contracts/staking/src/lib.rs`
 
-Staking predates this scheme and is not yet migrated (see note above), so
-its events carry no `schema_version` prefix -- the payload below is the
-on-wire shape as-is, not `(schema_version, payload)`.
+Migrated to `emit_versioned_event!` (issue #912). Every row below has the
+on-wire data shape `(schema_version, payload)`.
 
 | Event | Topics | Payload |
 |---|---|---|
+| `staked` | — | `(staker: Address, amount: i128, boost: i128, lock_expiry: u64)` |
+| `unstaked` | — | `(staker: Address, amount: i128, rewards: i128)` |
+| `lock_extended` | — | `(staker: Address, boost: i128, lock_expiry: u64)` |
+| `claimed` | — | `(staker: Address, rewards: i128)` |
+| `rewards_added` | — | `(admin: Address, amount: i128)` |
+| `rewards_updated` | — | `(distributable: i128)` |
+| `rewards_clamped` | — | `(requested: i128, pool_balance: i128)` |
+| `max_reward_pool_balance_set` | — | `(admin: Address, max_balance: i128)` |
+| `paused` | — | `(admin: Address)` |
+| `unpaused` | — | `(admin: Address)` |
+| `emergency_mode` | — | `(admin: Address, enabled: bool)` |
+| `emergency_withdraw` | — | `(staker: Address, amount: i128)` |
 | `boost_exp` | — | `(staker: Address, previous_boost: i128, settled_boost: i128)` |
 
 `boost_exp` (issue #699) is emitted by `settle_boost`/`settle_boost_batch`

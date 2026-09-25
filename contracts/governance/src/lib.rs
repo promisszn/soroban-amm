@@ -26,6 +26,20 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, 
 const MAX_BPS: i128 = 10_000;
 const MIN_PERSISTENT_TTL: u32 = 172_800; // ~10 days at 5s/ledger
 const PERSISTENT_TTL_BUMP_TO: u32 = 259_200; // ~15 days at 5s/ledger
+                                             // Instance-entry TTL maintenance. The instance entry holds the governance
+                                             // contract's executable and all `storage().instance()` state (admin, voting
+                                             // configuration, proposal count). If that entry lapses the contract is
+                                             // archived and every call traps: in-flight proposals can no longer be voted on
+                                             // or executed while the voting window keeps advancing, so a proposal can
+                                             // expire purely because the contract was archived. Every public entrypoint
+                                             // bumps this, including read-only paths, which are often the only traffic the
+                                             // contract sees for long stretches.
+                                             //
+                                             // Ledgers, at ~5 s each: 172_800 ≈ 10 days (top up when less than this
+                                             // remains) and 518_400 ≈ 30 days (target live-until), matching the amm
+                                             // reference contract.
+const MIN_INSTANCE_TTL: u32 = 172_800;
+const INSTANCE_TTL_BUMP_TO: u32 = 518_400;
 /// Multisig may veto a passed proposal within this window after voting ends.
 const VETO_WINDOW_SECS: u64 = 24 * 60 * 60;
 /// Maximum delegation chain depth (prevents unbounded recursion).
@@ -416,6 +430,7 @@ impl Governance {
         quorum_bps: i128,
         min_proposer_stake_bps: i128,
     ) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         if env.storage().instance().has(&DataKey::AmmPool) {
             return Err(GovernanceError::AlreadyInitialized);
         }
@@ -455,6 +470,7 @@ impl Governance {
 
     /// Admin-only: quorum increases by this many bps per day a proposal is open (#311).
     pub fn set_quorum_decay_bps_per_day(env: Env, new_rate: i128) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         if new_rate < 0 {
@@ -472,6 +488,7 @@ impl Governance {
     /// `proposal_id` rather than trapping, so off-chain callers can handle a
     /// missing proposal via `try_get_effective_quorum`.
     pub fn get_effective_quorum(env: Env, proposal_id: u32) -> Result<i128, GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let proposal: Proposal = env
             .storage()
             .persistent()
@@ -482,6 +499,7 @@ impl Governance {
 
     /// Admin-only governance parameter update.
     pub fn set_min_proposer_stake_bps(env: Env, new_bps: i128) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         if !(0..=MAX_BPS).contains(&new_bps) {
@@ -497,6 +515,7 @@ impl Governance {
     /// Execution is always gated by at least the veto window (24h), so even
     /// a delay of 0 does not allow execution before the veto window expires.
     pub fn set_timelock_delay(env: Env, new_delay: u64) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage().instance().set(&DataKey::Timelock, &new_delay);
@@ -512,6 +531,7 @@ impl Governance {
         current_admin: Address,
         new_admin: Address,
     ) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if current_admin != stored {
             return Err(GovernanceError::Unauthorized);
@@ -534,6 +554,7 @@ impl Governance {
     /// transaction. On success the stored admin is updated and the pending
     /// nomination is cleared.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let pending: Option<Address> = env
             .storage()
             .instance()
@@ -567,6 +588,7 @@ impl Governance {
         proposer: Address,
         kind: ProposalKind,
     ) -> Result<u32, GovernanceError> {
+        Self::extend_instance_ttl(&env);
         proposer.require_auth();
 
         match &kind {
@@ -718,6 +740,7 @@ impl Governance {
         proposal_id: u32,
         choice: Vote,
     ) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         voter.require_auth();
 
         if Self::get_delegate(env.clone(), voter.clone()).is_some() {
@@ -812,6 +835,7 @@ impl Governance {
     ///
     /// Anyone can call this once the conditions are met.
     pub fn execute(env: Env, proposal_id: u32) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let proposal_key = DataKey::Proposal(proposal_id);
         let mut proposal: Proposal = env
             .storage()
@@ -982,6 +1006,7 @@ impl Governance {
         proposal_id: u32,
         proposer: Address,
     ) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         proposer.require_auth();
 
         let proposal_key = DataKey::Proposal(proposal_id);
@@ -1021,6 +1046,7 @@ impl Governance {
     ///
     /// Returns `VotedFor`, `VotedAgainst`, or `DidNotVote`.
     pub fn get_vote_info(env: Env, proposal_id: u32, voter: Address) -> VoteRecord {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .persistent()
             .get(&DataKey::HasVoted(proposal_id, voter))
@@ -1029,6 +1055,7 @@ impl Governance {
 
     /// Return the current governance configuration parameters.
     pub fn get_params(env: Env) -> GovernanceParams {
+        Self::extend_instance_ttl(&env);
         GovernanceParams {
             voting_period_secs: env
                 .storage()
@@ -1053,6 +1080,7 @@ impl Governance {
 
     /// Unlock voting power for a concluded proposal.
     pub fn unlock_vote(env: Env, voter: Address, proposal_id: u32) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         voter.require_auth();
         let status = Self::proposal_status(env.clone(), proposal_id)?;
         if status != ProposalStatus::Executed
@@ -1097,6 +1125,7 @@ impl Governance {
     /// # Panics
     /// - If `from` is the same as `to`.
     pub fn delegate(env: Env, from: Address, to: Address) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         from.require_auth();
         if from == to {
             return Err(GovernanceError::CannotDelegateToSelf);
@@ -1125,6 +1154,7 @@ impl Governance {
     /// # Parameters
     /// - `from` – Address removing their delegation; must authorize this call.
     pub fn undelegate(env: Env, from: Address) {
+        Self::extend_instance_ttl(&env);
         from.require_auth();
         if let Some(delegatee) = Self::get_delegate(env.clone(), from.clone()) {
             Self::remove_delegator_index(&env, &delegatee, &from);
@@ -1140,6 +1170,7 @@ impl Governance {
     ///
     /// Returns `None` if no delegation is active.
     pub fn get_delegate(env: Env, from: Address) -> Option<Address> {
+        Self::extend_instance_ttl(&env);
         let key = DataKey::Delegate(from);
         let delegate = env.storage().persistent().get(&key).unwrap_or(None);
         if delegate.is_some() {
@@ -1150,6 +1181,7 @@ impl Governance {
 
     /// Admin-only: set the protocol multisig that may veto passed proposals.
     pub fn set_veto_multisig(env: Env, multisig: Address) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
         env.storage()
@@ -1167,6 +1199,7 @@ impl Governance {
     ///
     /// Triggers the governance discussion phase; the proposal cannot be executed.
     pub fn veto(env: Env, proposal_id: u32) -> Result<(), GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let multisig: Address = env
             .storage()
             .instance()
@@ -1241,6 +1274,7 @@ impl Governance {
 
     /// Returns the on-chain veto audit record for a proposal, if vetoed.
     pub fn get_veto_audit(env: Env, proposal_id: u32) -> Option<VetoAudit> {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .persistent()
             .get(&DataKey::VetoAudit(proposal_id))
@@ -1252,6 +1286,7 @@ impl Governance {
         proposal_id: u32,
         holder: Address,
     ) -> Result<i128, GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let proposal: Proposal = env
             .storage()
             .persistent()
@@ -1268,6 +1303,7 @@ impl Governance {
     /// `proposal_id` rather than trapping, so off-chain callers can handle a
     /// missing proposal via `try_get_proposal`.
     pub fn get_proposal(env: Env, proposal_id: u32) -> Result<Proposal, GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let key = DataKey::Proposal(proposal_id);
         let proposal: Proposal = env
             .storage()
@@ -1286,6 +1322,7 @@ impl Governance {
     /// It never decreases — cancelled, vetoed and executed proposals are
     /// status-transitioned in place, never removed from the count.
     pub fn get_proposal_count(env: Env) -> u32 {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::ProposalCount)
@@ -1309,6 +1346,7 @@ impl Governance {
     /// `offset >= count` returns an empty `Vec`, and `offset + limit` is
     /// clamped to `count`, mirroring `factory::get_pools`.
     pub fn get_proposals_paginated(env: Env, offset: u32, limit: u32) -> Vec<Proposal> {
+        Self::extend_instance_ttl(&env);
         let count = Self::get_proposal_count(env.clone());
         let start = offset.min(count);
         // Saturating: `start + limit` can overflow u32 for a large `limit`.
@@ -1331,6 +1369,7 @@ impl Governance {
     /// `proposal_id` rather than trapping, so off-chain callers can handle a
     /// missing proposal via `try_proposal_status`.
     pub fn proposal_status(env: Env, proposal_id: u32) -> Result<ProposalStatus, GovernanceError> {
+        Self::extend_instance_ttl(&env);
         let proposal: Proposal = env
             .storage()
             .persistent()
@@ -1561,6 +1600,15 @@ impl Governance {
         env.storage()
             .persistent()
             .extend_ttl(key, MIN_PERSISTENT_TTL, PERSISTENT_TTL_BUMP_TO);
+    }
+
+    /// Instance-storage TTL maintenance. Called first by every public
+    /// entrypoint so the governance instance entry cannot be archived out from
+    /// under in-flight proposals. See [`MIN_INSTANCE_TTL`].
+    fn extend_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(MIN_INSTANCE_TTL, INSTANCE_TTL_BUMP_TO);
     }
 
     /// Convert a fee tier ID (0-3) to its basis points value.
@@ -4210,5 +4258,35 @@ mod prop_tests {
         let another = Address::generate(&s.env);
         assert!(gov.try_propose_admin(&s.admin, &another).is_err());
         gov.propose_admin(&new_admin, &another);
+    }
+
+    // ── #906: instance TTL is extended on every entrypoint ───────────────────
+
+    /// Advancing the ledger far past the default instance-entry TTL and then
+    /// calling entrypoints keeps governance responsive rather than trapping on
+    /// an archived instance entry. The proposal registry and voting
+    /// configuration live in instance storage, so an archived instance entry
+    /// would make in-flight proposals unreadable and unexecutable while the
+    /// voting window keeps advancing. Each entrypoint now bumps the instance
+    /// TTL; this walks the ledger forward in steps smaller than the bump
+    /// window, calling in between, and asserts the reads still return. Without
+    /// the extension the first call after the advance would trap.
+    #[test]
+    fn instance_ttl_is_extended_on_access_across_ledger_advance() {
+        let s = setup_prop_env();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        s.env.ledger().with_mut(|l| {
+            l.sequence_number = 1_000;
+            l.max_entry_ttl = 6_312_000;
+        });
+
+        // Step forward in increments smaller than the TTL bump (518_400),
+        // calling an entrypoint each step. Each call re-bumps, so the next step
+        // stays live rather than trapping on an evicted instance entry.
+        for _ in 0..4 {
+            s.env.ledger().with_mut(|l| l.sequence_number += 400_000);
+            assert_eq!(gov.get_proposal_count(), 0);
+            let _params = gov.get_params();
+        }
     }
 }

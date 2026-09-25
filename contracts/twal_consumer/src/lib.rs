@@ -137,7 +137,28 @@ impl TwalConsumer {
     /// predictable regardless of caller-supplied input.
     pub const MAX_WINDOW_SECONDS: u64 = 7_776_000;
 
+    /// Instance-storage TTL maintenance.
+    ///
+    /// `twal_consumer` keeps the keeper address in instance storage, so the
+    /// instance entry holds the contract's executable together with its only
+    /// instance datum. A sporadically-read oracle surface is the most likely
+    /// contract in the workspace to have its instance entry lapse; if it does,
+    /// every call — including the read paths integrators depend on — traps
+    /// instead of returning a typed error. Every public entrypoint therefore
+    /// bumps the instance TTL. The persistent snapshot entries keep their own,
+    /// longer TTL bumps on the write paths (see `SNAPSHOT_TTL_LEDGERS`).
+    ///
+    /// Threshold and bump are expressed in ledgers. At ~5 s per ledger, 172_800
+    /// ledgers is about 10 days (top up when less than this remains) and
+    /// 518_400 ledgers is about 30 days (the target live-until). These match
+    /// the `amm` reference contract so the workspace ages its instance entries
+    /// on one schedule.
+    fn extend_ttl(env: &Env) {
+        env.storage().instance().extend_ttl(172_800, 518_400);
+    }
+
     pub fn initialize(env: Env, keeper: Address) -> Result<(), TwalError> {
+        Self::extend_ttl(&env);
         if env.storage().instance().has(&DataKey::Keeper) {
             return Err(TwalError::AlreadyInitialized);
         }
@@ -146,6 +167,7 @@ impl TwalConsumer {
     }
 
     pub fn get_keeper(env: Env) -> Result<Address, TwalError> {
+        Self::extend_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::Keeper)
@@ -158,6 +180,7 @@ impl TwalConsumer {
     }
 
     pub fn save_snapshot(env: Env, pool: Address) -> Result<(), TwalError> {
+        Self::extend_ttl(&env);
         Self::require_keeper(&env)?;
         let (cum, pool_ts) = AmmPoolLiquidityClient::new(&env, &pool).get_liquidity_cumulative();
         let ledger_ts = env.ledger().timestamp();
@@ -293,6 +316,7 @@ impl TwalConsumer {
     /// Adds `pool` to the tracked set as the given `pool_type`. Keeper-only,
     /// idempotent, rejects growth past `MAX_TRACKED_POOLS`.
     pub fn add_tracked_pool(env: Env, pool: Address, pool_type: PoolType) -> Result<(), TwalError> {
+        Self::extend_ttl(&env);
         Self::require_keeper(&env)?;
         Self::register_tracked_pool(&env, &pool, pool_type)
     }
@@ -301,6 +325,7 @@ impl TwalConsumer {
     /// the remaining pools. Keeper-only. Errors with `NotTracked` if the pool
     /// was never in the set.
     pub fn remove_tracked_pool(env: Env, pool: Address) -> Result<(), TwalError> {
+        Self::extend_ttl(&env);
         Self::require_keeper(&env)?;
         let mut tracked = Self::load_tracked(&env);
         let idx = Self::first_tracked_index(&tracked, &pool).ok_or(TwalError::NotTracked)?;
@@ -313,17 +338,20 @@ impl TwalConsumer {
 
     /// Returns whether `pool` is currently in the tracked set.
     pub fn is_tracked(env: Env, pool: Address) -> bool {
+        Self::extend_ttl(&env);
         Self::first_tracked_index(&Self::load_tracked(&env), &pool).is_some()
     }
 
     /// Returns the number of currently tracked pools.
     pub fn get_tracked_pool_count(env: Env) -> u32 {
+        Self::extend_ttl(&env);
         Self::load_tracked(&env).len()
     }
 
     /// Returns up to `limit` tracked pool addresses starting at `offset`.
     /// `limit == 0` and `offset >= count` both return an empty `Vec`.
     pub fn get_tracked_pools_paginated(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        Self::extend_ttl(&env);
         let tracked = Self::load_tracked(&env);
         let len = tracked.len();
         let mut out = Vec::new(&env);
@@ -483,6 +511,7 @@ impl TwalConsumer {
         pool: Address,
         window_seconds: u64,
     ) -> Result<i128, TwalError> {
+        Self::extend_ttl(&env);
         if window_seconds == 0 {
             return Err(TwalError::ZeroWindow);
         }
@@ -517,6 +546,7 @@ impl TwalConsumer {
     /// usable snapshot, a non-contract address, or a panicking callee yields
     /// `ok: false` in its slot rather than aborting the call.
     pub fn get_twal_all_safe(env: Env, window_seconds: u64) -> Vec<TwalEntry> {
+        Self::extend_ttl(&env);
         let tracked = Self::load_tracked(&env);
         let mut out = Vec::new(&env);
         for i in 0..tracked.len() {
@@ -541,6 +571,7 @@ impl TwalConsumer {
         pools: Vec<(Address, PoolType)>,
         window_seconds: u64,
     ) -> Result<Vec<TwalEntry>, TwalError> {
+        Self::extend_ttl(&env);
         if pools.len() > Self::MAX_TRACKED_POOLS {
             return Err(TwalError::TooManyPools);
         }
@@ -565,6 +596,7 @@ impl TwalConsumer {
     /// prefer `get_twal_all_safe` for per-pool detail; unlike this
     /// function, it never aborts the whole batch on one bad pool.
     pub fn get_twal_all(env: Env, window_seconds: u64) -> Result<Vec<(Address, i128)>, TwalError> {
+        Self::extend_ttl(&env);
         let entries = Self::get_twal_all_safe(env.clone(), window_seconds);
         let mut results: Vec<(Address, i128)> = Vec::new(&env);
         for i in 0..entries.len() {
@@ -579,6 +611,7 @@ impl TwalConsumer {
 
     /// Returns the full tracked-pool set, including each pool's type.
     pub fn get_tracked_pools(env: Env) -> Vec<TrackedPool> {
+        Self::extend_ttl(&env);
         Self::load_tracked(&env)
     }
 
@@ -591,6 +624,7 @@ impl TwalConsumer {
     /// in the snapshot, so `get_cl_twal` can difference two snapshots to recover
     /// an average liquidity *level* rather than a rate of change (issue #462).
     pub fn save_cl_snapshot(env: Env, pool: Address) -> Result<(), TwalError> {
+        Self::extend_ttl(&env);
         Self::require_keeper(&env)?;
         let active = ClPoolLiquidityClient::new(&env, &pool).active_liquidity();
         let ledger_ts = env.ledger().timestamp();
@@ -641,6 +675,7 @@ impl TwalConsumer {
 
     /// Deletes a stored liquidity snapshot from persistent storage. Keeper-only.
     pub fn delete_snapshot(env: Env, pool: Address, ledger_ts: u64) -> Result<(), TwalError> {
+        Self::extend_ttl(&env);
         Self::require_keeper(&env)?;
         let key = DataKey::LiquiditySnapshot(pool.clone(), ledger_ts);
         if !env.storage().persistent().has(&key) {
@@ -680,6 +715,7 @@ impl TwalConsumer {
     /// - [`TwalError::ElapsedZero`] — pool time did not advance across the
     ///   window.
     pub fn get_cl_twal(env: Env, pool: Address, window_seconds: u64) -> Result<i128, TwalError> {
+        Self::extend_ttl(&env);
         Self::get_cl_twal_checked(&env, &pool, window_seconds)
     }
 }
@@ -1688,5 +1724,42 @@ mod tests {
             consumer.try_get_cl_twal(&pool_addr, &600),
             Err(Ok(TwalError::MissingClAccumulator))
         );
+    }
+
+    // ── #911: instance TTL is extended on every entrypoint ───────────────────
+
+    /// Advancing the ledger far past the default instance-entry TTL and then
+    /// calling entrypoints must keep the contract responsive rather than
+    /// trapping on an archived instance entry. The keeper lives in instance
+    /// storage, so an archived instance entry means every call — including the
+    /// read paths integrators depend on — traps. Each entrypoint now bumps the
+    /// instance TTL; this walks the ledger forward in steps smaller than the
+    /// bump window, calling in between, and asserts the reads still return.
+    /// Without the extension the first call after the advance would trap.
+    #[test]
+    fn instance_ttl_is_extended_on_access_across_ledger_advance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 1_000;
+            l.max_entry_ttl = 6_312_000;
+        });
+
+        let admin = Address::generate(&env);
+        let consumer_addr = env.register_contract(None, TwalConsumer);
+        let consumer = TwalConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&admin);
+
+        let pool = Address::generate(&env);
+
+        // Step forward in increments smaller than the TTL bump (518_400),
+        // calling an entrypoint each step. Each call re-bumps, so the next step
+        // stays live rather than trapping on an evicted instance entry.
+        for _ in 0..4 {
+            env.ledger().with_mut(|l| l.sequence_number += 400_000);
+            assert_eq!(consumer.get_keeper(), admin);
+            assert_eq!(consumer.get_tracked_pool_count(), 0);
+            assert!(!consumer.is_tracked(&pool));
+        }
     }
 }

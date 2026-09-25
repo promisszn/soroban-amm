@@ -817,3 +817,43 @@ fn set_source_weight_emits_event() {
     assert_eq!(old_w, 10_000);
     assert_eq!(new_w, 25_000);
 }
+
+// ── #907: instance TTL is extended on every entrypoint ───────────────────────
+
+/// Advancing the ledger far past the default instance-entry TTL and then
+/// calling entrypoints must keep the contract responsive rather than trapping
+/// on an archived instance entry.
+///
+/// The oracle aggregator holds all of its state (admin, staleness, sources,
+/// deviation band) in instance storage, so if that entry lapses every call
+/// traps. Each entrypoint now bumps the instance TTL; this test walks the
+/// ledger forward in steps smaller than the bump window, calling in between,
+/// and asserts the reads still return. Without the extension the first call
+/// after the advance would trap.
+#[test]
+fn instance_ttl_is_extended_on_access_across_ledger_advance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| {
+        li.sequence_number = 1_000;
+        li.max_entry_ttl = 6_312_000;
+    });
+
+    let aggregator_id = env.register_contract(None, OracleAggregator);
+    let aggregator = OracleAggregatorClient::new(&env, &aggregator_id);
+    let admin = Address::generate(&env);
+    aggregator.initialize(&admin, &3_600);
+
+    // Register a source so the read paths have state to walk as well.
+    let source = deploy_source(&env, 1_000);
+    aggregator.register_source(&admin, &source, &OracleSourceType::External, &10_000);
+
+    // Step forward in increments smaller than the TTL bump (518_400), calling
+    // an entrypoint each step. Each call re-bumps, so the next step stays live.
+    for _ in 0..4 {
+        env.ledger().with_mut(|li| li.sequence_number += 400_000);
+        assert_eq!(aggregator.get_admin(), admin);
+        assert_eq!(aggregator.list_sources().len(), 1);
+        assert_eq!(aggregator.get_max_staleness(), 3_600);
+    }
+}

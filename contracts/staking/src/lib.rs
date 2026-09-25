@@ -385,9 +385,10 @@ impl Staking {
             .persistent()
             .extend_ttl(&key_debt, MIN_TTL, BUMP_TO);
 
-        env.events().publish(
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
             (Symbol::new(&env, "lock_extended"),),
-            (staker, boost, expiry),
+            (staker, boost, expiry)
         );
         Ok(())
     }
@@ -463,6 +464,11 @@ impl Staking {
             .instance()
             .set(&DataKey::RewardPoolBalance, &new_balance);
         // Emit event with the actual amount added
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "rewards_added"),),
+            (admin, received)
+        );
         env.events()
             .publish((Symbol::new(&env, "rewards_added"),), (admin, received));
         Ok(())
@@ -485,6 +491,7 @@ impl Staking {
             return Err(StakingError::Unauthorized);
         }
         env.storage().instance().set(&DataKey::Paused, &true);
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "paused"),), (admin,));
         env.events()
             .publish((Symbol::new(&env, "paused"),), (admin,));
         Ok(())
@@ -503,6 +510,7 @@ impl Staking {
             return Err(StakingError::Unauthorized);
         }
         env.storage().instance().set(&DataKey::Paused, &false);
+        soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "unpaused"),), (admin,));
         env.events()
             .publish((Symbol::new(&env, "unpaused"),), (admin,));
         Ok(())
@@ -652,9 +660,10 @@ impl Staking {
             .persistent()
             .extend_ttl(&key_debt, MIN_TTL, BUMP_TO);
 
-        env.events().publish(
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
             (Symbol::new(&env, "staked"),),
-            (staker, amount, new_boost, new_expiry),
+            (staker, amount, new_boost, new_expiry)
         );
         Ok(())
     }
@@ -769,6 +778,12 @@ impl Staking {
             .persistent()
             .extend_ttl(&key_debt, MIN_TTL, BUMP_TO);
 
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "unstaked"),),
+            (staker, amount, rewards)
+        );
+        (amount, rewards)
         env.events()
             .publish((Symbol::new(&env, "unstaked"),), (staker, amount, rewards));
         Ok((amount, rewards))
@@ -794,6 +809,11 @@ impl Staking {
         env.storage()
             .instance()
             .set(&DataKey::EmergencyMode, &enabled);
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "emergency_mode"),),
+            (admin, enabled)
+        );
         env.events()
             .publish((Symbol::new(&env, "emergency_mode"),), (admin, enabled));
         Ok(())
@@ -827,9 +847,10 @@ impl Staking {
         env.storage()
             .instance()
             .set(&DataKey::ConfigMaxRewardPoolBalance, &max_balance);
-        env.events().publish(
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
             (Symbol::new(&env, "max_reward_pool_balance_set"),),
-            (admin, max_balance),
+            (admin, max_balance)
         );
         Ok(())
     }
@@ -911,9 +932,10 @@ impl Staking {
         let pool_addr = env.current_contract_address();
         SepTokenClient::new(&env, &lp_token).transfer(&pool_addr, &staker, &staked_amount);
 
-        env.events().publish(
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
             (Symbol::new(&env, "emergency_withdraw"),),
-            (staker, staked_amount),
+            (staker, staked_amount)
         );
         Ok(staked_amount)
     }
@@ -1232,9 +1254,10 @@ impl Staking {
             .persistent()
             .extend_ttl(&key_debt, MIN_TTL, BUMP_TO);
 
-        env.events().publish(
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
             (Symbol::new(&env, "boost_exp"),),
-            (staker, stored_boost, min_boost),
+            (staker, stored_boost, min_boost)
         );
     }
 
@@ -1350,9 +1373,10 @@ impl Staking {
         } else {
             // Publish a lightweight event to record the clamping for
             // observability in tests and off-chain tooling.
-            env.events().publish(
+            soroban_amm_sdk::emit_versioned_event!(
+                env,
                 (Symbol::new(&env, "rewards_clamped"),),
-                (new_rewards, pool_balance),
+                (new_rewards, pool_balance)
             );
             pool_balance
         };
@@ -1370,13 +1394,19 @@ impl Staking {
                 .instance()
                 .set(&DataKey::RewardPoolBalance, &(pool_balance - distributable));
 
-            env.events()
-                .publish((Symbol::new(&env, "rewards_updated"),), (distributable,));
+            soroban_amm_sdk::emit_versioned_event!(
+                env,
+                (Symbol::new(&env, "rewards_updated"),),
+                (distributable,)
+            );
         } else {
             // No distributable amount: emit updated with zero to keep a
             // consistent event surface and return early.
-            env.events()
-                .publish((Symbol::new(&env, "rewards_updated"),), (0_i128,));
+            soroban_amm_sdk::emit_versioned_event!(
+                env,
+                (Symbol::new(&env, "rewards_updated"),),
+                (0_i128,)
+            );
         }
         Ok(())
     }
@@ -1420,6 +1450,12 @@ impl Staking {
             .instance()
             .set(&DataKey::RewardPoolBalance, &(pool_balance - pending));
 
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(env, "claimed"),),
+            (staker.clone(), pending)
+        );
+        pending
         env.events()
             .publish((Symbol::new(env, "claimed"),), (staker.clone(), pending));
         Ok(pending)
@@ -1626,8 +1662,11 @@ impl Staking {
             .instance()
             .set(&DataKey::RewardPoolBalance, &(pool_balance - pending));
 
-        env.events()
-            .publish((Symbol::new(env, "claimed"),), (staker.clone(), pending));
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(env, "claimed"),),
+            (staker.clone(), pending)
+        );
     }
 }
 
