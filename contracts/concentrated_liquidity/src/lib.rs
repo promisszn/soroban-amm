@@ -648,7 +648,9 @@ impl ConcentratedLiquidity {
         min_b: i128,
         deadline: u64,
     ) -> Result<(i128, i128), ClError> {
-        Self::require_initialized(&env)?;
+        // Reading the token pair first doubles as the initialization check,
+        // so this hot path pays for no extra storage lookup.
+        let (token_a, token_b) = Self::read_tokens(&env)?;
         if env.ledger().timestamp() > deadline {
             return Err(ClError::DeadlineExpired);
         }
@@ -679,7 +681,6 @@ impl ConcentratedLiquidity {
             return Err(ClError::ZeroAmounts);
         }
         let current_tick = Self::read_current_tick(&env)?;
-        let (token_a, token_b) = Self::read_tokens(&env)?;
         // Derive liquidity from the desired amounts using the same
         // sqrtPriceX96 math (`liquidity_from_amounts`) that burn/collect use
         // to convert liquidity back into amounts, then derive the *actual*
@@ -2041,7 +2042,9 @@ impl ConcentratedLiquidity {
         min_amount_out: i128,
         deadline: u64,
     ) -> Result<i128, ClError> {
-        Self::require_initialized(&env)?;
+        // Reading the token pair first doubles as the initialization check,
+        // so this hot path pays for no extra storage lookup.
+        let (token_a, token_b) = Self::read_tokens(&env)?;
         if env.ledger().timestamp() > deadline {
             return Err(ClError::DeadlineExpired);
         }
@@ -2052,8 +2055,6 @@ impl ConcentratedLiquidity {
         if amount_in <= 0 {
             return Err(ClError::ZeroAmounts);
         }
-
-        let (token_a, token_b) = Self::read_tokens(&env)?;
 
         let protocol_fee_bps: i128 = env
             .storage()
