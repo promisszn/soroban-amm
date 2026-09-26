@@ -40,6 +40,10 @@ pub enum FactoryError {
     NoPendingAdmin = 10,
     /// `accept_admin` called by an address other than the nominee.
     WrongAdmin = 11,
+    /// A function that reads factory configuration (admin, AMM/LP WASM
+    /// hashes) was called before `initialize`. Discriminant 2 is taken by
+    /// `InvalidFeeBps`, so this is appended rather than renumbered.
+    NotInitialized = 12,
 }
 
 #[contracttype]
@@ -294,7 +298,7 @@ impl Factory {
         }
 
         // ── Auth, rate-limit, fee ─────────────────────────────────────────
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         let permissionless: bool = env
             .storage()
             .instance()
@@ -309,12 +313,8 @@ impl Factory {
             admin.require_auth();
         }
 
-        let amm_wasm: BytesN<32> = env.storage().instance().get(&DataKey::AmmWasmHash).unwrap();
-        let token_wasm: BytesN<32> = env
-            .storage()
-            .instance()
-            .get(&DataKey::TokenWasmHash)
-            .unwrap();
+        let amm_wasm = Self::read_amm_wasm_hash(&env)?;
+        let token_wasm = Self::read_token_wasm_hash(&env)?;
 
         // Derive salts per pool from a monotonic counter.
         // We use n * 3 for LP salt, n * 3 + 1 for Pool salt, n * 3 + 2 for Governance salt.
@@ -435,7 +435,7 @@ impl Factory {
         amm_wasm_hash: Option<BytesN<32>>,
         token_wasm_hash: Option<BytesN<32>>,
     ) -> Result<(), FactoryError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
         if let Some(ref h) = amm_wasm_hash {
             env.storage().instance().set(&DataKey::AmmWasmHash, h);
@@ -457,7 +457,7 @@ impl Factory {
     /// Existing pools are unaffected; only pools created after this call
     /// will use the new default tier.
     pub fn set_default_fee_tier(env: Env, fee_tier: i128) -> Result<(), FactoryError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
 
         // Validate the fee tier
@@ -479,7 +479,7 @@ impl Factory {
     /// The new WASM must already be uploaded to the network.
     /// State is preserved; only bytecode is replaced.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), FactoryError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
@@ -493,7 +493,7 @@ impl Factory {
 
     /// Set or update the WASM hash used for concentrated_liquidity deployments. Admin-only.
     pub fn set_cl_wasm_hash(env: Env, cl_wasm_hash: BytesN<32>) -> Result<(), FactoryError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
         env.storage()
             .instance()
@@ -571,7 +571,7 @@ impl Factory {
         }
 
         // ── Auth, rate-limit, fee ─────────────────────────────────────────
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         let permissionless: bool = env
             .storage()
             .instance()
@@ -659,7 +659,7 @@ impl Factory {
     /// The pool creation fee and fee token must be set via `set_pool_creation_fee`
     /// before enabling permissionless mode.
     pub fn set_permissionless_mode(env: Env, enabled: bool) -> Result<(), FactoryError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
         env.storage()
             .instance()
@@ -682,7 +682,7 @@ impl Factory {
         fee_token: Address,
         fee_amount: i128,
     ) -> Result<(), FactoryError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
         if fee_amount <= 0 {
             return Err(FactoryError::FeeNotConfigured);
@@ -704,7 +704,7 @@ impl Factory {
     /// Defaults to 1 (one pool per ledger per address). Increase to slow down
     /// burst creation attempts. Set to 0 to disable rate limiting.
     pub fn set_rate_limit(env: Env, min_ledgers: u32) -> Result<(), FactoryError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
         env.storage()
             .instance()
@@ -714,11 +714,7 @@ impl Factory {
 
     /// Nominate a new admin. The nominee must call `accept_admin` to complete the transfer.
     pub fn propose_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), FactoryError> {
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if admin != stored_admin {
-            return Err(FactoryError::Unauthorized);
-        }
-        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &Some(new_admin.clone()));
@@ -976,11 +972,7 @@ impl Factory {
         treasury: Address,
         global_protocol_fee_bps: i128,
     ) -> Result<(), FactoryError> {
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if admin != stored_admin {
-            return Err(FactoryError::Unauthorized);
-        }
-        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
         if !(0..=10_000).contains(&global_protocol_fee_bps) {
             return Err(FactoryError::InvalidFeeBps);
         }
@@ -1038,11 +1030,7 @@ impl Factory {
         admin: Address,
         protocol_fee_bps: i128,
     ) -> Result<u32, FactoryError> {
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if admin != stored_admin {
-            return Err(FactoryError::Unauthorized);
-        }
-        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
         if !env.storage().instance().has(&DataKey::Treasury) {
             return Err(FactoryError::FeeNotConfigured);
         }
@@ -1070,11 +1058,7 @@ impl Factory {
         offset: u32,
         limit: u32,
     ) -> Result<u32, FactoryError> {
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
-        if admin != stored_admin {
-            return Err(FactoryError::Unauthorized);
-        }
-        admin.require_auth();
+        Self::require_admin(&env, &admin)?;
         if !env.storage().instance().has(&DataKey::Treasury) {
             return Err(FactoryError::FeeNotConfigured);
         }
@@ -1227,8 +1211,30 @@ impl Factory {
             .unwrap_or(0u64) as u32
     }
 
+    /// Stored admin, written by `initialize`; absent means not initialized.
+    fn read_admin(env: &Env) -> Result<Address, FactoryError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(FactoryError::NotInitialized)
+    }
+
+    fn read_amm_wasm_hash(env: &Env) -> Result<BytesN<32>, FactoryError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AmmWasmHash)
+            .ok_or(FactoryError::NotInitialized)
+    }
+
+    fn read_token_wasm_hash(env: &Env) -> Result<BytesN<32>, FactoryError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::TokenWasmHash)
+            .ok_or(FactoryError::NotInitialized)
+    }
+
     fn require_admin(env: &Env, admin: &Address) -> Result<(), FactoryError> {
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored_admin = Self::read_admin(env)?;
         if *admin != stored_admin {
             return Err(FactoryError::Unauthorized);
         }
@@ -3170,5 +3176,118 @@ mod tests {
             Err(Ok(FactoryError::WrongAdmin))
         );
         assert_eq!(factory.get_admin(), Some(admin));
+    }
+
+    // ── #932: typed NotInitialized instead of host traps ─────────────────────
+
+    fn uninitialized_factory(env: &Env) -> FactoryClient<'_> {
+        env.mock_all_auths();
+        let factory_addr = env.register_contract(None, Factory);
+        FactoryClient::new(env, &factory_addr)
+    }
+
+    #[test]
+    fn test_pre_init_pool_creation_returns_not_initialized() {
+        let env = Env::default();
+        let factory = uninitialized_factory(&env);
+        let caller = Address::generate(&env);
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+
+        assert_eq!(
+            factory.try_create_pool(&caller, &token_a, &token_b, &2_i128, &None),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_create_pool_with_fee_bps(&caller, &token_a, &token_b, &30_i128, &None),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_create_cl_pool(&caller, &token_a, &token_b, &30_i128, &0_i32),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+    }
+
+    #[test]
+    fn test_pre_init_admin_entrypoints_return_not_initialized() {
+        let env = Env::default();
+        let factory = uninitialized_factory(&env);
+        let admin = Address::generate(&env);
+        let other = Address::generate(&env);
+        let hash = soroban_sdk::BytesN::from_array(&env, &[7u8; 32]);
+
+        assert_eq!(
+            factory.try_update_wasm_hashes(&Some(hash.clone()), &None),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_set_default_fee_tier(&1_i128),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_upgrade(&hash),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_set_cl_wasm_hash(&hash),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_pause_creation(&admin),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_unpause_creation(&admin),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_set_permissionless_mode(&true),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_set_pool_creation_fee(&other, &100_i128),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_set_rate_limit(&5_u32),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_propose_admin(&admin, &other),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_set_treasury(&admin, &other, &100_i128),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_set_global_fee(&admin, &100_i128),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+        assert_eq!(
+            factory.try_set_global_fee_paginated(&admin, &0_u32, &10_u32),
+            Err(Ok(FactoryError::NotInitialized))
+        );
+    }
+
+    #[test]
+    fn test_pre_init_other_entrypoints_do_not_trap() {
+        let env = Env::default();
+        let factory = uninitialized_factory(&env);
+        let someone = Address::generate(&env);
+
+        // Entry points that never read admin/WASM config keep their own
+        // typed errors or empty defaults.
+        assert_eq!(
+            factory.try_accept_admin(&someone),
+            Err(Ok(FactoryError::NoPendingAdmin))
+        );
+        assert_eq!(
+            factory.try_sweep_fees(&someone),
+            Err(Ok(FactoryError::FeeNotConfigured))
+        );
+        assert_eq!(factory.get_admin(), None);
+        assert_eq!(factory.get_pool_count(), 0);
+        assert!(!factory.is_creation_paused());
     }
 }

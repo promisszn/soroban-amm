@@ -304,6 +304,7 @@ constant-product V2 pools, `Cl` for concentrated liquidity).
 | `route_alt` | — | `(venue: Address, amount_out: i128, alt_venue: Address, alt_venue_kind: PoolKind, alt_amount_out: i128)` |
 | `route_exe` | — | `(trader: Address, token_in: Address, token_out: Address, amount_in: i128, amount_out: i128, pool: Address)` |
 | `tol_fail` | — | `(pool: Address, observed_bps: i128, tolerance_bps: i128)` |
+| `pause` / `unpause` | — | `(admin: Address)` |
 
 `route_sel` is emitted by `find_best_route` (and therefore by `get_quote`,
 `swap_best` and `is_price_within_tolerance`, which all route through it).
@@ -313,6 +314,15 @@ is measurable; a single-venue pair emits `route_sel` alone. `route_exe` is
 emitted by `execute_route` (and so by `swap_best`) after the swap settles and
 carries the output the pools actually returned, not the quoted amount.
 `tol_fail` is emitted only when `is_price_within_tolerance` rejects a quote.
+
+### Router — `contracts/router/src/lib.rs`
+
+| Event | Topics | Payload |
+|---|---|---|
+| `pause` / `unpause` | — | `(admin: Address)` |
+
+`pause` / `unpause` (#937, #938) are emitted by the admin pause switch on both
+the router and the DEX aggregator, after the stored-admin check passes.
 
 ### Staking — `contracts/staking/src/lib.rs` (unversioned, plain events)
 

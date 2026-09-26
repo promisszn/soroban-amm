@@ -223,7 +223,9 @@ Defined in [contracts/dex_aggregator/src/lib.rs](../contracts/dex_aggregator/src
 | 3 | `UnregisteredPool` | A route hop references a pool that is not registered with the factory. | Only route through pools registered via the factory. |
 | 4 | `InvalidMaxHops` | `set_max_hops` called with `0`. | Pass a positive hop count. |
 | 5 | `TooManyRoutingTokens` | `set_routing_tokens` called with more than `MAX_ROUTING_TOKENS` addresses. | Reduce the routing token list size. |
-| 6 | `NotInitialized` | An admin setter, quote, or swap entrypoint was called before `initialize` (admin/factory unset). | Call `initialize` first. |
+| 6 | `NotInitialized` | An admin setter, quote, swap, or `pause`/`unpause` entrypoint was called before `initialize` (admin/factory unset). | Call `initialize` first. |
+| 7 | `Paused` | A state-mutating entrypoint (`set_max_hops`, `register_cl_pool`, `set_routing_tokens`, `remove_cl_pool`, `execute_route`, `swap_best`) was called while the aggregator is paused. Quotes (`find_best_route`, `get_quote`, `is_price_within_tolerance`) stay callable. | Wait for the admin to call `unpause`; check `is_paused` first. |
+| 8 | `Unauthorized` | `pause` or `unpause` was called with an `admin` address that does not match the stored admin. | Pass the stored admin address and sign with its key. |
 
 ---
 
@@ -271,6 +273,7 @@ Defined in [contracts/factory/src/lib.rs](../contracts/factory/src/lib.rs) as `F
 | 9 | `CreationPaused` | Admin administratively paused pool creation. | Wait for admin to unpause creation. |
 | 10 | `NoPendingAdmin` | `accept_admin` was called when no admin transfer is in progress. | Call `propose_admin` first to nominate a successor. |
 | 11 | `WrongAdmin` | `accept_admin` was called by an address that does not match the pending nominee. | Have the correct address (the one passed to `propose_admin`) call `accept_admin`. |
+| 12 | `NotInitialized` | A function that reads factory configuration (admin, AMM/LP WASM hashes) was called before `initialize`. Covers pool creation (`create_pool`, `create_pool_with_fee_bps`, `create_cl_pool`) and every admin entrypoint. Code 2 is `InvalidFeeBps`, so this code is appended. | Call `initialize` first. |
 
 ---
 
@@ -343,6 +346,7 @@ Defined in [contracts/governance/src/lib.rs](../contracts/governance/src/lib.rs)
 | 32 | `VetoMultisigNotSet` | Veto-related operation called when no veto multisig is configured. | Configure the veto multisig during governance initialization. |
 | 33 | `NoPendingAdmin` | `accept_admin` called without a prior `propose_admin`. | Call `propose_admin` first to nominate a successor. |
 | 34 | `PartialFactoryUpdate` | `UpdateFactoryGlobalFee` proposal window (`offset`/`limit`) does not cover all factory pools. | Submit proposal covering all registered factory pools. |
+| 35 | `NotInitialized` | A function that reads governance configuration (admin, AMM pool, LP token, voting period, timelock, quorum, proposer stake, proposal counter) was called before `initialize`. Covers the admin setters, `propose_admin`, `propose`, `get_params`, and any proposal path that reaches that configuration. Code 2 is `InvalidVotingPeriod`, so this code is appended. | Call `initialize` first. |
 
 ---
 
@@ -460,6 +464,8 @@ Defined in [contracts/router/src/lib.rs](../contracts/router/src/lib.rs) as `Rou
 | 6 | `DeadlineExceeded` | `env.ledger().timestamp() > deadline`. | Re-submit the swap with a future deadline. |
 | 7 | `PoolNotFound` | The factory returned no pool for the token pair at some hop. | Ensure a pool exists for every adjacent pair; call `is_path_routable` to check before quoting. |
 | 8 | `SlippageExceeded` | Realized output `< min_amount_out`, or required input `> max_in`. | Widen the slippage bounds or recalculate the path quote. |
+| 9 | `Paused` | `swap_exact_in` or `swap_exact_out` was called while the router is paused. Quotes and path views stay callable. | Wait for the admin to call `unpause`; check `is_paused` first. |
+| 10 | `Unauthorized` | `pause` or `unpause` was called with an `admin` address that does not match the stored admin. | Pass the stored admin address and sign with its key. |
 
 ---
 

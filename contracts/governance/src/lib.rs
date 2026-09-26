@@ -74,6 +74,11 @@ pub enum GovernanceError {
     /// so the proposal cannot be permanently marked executed while only a
     /// partial set of pools was updated.
     PartialFactoryUpdate = 34,
+    /// A function that reads governance configuration (admin, AMM pool, LP
+    /// token, voting period, timelock, quorum, proposer stake, proposal
+    /// counter) was called before `initialize`. Discriminant 2 is taken by
+    /// `InvalidVotingPeriod`, so this is appended rather than renumbered.
+    NotInitialized = 35,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -455,7 +460,7 @@ impl Governance {
 
     /// Admin-only: quorum increases by this many bps per day a proposal is open (#311).
     pub fn set_quorum_decay_bps_per_day(env: Env, new_rate: i128) -> Result<(), GovernanceError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
         if new_rate < 0 {
             return Err(GovernanceError::InvalidQuorumBps);
@@ -477,12 +482,12 @@ impl Governance {
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
             .ok_or(GovernanceError::ProposalNotFound)?;
-        Ok(Self::effective_quorum_bps(&env, &proposal))
+        Self::effective_quorum_bps(&env, &proposal)
     }
 
     /// Admin-only governance parameter update.
     pub fn set_min_proposer_stake_bps(env: Env, new_bps: i128) -> Result<(), GovernanceError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
         if !(0..=MAX_BPS).contains(&new_bps) {
             return Err(GovernanceError::InvalidProposerStake);
@@ -497,7 +502,7 @@ impl Governance {
     /// Execution is always gated by at least the veto window (24h), so even
     /// a delay of 0 does not allow execution before the veto window expires.
     pub fn set_timelock_delay(env: Env, new_delay: u64) -> Result<(), GovernanceError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
         env.storage().instance().set(&DataKey::Timelock, &new_delay);
         Ok(())
@@ -512,7 +517,7 @@ impl Governance {
         current_admin: Address,
         new_admin: Address,
     ) -> Result<(), GovernanceError> {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored = Self::read_admin(&env)?;
         if current_admin != stored {
             return Err(GovernanceError::Unauthorized);
         }
@@ -624,7 +629,7 @@ impl Governance {
             ProposalKind::SetClPositionNft(_) => {}
         }
 
-        let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
+        let lp_token = Self::read_lp_token(&env)?;
         let lp_client = LpTokenClient::new(&env, &lp_token);
 
         let total_supply = lp_client.total_supply();
@@ -642,12 +647,8 @@ impl Governance {
             return Err(GovernanceError::InsufficientStake);
         }
 
-        let voting_period: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::VotingPeriod)
-            .unwrap();
-        let timelock: u64 = env.storage().instance().get(&DataKey::Timelock).unwrap();
+        let voting_period = Self::read_voting_period(&env)?;
+        let timelock = Self::read_timelock(&env)?;
 
         let now = env.ledger().timestamp();
         let vote_end = now + voting_period;
@@ -655,11 +656,7 @@ impl Governance {
         // Execution window: at least one voting period even when timelock is 0.
         let expires_at = execute_after + timelock.max(voting_period);
 
-        let id: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::ProposalCount)
-            .unwrap();
+        let id = Self::read_proposal_count(&env)?;
 
         // Snapshot the last already-closed ledger, never the current still-open
         // one. LpToken::write_checkpoint overwrites (not appends) the checkpoint
@@ -754,7 +751,7 @@ impl Governance {
             return Err(GovernanceError::AlreadyVoted);
         }
 
-        let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
+        let lp_token = Self::read_lp_token(&env)?;
         let lp_client = LpTokenClient::new(&env, &lp_token);
 
         let (voting_power, lock_accounts) =
@@ -770,6 +767,7 @@ impl Governance {
         };
 
         for i in 0..lock_accounts.len() {
+            // In bounds: `i` ranges over `0..lock_accounts.len()`.
             let (account, amount) = lock_accounts.get(i).unwrap();
             lp_client.lock(&account, &amount);
             let lock_key = DataKey::LockedVote(proposal_id, account.clone());
@@ -842,7 +840,7 @@ impl Governance {
             return Err(GovernanceError::TimelockNotElapsed);
         }
 
-        let effective_quorum = Self::effective_quorum_bps(&env, &proposal);
+        let effective_quorum = Self::effective_quorum_bps(&env, &proposal)?;
         let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
         let quorum_threshold = proposal.snapshot_total_supply * effective_quorum / MAX_BPS;
         if total_votes < quorum_threshold {
@@ -853,7 +851,7 @@ impl Governance {
             return Err(GovernanceError::ProposalDefeated);
         }
 
-        let amm_pool: Address = env.storage().instance().get(&DataKey::AmmPool).unwrap();
+        let amm_pool = Self::read_amm_pool(&env)?;
         let amm_client = AmmPoolClient::new(&env, &amm_pool);
         match &proposal.kind {
             ProposalKind::UpdateFee(new_fee_bps) => {
@@ -1028,27 +1026,21 @@ impl Governance {
     }
 
     /// Return the current governance configuration parameters.
-    pub fn get_params(env: Env) -> GovernanceParams {
-        GovernanceParams {
-            voting_period_secs: env
-                .storage()
-                .instance()
-                .get(&DataKey::VotingPeriod)
-                .unwrap(),
-            timelock_secs: env.storage().instance().get(&DataKey::Timelock).unwrap(),
-            quorum_bps: env.storage().instance().get(&DataKey::QuorumBps).unwrap(),
-            min_proposer_stake_bps: env
-                .storage()
-                .instance()
-                .get(&DataKey::MinProposerStakeBps)
-                .unwrap(),
+    ///
+    /// Returns [`GovernanceError::NotInitialized`] before `initialize`.
+    pub fn get_params(env: Env) -> Result<GovernanceParams, GovernanceError> {
+        Ok(GovernanceParams {
+            voting_period_secs: Self::read_voting_period(&env)?,
+            timelock_secs: Self::read_timelock(&env)?,
+            quorum_bps: Self::read_quorum_bps(&env)?,
+            min_proposer_stake_bps: Self::read_min_proposer_stake_bps(&env)?,
             veto_multisig: env.storage().instance().get(&DataKey::VetoMultisig),
             quorum_decay_rate_bps_per_day: env
                 .storage()
                 .instance()
                 .get(&DataKey::QuorumDecayRateBpsPerDay)
                 .unwrap_or(0),
-        }
+        })
     }
 
     /// Unlock voting power for a concluded proposal.
@@ -1070,7 +1062,7 @@ impl Governance {
             return Err(GovernanceError::NoLockedVote);
         }
 
-        let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
+        let lp_token = Self::read_lp_token(&env)?;
         // Issue #556: pass `self_addr` as the locker so the LP token authorises this
         // contract, even after Admin has rotated `set_locker` to a different contract.
         let self_addr = env.current_contract_address();
@@ -1150,7 +1142,7 @@ impl Governance {
 
     /// Admin-only: set the protocol multisig that may veto passed proposals.
     pub fn set_veto_multisig(env: Env, multisig: Address) -> Result<(), GovernanceError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
         env.storage()
             .instance()
@@ -1200,18 +1192,14 @@ impl Governance {
             return Err(GovernanceError::VetoWindowExpired);
         }
 
-        let effective_quorum = Self::effective_quorum_bps(&env, &proposal);
+        let effective_quorum = Self::effective_quorum_bps(&env, &proposal)?;
         let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
         let quorum_threshold = proposal.snapshot_total_supply * effective_quorum / MAX_BPS;
         if total_votes < quorum_threshold || proposal.votes_for <= proposal.votes_against {
             return Err(GovernanceError::ProposalDefeated);
         }
 
-        let voting_period: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::VotingPeriod)
-            .unwrap();
+        let voting_period = Self::read_voting_period(&env)?;
         let discussion_end = now + voting_period;
 
         proposal.vetoed = true;
@@ -1257,7 +1245,7 @@ impl Governance {
             .persistent()
             .get(&DataKey::Proposal(proposal_id))
             .ok_or(GovernanceError::ProposalNotFound)?;
-        let lp_token: Address = env.storage().instance().get(&DataKey::LpToken).unwrap();
+        let lp_token = Self::read_lp_token(&env)?;
         let lp_client = LpTokenClient::new(&env, &lp_token);
         Ok(lp_client.balance_at(&holder, &proposal.snapshot_ledger))
     }
@@ -1361,7 +1349,7 @@ impl Governance {
             return Ok(ProposalStatus::Active);
         }
 
-        let effective_quorum = Self::effective_quorum_bps(&env, &proposal);
+        let effective_quorum = Self::effective_quorum_bps(&env, &proposal)?;
         let total_votes = proposal.votes_for + proposal.votes_against + proposal.votes_abstain;
         let quorum_threshold = proposal.snapshot_total_supply * effective_quorum / MAX_BPS;
         let passed = total_votes >= quorum_threshold && proposal.votes_for > proposal.votes_against;
@@ -1381,15 +1369,15 @@ impl Governance {
         }
     }
 
-    fn effective_quorum_bps(env: &Env, proposal: &Proposal) -> i128 {
-        let base: i128 = env.storage().instance().get(&DataKey::QuorumBps).unwrap();
+    fn effective_quorum_bps(env: &Env, proposal: &Proposal) -> Result<i128, GovernanceError> {
+        let base = Self::read_quorum_bps(env)?;
         let decay_rate: i128 = env
             .storage()
             .instance()
             .get(&DataKey::QuorumDecayRateBpsPerDay)
             .unwrap_or(0);
         if decay_rate == 0 {
-            return base;
+            return Ok(base);
         }
         // Freeze decay at vote_end: once voting closes the tally is final, so
         // the required quorum must not keep climbing based on when execute(),
@@ -1400,7 +1388,7 @@ impl Governance {
         } else {
             0
         };
-        (base + decay_rate * days_open as i128).min(MAX_BPS)
+        Ok((base + decay_rate * days_open as i128).min(MAX_BPS))
     }
 
     fn snapshot_voting_power(
@@ -1459,6 +1447,8 @@ impl Governance {
         }
         for i in 0..count {
             let delegator_key = DataKey::Delegator(holder.clone(), i);
+            // Present: `add_delegator_index` / `remove_delegator_index` keep
+            // `Delegator(holder, 0..count)` dense, so every index below `count` exists.
             let delegator: Address = env.storage().persistent().get(&delegator_key).unwrap();
             Self::bump_key_ttl(env, &delegator_key);
             Self::collect_voting_power(
@@ -1531,6 +1521,8 @@ impl Governance {
         let last_index = count - 1;
         if index != last_index {
             let last_delegator_key = DataKey::Delegator(delegatee.clone(), last_index);
+            // Present: the delegator index is dense over `0..count`, and
+            // `last_index == count - 1` with `count > 0` checked above.
             let last_delegator: Address =
                 env.storage().persistent().get(&last_delegator_key).unwrap();
             Self::bump_key_ttl(env, &last_delegator_key);
@@ -1555,6 +1547,68 @@ impl Governance {
             .remove(&DataKey::DelegatorSlot(delegator.clone()));
         env.storage().persistent().set(&count_key, &last_index);
         Self::bump_key_ttl(env, &count_key);
+    }
+
+    // ── Instance configuration accessors ────────────────────────────────────
+    //
+    // Every value below is written by `initialize`, so absence means the
+    // contract has not been initialized. Returning a typed error instead of
+    // unwrapping lets callers branch on `NotInitialized` rather than trap.
+
+    fn read_admin(env: &Env) -> Result<Address, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(GovernanceError::NotInitialized)
+    }
+
+    fn read_amm_pool(env: &Env) -> Result<Address, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::AmmPool)
+            .ok_or(GovernanceError::NotInitialized)
+    }
+
+    fn read_lp_token(env: &Env) -> Result<Address, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::LpToken)
+            .ok_or(GovernanceError::NotInitialized)
+    }
+
+    fn read_voting_period(env: &Env) -> Result<u64, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::VotingPeriod)
+            .ok_or(GovernanceError::NotInitialized)
+    }
+
+    fn read_timelock(env: &Env) -> Result<u64, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Timelock)
+            .ok_or(GovernanceError::NotInitialized)
+    }
+
+    fn read_quorum_bps(env: &Env) -> Result<i128, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::QuorumBps)
+            .ok_or(GovernanceError::NotInitialized)
+    }
+
+    fn read_min_proposer_stake_bps(env: &Env) -> Result<i128, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::MinProposerStakeBps)
+            .ok_or(GovernanceError::NotInitialized)
+    }
+
+    fn read_proposal_count(env: &Env) -> Result<u32, GovernanceError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ProposalCount)
+            .ok_or(GovernanceError::NotInitialized)
     }
 
     fn bump_key_ttl(env: &Env, key: &DataKey) {
@@ -3531,6 +3585,98 @@ mod tests {
             gov.try_unlock_vote(&lp1, &999),
             Err(Ok(GovernanceError::ProposalNotFound))
         );
+    }
+
+    // ── #931: typed NotInitialized instead of host traps ─────────────────────
+
+    fn uninitialized_gov(env: &Env) -> GovernanceClient<'_> {
+        env.mock_all_auths();
+        let gov_addr = env.register_contract(None, Governance);
+        GovernanceClient::new(env, &gov_addr)
+    }
+
+    #[test]
+    fn test_pre_init_admin_setters_return_not_initialized() {
+        let env = Env::default();
+        let gov = uninitialized_gov(&env);
+        let someone = Address::generate(&env);
+
+        assert_eq!(
+            gov.try_set_quorum_decay_bps_per_day(&10_i128),
+            Err(Ok(GovernanceError::NotInitialized))
+        );
+        assert_eq!(
+            gov.try_set_min_proposer_stake_bps(&100_i128),
+            Err(Ok(GovernanceError::NotInitialized))
+        );
+        assert_eq!(
+            gov.try_set_timelock_delay(&60_u64),
+            Err(Ok(GovernanceError::NotInitialized))
+        );
+        assert_eq!(
+            gov.try_set_veto_multisig(&someone),
+            Err(Ok(GovernanceError::NotInitialized))
+        );
+        assert_eq!(
+            gov.try_propose_admin(&someone, &Address::generate(&env)),
+            Err(Ok(GovernanceError::NotInitialized))
+        );
+    }
+
+    #[test]
+    fn test_pre_init_propose_and_get_params_return_not_initialized() {
+        let env = Env::default();
+        let gov = uninitialized_gov(&env);
+        let proposer = Address::generate(&env);
+
+        // A well-formed proposal passes kind validation and then needs the
+        // LP token, which only `initialize` sets.
+        assert_eq!(
+            gov.try_propose(&proposer, &ProposalKind::UpdateFee(30)),
+            Err(Ok(GovernanceError::NotInitialized))
+        );
+        // `GovernanceParams` is not `PartialEq`, so compare the error side only.
+        assert_eq!(
+            gov.try_get_params().err(),
+            Some(Ok(GovernanceError::NotInitialized))
+        );
+    }
+
+    #[test]
+    fn test_pre_init_proposal_entrypoints_return_typed_errors() {
+        let env = Env::default();
+        let gov = uninitialized_gov(&env);
+        let voter = Address::generate(&env);
+
+        // No proposal can exist before `initialize`, so proposal-scoped
+        // entrypoints report the missing proposal instead of trapping.
+        assert_eq!(
+            gov.try_vote(&voter, &0, &Vote::For),
+            Err(Ok(GovernanceError::ProposalNotFound))
+        );
+        assert_eq!(
+            gov.try_execute(&0),
+            Err(Ok(GovernanceError::ProposalNotFound))
+        );
+        assert_eq!(
+            gov.try_get_effective_quorum(&0),
+            Err(Ok(GovernanceError::ProposalNotFound))
+        );
+        assert_eq!(
+            gov.try_get_snapshot_balance(&0, &voter),
+            Err(Ok(GovernanceError::ProposalNotFound))
+        );
+        assert_eq!(
+            gov.try_veto(&0),
+            Err(Ok(GovernanceError::VetoMultisigNotSet))
+        );
+        assert_eq!(
+            gov.try_accept_admin(&voter),
+            Err(Ok(GovernanceError::NoPendingAdmin))
+        );
+        // Plain counters degrade to their empty value.
+        assert_eq!(gov.get_proposal_count(), 0);
+        assert_eq!(gov.get_proposals_paginated(&0, &10).len(), 0);
     }
 }
 
