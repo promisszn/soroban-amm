@@ -36,6 +36,19 @@ pub enum FactoryError {
     FeeNotConfigured = 7,
     RateLimitExceeded = 8,
     CreationPaused = 9,
+    /// `accept_admin` called without a prior `propose_admin`.
+    NoPendingAdmin = 10,
+    /// `accept_admin` called by an address other than the nominee.
+    WrongAdmin = 11,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PoolState {
+    pub sqrt_price: u128,
+    pub current_tick: i32,
+    pub active_liquidity: i128,
+    pub tick_spacing: i32,
 }
 
 #[contractclient(name = "ClPoolClient")]
@@ -50,7 +63,7 @@ pub trait ClPoolInterface {
         tick_spacing: i32,
     );
 
-    fn get_pool_state(env: Env) -> concentrated_liquidity::PoolState;
+    fn get_pool_state(env: Env) -> PoolState;
 }
 
 #[contractclient(name = "AmmPoolClient")]
@@ -130,6 +143,7 @@ pub enum DataKey {
     GlobalProtocolFeeBps, // i128 — global protocol fee rate (0 = off)
     PoolTokens(Address), // pool address → (token_a, token_b) for sweep forwarding
     CreationPaused, // bool — true blocks new V2 and CL pool creation
+    PendingAdmin, // Option<Address> — nominee for two-step admin rotation
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -696,6 +710,61 @@ impl Factory {
             .instance()
             .set(&DataKey::RateLimitLedgers, &min_ledgers);
         Ok(())
+    }
+
+    /// Nominate a new admin. The nominee must call `accept_admin` to complete the transfer.
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), FactoryError> {
+        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        if admin != stored_admin {
+            return Err(FactoryError::Unauthorized);
+        }
+        admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &Some(new_admin.clone()));
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "admin_nominated"),),
+            (admin, new_admin)
+        );
+        Ok(())
+    }
+
+    /// Accept the pending admin nomination. Caller becomes the new admin.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), FactoryError> {
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None);
+        let nominee = pending.ok_or(FactoryError::NoPendingAdmin)?;
+        if new_admin != nominee {
+            return Err(FactoryError::WrongAdmin);
+        }
+        new_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &Option::<Address>::None);
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "admin_changed"),),
+            (new_admin,)
+        );
+        Ok(())
+    }
+
+    /// Return current admin address, or `None` if unset.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    /// Return pending admin nominee, if any.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None)
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
@@ -3026,5 +3095,80 @@ mod tests {
             checked >= 5,
             "representative sequence should emit several factory events, saw {checked}"
         );
+    }
+
+    #[test]
+    fn test_admin_rotation_happy_path() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        let dummy_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+        factory.initialize(&admin, &dummy_hash, &dummy_hash);
+
+        let new_admin = Address::generate(&env);
+        assert_eq!(factory.get_admin(), Some(admin.clone()));
+        assert_eq!(factory.get_pending_admin(), None);
+
+        // Propose admin
+        factory.propose_admin(&admin, &new_admin);
+        assert_eq!(factory.get_pending_admin(), Some(new_admin.clone()));
+        assert_eq!(factory.get_admin(), Some(admin.clone()));
+
+        // Accept admin
+        factory.accept_admin(&new_admin);
+        assert_eq!(factory.get_admin(), Some(new_admin.clone()));
+        assert_eq!(factory.get_pending_admin(), None);
+    }
+
+    #[test]
+    fn test_propose_admin_unauthorized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let rando = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        let dummy_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+        factory.initialize(&admin, &dummy_hash, &dummy_hash);
+
+        let new_admin = Address::generate(&env);
+        assert_eq!(
+            factory.try_propose_admin(&rando, &new_admin),
+            Err(Ok(FactoryError::Unauthorized))
+        );
+        assert_eq!(factory.get_pending_admin(), None);
+        assert_eq!(factory.get_admin(), Some(admin));
+    }
+
+    #[test]
+    fn test_accept_admin_wrong_address_or_no_pending() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let rando = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(&env, &factory_addr);
+        let dummy_hash = soroban_sdk::BytesN::from_array(&env, &[0u8; 32]);
+        factory.initialize(&admin, &dummy_hash, &dummy_hash);
+
+        let new_admin = Address::generate(&env);
+
+        // Accept without prior proposal
+        assert_eq!(
+            factory.try_accept_admin(&new_admin),
+            Err(Ok(FactoryError::NoPendingAdmin))
+        );
+
+        // Propose to new_admin
+        factory.propose_admin(&admin, &new_admin);
+
+        // Wrong address calling accept_admin
+        assert_eq!(
+            factory.try_accept_admin(&rando),
+            Err(Ok(FactoryError::WrongAdmin))
+        );
+        assert_eq!(factory.get_admin(), Some(admin));
     }
 }
