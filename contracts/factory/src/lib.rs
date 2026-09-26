@@ -143,7 +143,7 @@ pub enum DataKey {
     GlobalProtocolFeeBps, // i128 — global protocol fee rate (0 = off)
     PoolTokens(Address), // pool address → (token_a, token_b) for sweep forwarding
     CreationPaused, // bool — true blocks new V2 and CL pool creation
-    PendingAdmin,   // Option<Address> — nominee for two-step admin rotation
+    PendingAdmin, // Option<Address> — nominee for two-step admin rotation
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -713,11 +713,7 @@ impl Factory {
     }
 
     /// Nominate a new admin. The nominee must call `accept_admin` to complete the transfer.
-    pub fn propose_admin(
-        env: Env,
-        admin: Address,
-        new_admin: Address,
-    ) -> Result<(), FactoryError> {
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), FactoryError> {
         let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         if admin != stored_admin {
             return Err(FactoryError::Unauthorized);

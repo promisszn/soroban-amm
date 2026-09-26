@@ -515,11 +515,7 @@ impl Staking {
     }
 
     /// Nominate a new admin. The nominee must call `accept_admin` to complete the transfer.
-    pub fn propose_admin(
-        env: Env,
-        admin: Address,
-        new_admin: Address,
-    ) -> Result<(), StakingError> {
+    pub fn propose_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), StakingError> {
         Self::extend_instance_ttl(&env);
         let stored_admin: Address = env
             .storage()
