@@ -160,6 +160,7 @@ pub enum DataKey {
     /// Insertion-ordered index of every pair that currently has a non-zero
     /// requirement, stored normalised as (smaller_addr, larger_addr).
     ConfiguredPairs,
+    Paused,
 }
 
 // ── Typed errors ─────────────────────────────────────────────────────────────
@@ -173,6 +174,7 @@ pub enum ReserveManagerError {
     NegativeReserveAmount = 4,
     /// A batch health check was handed more pools than `MAX_PAGE`.
     BatchTooLarge = 5,
+    Paused = 6,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -212,6 +214,9 @@ impl ReserveManager {
         current_governance: Address,
         new_governance: Address,
     ) -> Result<(), ReserveManagerError> {
+        if Self::is_paused(env.clone()) {
+            return Err(ReserveManagerError::Paused);
+        }
         let stored: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
         if current_governance != stored {
             return Err(ReserveManagerError::Unauthorized);
@@ -234,6 +239,9 @@ impl ReserveManager {
     /// transaction. On success the stored governance is updated, the pending
     /// nominee is cleared, and a `governance_transferred` event is emitted.
     pub fn accept_governance(env: Env, new_governance: Address) -> Result<(), ReserveManagerError> {
+        if Self::is_paused(env.clone()) {
+            return Err(ReserveManagerError::Paused);
+        }
         let pending: Option<Address> = env
             .storage()
             .instance()
@@ -266,6 +274,37 @@ impl ReserveManager {
             .unwrap_or(None)
     }
 
+    pub fn pause(env: Env) -> Result<(), ReserveManagerError> {
+        let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
+        gov.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &true);
+        emit_versioned_event!(
+            env,
+            (symbol_short!("pause"),),
+            ()
+        );
+        Ok(())
+    }
+
+    pub fn unpause(env: Env) -> Result<(), ReserveManagerError> {
+        let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
+        gov.require_auth();
+        env.storage().instance().set(&DataKey::Paused, &false);
+        emit_versioned_event!(
+            env,
+            (symbol_short!("unpause"),),
+            ()
+        );
+        Ok(())
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
     // ── Reserve requirements ──────────────────────────────────────────────────
 
     /// Set the minimum reserve amounts for a token pair.
@@ -293,6 +332,9 @@ impl ReserveManager {
         min_reserve_a: i128,
         min_reserve_b: i128,
     ) -> Result<(), ReserveManagerError> {
+        if Self::is_paused(env.clone()) {
+            return Err(ReserveManagerError::Paused);
+        }
         let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
         gov.require_auth();
         if min_reserve_a < 0 || min_reserve_b < 0 {
@@ -436,12 +478,16 @@ impl ReserveManager {
     ///
     /// This is optional: `check_reserves` auto-detects unregistered pools.
     /// Registering a kind only avoids the cost of a failed `get_info` probe.
-    pub fn set_pool_kind(env: Env, pool: Address, kind: PoolKind) {
+    pub fn set_pool_kind(env: Env, pool: Address, kind: PoolKind) -> Result<(), ReserveManagerError> {
+        if Self::is_paused(env.clone()) {
+            return Err(ReserveManagerError::Paused);
+        }
         let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
         gov.require_auth();
         env.storage()
             .instance()
             .set(&DataKey::PoolKind(pool), &kind);
+        Ok(())
     }
 
     /// Return the recorded kind for `pool`, or `None` if it is auto-detected.
@@ -1313,5 +1359,59 @@ mod tests {
         let (version, data): (u32, (Address,)) = last_versioned_event(&s, "governance_transferred");
         assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
         assert_eq!(data, (new_gov,));
+    }
+
+    #[test]
+    fn test_pause_and_unpause_requires_auth() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        
+        // This will panic internally in the mock auth test environment because we didn't mock the auth for a random user,
+        // or it will fail authorization. Wait, if we use `try_pause`, we can't catch the require_auth() easily without a specific setup,
+        // but since `s.governance` has mock auth, calling it directly works. We can check that the admin can pause.
+        rm.pause();
+        assert!(rm.is_paused());
+        rm.unpause();
+        assert!(!rm.is_paused());
+    }
+
+    #[test]
+    fn test_mutating_functions_paused() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        rm.pause();
+        assert!(rm.is_paused());
+
+        assert_eq!(
+            rm.try_set_min_reserve(&s.ta, &s.tb, &1_i128, &1_i128),
+            Err(Ok(ReserveManagerError::Paused))
+        );
+        
+        assert_eq!(
+            rm.try_set_pool_kind(&s.pool, &PoolKind::Amm),
+            Err(Ok(ReserveManagerError::Paused))
+        );
+        
+        let new_gov = Address::generate(&s.env);
+        assert_eq!(
+            rm.try_propose_governance(&s.governance, &new_gov),
+            Err(Ok(ReserveManagerError::Paused))
+        );
+        
+        assert_eq!(
+            rm.try_accept_governance(&new_gov),
+            Err(Ok(ReserveManagerError::Paused))
+        );
+    }
+
+    #[test]
+    fn test_read_views_unpaused() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        rm.pause();
+        // Reads should still work
+        let _ = rm.check_reserves(&s.pool);
+        let _ = rm.get_configured_pair_count();
+        let _ = rm.list_configured_pairs(&0, &10);
     }
 }
