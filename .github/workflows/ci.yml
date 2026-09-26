@@ -156,8 +156,16 @@ jobs:
               uses: actions/setup-node@v7
               with:
                   node-version: 22
+            # `npm ci` installs exactly what each workspace's package-lock.json
+            # pins and errors when the lockfile and package.json disagree, so a
+            # transitive dependency publishing between two runs can no longer
+            # turn CI red on an unchanged tree — the same guarantee
+            # rust-toolchain.toml gives the Rust jobs above. Every workspace
+            # now commits a lockfile, so there is always something to install
+            # from; regenerating one requires an explicit `npm install` in that
+            # workspace, which keeps lockfile changes visible in review.
             - name: Install dependencies
-              run: npm install
+              run: npm ci
             - name: Build
               run: npm run build
             - name: Test
