@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Property-based tests for the concentrated-liquidity engine.
 //!
 //! The V2 suite in `lib.rs` targets the constant-product pool. The
@@ -36,7 +37,8 @@ use proptest::prelude::*;
 ///
 /// Copied verbatim from `concentrated_liquidity/src/math.rs` so the properties
 /// below exercise the exact code the contract links, not a re-derivation.
-pub use concentrated_liquidity::math;
+#[path = "../../concentrated_liquidity/src/math.rs"]
+pub mod math;
 
 /// Pure mirror of the CL packed tick bitmap.
 ///
