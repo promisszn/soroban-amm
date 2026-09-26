@@ -1,4 +1,3 @@
-
 #![allow(dead_code)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::needless_lifetimes)]
