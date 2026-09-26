@@ -184,7 +184,8 @@ impl OracleAggregator {
             .instance()
             .get(&DataKey::PendingAdmin)
             .unwrap_or(None);
-        let nominee = pending.unwrap_or_else(|| panic_with_error!(&env, OracleError::NoPendingAdmin));
+        let nominee =
+            pending.unwrap_or_else(|| panic_with_error!(&env, OracleError::NoPendingAdmin));
         if new_admin != nominee {
             panic_with_error!(&env, OracleError::WrongAdmin);
         }
