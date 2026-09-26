@@ -438,6 +438,8 @@ Defined in [contracts/reserve_manager/src/lib.rs](../contracts/reserve_manager/s
 | 3 | `AlreadyInitialized` | Reserve manager initialized twice. | Initialize once upon deployment. |
 | 4 | `NegativeReserveAmount` | `min_reserve` specified as negative value. | Pass non-negative reserve amount. |
 | 5 | `BatchTooLarge` | `check_reserves_batch` called with more than `MAX_PAGE` (50) pools. | Split the pool list into batches of at most 50. |
+| 6 | `NoPendingAdmin` | `accept_admin` was called when no admin transfer is in progress. | Call `propose_admin` first to nominate a successor. |
+| 7 | `WrongAdmin` | `accept_admin` was called by an address that does not match the pending nominee. | Have the correct address (the one passed to `propose_admin`) call `accept_admin`. |
 
 ---
 

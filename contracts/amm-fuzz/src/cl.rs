@@ -606,14 +606,16 @@ proptest! {
 
 #[cfg(feature = "cl")]
 mod stateful {
-    use super::*;
+    use std::collections::HashMap;
+
     use proptest::test_runner::TestCaseError;
     use soroban_sdk::{
         testutils::Address as _,
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
         Address, BytesN, Env,
     };
-    use std::collections::HashMap;
+
+    use super::*;
 
     mod cl_wasm {
         soroban_sdk::contractimport!(
@@ -663,6 +665,8 @@ mod stateful {
         swap_out_b: i128,
         collected_a: i128,
         collected_b: i128,
+        protocol_fees_a: i128,
+        protocol_fees_b: i128,
     }
 
     impl Ctx {
@@ -909,6 +913,302 @@ mod stateful {
             }
             true
         }
+
+        fn swap_exact_out(&mut self, zero_for_one: bool, amount_out: i128) -> bool {
+            let env = self.env.clone();
+            let cl_addr = self.cl_addr.clone();
+            let client = cl_wasm::Client::new(&env, &cl_addr);
+            let max_in = amount_out.saturating_mul(20).max(1_000_000);
+            if zero_for_one {
+                StellarAssetClient::new(&env, &self.ta).mint(&self.provider, &max_in);
+            } else {
+                StellarAssetClient::new(&env, &self.tb).mint(&self.provider, &max_in);
+            }
+            let (ba0, bb0) = (self.bal_a(), self.bal_b());
+            let limit = if zero_for_one {
+                math::MIN_SQRT_PRICE + 1
+            } else {
+                math::MAX_SQRT_PRICE - 1
+            };
+            let res = client.try_swap_exact_out(
+                &self.provider,
+                &zero_for_one,
+                &amount_out,
+                &limit,
+                &max_in,
+                &u64::MAX,
+            );
+            let Ok(Ok(_)) = res else {
+                return false;
+            };
+            let (ba1, bb1) = (self.bal_a(), self.bal_b());
+            if zero_for_one {
+                self.swap_in_a += (ba1 - ba0).max(0);
+                self.swap_out_b += (bb0 - bb1).max(0);
+            } else {
+                self.swap_in_b += (bb1 - bb0).max(0);
+                self.swap_out_a += (ba0 - ba1).max(0);
+            }
+            true
+        }
+
+        fn modify_pos(&mut self, idx: usize, delta: i128, spacing: i32, p1: i32, p2: i32) -> bool {
+            let env = self.env.clone();
+            let cl_addr = self.cl_addr.clone();
+            let client = cl_wasm::Client::new(&env, &cl_addr);
+            let (lower, upper) = if self.positions.is_empty() || idx >= self.positions.len() {
+                let lo = align(p1.min(p2), spacing).clamp(MIN_TICK, MAX_TICK - spacing);
+                let hi = align(p1.max(p2), spacing).clamp(lo + spacing, MAX_TICK);
+                if lo >= hi {
+                    return false;
+                }
+                (lo, hi)
+            } else {
+                (self.positions[idx].lower, self.positions[idx].upper)
+            };
+
+            let (ba0, bb0) = (self.bal_a(), self.bal_b());
+            let res = client.try_modify_position(
+                &self.provider,
+                &lower,
+                &upper,
+                &delta,
+                &0,
+                &0,
+                &u64::MAX,
+            );
+            let Ok(Ok((aa, ab))) = res else {
+                return false;
+            };
+            let (ba1, bb1) = (self.bal_a(), self.bal_b());
+            if delta > 0 {
+                self.minted_a += (ba1 - ba0).max(0);
+                self.minted_b += (bb1 - bb0).max(0);
+                for tick in [lower, upper] {
+                    *self.gross.entry(tick).or_insert(0) += delta;
+                }
+                if !self
+                    .positions
+                    .iter()
+                    .any(|p| p.lower == lower && p.upper == upper)
+                {
+                    self.positions.push(LivePos { lower, upper });
+                }
+            } else {
+                self.burned_a += (ba0 - ba1).max(0);
+                self.burned_b += (bb0 - bb1).max(0);
+                let burn_abs = (-delta).min(aa.abs() + ab.abs());
+                for tick in [lower, upper] {
+                    if let Some(g) = self.gross.get_mut(&tick) {
+                        *g -= burn_abs;
+                        if *g <= 0 {
+                            self.gross.remove(&tick);
+                        }
+                    }
+                }
+            }
+            true
+        }
+
+        fn mint_single_token(
+            &mut self,
+            lower: i32,
+            upper: i32,
+            token_is_a: bool,
+            amount: i128,
+        ) -> bool {
+            let env = self.env.clone();
+            let cl_addr = self.cl_addr.clone();
+            let client = cl_wasm::Client::new(&env, &cl_addr);
+            let token_in = if token_is_a {
+                self.ta.clone()
+            } else {
+                self.tb.clone()
+            };
+            if token_is_a {
+                StellarAssetClient::new(&env, &self.ta).mint(&self.provider, &amount);
+            } else {
+                StellarAssetClient::new(&env, &self.tb).mint(&self.provider, &amount);
+            }
+            let old_liq = match client.try_get_position(&self.provider, &lower, &upper) {
+                Ok(Ok(p)) => p.liquidity,
+                _ => 0,
+            };
+            let (ba0, bb0) = (self.bal_a(), self.bal_b());
+            let res = client.try_mint_position_single_token(
+                &self.provider,
+                &lower,
+                &upper,
+                &token_in,
+                &amount,
+                &0,
+                &u64::MAX,
+            );
+            let Ok(Ok(_res)) = res else {
+                return false;
+            };
+            let (ba1, bb1) = (self.bal_a(), self.bal_b());
+            self.minted_a += (ba1 - ba0).max(0);
+            self.minted_b += (bb1 - bb0).max(0);
+
+            let new_liq = match client.try_get_position(&self.provider, &lower, &upper) {
+                Ok(Ok(p)) => p.liquidity,
+                _ => 0,
+            };
+            let delta = new_liq - old_liq;
+            if delta > 0 {
+                for tick in [lower, upper] {
+                    *self.gross.entry(tick).or_insert(0) += delta;
+                }
+                if !self
+                    .positions
+                    .iter()
+                    .any(|p| p.lower == lower && p.upper == upper)
+                {
+                    self.positions.push(LivePos { lower, upper });
+                }
+            }
+            true
+        }
+
+        fn place_range_order(&mut self, p1: i32, p2: i32, amount: i128, spacing: i32) -> bool {
+            let env = self.env.clone();
+            let cl_addr = self.cl_addr.clone();
+            let client = cl_wasm::Client::new(&env, &cl_addr);
+            let cur = self.current_tick();
+            let lower = align(p1.min(p2), spacing).clamp(MIN_TICK, MAX_TICK - spacing);
+            let upper = align(p1.max(p2), spacing).clamp(lower + spacing, MAX_TICK);
+            if lower >= upper {
+                return false;
+            }
+            if cur >= lower && cur < upper {
+                return false;
+            }
+
+            let is_above = cur < lower;
+            let token_in = if is_above {
+                self.ta.clone()
+            } else {
+                self.tb.clone()
+            };
+            if is_above {
+                StellarAssetClient::new(&env, &self.ta).mint(&self.provider, &amount);
+            } else {
+                StellarAssetClient::new(&env, &self.tb).mint(&self.provider, &amount);
+            }
+
+            let old_liq = match client.try_get_position(&self.provider, &lower, &upper) {
+                Ok(Ok(p)) => p.liquidity,
+                _ => 0,
+            };
+            let (ba0, bb0) = (self.bal_a(), self.bal_b());
+            let res = client.try_place_range_order(
+                &self.provider,
+                &lower,
+                &upper,
+                &token_in,
+                &amount,
+                &0,
+                &u64::MAX,
+            );
+            let Ok(Ok(_res)) = res else {
+                return false;
+            };
+            let (ba1, bb1) = (self.bal_a(), self.bal_b());
+            self.minted_a += (ba1 - ba0).max(0);
+            self.minted_b += (bb1 - bb0).max(0);
+
+            // Also call check_range_order_filled
+            let _ = client.try_check_range_order_filled(&self.provider, &lower, &upper);
+
+            let new_liq = match client.try_get_position(&self.provider, &lower, &upper) {
+                Ok(Ok(p)) => p.liquidity,
+                _ => 0,
+            };
+            let delta = new_liq - old_liq;
+            if delta > 0 {
+                for tick in [lower, upper] {
+                    *self.gross.entry(tick).or_insert(0) += delta;
+                }
+                if !self
+                    .positions
+                    .iter()
+                    .any(|p| p.lower == lower && p.upper == upper)
+                {
+                    self.positions.push(LivePos { lower, upper });
+                }
+            }
+            true
+        }
+
+        fn collect_by_token_id(&mut self, idx: usize) {
+            if self.positions.is_empty() || idx >= self.positions.len() {
+                return;
+            }
+            let p = self.positions[idx].clone();
+            let env = self.env.clone();
+            let cl_addr = self.cl_addr.clone();
+            let client = cl_wasm::Client::new(&env, &cl_addr);
+            if let Ok(Ok(Some(token_id))) =
+                client.try_position_token_id(&self.provider, &p.lower, &p.upper)
+            {
+                if let Ok(Ok((ca, cb))) =
+                    client.try_collect_fees_by_token_id(&self.provider, &token_id)
+                {
+                    self.collected_a += ca;
+                    self.collected_b += cb;
+                }
+            }
+        }
+
+        fn burn_by_token_id(&mut self, idx: usize, amount: i128) {
+            if self.positions.is_empty() || idx >= self.positions.len() {
+                return;
+            }
+            let p = self.positions[idx].clone();
+            let env = self.env.clone();
+            let cl_addr = self.cl_addr.clone();
+            let client = cl_wasm::Client::new(&env, &cl_addr);
+            let liq = match client.try_get_position(&self.provider, &p.lower, &p.upper) {
+                Ok(Ok(pos)) => pos.liquidity,
+                _ => 0,
+            };
+            if liq <= 0 {
+                return;
+            }
+            let burn = amount.min(liq);
+            if let Ok(Ok(Some(token_id))) =
+                client.try_position_token_id(&self.provider, &p.lower, &p.upper)
+            {
+                let Ok(Ok((ba, bb))) =
+                    client.try_burn_position_by_token_id(&self.provider, &token_id, &burn)
+                else {
+                    return;
+                };
+                self.burned_a += ba;
+                self.burned_b += bb;
+                for tick in [p.lower, p.upper] {
+                    if let Some(g) = self.gross.get_mut(&tick) {
+                        *g -= burn;
+                        if *g <= 0 {
+                            self.gross.remove(&tick);
+                        }
+                    }
+                }
+            }
+        }
+
+        fn withdraw_protocol_fees(&mut self) {
+            let env = self.env.clone();
+            let cl_addr = self.cl_addr.clone();
+            let client = cl_wasm::Client::new(&env, &cl_addr);
+            let (ba0, bb0) = (self.bal_a(), self.bal_b());
+            if client.try_withdraw_protocol_fees(&self.admin).is_ok() {
+                let (ba1, bb1) = (self.bal_a(), self.bal_b());
+                self.protocol_fees_a += (ba0 - ba1).max(0);
+                self.protocol_fees_b += (bb0 - bb1).max(0);
+            }
+        }
     }
 
     fn deploy(fee_bps: i128, initial_tick: i32, spacing: i32) -> Ctx {
@@ -960,6 +1260,8 @@ mod stateful {
             swap_out_b: 0,
             collected_a: 0,
             collected_b: 0,
+            protocol_fees_a: 0,
+            protocol_fees_b: 0,
         }
     }
 
@@ -995,10 +1297,12 @@ mod stateful {
         // 2. Balance conservation: the pool's token balances exactly match the
         //    algebraic sum of every transfer it has performed.
         let (ba, bb) = (ctx.bal_a(), ctx.bal_b());
-        let derived_a =
-            ctx.minted_a - ctx.burned_a - ctx.collected_a + ctx.swap_in_a - ctx.swap_out_a;
-        let derived_b =
-            ctx.minted_b - ctx.burned_b - ctx.collected_b + ctx.swap_in_b - ctx.swap_out_b;
+        let derived_a = ctx.minted_a - ctx.burned_a - ctx.collected_a - ctx.protocol_fees_a
+            + ctx.swap_in_a
+            - ctx.swap_out_a;
+        let derived_b = ctx.minted_b - ctx.burned_b - ctx.collected_b - ctx.protocol_fees_b
+            + ctx.swap_in_b
+            - ctx.swap_out_b;
         prop_assert_eq!(
             ba,
             derived_a,
@@ -1108,20 +1412,29 @@ mod stateful {
         let mut last_accrued = (0_i128, 0_i128);
         for (kind, p1, p2, amount, flag) in ops {
             step += 1;
-            let op_label = match kind {
+            let op_kind = kind % 11;
+            let op_label = match op_kind {
                 0 => "mint",
                 1 => "swap",
                 2 => "burn",
-                _ => "collect",
+                3 => "collect",
+                4 => "swap_exact_out",
+                5 => "modify_position",
+                6 => "mint_single_token",
+                7 => "place_range_order",
+                8 => "collect_by_token_id",
+                9 => "withdraw_protocol_fees",
+                10 => "burn_by_token_id",
+                _ => "op",
             };
 
-            let tick_before = if kind == 1 {
+            let tick_before = if op_kind == 1 || op_kind == 4 {
                 Some(ctx.current_tick())
             } else {
                 None
             };
 
-            match kind {
+            match op_kind {
                 0 => {
                     let lower = align(p1.min(p2), spacing).clamp(MIN_TICK, MAX_TICK - spacing);
                     let upper = align(p1.max(p2), spacing).clamp(lower + spacing, MAX_TICK);
@@ -1130,16 +1443,45 @@ mod stateful {
                     }
                 }
                 1 => {
-                    ctx.swap(flag == 0, amount);
+                    ctx.swap(flag == 0, amount.abs().max(1));
                 }
                 2 => {
                     let idx = (p1.unsigned_abs() as usize) % ctx.positions.len().max(1);
-                    ctx.burn(idx, amount);
+                    ctx.burn(idx, amount.abs());
                 }
-                _ => {
+                3 => {
                     let idx = (p1.unsigned_abs() as usize) % ctx.positions.len().max(1);
                     ctx.collect(idx);
                 }
+                4 => {
+                    ctx.swap_exact_out(flag == 0, amount.abs().clamp(1, 10_000));
+                }
+                5 => {
+                    let idx = (p1.unsigned_abs() as usize) % ctx.positions.len().max(1);
+                    ctx.modify_pos(idx, amount, spacing, p1, p2);
+                }
+                6 => {
+                    let lower = align(p1.min(p2), spacing).clamp(MIN_TICK, MAX_TICK - spacing);
+                    let upper = align(p1.max(p2), spacing).clamp(lower + spacing, MAX_TICK);
+                    if lower < upper {
+                        ctx.mint_single_token(lower, upper, flag == 0, amount.abs().max(1));
+                    }
+                }
+                7 => {
+                    ctx.place_range_order(p1, p2, amount.abs().max(1), spacing);
+                }
+                8 => {
+                    let idx = (p1.unsigned_abs() as usize) % ctx.positions.len().max(1);
+                    ctx.collect_by_token_id(idx);
+                }
+                9 => {
+                    ctx.withdraw_protocol_fees();
+                }
+                10 => {
+                    let idx = (p1.unsigned_abs() as usize) % ctx.positions.len().max(1);
+                    ctx.burn_by_token_id(idx, amount.abs());
+                }
+                _ => {}
             }
 
             if let Some(t0) = tick_before {
@@ -1178,10 +1520,15 @@ mod stateful {
             ops.push((1, i, 0, 50_000 + i as i128 * 7_777, (i % 2) as u8)); // swap
         }
         ops.push((0, -200, 200, 100_000, 0)); // mint
+        ops.push((4, 0, 0, 500, 0)); // swap_exact_out
+        ops.push((5, 0, -200, 10_000, 0)); // modify_position (add)
+        ops.push((6, 500, 1000, 50_000, 0)); // mint_position_single_token
+        ops.push((7, 1200, 1500, 50_000, 0)); // place_range_order & check_range_order_filled
         ops.push((2, 0, 0, 50_000, 0)); // burn
         ops.push((3, 1, 0, 0, 0)); // collect
-        ops.push((2, 2, 0, 100_000, 0)); // burn
-        ops.push((3, 0, 0, 0, 0)); // collect
+        ops.push((8, 0, 0, 0, 0)); // collect_fees_by_token_id
+        ops.push((9, 0, 0, 0, 0)); // withdraw_protocol_fees
+        ops.push((10, 2, 0, 50_000, 0)); // burn_position_by_token_id
 
         let (ctx, max_crossings) =
             run_script((30_i128, 0_i32, 1_i32, seed, ops)).expect("stateful invariants failed");
