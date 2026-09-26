@@ -1231,6 +1231,10 @@ mod stateful {
                 StellarAssetClient::new(&env, &self.tb).mint(&self.provider, &amount);
             }
 
+            let old_liq = match client.try_get_position(&self.provider, &lower, &upper) {
+                Ok(Ok(p)) => p.liquidity,
+                _ => 0,
+            };
             let (ba0, bb0) = (self.bal_a(), self.bal_b());
             let res = client.try_place_range_order(
                 &self.provider,
@@ -1251,12 +1255,22 @@ mod stateful {
             // Also call check_range_order_filled
             let _ = client.try_check_range_order_filled(&self.provider, &lower, &upper);
 
-            if !self
-                .positions
-                .iter()
-                .any(|p| p.lower == lower && p.upper == upper)
-            {
-                self.positions.push(LivePos { lower, upper });
+            let new_liq = match client.try_get_position(&self.provider, &lower, &upper) {
+                Ok(Ok(p)) => p.liquidity,
+                _ => 0,
+            };
+            let delta = new_liq - old_liq;
+            if delta > 0 {
+                for tick in [lower, upper] {
+                    *self.gross.entry(tick).or_insert(0) += delta;
+                }
+                if !self
+                    .positions
+                    .iter()
+                    .any(|p| p.lower == lower && p.upper == upper)
+                {
+                    self.positions.push(LivePos { lower, upper });
+                }
             }
             true
         }
