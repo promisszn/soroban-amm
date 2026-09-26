@@ -94,7 +94,9 @@ pub enum OracleError {
     InvalidDeviation = 8,
     InvalidWeight = 9,
     WeightFloorNotMet = 10,
-    Paused = 11,
+    NoPendingAdmin = 11,
+    WrongAdmin = 12,
+    Paused = 13,
 }
 
 // ── Storage ────────────────────────────────────────────────────────────────
@@ -102,6 +104,7 @@ pub enum OracleError {
 #[contracttype]
 pub enum DataKey {
     Admin,
+    PendingAdmin,
     MaxStaleness,
     Sources,
     MaxDeviationBps,
@@ -163,6 +166,39 @@ impl OracleAggregator {
 
         let empty: Vec<OracleSource> = Vec::new(&env);
         env.storage().instance().set(&DataKey::Sources, &empty);
+    }
+
+    pub fn propose_admin(env: Env, current_admin: Address, new_admin: Address) {
+        require_admin(&env, &current_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (soroban_sdk::Symbol::new(&env, "admin_nominated"),),
+            (current_admin, new_admin)
+        );
+    }
+
+    pub fn accept_admin(env: Env, new_admin: Address) {
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None);
+        let nominee =
+            pending.unwrap_or_else(|| panic_with_error!(&env, OracleError::NoPendingAdmin));
+        if new_admin != nominee {
+            panic_with_error!(&env, OracleError::WrongAdmin);
+        }
+        new_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (soroban_sdk::Symbol::new(&env, "admin_changed"),),
+            (new_admin,)
+        );
     }
 
     pub fn pause(env: Env, admin: Address) {

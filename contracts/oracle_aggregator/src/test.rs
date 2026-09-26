@@ -819,6 +819,88 @@ fn set_source_weight_emits_event() {
 }
 
 #[test]
+fn test_admin_rotation_happy_path() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let new_admin = Address::generate(&env);
+
+    h.aggregator.propose_admin(&h.admin, &new_admin);
+
+    // Check event emitted
+    let events = env.events().all();
+    let (_, topics, data) = events.last().unwrap();
+    assert_eq!(
+        topics,
+        (soroban_sdk::Symbol::new(&env, "admin_nominated"),).into_val(&env)
+    );
+    let (version, (from, to)): (u32, (Address, Address)) = data.into_val(&env);
+    assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+    assert_eq!(from, h.admin);
+    assert_eq!(to, new_admin);
+
+    // Accept admin
+    h.aggregator.accept_admin(&new_admin);
+
+    let events2 = env.events().all();
+    let (_, topics2, data2) = events2.last().unwrap();
+    assert_eq!(
+        topics2,
+        (soroban_sdk::Symbol::new(&env, "admin_changed"),).into_val(&env)
+    );
+    let (version2, (accepted,)): (u32, (Address,)) = data2.into_val(&env);
+    assert_eq!(version2, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+    assert_eq!(accepted, new_admin);
+
+    assert_eq!(h.aggregator.get_admin(), new_admin);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #12)")] // WrongAdmin
+fn test_admin_rotation_rejected_non_proposed() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let new_admin = Address::generate(&env);
+    let rando = Address::generate(&env);
+
+    h.aggregator.propose_admin(&h.admin, &new_admin);
+    h.aggregator.accept_admin(&rando);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #11)")] // NoPendingAdmin
+fn test_admin_rotation_accept_without_proposal() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let rando = Address::generate(&env);
+
+    h.aggregator.accept_admin(&rando);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #3)")] // NotAdmin
+fn test_admin_rotation_propose_wrong_admin() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let new_admin = Address::generate(&env);
+    let rando = Address::generate(&env);
+
+    h.aggregator.propose_admin(&rando, &new_admin);
+}
+
+#[test]
+fn test_admin_rotation_old_admin_retains_control() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let new_admin = Address::generate(&env);
+
+    h.aggregator.propose_admin(&h.admin, &new_admin);
+
+    // Old admin can still set max staleness
+    h.aggregator.set_max_staleness(&h.admin, &1200);
+    assert_eq!(h.aggregator.get_max_staleness(), 1200);
+}
+
+#[test]
 fn test_pause_and_unpause_requires_admin() {
     let env = Env::default();
     let h = deploy(&env, 600);
@@ -833,7 +915,7 @@ fn test_pause_and_unpause_requires_admin() {
 }
 
 #[test]
-#[should_panic(expected = "Error(Contract, #11)")] // Paused error
+#[should_panic(expected = "Error(Contract, #13)")] // Paused error
 fn test_get_price_panics_when_paused() {
     let env = Env::default();
     let h = deploy(&env, 600);
