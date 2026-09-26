@@ -1,10 +1,9 @@
 {
   "generators": {
-    "address": 3,
+    "address": 2,
     "nonce": 0
   },
   "auth": [
-    [],
     [],
     []
   ],
@@ -149,58 +148,35 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000002"
               },
               {
-                "symbol": "get_keeper"
-              }
-            ],
-            "data": "void"
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": "0000000000000000000000000000000000000000000000000000000000000002",
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_return"
-              },
-              {
-                "symbol": "get_keeper"
+                "symbol": "set_retention_policy"
               }
             ],
             "data": {
-              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
-            }
-          }
-        }
-      },
-      "failed_call": false
-    },
-    {
-      "event": {
-        "ext": "v0",
-        "contract_id": null,
-        "type_": "diagnostic",
-        "body": {
-          "v0": {
-            "topics": [
-              {
-                "symbol": "fn_call"
-              },
-              {
-                "bytes": "0000000000000000000000000000000000000000000000000000000000000002"
-              },
-              {
-                "symbol": "initialize"
-              }
-            ],
-            "data": {
-              "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+              "vec": [
+                {
+                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                },
+                {
+                  "map": [
+                    {
+                      "key": {
+                        "symbol": "max_age_seconds"
+                      },
+                      "val": {
+                        "u64": 86399
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "max_snapshots_per_pool"
+                      },
+                      "val": {
+                        "u32": 100
+                      }
+                    }
+                  ]
+                }
+              ]
             }
           }
         }
@@ -219,12 +195,12 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "initialize"
+                "symbol": "set_retention_policy"
               }
             ],
             "data": {
               "error": {
-                "contract": 1
+                "contract": 12
               }
             }
           }
@@ -245,7 +221,7 @@
               },
               {
                 "error": {
-                  "contract": 1
+                  "contract": 12
                 }
               }
             ],
@@ -270,7 +246,7 @@
               },
               {
                 "error": {
-                  "contract": 1
+                  "contract": 12
                 }
               }
             ],
@@ -280,12 +256,32 @@
                   "string": "contract try_call failed"
                 },
                 {
-                  "symbol": "initialize"
+                  "symbol": "set_retention_policy"
                 },
                 {
                   "vec": [
                     {
-                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                    },
+                    {
+                      "map": [
+                        {
+                          "key": {
+                            "symbol": "max_age_seconds"
+                          },
+                          "val": {
+                            "u64": 86399
+                          }
+                        },
+                        {
+                          "key": {
+                            "symbol": "max_snapshots_per_pool"
+                          },
+                          "val": {
+                            "u32": 100
+                          }
+                        }
+                      ]
                     }
                   ]
                 }
