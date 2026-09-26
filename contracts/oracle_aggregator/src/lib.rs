@@ -18,6 +18,7 @@
 //! The band defaults to [`DEFAULT_MAX_DEVIATION_BPS`] and is tunable by the
 //! admin via [`OracleAggregator::set_max_deviation_bps`].
 
+use soroban_amm_sdk::emit_versioned_event;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
     symbol_short, Address, Env, Vec,
@@ -227,9 +228,10 @@ impl OracleAggregator {
             panic_with_error!(&env, OracleError::InsufficientSources);
         }
 
-        env.events().publish(
+        emit_versioned_event!(
+            env,
             (symbol_short!("price"),),
-            (token_a, token_b, breakdown.price, breakdown.confidence),
+            (token_a, token_b, breakdown.price, breakdown.confidence)
         );
 
         AggregatedPrice {
@@ -310,9 +312,10 @@ impl OracleAggregator {
                 sources.set(i, source);
                 found = true;
 
-                env.events().publish(
+                emit_versioned_event!(
+                    env,
                     (symbol_short!("src_wt"),),
-                    (source_contract, old_weight, weight),
+                    (source_contract, old_weight, weight)
                 );
                 break;
             }
@@ -410,8 +413,7 @@ impl OracleAggregator {
         }
 
         if !stale_sources.is_empty() {
-            env.events()
-                .publish((symbol_short!("stale_src"),), (stale_sources,));
+            emit_versioned_event!(env, (symbol_short!("stale_src"),), (stale_sources,));
         }
 
         if prices.len() < MIN_VALID_SOURCES {
@@ -448,8 +450,7 @@ impl OracleAggregator {
         }
 
         if !deviant_sources.is_empty() {
-            env.events()
-                .publish((symbol_short!("deviant"),), (deviant_sources.clone(),));
+            emit_versioned_event!(env, (symbol_short!("deviant"),), (deviant_sources.clone(),));
         }
 
         // Check minimum total agreeing weight.

@@ -378,12 +378,11 @@ for it is listed in the Concentrated-liquidity AMM event table above.
 
 ## Update (#689)
 
-`contracts/oracle_aggregator/src/lib.rs` gained a new unversioned `src_wt`
-event emitted by `set_source_weight`, consistent with the oracle aggregator's
-existing plain-event convention (predating the `emit_versioned_event!` scheme).
-The event is emitted via `env.events().publish(...)` directly.
+`contracts/oracle_aggregator/src/lib.rs` gained a new `src_wt` event emitted
+by `set_source_weight`. It has since been migrated onto the versioned scheme
+(see #916 below).
 
-### Oracle Aggregator — `contracts/oracle_aggregator/src/lib.rs` (unversioned, plain events)
+### Oracle Aggregator — `contracts/oracle_aggregator/src/lib.rs`
 
 | Event | Topics | Payload |
 |---|---|---|
@@ -426,3 +425,34 @@ test modules.
 
 All event rows for these contracts are listed in the catalogue above under the
 Factory, Token, Reserve Manager, and Batch Auction sections.
+
+## Update (#916)
+
+`contracts/oracle_aggregator/src/lib.rs` is now fully migrated onto the
+versioned scheme. All four raw `env.events().publish(...)` sites
+(`price`, `src_wt`, `stale_src`, `deviant`) now emit through
+`emit_versioned_event!`, with one test per topic decoding the payload as a
+version-stamped `(u32, T)` pair in the style of `last_versioned_event` from
+the governance test module. No raw `env.events().publish` call remains in
+`contracts/oracle_aggregator/src/` outside test modules. The event row for
+this contract, listed above under Oracle Aggregator, is unchanged except for
+the leading `schema_version` field now present on the wire.
+
+## Update (#915)
+
+`contracts/cl_position_nft/src/lib.rs` is now fully migrated onto the
+versioned scheme. All five raw `env.events().publish(...)` sites
+(`nft_mint`, `nft_burn`, `approve`, `approval_for_all`, `transfer`) now emit
+through `emit_versioned_event!`, with one test per topic decoding the payload
+as a version-stamped `(u32, T)` pair. No raw `env.events().publish` call
+remains in `contracts/cl_position_nft/src/` outside test modules.
+
+### CL Position NFT — `contracts/cl_position_nft/src/lib.rs`
+
+| Event | Topics | Payload |
+|---|---|---|
+| `nft_mint` | `to` | `(token_id: u64,)` |
+| `nft_burn` | `owner` | `(token_id: u64,)` |
+| `approve` | `caller`, `approved` | `(token_id: u64,)` |
+| `approval_for_all` | `owner`, `operator` | `(approved: bool,)` |
+| `transfer` | `from`, `to` | `(token_id: u64,)` |
