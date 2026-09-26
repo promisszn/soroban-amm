@@ -94,6 +94,7 @@ pub enum OracleError {
     InvalidDeviation = 8,
     InvalidWeight = 9,
     WeightFloorNotMet = 10,
+    Paused = 11,
 }
 
 // ── Storage ────────────────────────────────────────────────────────────────
@@ -104,6 +105,7 @@ pub enum DataKey {
     MaxStaleness,
     Sources,
     MaxDeviationBps,
+    Paused,
 }
 
 pub const MIN_VALID_SOURCES: u32 = 2;
@@ -161,6 +163,25 @@ impl OracleAggregator {
 
         let empty: Vec<OracleSource> = Vec::new(&env);
         env.storage().instance().set(&DataKey::Sources, &empty);
+    }
+
+    pub fn pause(env: Env, admin: Address) {
+        require_admin(&env, &admin);
+        env.storage().instance().set(&DataKey::Paused, &true);
+        env.events().publish((symbol_short!("pause"),), ());
+    }
+
+    pub fn unpause(env: Env, admin: Address) {
+        require_admin(&env, &admin);
+        env.storage().instance().set(&DataKey::Paused, &false);
+        env.events().publish((symbol_short!("unpause"),), ());
+    }
+
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
     }
 
     pub fn register_source(
@@ -222,6 +243,9 @@ impl OracleAggregator {
     }
 
     pub fn get_price(env: Env, token_a: Address, token_b: Address) -> AggregatedPrice {
+        if Self::is_paused(env.clone()) {
+            panic_with_error!(&env, OracleError::Paused);
+        }
         let breakdown = Self::aggregate_price(&env, token_a.clone(), token_b.clone(), true);
         if breakdown.confidence == 0 {
             panic_with_error!(&env, OracleError::InsufficientSources);
