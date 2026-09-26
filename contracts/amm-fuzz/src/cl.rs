@@ -740,14 +740,16 @@ proptest! {
 
 #[cfg(feature = "cl")]
 mod stateful {
-    use super::*;
+    use std::collections::HashMap;
+
     use proptest::test_runner::TestCaseError;
     use soroban_sdk::{
         testutils::Address as _,
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
         Address, BytesN, Env,
     };
-    use std::collections::HashMap;
+
+    use super::*;
 
     mod cl_wasm {
         soroban_sdk::contractimport!(
@@ -1057,7 +1059,11 @@ mod stateful {
                 StellarAssetClient::new(&env, &self.tb).mint(&self.provider, &max_in);
             }
             let (ba0, bb0) = (self.bal_a(), self.bal_b());
-            let limit = if zero_for_one { MIN_SQRT_PRICE + 1 } else { MAX_SQRT_PRICE - 1 };
+            let limit = if zero_for_one {
+                math::MIN_SQRT_PRICE + 1
+            } else {
+                math::MAX_SQRT_PRICE - 1
+            };
             let res = client.try_swap_exact_out(
                 &self.provider,
                 &zero_for_one,
@@ -1087,7 +1093,9 @@ mod stateful {
             let (lower, upper) = if self.positions.is_empty() || idx >= self.positions.len() {
                 let lo = align(p1.min(p2), spacing).clamp(MIN_TICK, MAX_TICK - spacing);
                 let hi = align(p1.max(p2), spacing).clamp(lo + spacing, MAX_TICK);
-                if lo >= hi { return false; }
+                if lo >= hi {
+                    return false;
+                }
                 (lo, hi)
             } else {
                 (self.positions[idx].lower, self.positions[idx].upper)
@@ -1113,7 +1121,11 @@ mod stateful {
                 for tick in [lower, upper] {
                     *self.gross.entry(tick).or_insert(0) += delta;
                 }
-                if !self.positions.iter().any(|p| p.lower == lower && p.upper == upper) {
+                if !self
+                    .positions
+                    .iter()
+                    .any(|p| p.lower == lower && p.upper == upper)
+                {
                     self.positions.push(LivePos { lower, upper });
                 }
             } else {
@@ -1142,7 +1154,11 @@ mod stateful {
             let env = self.env.clone();
             let cl_addr = self.cl_addr.clone();
             let client = cl_wasm::Client::new(&env, &cl_addr);
-            let token_in = if token_is_a { self.ta.clone() } else { self.tb.clone() };
+            let token_in = if token_is_a {
+                self.ta.clone()
+            } else {
+                self.tb.clone()
+            };
             if token_is_a {
                 StellarAssetClient::new(&env, &self.ta).mint(&self.provider, &amount);
             } else {
@@ -1178,7 +1194,11 @@ mod stateful {
                 for tick in [lower, upper] {
                     *self.gross.entry(tick).or_insert(0) += delta;
                 }
-                if !self.positions.iter().any(|p| p.lower == lower && p.upper == upper) {
+                if !self
+                    .positions
+                    .iter()
+                    .any(|p| p.lower == lower && p.upper == upper)
+                {
                     self.positions.push(LivePos { lower, upper });
                 }
             }
@@ -1192,11 +1212,19 @@ mod stateful {
             let cur = self.current_tick();
             let lower = align(p1.min(p2), spacing).clamp(MIN_TICK, MAX_TICK - spacing);
             let upper = align(p1.max(p2), spacing).clamp(lower + spacing, MAX_TICK);
-            if lower >= upper { return false; }
-            if cur >= lower && cur < upper { return false; }
+            if lower >= upper {
+                return false;
+            }
+            if cur >= lower && cur < upper {
+                return false;
+            }
 
             let is_above = cur < lower;
-            let token_in = if is_above { self.ta.clone() } else { self.tb.clone() };
+            let token_in = if is_above {
+                self.ta.clone()
+            } else {
+                self.tb.clone()
+            };
             if is_above {
                 StellarAssetClient::new(&env, &self.ta).mint(&self.provider, &amount);
             } else {
@@ -1223,7 +1251,11 @@ mod stateful {
             // Also call check_range_order_filled
             let _ = client.try_check_range_order_filled(&self.provider, &lower, &upper);
 
-            if !self.positions.iter().any(|p| p.lower == lower && p.upper == upper) {
+            if !self
+                .positions
+                .iter()
+                .any(|p| p.lower == lower && p.upper == upper)
+            {
                 self.positions.push(LivePos { lower, upper });
             }
             true
@@ -1237,8 +1269,12 @@ mod stateful {
             let env = self.env.clone();
             let cl_addr = self.cl_addr.clone();
             let client = cl_wasm::Client::new(&env, &cl_addr);
-            if let Ok(Ok(token_id)) = client.try_position_token_id(&self.provider, &p.lower, &p.upper) {
-                if let Ok(Ok((ca, cb))) = client.try_collect_fees_by_token_id(&self.provider, &token_id) {
+            if let Ok(Ok(Some(token_id))) =
+                client.try_position_token_id(&self.provider, &p.lower, &p.upper)
+            {
+                if let Ok(Ok((ca, cb))) =
+                    client.try_collect_fees_by_token_id(&self.provider, &token_id)
+                {
                     self.collected_a += ca;
                     self.collected_b += cb;
                 }
@@ -1261,8 +1297,12 @@ mod stateful {
                 return;
             }
             let burn = amount.min(liq);
-            if let Ok(Ok(token_id)) = client.try_position_token_id(&self.provider, &p.lower, &p.upper) {
-                let Ok(Ok((ba, bb))) = client.try_burn_position_by_token_id(&self.provider, &token_id, &burn) else {
+            if let Ok(Ok(Some(token_id))) =
+                client.try_position_token_id(&self.provider, &p.lower, &p.upper)
+            {
+                let Ok(Ok((ba, bb))) =
+                    client.try_burn_position_by_token_id(&self.provider, &token_id, &burn)
+                else {
                     return;
                 };
                 self.burned_a += ba;
@@ -1378,9 +1418,11 @@ mod stateful {
         //    algebraic sum of every transfer it has performed.
         let (ba, bb) = (ctx.bal_a(), ctx.bal_b());
         let derived_a = ctx.minted_a - ctx.burned_a - ctx.collected_a - ctx.protocol_fees_a
-            + ctx.swap_in_a - ctx.swap_out_a;
+            + ctx.swap_in_a
+            - ctx.swap_out_a;
         let derived_b = ctx.minted_b - ctx.burned_b - ctx.collected_b - ctx.protocol_fees_b
-            + ctx.swap_in_b - ctx.swap_out_b;
+            + ctx.swap_in_b
+            - ctx.swap_out_b;
         prop_assert_eq!(
             ba,
             derived_a,
@@ -1599,7 +1641,7 @@ mod stateful {
         }
         ops.push((0, -200, 200, 100_000, 0)); // mint
         ops.push((4, 0, 0, 500, 0)); // swap_exact_out
-        ops.push((5, 0, -200, 200, 10_000, 0)); // modify_position (add)
+        ops.push((5, 0, -200, 10_000, 0)); // modify_position (add)
         ops.push((6, 500, 1000, 50_000, 0)); // mint_position_single_token
         ops.push((7, 1200, 1500, 50_000, 0)); // place_range_order & check_range_order_filled
         ops.push((2, 0, 0, 50_000, 0)); // burn

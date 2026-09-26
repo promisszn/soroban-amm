@@ -314,15 +314,13 @@ impl ReserveManager {
         }
         new_admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.storage().instance().set(&DataKey::Governance, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::Governance, &new_admin);
         env.storage()
             .instance()
             .set(&DataKey::PendingAdmin, &Option::<Address>::None);
-        emit_versioned_event!(
-            env,
-            (Symbol::new(&env, "admin_changed"),),
-            (new_admin,)
-        );
+        emit_versioned_event!(env, (Symbol::new(&env, "admin_changed"),), (new_admin,));
         Ok(())
     }
 
@@ -745,7 +743,6 @@ impl ReserveManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use amm::AmmPool;
     use soroban_sdk::{
         testutils::{Address as _, Events as _},
@@ -753,6 +750,8 @@ mod tests {
         Env, IntoVal, String,
     };
     use token::{LpToken, LpTokenClient};
+
+    use super::*;
 
     struct Setup {
         env: Env,
@@ -1410,11 +1409,13 @@ mod tests {
         assert_eq!(rm.get_admin(), Some(new_admin.clone()));
         assert_eq!(rm.get_pending_admin(), None);
 
-        let (version, data): (u32, (Address, Address)) = last_versioned_event(&s, "admin_nominated");
+        let (version, data): (u32, (Address, Address)) =
+            last_versioned_event(&s, "admin_nominated");
         assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
         assert_eq!(data, (s.governance.clone(), new_admin.clone()));
 
-        let (version_changed, data_changed): (u32, (Address,)) = last_versioned_event(&s, "admin_changed");
+        let (version_changed, data_changed): (u32, (Address,)) =
+            last_versioned_event(&s, "admin_changed");
         assert_eq!(version_changed, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
         assert_eq!(data_changed, (new_admin,));
     }
