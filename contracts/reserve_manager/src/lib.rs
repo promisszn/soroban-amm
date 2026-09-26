@@ -278,11 +278,7 @@ impl ReserveManager {
         let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
         gov.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
-        emit_versioned_event!(
-            env,
-            (symbol_short!("pause"),),
-            ()
-        );
+        emit_versioned_event!(env, (symbol_short!("pause"),), ());
         Ok(())
     }
 
@@ -290,11 +286,7 @@ impl ReserveManager {
         let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
         gov.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
-        emit_versioned_event!(
-            env,
-            (symbol_short!("unpause"),),
-            ()
-        );
+        emit_versioned_event!(env, (symbol_short!("unpause"),), ());
         Ok(())
     }
 
@@ -478,7 +470,11 @@ impl ReserveManager {
     ///
     /// This is optional: `check_reserves` auto-detects unregistered pools.
     /// Registering a kind only avoids the cost of a failed `get_info` probe.
-    pub fn set_pool_kind(env: Env, pool: Address, kind: PoolKind) -> Result<(), ReserveManagerError> {
+    pub fn set_pool_kind(
+        env: Env,
+        pool: Address,
+        kind: PoolKind,
+    ) -> Result<(), ReserveManagerError> {
         if Self::is_paused(env.clone()) {
             return Err(ReserveManagerError::Paused);
         }
@@ -1365,7 +1361,7 @@ mod tests {
     fn test_pause_and_unpause_requires_auth() {
         let s = setup();
         let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
-        
+
         // This will panic internally in the mock auth test environment because we didn't mock the auth for a random user,
         // or it will fail authorization. Wait, if we use `try_pause`, we can't catch the require_auth() easily without a specific setup,
         // but since `s.governance` has mock auth, calling it directly works. We can check that the admin can pause.
@@ -1386,18 +1382,18 @@ mod tests {
             rm.try_set_min_reserve(&s.ta, &s.tb, &1_i128, &1_i128),
             Err(Ok(ReserveManagerError::Paused))
         );
-        
+
         assert_eq!(
             rm.try_set_pool_kind(&s.pool, &PoolKind::Amm),
             Err(Ok(ReserveManagerError::Paused))
         );
-        
+
         let new_gov = Address::generate(&s.env);
         assert_eq!(
             rm.try_propose_governance(&s.governance, &new_gov),
             Err(Ok(ReserveManagerError::Paused))
         );
-        
+
         assert_eq!(
             rm.try_accept_governance(&new_gov),
             Err(Ok(ReserveManagerError::Paused))

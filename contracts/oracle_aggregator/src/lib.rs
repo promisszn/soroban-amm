@@ -168,19 +168,13 @@ impl OracleAggregator {
     pub fn pause(env: Env, admin: Address) {
         require_admin(&env, &admin);
         env.storage().instance().set(&DataKey::Paused, &true);
-        env.events().publish(
-            (symbol_short!("pause"),),
-            ()
-        );
+        env.events().publish((symbol_short!("pause"),), ());
     }
 
     pub fn unpause(env: Env, admin: Address) {
         require_admin(&env, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
-        env.events().publish(
-            (symbol_short!("unpause"),),
-            ()
-        );
+        env.events().publish((symbol_short!("unpause"),), ());
     }
 
     pub fn is_paused(env: Env) -> bool {

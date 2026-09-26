@@ -822,11 +822,11 @@ fn set_source_weight_emits_event() {
 fn test_pause_and_unpause_requires_admin() {
     let env = Env::default();
     let h = deploy(&env, 600);
-    
+
     // Pause as admin
     h.aggregator.pause(&h.admin);
     assert!(h.aggregator.is_paused());
-    
+
     // Unpause as admin
     h.aggregator.unpause(&h.admin);
     assert!(!h.aggregator.is_paused());
@@ -838,7 +838,7 @@ fn test_get_price_panics_when_paused() {
     let env = Env::default();
     let h = deploy(&env, 600);
     h.aggregator.pause(&h.admin);
-    
+
     // Should panic with Paused
     h.aggregator.get_price(&h.token_a, &h.token_b);
 }
@@ -848,7 +848,7 @@ fn test_read_views_callable_when_paused() {
     let env = Env::default();
     let h = deploy(&env, 600);
     h.aggregator.pause(&h.admin);
-    
+
     // Read-only views remain callable
     let _ = h.aggregator.get_price_safe(&h.token_a, &h.token_b);
     let _ = h.aggregator.get_price_detailed(&h.token_a, &h.token_b);
