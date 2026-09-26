@@ -899,3 +899,44 @@ fn test_admin_rotation_old_admin_retains_control() {
     h.aggregator.set_max_staleness(&h.admin, &1200);
     assert_eq!(h.aggregator.get_max_staleness(), 1200);
 }
+
+#[test]
+fn test_pause_and_unpause_requires_admin() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+
+    // Pause as admin
+    h.aggregator.pause(&h.admin);
+    assert!(h.aggregator.is_paused());
+
+    // Unpause as admin
+    h.aggregator.unpause(&h.admin);
+    assert!(!h.aggregator.is_paused());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")] // Paused error
+fn test_get_price_panics_when_paused() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    h.aggregator.pause(&h.admin);
+
+    // Should panic with Paused
+    h.aggregator.get_price(&h.token_a, &h.token_b);
+}
+
+#[test]
+fn test_read_views_callable_when_paused() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    h.aggregator.pause(&h.admin);
+
+    // Read-only views remain callable
+    let _ = h.aggregator.get_price_safe(&h.token_a, &h.token_b);
+    let _ = h.aggregator.get_price_detailed(&h.token_a, &h.token_b);
+    let _ = h.aggregator.get_price_spread_bps(&h.token_a, &h.token_b);
+    let _ = h.aggregator.list_sources();
+    let _ = h.aggregator.get_max_staleness();
+    let _ = h.aggregator.get_max_deviation_bps();
+    let _ = h.aggregator.get_admin();
+}

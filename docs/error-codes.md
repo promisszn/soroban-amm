@@ -46,6 +46,7 @@ Defined in [contracts/oracle_aggregator/src/lib.rs](../contracts/oracle_aggregat
 | 10 | `WeightFloorNotMet` | The total agreeing weight was below `MIN_AGREEING_WEIGHT` (20 000). | Increase individual source weights or register more sources. |
 | 11 | `NoPendingAdmin` | `accept_admin` was called when no admin transfer is in progress. | Call `propose_admin` first to nominate a successor. |
 | 12 | `WrongAdmin` | `accept_admin` was called by an address that does not match the pending nominee. | Have the correct address (the one passed to `propose_admin`) call `accept_admin`. |
+| 13 | `Paused` | The aggregator has been paused. | Wait for the admin to call `unpause`. |
 
 > **ABI change (#689):** `AggregatedPrice.confidence` is now the **summed weight**
 > of agreeing sources (not a raw count). A source with weight 10 000 contributes
@@ -405,6 +406,9 @@ Defined in [contracts/oracle_aggregator/src/lib.rs](../contracts/oracle_aggregat
 | 6 | `InsufficientSources` | Fewer active sources available than required quorum. | Register additional valid oracle sources. |
 | 7 | `InvalidStaleness` | Max staleness parameter is 0 or invalid. | Set positive max staleness duration. |
 | 8 | `InvalidDeviation` | Max allowed price deviation parameter out of bounds. | Set valid deviation threshold. |
+| 9 | `InvalidWeight` | A source weight was zero or exceeded `MAX_SOURCE_WEIGHT`. | Use a positive value. |
+| 10 | `WeightFloorNotMet` | Total agreeing weight fell below the floor. | Register more sources or increase weights. |
+| 11 | `Paused` | The aggregator has been paused. | Wait for the admin to call `unpause`. |
 
 ---
 
@@ -440,6 +444,7 @@ Defined in [contracts/reserve_manager/src/lib.rs](../contracts/reserve_manager/s
 | 5 | `BatchTooLarge` | `check_reserves_batch` called with more than `MAX_PAGE` (50) pools. | Split the pool list into batches of at most 50. |
 | 6 | `NoPendingAdmin` | `accept_admin` was called when no admin transfer is in progress. | Call `propose_admin` first to nominate a successor. |
 | 7 | `WrongAdmin` | `accept_admin` was called by an address that does not match the pending nominee. | Have the correct address (the one passed to `propose_admin`) call `accept_admin`. |
+| 8 | `Paused` | Contract is administratively paused. | Wait for governance to call `unpause`. |
 
 ---
 
