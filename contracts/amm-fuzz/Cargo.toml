@@ -10,6 +10,7 @@ crate-type = ["lib"]
 [dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 proptest = "1"
+concentrated_liquidity = { path = "../concentrated_liquidity", features = ["library"] }
 
 [features]
 # Deployed-contract CL properties: `concentrated_liquidity.wasm` must exist
