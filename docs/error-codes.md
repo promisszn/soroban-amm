@@ -10,7 +10,6 @@ Soroban AMM contracts across all contract crates in `contracts/`. For each code 
 - **Remedy** – actionable instructions for the caller to recover.
 
 Use the numeric code when parsing RPC responses or writing off-chain tooling.
-=======
 ## Factory
 
 | Code | Name | Description |
@@ -408,7 +407,9 @@ Defined in [contracts/oracle_aggregator/src/lib.rs](../contracts/oracle_aggregat
 | 8 | `InvalidDeviation` | Max allowed price deviation parameter out of bounds. | Set valid deviation threshold. |
 | 9 | `InvalidWeight` | A source weight was zero or exceeded `MAX_SOURCE_WEIGHT`. | Use a positive value. |
 | 10 | `WeightFloorNotMet` | Total agreeing weight fell below the floor. | Register more sources or increase weights. |
-| 11 | `Paused` | The aggregator has been paused. | Wait for the admin to call `unpause`. |
+| 11 | `NoPendingAdmin` | `accept_admin` was called when no admin transfer is in progress. | Call `propose_admin` first to nominate a successor. |
+| 12 | `WrongAdmin` | `accept_admin` was called by an address that does not match the pending nominee. | Have the correct address (the one passed to `propose_admin`) call `accept_admin`. |
+| 13 | `Paused` | The aggregator has been paused. | Wait for the admin to call `unpause`. |
 
 ---
 
@@ -647,6 +648,5 @@ bash scripts/check_error_docs.sh
 ```
 
 CI automatically runs `make check-docs` on every pull request and push to prevent documentation drift.
-=======
 (TODO)
 
