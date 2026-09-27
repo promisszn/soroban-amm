@@ -1650,7 +1650,7 @@ dependencies = [
  "serde_with",
  "soroban-env-common",
  "soroban-env-host",
- "thiserror",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1703,7 +1703,7 @@ checksum = "c2c70b20e68cae3ef700b8fa3ae29db1c6a294b311fba66918f90cb8f9fd0a1a"
 dependencies = [
  "base64 0.13.1",
  "stellar-xdr",
- "thiserror",
+ "thiserror 1.0.69",
  "wasmparser 0.116.1",
 ]
 
@@ -1720,7 +1720,7 @@ dependencies = [
  "soroban-spec",
  "stellar-xdr",
  "syn 2.0.117",
- "thiserror",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1757,7 +1757,7 @@ dependencies = [
  "serde",
  "serde_json",
  "soroban-sdk",
- "thiserror",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1798,7 +1798,7 @@ checksum = "12d2bf45e114117ea91d820a846fd1afbe3ba7d717988fee094ce8227a3bf8bd"
 dependencies = [
  "base32",
  "crate-git-revision",
- "thiserror",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -1870,7 +1870,16 @@ version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
 dependencies = [
- "thiserror-impl",
+ "thiserror-impl 1.0.69",
+]
+
+[[package]]
+name = "thiserror"
+version = "2.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
+dependencies = [
+ "thiserror-impl 2.0.21",
 ]
 
 [[package]]
@@ -1882,6 +1891,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "thiserror-impl"
+version = "2.0.21"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe5197923287db20a58125f0bc85c062f7f2c892de97b18c356f9efb14b28524"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
 ]
 
 [[package]]
