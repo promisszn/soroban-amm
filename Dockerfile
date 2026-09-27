@@ -14,8 +14,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install wasm32 target
 RUN rustup target add wasm32-unknown-unknown
 
-# Install Stellar CLI pinned to version 25.1.0
-RUN cargo install stellar-cli --version 25.1.0 --locked
+# Install the Stellar CLI at the repo-wide pinned version. `.stellar-version`
+# is the single source of truth, read here and by .github/workflows/release.yml
+# and .github/workflows/smoke-test.yml, so the optimizer that produces release
+# artifacts, the container contributors build in, and the smoke test that
+# verifies a deploy cannot drift to different versions.
+COPY .stellar-version /tmp/.stellar-version
+RUN cargo install stellar-cli --version "$(cat /tmp/.stellar-version)" --locked
 
 # Set working directory
 WORKDIR /app
@@ -30,3 +35,4 @@ COPY . .
 
 # Default command
 CMD ["make", "build"]
+

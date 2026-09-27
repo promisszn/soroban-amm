@@ -62,9 +62,41 @@ you'd like to work on and we'll help you find a starting point.
     To move the toolchain, bump `channel` in that file in its own PR rather
     than upgrading locally — otherwise your build and CI's diverge.
 
-- **Stellar CLI** (for building optimized WASM and deploying) — see the
-  [Stellar CLI install guide](https://developers.stellar.org/docs/tools/developer-tools/cli/install-cli).
+- **Stellar CLI** (for building optimized WASM and deploying) — the exact
+  version is pinned in [`.stellar-version`](.stellar-version) and is read by the
+  `Dockerfile`, `.github/workflows/release.yml` and
+  `.github/workflows/smoke-test.yml`. Install that version rather than the
+  latest release:
+
+    ```bash
+    cargo install --locked stellar-cli --version "$(cat .stellar-version)"
+    ```
+
+    The pin is deliberate — see
+    [Why the Stellar CLI version is pinned](#why-the-stellar-cli-version-is-pinned).
+    To move it, bump the single line in `.stellar-version` in its own PR; the
+    container, the release optimizer and the smoke test all follow from it.
 - `make` (optional but recommended — the `Makefile` wraps the common commands).
+
+### Why the Stellar CLI version is pinned
+
+`stellar contract optimize` turns the workspace WASM into the artifacts published
+in a GitHub release, so the CLI version decides the bytes users deploy. It used
+to be written out in three places — `Dockerfile` (25.1.0), `release.yml`
+(23.0.0) and `smoke-test.yml` (27.1.0) — so the optimizer that produced a
+release artifact and the CLI the smoke test deployed it with were four major
+versions apart, and `stellar contract optimize` output changing between them
+would have gone unnoticed. That is the same hazard `rust-toolchain.toml` guards
+against for the compiler, so the CLI now gets the same treatment: one file,
+read by every consumer.
+
+The version is chosen deliberately rather than by taking the newest release.
+`25.1.0` is the version the contributor `Dockerfile` already built the CLI
+from, so the release optimizer and the smoke test are aligned to the version the
+development image uses — not the stale `23.0.0` in the release workflow nor the
+newer-but-unproven `27.1.0` the smoke test was on. Adopting a newer CLI is a
+separate decision that should be made once a release has been produced and
+verified with it.
 
 ---
 
@@ -220,3 +252,4 @@ that violate this standard.
 
 By contributing, you agree that your contributions will be licensed under the
 [MIT License](LICENSE) that covers this project.
+

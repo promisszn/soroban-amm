@@ -29,8 +29,13 @@ jobs:
         run: bash scripts/build_workspace.sh
       - name: Check contract sizes
         run: bash scripts/size_report.sh --fail-on-limit
+      # Version comes from .stellar-version (single source of truth, also read
+      # by the Dockerfile and the smoke-test workflow).
+      - name: Read Stellar CLI version
+        id: stellar_cli
+        run: echo "version=$(cat .stellar-version)" >> "$GITHUB_OUTPUT"
       - name: Install Stellar CLI
-        run: cargo install --locked stellar-cli --version 23.0.0
+        run: cargo install --locked stellar-cli --version "${{ steps.stellar_cli.outputs.version }}"
       - name: Optimize WASM artifacts
         shell: bash
         run: |
@@ -62,3 +67,4 @@ jobs:
           generate_release_notes: true
           body_path: CHANGELOG.md
           files: release-artifacts/*
+

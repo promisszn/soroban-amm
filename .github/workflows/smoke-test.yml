@@ -23,8 +23,15 @@ jobs:
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
 
+      # Version comes from .stellar-version (single source of truth, also read
+      # by the Dockerfile and the release workflow). The stellar/stellar-cli
+      # action is not used here because GitHub Actions does not allow an
+      # expression in `uses:`, so its tag could not follow the pinned file.
+      - name: Read Stellar CLI version
+        id: stellar_cli
+        run: echo "version=$(cat .stellar-version)" >> "$GITHUB_OUTPUT"
       - name: Install Stellar CLI
-        uses: stellar/stellar-cli@v27.1.0
+        run: cargo install --locked stellar-cli --version "${{ steps.stellar_cli.outputs.version }}"
 
       - name: Import smoke test identity
         shell: bash
@@ -44,3 +51,4 @@ jobs:
           STELLAR_NETWORK: ${{ inputs.network }}
           STELLAR_SECRET_KEY: ${{ secrets.TESTNET_SECRET_KEY }}
           SOURCE_ACCOUNT: ci-smoke
+
