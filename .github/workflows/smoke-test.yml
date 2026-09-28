@@ -72,19 +72,31 @@ jobs:
       - name: Install Stellar CLI
         uses: stellar/stellar-cli@v27.1.0
 
+      # TESTNET_SECRET_KEY is optional on networks with a friendbot: without
+      # it, each run signs with a throwaway key that preflight funds through
+      # friendbot. A configured secret still wins, and is required elsewhere.
       - name: Import smoke test identity
         id: identity
         shell: bash
         env:
           STELLAR_SECRET_KEY: ${{ secrets.TESTNET_SECRET_KEY }}
         run: |
-          if [ -z "$STELLAR_SECRET_KEY" ]; then
-            reason="TESTNET_SECRET_KEY is not configured"
-            echo "::error title=Smoke test infrastructure failure::$reason"
-            echo "reason=$reason" >> "$GITHUB_OUTPUT"
-            exit 1
+          if [ -n "$STELLAR_SECRET_KEY" ]; then
+            printf '%s\n' "$STELLAR_SECRET_KEY" | stellar keys add "$SOURCE_ACCOUNT" --secret-key
+            exit 0
           fi
-          printf '%s\n' "$STELLAR_SECRET_KEY" | stellar keys add "$SOURCE_ACCOUNT" --secret-key
+          case "$STELLAR_NETWORK" in
+            testnet|futurenet)
+              stellar keys generate "$SOURCE_ACCOUNT"
+              echo "::notice title=Ephemeral smoke test identity::TESTNET_SECRET_KEY is not configured; signing with a throwaway key funded by friendbot"
+              ;;
+            *)
+              reason="TESTNET_SECRET_KEY is not configured and $STELLAR_NETWORK has no friendbot"
+              echo "::error title=Smoke test infrastructure failure::$reason"
+              echo "reason=$reason" >> "$GITHUB_OUTPUT"
+              exit 1
+              ;;
+          esac
 
       # RPC health, account existence (re-created via friendbot after a
       # testnet reset) and balance. Fails here, as infrastructure, before

@@ -12,14 +12,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     make \
+    libdbus-1-3 \
+    libudev1 \
     && rm -rf /var/lib/apt/lists/*
 
 # rust-toolchain.toml already declares wasm32v1-none as a required target,
 # so rustup will install it automatically when cargo first runs.  There is
 # no need (and it would be wrong) to add wasm32-unknown-unknown here.
 
-# Install Stellar CLI pinned to the same version documented in README.md.
-RUN cargo install stellar-cli --version 25.1.0 --locked
+# Install the Stellar CLI from its prebuilt release binary rather than
+# `cargo install`: compiling it ties the CLI to this image's compiler, and
+# stellar-cli 25.1.0's locked `ethnum` no longer builds on Rust 1.98. The
+# version stays the one documented in README.md and the deployment runbook
+# (unifying the pins is #955). The binary links libdbus and libudev
+# (installed above) and needs glibc >= 2.34.
+ARG STELLAR_CLI_VERSION=25.1.0
+RUN arch="$(uname -m)" \
+    && curl -fsSL "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-${arch}-unknown-linux-gnu.tar.gz" \
+    | tar -xz -C /usr/local/bin stellar \
+    && stellar --version
 
 WORKDIR /app
 
