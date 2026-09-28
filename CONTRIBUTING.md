@@ -64,9 +64,7 @@ you'd like to work on and we'll help you find a starting point.
 
 - **Stellar CLI** (for building optimized WASM and deploying) — the exact
   version is pinned in [`.stellar-version`](.stellar-version) and is read by the
-  `Dockerfile`, `.github/workflows/release.yml` and
-  `.github/workflows/smoke-test.yml`. Install that version rather than the
-  latest release:
+  `Dockerfile`. Install that version rather than the latest release:
 
     ```bash
     cargo install --locked stellar-cli --version "$(cat .stellar-version)"
@@ -75,7 +73,8 @@ you'd like to work on and we'll help you find a starting point.
     The pin is deliberate — see
     [Why the Stellar CLI version is pinned](#why-the-stellar-cli-version-is-pinned).
     To move it, bump the single line in `.stellar-version` in its own PR; the
-    container, the release optimizer and the smoke test all follow from it.
+    container follows from it, and `release.yml` pins the same version
+    through the `stellar/stellar-cli` action.
 - `make` (optional but recommended — the `Makefile` wraps the common commands).
 
 ### Why the Stellar CLI version is pinned
@@ -87,16 +86,16 @@ to be written out in three places — `Dockerfile` (25.1.0), `release.yml`
 release artifact and the CLI the smoke test deployed it with were four major
 versions apart, and `stellar contract optimize` output changing between them
 would have gone unnoticed. That is the same hazard `rust-toolchain.toml` guards
-against for the compiler, so the CLI now gets the same treatment: one file,
-read by every consumer.
+against for the compiler, so the CLI version now lives in one file that the
+container reads, with `release.yml` pinning the same version explicitly.
 
 The version is chosen deliberately rather than by taking the newest release.
-`25.1.0` is the version the contributor `Dockerfile` already built the CLI
-from, so the release optimizer and the smoke test are aligned to the version the
-development image uses — not the stale `23.0.0` in the release workflow nor the
-newer-but-unproven `27.1.0` the smoke test was on. Adopting a newer CLI is a
-separate decision that should be made once a release has been produced and
-verified with it.
+`27.1.0` is what this image can build: `--locked` compiles the CLI's own
+`Cargo.lock` with the toolchain above, and `25.1.0` locks `ethnum 1.5.2`,
+which Rust 1.98.1 rejects with E0512 (`cannot transmute between types of
+different sizes`). `27.1.0` locks `ethnum 1.5.3`, the version this workspace
+already builds with, so the container, the release optimizer and the smoke
+test all agree on a CLI that compiles here.
 
 ---
 
@@ -164,6 +163,20 @@ This is intended to track the same set of checks CI enforces in
   (edition 2021, 100-column width, crate-granularity imports). Run
   `make fmt` before committing.
 - **Linting**: `cargo clippy` must pass with **no warnings** (`-D warnings`).
+- **JavaScript/TypeScript linting**: every JS workspace (`packages/sdk`,
+  `packages/ui-components`, `packages/ts-advanced-client`, `services/*`,
+  `examples/client`) is linted by the shared `eslint.config.mjs` at the repo
+  root, which extends typescript-eslint's `recommended-type-checked` set, and
+  CI fails on any error. Run `npm ci` once at the root and in the workspace,
+  build it, then `npm run lint` there (or `make lint-js` for all of them).
+  Rules are errors or deliberately off with a reason in the config; there is
+  no warn-only tier.
+- **Node version**: `.nvmrc` pins the Node major that CI runs every JS package
+  on. Each package declares it as `engines.node`, and any `@types/node`
+  dependency uses the same major, so `tsc` cannot accept an API the CI runtime
+  lacks. `make check-node-versions` (run in CI) fails on any mismatch. Moving to
+  a new Node major means changing `.nvmrc`, every `@types/node` and every
+  `engines.node` together, in one PR, with the lockfiles regenerated.
 - **WASM size**: contract binaries are size-constrained — CI fails any WASM over
   the configured limit. Prefer minimal dependencies and avoid unnecessary
   allocations in hot paths.
