@@ -1656,6 +1656,18 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "Admin"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "Factory"
                             }
                           ]
@@ -1890,6 +1902,21 @@
                         },
                         "val": {
                           "bool": false
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
+                              "symbol": "SqrtPriceX96"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "u128": {
+                            "hi": 4294967296,
+                            "lo": 0
+                          }
                         }
                       },
                       {

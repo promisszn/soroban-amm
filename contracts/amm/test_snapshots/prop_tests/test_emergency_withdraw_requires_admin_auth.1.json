@@ -107,18 +107,16 @@
           "v0": {
             "topics": [
               {
-                "symbol": "log"
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "emergency_withdraw"
               }
             ],
             "data": {
-              "vec": [
-                {
-                  "string": "caught panic 'called `Option::unwrap()` on a `None` value' from contract function 'Symbol(obj#7)'"
-                },
-                {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFCT4"
-                }
-              ]
+              "error": {
+                "contract": 21
+              }
             }
           }
         }
@@ -138,12 +136,12 @@
               },
               {
                 "error": {
-                  "wasm_vm": "invalid_action"
+                  "contract": 21
                 }
               }
             ],
             "data": {
-              "string": "caught error from function"
+              "string": "escalating Ok(ScErrorType::Contract) frame-exit to Err"
             }
           }
         }
@@ -163,7 +161,7 @@
               },
               {
                 "error": {
-                  "wasm_vm": "invalid_action"
+                  "contract": 21
                 }
               }
             ],
@@ -202,7 +200,7 @@
               },
               {
                 "error": {
-                  "wasm_vm": "invalid_action"
+                  "contract": 21
                 }
               }
             ],

@@ -65,6 +65,14 @@ pub enum ClError {
     /// partial fill — the caller asked for a specific output amount, so a
     /// shortfall is an error rather than a smaller-than-requested output.
     ExactOutNotFullyFilled = 23,
+    /// A function that depends on pool state (tokens, admin, current tick)
+    /// was called before `initialize`.
+    NotInitialized = 24,
+    /// A position amount or liquidity figure cannot be represented: it does
+    /// not fit in an `i128`, or an intermediate of its wide evaluation does
+    /// not fit in a `u128`. Reported instead of acting on a truncated value
+    /// (#963).
+    MathOverflow = 25,
 }
 
 /// Status of a range order (issue #295).
@@ -323,7 +331,7 @@ impl ConcentratedLiquidity {
 
     /// Admin: attach or remove the oracle aggregator for swap deviation checks (#318).
     pub fn set_oracle(env: Env, admin: Address, oracle: Option<Address>) -> Result<(), ClError> {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
         }
@@ -346,7 +354,7 @@ impl ConcentratedLiquidity {
     /// The NFT contract must be initialized with this pool's address as its
     /// `cl_pool`, otherwise mint/burn calls from the pool will be rejected.
     pub fn set_position_nft(env: Env, admin: Address, nft: Option<Address>) -> Result<(), ClError> {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
         }
@@ -407,7 +415,7 @@ impl ConcentratedLiquidity {
         admin: Address,
         max_deviation_bps: i128,
     ) -> Result<(), ClError> {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
         }
@@ -423,7 +431,7 @@ impl ConcentratedLiquidity {
 
     /// Pause all minting and swapping. Admin-only.
     pub fn pause(env: Env, admin: Address) -> Result<(), ClError> {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
         }
@@ -434,7 +442,7 @@ impl ConcentratedLiquidity {
 
     /// Resume minting and swapping. Admin-only.
     pub fn unpause(env: Env, admin: Address) -> Result<(), ClError> {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
         }
@@ -444,7 +452,7 @@ impl ConcentratedLiquidity {
     }
 
     pub fn propose_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), ClError> {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
         }
@@ -477,7 +485,7 @@ impl ConcentratedLiquidity {
         recipient: Address,
         bps: i128,
     ) -> Result<(), ClError> {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
         }
@@ -493,7 +501,7 @@ impl ConcentratedLiquidity {
     }
 
     pub fn withdraw_protocol_fees(env: Env, admin: Address) -> Result<(), ClError> {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
         }
@@ -510,7 +518,7 @@ impl ConcentratedLiquidity {
             .get(&DataKey::AccruedProtocolFeeA)
             .unwrap_or(0);
         if accrued_a > 0 {
-            let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
+            let token_a = Self::read_tokens(&env)?.0;
             TokenClient::new(&env, &token_a).transfer(
                 &env.current_contract_address(),
                 &recipient,
@@ -526,7 +534,7 @@ impl ConcentratedLiquidity {
             .get(&DataKey::AccruedProtocolFeeB)
             .unwrap_or(0);
         if accrued_b > 0 {
-            let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+            let token_b = Self::read_tokens(&env)?.1;
             TokenClient::new(&env, &token_b).transfer(
                 &env.current_contract_address(),
                 &recipient,
@@ -552,6 +560,37 @@ impl ConcentratedLiquidity {
     ///
     /// Must only be called for an entry that currently exists — i.e. right
     /// after writing it — because `extend_ttl` traps on a missing key.
+    fn require_initialized(env: &Env) -> Result<(), ClError> {
+        if env.storage().instance().has(&DataKey::TokenA) {
+            Ok(())
+        } else {
+            Err(ClError::NotInitialized)
+        }
+    }
+
+    fn read_admin(env: &Env) -> Result<Address, ClError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(ClError::NotInitialized)
+    }
+
+    fn read_tokens(env: &Env) -> Result<(Address, Address), ClError> {
+        let token_a = env.storage().instance().get(&DataKey::TokenA);
+        let token_b = env.storage().instance().get(&DataKey::TokenB);
+        match (token_a, token_b) {
+            (Some(a), Some(b)) => Ok((a, b)),
+            _ => Err(ClError::NotInitialized),
+        }
+    }
+
+    fn read_current_tick(env: &Env) -> Result<i32, ClError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::CurrentTick)
+            .ok_or(ClError::NotInitialized)
+    }
+
     fn bump_position(env: &Env, key: &DataKey) {
         env.storage()
             .persistent()
@@ -614,6 +653,9 @@ impl ConcentratedLiquidity {
         min_b: i128,
         deadline: u64,
     ) -> Result<(i128, i128), ClError> {
+        // Reading the token pair first doubles as the initialization check,
+        // so this hot path pays for no extra storage lookup.
+        let (token_a, token_b) = Self::read_tokens(&env)?;
         if env.ledger().timestamp() > deadline {
             return Err(ClError::DeadlineExpired);
         }
@@ -643,9 +685,7 @@ impl ConcentratedLiquidity {
         if amount_a_desired < 0 || amount_b_desired < 0 {
             return Err(ClError::ZeroAmounts);
         }
-        let current_tick: i32 = env.storage().instance().get(&DataKey::CurrentTick).unwrap();
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let current_tick = Self::read_current_tick(&env)?;
         // Derive liquidity from the desired amounts using the same
         // sqrtPriceX96 math (`liquidity_from_amounts`) that burn/collect use
         // to convert liquidity back into amounts, then derive the *actual*
@@ -665,7 +705,7 @@ impl ConcentratedLiquidity {
             amount_a_desired,
             amount_b_desired,
             sqrt_price_now,
-        );
+        )?;
         if liquidity <= 0 {
             return Err(ClError::ZeroLiquidity);
         }
@@ -675,7 +715,7 @@ impl ConcentratedLiquidity {
             upper_tick,
             liquidity,
             sqrt_price_now,
-        );
+        )?;
         if amount_a < 0 || amount_b < 0 {
             return Err(ClError::ZeroAmounts);
         }
@@ -794,6 +834,7 @@ impl ConcentratedLiquidity {
         min_b: i128,
         deadline: u64,
     ) -> Result<(i128, i128), ClError> {
+        Self::require_initialized(&env)?;
         if env.ledger().timestamp() > deadline {
             return Err(ClError::DeadlineExpired);
         }
@@ -820,9 +861,8 @@ impl ConcentratedLiquidity {
             return Err(ClError::ZeroLiquidity);
         }
 
-        let current_tick: i32 = env.storage().instance().get(&DataKey::CurrentTick).unwrap();
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let current_tick = Self::read_current_tick(&env)?;
+        let (token_a, token_b) = Self::read_tokens(&env)?;
         let pos_key = DataKey::Position(provider.clone(), lower_tick, upper_tick);
         let mut pos: Position = env
             .storage()
@@ -837,7 +877,7 @@ impl ConcentratedLiquidity {
             upper_tick,
             liquidity_delta,
             sqrt_price_now,
-        );
+        )?;
         if amount_a <= 0 && amount_b <= 0 {
             return Err(ClError::ZeroLiquidity);
         }
@@ -958,6 +998,7 @@ impl ConcentratedLiquidity {
         min_liquidity: i128,
         deadline: u64,
     ) -> Result<SingleTokenDepositResult, ClError> {
+        Self::require_initialized(&env)?;
         if env.ledger().timestamp() > deadline {
             return Err(ClError::DeadlineExpired);
         }
@@ -987,14 +1028,13 @@ impl ConcentratedLiquidity {
         }
 
         // ── Identify which token was supplied ────────────────────────────────
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let (token_a, token_b) = Self::read_tokens(&env)?;
         let is_token_a = token_in == token_a;
         if !is_token_a && token_in != token_b {
             return Err(ClError::InvalidToken);
         }
 
-        let current_tick: i32 = env.storage().instance().get(&DataKey::CurrentTick).unwrap();
+        let current_tick = Self::read_current_tick(&env)?;
 
         // ── Compute (amount_a, amount_b, liquidity) from the single token ─────
         //
@@ -1022,7 +1062,8 @@ impl ConcentratedLiquidity {
             // Use proper sqrtPriceX96 formulas for accurate calculation
             let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
             let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let liq = math::get_liquidity_for_amount0(sqrt_lower, sqrt_upper, amount_in);
+            let liq = math::get_liquidity_for_amount0(sqrt_lower, sqrt_upper, amount_in)
+                .ok_or(ClError::MathOverflow)?;
             (amount_in, 0_i128, liq.max(1), amount_in)
         } else if current_tick >= upper_tick {
             // Case 2: price above range — only token B
@@ -1032,7 +1073,8 @@ impl ConcentratedLiquidity {
             // Use proper sqrtPriceX96 formulas for accurate calculation
             let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
             let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_upper, amount_in);
+            let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_upper, amount_in)
+                .ok_or(ClError::MathOverflow)?;
             (0_i128, amount_in, liq.max(1), amount_in)
         } else {
             // Case 3: price in range — compute liquidity from the single token's half
@@ -1044,41 +1086,53 @@ impl ConcentratedLiquidity {
             if sqrt_current >= sqrt_upper {
                 // Degenerate: current at or above upper tick
                 if is_token_a {
-                    let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in);
+                    let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
+                        .ok_or(ClError::MathOverflow)?;
                     let liq = liq.max(1);
-                    let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq);
+                    let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
+                        .ok_or(ClError::MathOverflow)?;
                     (used, 0_i128, liq, used)
                 } else {
-                    let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in);
+                    let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
+                        .ok_or(ClError::MathOverflow)?;
                     let liq = liq.max(1);
-                    let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq);
+                    let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
+                        .ok_or(ClError::MathOverflow)?;
                     (0_i128, used, liq, used)
                 }
             } else if sqrt_current <= sqrt_lower {
                 // Degenerate: current at or below lower tick
                 if is_token_a {
-                    let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in);
+                    let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
+                        .ok_or(ClError::MathOverflow)?;
                     let liq = liq.max(1);
-                    let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq);
+                    let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
+                        .ok_or(ClError::MathOverflow)?;
                     (used, 0_i128, liq, used)
                 } else {
-                    let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in);
+                    let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
+                        .ok_or(ClError::MathOverflow)?;
                     let liq = liq.max(1);
-                    let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq);
+                    let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
+                        .ok_or(ClError::MathOverflow)?;
                     (0_i128, used, liq, used)
                 }
             } else if is_token_a {
                 // Token A covers [current_price, upper_price].
                 // Liquidity is computed from the amount, then we back-compute actual token amount.
-                let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in);
+                let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
+                    .ok_or(ClError::MathOverflow)?;
                 let liq = liq.max(1);
-                let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq);
+                let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
+                    .ok_or(ClError::MathOverflow)?;
                 (used, 0_i128, liq, used)
             } else {
                 // Token B covers [lower_price, current_price].
-                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in);
+                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
+                    .ok_or(ClError::MathOverflow)?;
                 let liq = liq.max(1);
-                let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq);
+                let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
+                    .ok_or(ClError::MathOverflow)?;
                 (0_i128, used, liq, used)
             }
         };
@@ -1202,6 +1256,7 @@ impl ConcentratedLiquidity {
         token_in: Address,
         amount_in: i128,
     ) -> Result<SingleTokenDepositResult, ClError> {
+        Self::require_initialized(&env)?;
         if lower_tick >= upper_tick {
             return Err(ClError::TickOutOfRange);
         }
@@ -1212,14 +1267,13 @@ impl ConcentratedLiquidity {
             return Err(ClError::ZeroAmounts);
         }
 
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let (token_a, token_b) = Self::read_tokens(&env)?;
         let is_token_a = token_in == token_a;
         if !is_token_a && token_in != token_b {
             return Err(ClError::InvalidToken);
         }
 
-        let current_tick: i32 = env.storage().instance().get(&DataKey::CurrentTick).unwrap();
+        let current_tick = Self::read_current_tick(&env)?;
 
         // Mirror the exact same logic as mint_position_single_token.
         let (liquidity, amount_used) = if current_tick < lower_tick {
@@ -1228,7 +1282,8 @@ impl ConcentratedLiquidity {
             }
             let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
             let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let liq = math::get_liquidity_for_amount0(sqrt_lower, sqrt_upper, amount_in);
+            let liq = math::get_liquidity_for_amount0(sqrt_lower, sqrt_upper, amount_in)
+                .ok_or(ClError::MathOverflow)?;
             (liq.max(1), amount_in)
         } else if current_tick >= upper_tick {
             if is_token_a {
@@ -1236,7 +1291,8 @@ impl ConcentratedLiquidity {
             }
             let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
             let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_upper, amount_in);
+            let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_upper, amount_in)
+                .ok_or(ClError::MathOverflow)?;
             (liq.max(1), amount_in)
         } else {
             let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
@@ -1244,20 +1300,26 @@ impl ConcentratedLiquidity {
             let sqrt_current = Self::tick_to_sqrt_price_x96(current_tick);
 
             if sqrt_current >= sqrt_upper {
-                let liq = math::get_liquidity_for_amount0(sqrt_upper, sqrt_upper, amount_in);
+                let liq = math::get_liquidity_for_amount0(sqrt_upper, sqrt_upper, amount_in)
+                    .ok_or(ClError::MathOverflow)?;
                 (liq.max(1), amount_in)
             } else if sqrt_current <= sqrt_lower {
-                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_lower, amount_in);
+                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_lower, amount_in)
+                    .ok_or(ClError::MathOverflow)?;
                 (liq.max(1), amount_in)
             } else if is_token_a {
-                let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in);
+                let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
+                    .ok_or(ClError::MathOverflow)?;
                 let liq = liq.max(1);
-                let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq);
+                let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
+                    .ok_or(ClError::MathOverflow)?;
                 (liq, used)
             } else {
-                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in);
+                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
+                    .ok_or(ClError::MathOverflow)?;
                 let liq = liq.max(1);
-                let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq);
+                let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
+                    .ok_or(ClError::MathOverflow)?;
                 (liq, used)
             }
         };
@@ -1310,6 +1372,7 @@ impl ConcentratedLiquidity {
         min_liquidity: i128,
         deadline: u64,
     ) -> Result<SingleTokenDepositResult, ClError> {
+        Self::require_initialized(&env)?;
         let current_tick: i32 = env
             .storage()
             .instance()
@@ -1388,6 +1451,7 @@ impl ConcentratedLiquidity {
         lower_tick: i32,
         upper_tick: i32,
     ) -> Result<RangeOrderStatus, ClError> {
+        Self::require_initialized(&env)?;
         // Verify the position exists and is tagged as a range order.
         let _pos: Position = env
             .storage()
@@ -1440,6 +1504,7 @@ impl ConcentratedLiquidity {
         upper_tick: i32,
         liquidity: i128,
     ) -> Result<(i128, i128), ClError> {
+        Self::require_initialized(&env)?;
         // No pause guard — LPs must always be able to exit.
         provider.require_auth();
         Self::ensure_legacy_owner(&env, &provider, lower_tick, upper_tick)?;
@@ -1462,6 +1527,7 @@ impl ConcentratedLiquidity {
         token_id: u64,
         liquidity: i128,
     ) -> Result<(i128, i128), ClError> {
+        Self::require_initialized(&env)?;
         let (provider, lower_tick, upper_tick) =
             Self::resolve_token_owner(&env, &caller, token_id)?;
         caller.require_auth();
@@ -1495,6 +1561,7 @@ impl ConcentratedLiquidity {
         lower_tick: i32,
         upper_tick: i32,
     ) -> Result<(i128, i128), ClError> {
+        Self::require_initialized(&env)?;
         // No pause guard — LPs must always be able to collect fees.
         provider.require_auth();
         Self::ensure_legacy_owner(&env, &provider, lower_tick, upper_tick)?;
@@ -1508,6 +1575,7 @@ impl ConcentratedLiquidity {
         caller: Address,
         token_id: u64,
     ) -> Result<(i128, i128), ClError> {
+        Self::require_initialized(&env)?;
         let (provider, lower_tick, upper_tick) =
             Self::resolve_token_owner(&env, &caller, token_id)?;
         caller.require_auth();
@@ -1537,9 +1605,8 @@ impl ConcentratedLiquidity {
         if pos.liquidity < liquidity {
             return Err(ClError::InsufficientLiquidity);
         }
-        let current_tick: i32 = env.storage().instance().get(&DataKey::CurrentTick).unwrap();
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let current_tick = Self::read_current_tick(env)?;
+        let (token_a, token_b) = Self::read_tokens(env)?;
 
         let (fg_inside_a, fg_inside_b) =
             Self::fee_growth_inside(env.clone(), lower_tick, upper_tick);
@@ -1554,7 +1621,7 @@ impl ConcentratedLiquidity {
             upper_tick,
             liquidity,
             sqrt_price_now,
-        );
+        )?;
         pos.liquidity -= liquidity;
 
         // The principal recomputed above from the current tick can, due to a
@@ -1669,8 +1736,7 @@ impl ConcentratedLiquidity {
         let total_b = pos.tokens_owed.1 + nb;
         pos.fee_growth_inside_a = fg_inside_a;
         pos.fee_growth_inside_b = fg_inside_b;
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let (token_a, token_b) = Self::read_tokens(env)?;
 
         // As in burn_position_core: never transfer more than the contract
         // actually holds. Keep any shortfall recorded in `tokens_owed`
@@ -1821,8 +1887,8 @@ impl ConcentratedLiquidity {
             .ok_or(ClError::PositionNotFound)
     }
 
-    pub fn current_tick(env: Env) -> i32 {
-        env.storage().instance().get(&DataKey::CurrentTick).unwrap()
+    pub fn current_tick(env: Env) -> Result<i32, ClError> {
+        Self::read_current_tick(&env)
     }
 
     /// Returns the pool's token pair as `(token_a, token_b)` (issue #470).
@@ -1833,11 +1899,9 @@ impl ConcentratedLiquidity {
     /// `batch_auction` and other venue-agnostic callers validating an order's
     /// token pair — use this accessor.
     ///
-    /// Panics if the pool has not been initialized.
-    pub fn get_tokens(env: Env) -> (Address, Address) {
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
-        (token_a, token_b)
+    /// Returns `ClError::NotInitialized` if the pool has not been initialized.
+    pub fn get_tokens(env: Env) -> Result<(Address, Address), ClError> {
+        Self::read_tokens(&env)
     }
 
     pub fn active_liquidity(env: Env) -> i128 {
@@ -1885,8 +1949,11 @@ impl ConcentratedLiquidity {
     /// Lets a venue-agnostic caller (e.g. batch_auction's factory-backed venue
     /// registry) look this pool up via `Factory::get_cl_pool(token_a, token_b,
     /// fee_bps)` without needing the fee tier supplied out of band.
-    pub fn fee_bps(env: Env) -> i128 {
-        env.storage().instance().get(&DataKey::FeeBps).unwrap()
+    pub fn fee_bps(env: Env) -> Result<i128, ClError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::FeeBps)
+            .ok_or(ClError::NotInitialized)
     }
 
     // ── Issue #203: per-tick view functions ───────────────────────────────────
@@ -2002,6 +2069,9 @@ impl ConcentratedLiquidity {
         min_amount_out: i128,
         deadline: u64,
     ) -> Result<i128, ClError> {
+        // Reading the token pair first doubles as the initialization check,
+        // so this hot path pays for no extra storage lookup.
+        let (token_a, token_b) = Self::read_tokens(&env)?;
         if env.ledger().timestamp() > deadline {
             return Err(ClError::DeadlineExpired);
         }
@@ -2012,9 +2082,6 @@ impl ConcentratedLiquidity {
         if amount_in <= 0 {
             return Err(ClError::ZeroAmounts);
         }
-
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
 
         let protocol_fee_bps: i128 = env
             .storage()
@@ -2762,6 +2829,7 @@ impl ConcentratedLiquidity {
         max_amount_in: i128,
         deadline: u64,
     ) -> Result<i128, ClError> {
+        Self::require_initialized(&env)?;
         if env.ledger().timestamp() > deadline {
             return Err(ClError::DeadlineExpired);
         }
@@ -2773,8 +2841,7 @@ impl ConcentratedLiquidity {
             return Err(ClError::ZeroAmounts);
         }
 
-        let token_a: Address = env.storage().instance().get(&DataKey::TokenA).unwrap();
-        let token_b: Address = env.storage().instance().get(&DataKey::TokenB).unwrap();
+        let (token_a, token_b) = Self::read_tokens(&env)?;
         let protocol_fee_bps: i128 = env
             .storage()
             .instance()
@@ -2988,6 +3055,7 @@ impl ConcentratedLiquidity {
         amount_out: i128,
         sqrt_price_limit_x96: u128,
     ) -> Result<i128, ClError> {
+        Self::require_initialized(&env)?;
         if amount_out <= 0 {
             return Err(ClError::ZeroAmounts);
         }
@@ -3050,6 +3118,7 @@ impl ConcentratedLiquidity {
         amount_in: i128,
         sqrt_price_limit_x96: u128,
     ) -> Result<PriceImpactEstimate, ClError> {
+        Self::require_initialized(&env)?;
         if amount_in <= 0 {
             return Err(ClError::ZeroAmounts);
         }
@@ -3267,6 +3336,7 @@ impl ConcentratedLiquidity {
         upper_tick: i32,
         liquidity: i128,
     ) -> Result<(i128, i128), ClError> {
+        Self::require_initialized(&env)?;
         if lower_tick >= upper_tick {
             return Err(ClError::TickOutOfRange);
         }
@@ -3282,13 +3352,13 @@ impl ConcentratedLiquidity {
             .get(&DataKey::CurrentTick)
             .unwrap_or(0);
         let sqrt_price_now = Self::current_sqrt_price(&env, current_tick);
-        Ok(Self::amounts_for_liquidity_to_burn(
+        Self::amounts_for_liquidity_to_burn(
             current_tick,
             lower_tick,
             upper_tick,
             liquidity,
             sqrt_price_now,
-        ))
+        )
     }
 
     pub fn fee_growth_inside(env: Env, lower_tick: i32, upper_tick: i32) -> (i128, i128) {
@@ -3401,18 +3471,20 @@ impl ConcentratedLiquidity {
         ut: i32,
         liquidity: i128,
         sqrt_current_x96: u128,
-    ) -> (i128, i128) {
+    ) -> Result<(i128, i128), ClError> {
         if ct < lt {
             let sqrt_lower = Self::tick_to_sqrt_price_x96(lt);
             let sqrt_upper = Self::tick_to_sqrt_price_x96(ut);
-            let amount_a = math::get_amount0_delta(sqrt_lower, sqrt_upper, liquidity);
-            return (amount_a, 0);
+            let amount_a = math::get_amount0_delta(sqrt_lower, sqrt_upper, liquidity)
+                .ok_or(ClError::MathOverflow)?;
+            return Ok((amount_a, 0));
         }
         if ct >= ut {
             let sqrt_lower = Self::tick_to_sqrt_price_x96(lt);
             let sqrt_upper = Self::tick_to_sqrt_price_x96(ut);
-            let amount_b = math::get_amount1_delta(sqrt_lower, sqrt_upper, liquidity);
-            return (0, amount_b);
+            let amount_b = math::get_amount1_delta(sqrt_lower, sqrt_upper, liquidity)
+                .ok_or(ClError::MathOverflow)?;
+            return Ok((0, amount_b));
         }
 
         // In-range: split at the live price, clamped into the position's own
@@ -3423,9 +3495,11 @@ impl ConcentratedLiquidity {
         let sqrt_current = sqrt_current_x96.clamp(sqrt_lower, sqrt_upper);
 
         // Token A covers [current, upper], Token B covers [lower, current]
-        let amount_a = math::get_amount0_delta(sqrt_current, sqrt_upper, liquidity);
-        let amount_b = math::get_amount1_delta(sqrt_lower, sqrt_current, liquidity);
-        (amount_a, amount_b)
+        let amount_a = math::get_amount0_delta(sqrt_current, sqrt_upper, liquidity)
+            .ok_or(ClError::MathOverflow)?;
+        let amount_b = math::get_amount1_delta(sqrt_lower, sqrt_current, liquidity)
+            .ok_or(ClError::MathOverflow)?;
+        Ok((amount_a, amount_b))
     }
 
     /// Inverse of [`Self::amounts_for_liquidity_to_burn`]; takes the live
@@ -3438,24 +3512,30 @@ impl ConcentratedLiquidity {
         a: i128,
         b: i128,
         sqrt_current_x96: u128,
-    ) -> i128 {
+    ) -> Result<i128, ClError> {
         if ct < lt {
             let sqrt_lower = Self::tick_to_sqrt_price_x96(lt);
             let sqrt_upper = Self::tick_to_sqrt_price_x96(ut);
-            math::get_liquidity_for_amount0(sqrt_lower, sqrt_upper, a).max(1)
+            Ok(math::get_liquidity_for_amount0(sqrt_lower, sqrt_upper, a)
+                .ok_or(ClError::MathOverflow)?
+                .max(1))
         } else if ct >= ut {
             let sqrt_lower = Self::tick_to_sqrt_price_x96(lt);
             let sqrt_upper = Self::tick_to_sqrt_price_x96(ut);
-            math::get_liquidity_for_amount1(sqrt_lower, sqrt_upper, b).max(1)
+            Ok(math::get_liquidity_for_amount1(sqrt_lower, sqrt_upper, b)
+                .ok_or(ClError::MathOverflow)?
+                .max(1))
         } else {
             let sqrt_lower = Self::tick_to_sqrt_price_x96(lt);
             let sqrt_upper = Self::tick_to_sqrt_price_x96(ut);
             let sqrt_current = sqrt_current_x96.clamp(sqrt_lower, sqrt_upper);
             let liquidity_from_amount0 =
-                math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, a);
+                math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, a)
+                    .ok_or(ClError::MathOverflow)?;
             let liquidity_from_amount1 =
-                math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, b);
-            liquidity_from_amount0.min(liquidity_from_amount1).max(1)
+                math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, b)
+                    .ok_or(ClError::MathOverflow)?;
+            Ok(liquidity_from_amount0.min(liquidity_from_amount1).max(1))
         }
     }
 
@@ -4012,6 +4092,123 @@ mod tests {
             sac_a,
             sac_b,
         }
+    }
+
+    #[test]
+    fn test_pre_init_calls_return_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        let admin = Address::generate(&env);
+        let provider = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        // Admin setters
+        assert_eq!(
+            client.try_set_oracle(&admin, &None),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_set_position_nft(&admin, &None),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_set_max_oracle_deviation_bps(&admin, &100),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(client.try_pause(&admin), Err(Ok(ClError::NotInitialized)));
+        assert_eq!(client.try_unpause(&admin), Err(Ok(ClError::NotInitialized)));
+        assert_eq!(
+            client.try_propose_admin(&admin, &provider),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_set_protocol_fee(&admin, &provider, &100),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_withdraw_protocol_fees(&admin),
+            Err(Ok(ClError::NotInitialized))
+        );
+
+        // Liquidity
+        assert_eq!(
+            client.try_mint_position(&provider, &-10, &10, &100, &100, &0, &0, &u64::MAX),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_modify_position(&provider, &-10, &10, &100, &0, &0, &u64::MAX),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_mint_position_single_token(
+                &provider,
+                &-10,
+                &10,
+                &token,
+                &100,
+                &0,
+                &u64::MAX
+            ),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_quote_single_token_deposit(&-10, &10, &token, &100),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_place_range_order(&provider, &10, &20, &token, &100, &0, &u64::MAX),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_check_range_order_filled(&provider, &10, &20),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_burn_position(&provider, &-10, &10, &1),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_burn_position_by_token_id(&provider, &0, &1),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_collect_fees(&provider, &-10, &10),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_collect_fees_by_token_id(&provider, &0),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_quote_position(&-10, &10, &100),
+            Err(Ok(ClError::NotInitialized))
+        );
+
+        // Swaps and quotes
+        let limit = ConcentratedLiquidity::tick_to_sqrt_price_x96(-100);
+        assert_eq!(
+            client.try_swap(&provider, &true, &100, &limit, &0, &u64::MAX),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_swap_exact_out(&provider, &true, &100, &limit, &1_000, &u64::MAX),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_quote_exact_out(&true, &100, &limit),
+            Err(Ok(ClError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_estimate_price_impact(&true, &100, &limit),
+            Err(Ok(ClError::NotInitialized))
+        );
+
+        // Views that used to unwrap pool state
+        assert_eq!(client.try_current_tick(), Err(Ok(ClError::NotInitialized)));
+        assert_eq!(client.try_get_tokens(), Err(Ok(ClError::NotInitialized)));
+        assert_eq!(client.try_fee_bps(), Err(Ok(ClError::NotInitialized)));
     }
 
     #[test]
@@ -5113,6 +5310,190 @@ mod tests {
             &u64::MAX,
         );
         assert_eq!(result, Err(Ok(ClError::SlippageExceeded)));
+    }
+
+    // ── #963: position path over a high-magnitude tick range ─────────────────
+    //
+    // [100_000, 200_000] is a price ratio of ~22,000. Converting a 10^12
+    // deposit to liquidity there needs `X * 2^96` or `X * sa * sb / 2^96`,
+    // both far over u128::MAX, which the removed wrapping multiply truncated
+    // silently: it credited 1_035_593 and 860_209 liquidity for the token-A
+    // and token-B legs below instead of the exact values asserted here.
+    //
+    // Expected values are exact-precision floors computed from the prices the
+    // contract actually uses for these ticks (its own
+    // `tick_to_sqrt_price_x96`, which caps at u128::MAX / 10^6 by tick
+    // 200_000):
+    //
+    //   sa = 11_695_531_891_538_153_207_631_330_097_785
+    //   sb = 340_282_366_920_938_463_463_374_607_431_768
+    //   liq0 = floor(X * sa * sb / (2^96 * (sb - sa))) = 152_872_609_698_397
+    //   liq1 = floor(X * 2^96 / (sb - sa))             = 241_117_884
+
+    const WIDE_LO: i32 = 100_000;
+    const WIDE_HI: i32 = 200_000;
+    const WIDE_DEPOSIT: i128 = 1_000_000_000_000;
+
+    /// Mints `WIDE_DEPOSIT` of one token into the wide range, checks the
+    /// credited liquidity against the exact-precision value, then burns it all
+    /// and checks the provider gets the deposit back within rounding.
+    ///
+    /// Tolerance: the round trip loses at most the value of the liquidity
+    /// units dropped by rounding liquidity down, plus one unit for rounding
+    /// the amount down. `max_loss` is that bound for the leg being tested.
+    fn assert_wide_single_leg_round_trip(
+        initial_tick: i32,
+        deposit_a: bool,
+        exact_liquidity: i128,
+        liquidity_slack: i128,
+        max_loss: i128,
+    ) {
+        let env = Env::default();
+        let te = setup_test_env(&env, 30, initial_tick);
+        let (sac, token) = if deposit_a {
+            (&te.sac_a, &te.token_a)
+        } else {
+            (&te.sac_b, &te.token_b)
+        };
+        sac.mint(&te.provider, &WIDE_DEPOSIT);
+        let tc = soroban_sdk::token::Client::new(&env, token);
+        let before = tc.balance(&te.provider);
+
+        let (desired_a, desired_b) = if deposit_a {
+            (WIDE_DEPOSIT, 0)
+        } else {
+            (0, WIDE_DEPOSIT)
+        };
+        let (ma, mb) = te.client.mint_position(
+            &te.provider,
+            &WIDE_LO,
+            &WIDE_HI,
+            &desired_a,
+            &desired_b,
+            &0_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+        let minted = if deposit_a { ma } else { mb };
+        assert_eq!(if deposit_a { mb } else { ma }, 0, "one-sided mint");
+
+        let pos = te.client.get_position(&te.provider, &WIDE_LO, &WIDE_HI);
+        // Liquidity rounds down: never more than the deposit pays for.
+        assert!(
+            pos.liquidity <= exact_liquidity && pos.liquidity >= exact_liquidity - liquidity_slack,
+            "liquidity {} vs exact {exact_liquidity}",
+            pos.liquidity
+        );
+        // The pool charges no more than was offered, and at most `max_loss` less.
+        assert!(minted <= WIDE_DEPOSIT && WIDE_DEPOSIT - minted <= max_loss);
+
+        // The quote for the recorded liquidity agrees with what was charged.
+        assert_eq!(
+            te.client.quote_position(&WIDE_LO, &WIDE_HI, &pos.liquidity),
+            (ma, mb)
+        );
+
+        let (ba, bb) = te
+            .client
+            .burn_position(&te.provider, &WIDE_LO, &WIDE_HI, &pos.liquidity);
+        // Burning pays back exactly what minting charged: never more.
+        assert_eq!((ba, bb), (ma, mb));
+        let after = tc.balance(&te.provider);
+        assert!(after <= before && before - after <= max_loss);
+    }
+
+    #[test]
+    fn wide_range_below_price_mint_burn_round_trips_token_a() {
+        // Price below the range: token A only. The inner floor of
+        // `get_liquidity_for_amount0` can drop up to sa / 2^96 + 1 = 148 units
+        // of liquidity, each worth ~0.0065 of token A, so the round trip loses
+        // at most 2 units; 3 leaves one unit of headroom.
+        assert_wide_single_leg_round_trip(0, true, 152_872_609_698_397, 148, 3);
+    }
+
+    #[test]
+    fn wide_range_above_price_mint_burn_round_trips_token_b() {
+        // Price above the range: token B only. Liquidity is the exact floor.
+        // One liquidity unit is worth (sb - sa) / 2^96 ~= 4_147.3 of token B,
+        // which bounds the round-trip loss (plus one unit for the final floor).
+        assert_wide_single_leg_round_trip(250_000, false, 241_117_884, 0, 4_149);
+    }
+
+    #[test]
+    fn wide_range_in_price_mint_burn_round_trips_both_tokens() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 30, 150_000);
+        te.sac_a.mint(&te.provider, &WIDE_DEPOSIT);
+        te.sac_b.mint(&te.provider, &WIDE_DEPOSIT);
+
+        let (ma, mb) = te.client.mint_position(
+            &te.provider,
+            &WIDE_LO,
+            &WIDE_HI,
+            &WIDE_DEPOSIT,
+            &WIDE_DEPOSIT,
+            &0_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+        assert!(ma > 0 && mb > 0, "in-range mint takes both tokens");
+        assert!(ma <= WIDE_DEPOSIT && mb <= WIDE_DEPOSIT);
+        // Liquidity is limited by one token; that one is used almost in full.
+        // A liquidity unit is worth at most (sb - sa) / 2^96 ~= 4_147.3 of
+        // token B and under 1 of token A anywhere in this range.
+        let limiting_loss = (WIDE_DEPOSIT - ma).min(WIDE_DEPOSIT - mb);
+        assert!(limiting_loss <= 4_149, "limiting leg lost {limiting_loss}");
+
+        let pos = te.client.get_position(&te.provider, &WIDE_LO, &WIDE_HI);
+        let (ba, bb) = te
+            .client
+            .burn_position(&te.provider, &WIDE_LO, &WIDE_HI, &pos.liquidity);
+        assert_eq!((ba, bb), (ma, mb));
+    }
+
+    #[test]
+    fn wide_range_single_token_deposit_matches_exact_liquidity() {
+        // Below-range single-token deposit of token A: the recorded liquidity
+        // is the same exact-precision value as the two-token path, and the
+        // quote agrees with the mint.
+        let env = Env::default();
+        let te = setup_test_env(&env, 30, 0);
+        te.sac_a.mint(&te.provider, &WIDE_DEPOSIT);
+
+        let quote =
+            te.client
+                .quote_single_token_deposit(&WIDE_LO, &WIDE_HI, &te.token_a, &WIDE_DEPOSIT);
+        let res = te.client.mint_position_single_token(
+            &te.provider,
+            &WIDE_LO,
+            &WIDE_HI,
+            &te.token_a,
+            &WIDE_DEPOSIT,
+            &0_i128,
+            &u64::MAX,
+        );
+        assert_eq!(quote, res);
+        assert!(res.liquidity <= 152_872_609_698_397);
+        assert!(res.liquidity >= 152_872_609_698_397 - 148);
+
+        let (ba, bb) = te
+            .client
+            .burn_position(&te.provider, &WIDE_LO, &WIDE_HI, &res.liquidity);
+        assert_eq!(bb, 0);
+        assert!(ba <= WIDE_DEPOSIT && WIDE_DEPOSIT - ba <= 3);
+    }
+
+    #[test]
+    fn unrepresentable_position_amount_is_a_typed_error() {
+        // Over the narrow range [0, 100] an i128::MAX token-B deposit is
+        // worth ~3.4e40 liquidity, more than an i128 can hold. That is
+        // reported as MathOverflow instead of a wrapped liquidity figure.
+        let env = Env::default();
+        let te = setup_test_env(&env, 30, 100);
+        let res =
+            te.client
+                .try_quote_single_token_deposit(&0_i32, &100_i32, &te.token_b, &i128::MAX);
+        assert_eq!(res, Err(Ok(ClError::MathOverflow)));
     }
 }
 

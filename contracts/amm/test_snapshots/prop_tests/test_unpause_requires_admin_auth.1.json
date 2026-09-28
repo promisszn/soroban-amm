@@ -105,11 +105,16 @@
           "v0": {
             "topics": [
               {
-                "symbol": "log"
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "unpause"
               }
             ],
             "data": {
-              "string": "caught panic 'called `Option::unwrap()` on a `None` value' from contract function 'Symbol(unpause)'"
+              "error": {
+                "contract": 21
+              }
             }
           }
         }
@@ -129,12 +134,12 @@
               },
               {
                 "error": {
-                  "wasm_vm": "invalid_action"
+                  "contract": 21
                 }
               }
             ],
             "data": {
-              "string": "caught error from function"
+              "string": "escalating Ok(ScErrorType::Contract) frame-exit to Err"
             }
           }
         }
@@ -154,7 +159,7 @@
               },
               {
                 "error": {
-                  "wasm_vm": "invalid_action"
+                  "contract": 21
                 }
               }
             ],
@@ -189,7 +194,7 @@
               },
               {
                 "error": {
-                  "wasm_vm": "invalid_action"
+                  "contract": 21
                 }
               }
             ],

@@ -7,6 +7,8 @@
  */
 
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import { AmmContractError, decodeError } from "./AmmPool.js";
 import { AmmErrors, AmmErrorNames } from "./types.js";
@@ -30,6 +32,9 @@ describe("decodeError", () => {
     [7, "Unauthorized", "unauthorized"],
     [11, "InsufficientLiquidity", "insufficient liquidity"],
     [18, "FlashLoanRepaymentFailed", "flash loan repayment failed"],
+    [19, "AlreadyExecuted", "multisig proposal already executed"],
+    [20, "ProposalExpired", "multisig proposal expired"],
+    [21, "NotInitialized", "pool not initialized"],
   ])("maps Error(Contract, #%i) to %s", (code, name, text) => {
     const err = decodeError(new Error(`Error(Contract, #${code})`));
     expect(err).toBeInstanceOf(AmmContractError);
@@ -93,9 +98,9 @@ describe("decodeError", () => {
 });
 
 describe("AmmErrors", () => {
-  it("covers all 18 AmmError discriminants from contracts/amm/src/lib.rs", () => {
+  it("covers all 21 AmmError discriminants from contracts/amm/src/lib.rs", () => {
     const codes = Object.keys(AmmErrors).map(Number).sort((a, b) => a - b);
-    expect(codes).toEqual(Array.from({ length: 18 }, (_, i) => i + 1));
+    expect(codes).toEqual(Array.from({ length: 21 }, (_, i) => i + 1));
   });
 
   it("has a symbolic name for every discriminant", () => {
@@ -123,6 +128,26 @@ describe("AmmErrors", () => {
       16: "FotSlippage",
       17: "OracleDeviationExceeded",
       18: "FlashLoanRepaymentFailed",
+      19: "AlreadyExecuted",
+      20: "ProposalExpired",
+      21: "NotInitialized",
     });
+  });
+
+  it("matches `pub enum AmmError` in the Rust source", () => {
+    // Parse the enum straight from the contract so a variant added on the
+    // Rust side fails this test instead of silently going undecoded here.
+    const src = readFileSync(
+      fileURLToPath(new URL("../../../contracts/amm/src/lib.rs", import.meta.url)),
+      "utf8",
+    );
+    const body = src.match(/pub enum AmmError \{([\s\S]*?)\n\}/)?.[1];
+    expect(body).toBeDefined();
+    const fromRust: Record<number, string> = {};
+    for (const m of body!.matchAll(/^\s*(\w+)\s*=\s*(\d+),/gm)) {
+      fromRust[Number(m[2])] = m[1];
+    }
+    expect(Object.keys(fromRust).length).toBeGreaterThan(0);
+    expect(AmmErrorNames).toEqual(fromRust);
   });
 });

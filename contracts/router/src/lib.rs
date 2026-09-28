@@ -6,7 +6,9 @@
 
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Vec,
+};
 
 use pool_interfaces::{AmmPoolClient, FactoryClient};
 
@@ -41,12 +43,19 @@ pub enum RouterError {
     PoolNotFound = 7,
     /// The realized amount violated the caller's slippage bound.
     SlippageExceeded = 8,
+    /// A swap was attempted while the router is paused by its admin.
+    Paused = 9,
+    /// `pause` / `unpause` was called with an address that is not the stored
+    /// admin.
+    Unauthorized = 10,
 }
 
 #[contracttype]
 pub enum DataKey {
     Factory,
     Admin,
+    /// `true` while swaps are halted by the admin; absent means unpaused.
+    Paused,
 }
 
 #[contract]
@@ -65,6 +74,35 @@ impl Router {
         Ok(())
     }
 
+    /// Halt every swap entrypoint. Admin-only.
+    ///
+    /// Quotes and path views stay callable so integrators can still read
+    /// routes while the router is paused.
+    pub fn pause(env: Env, admin: Address) -> Result<(), RouterError> {
+        Self::extend_ttl(&env);
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::Paused, &true);
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("pause"),), (admin,));
+        Ok(())
+    }
+
+    /// Resume swaps after `pause`. Admin-only.
+    pub fn unpause(env: Env, admin: Address) -> Result<(), RouterError> {
+        Self::extend_ttl(&env);
+        Self::require_admin(&env, &admin)?;
+        env.storage().instance().set(&DataKey::Paused, &false);
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("unpause"),), (admin,));
+        Ok(())
+    }
+
+    /// Whether swaps are currently halted.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
     /// Execute a multi-hop swap along `path`.
     pub fn swap_exact_in(
         env: Env,
@@ -75,6 +113,7 @@ impl Router {
         deadline: u64,
     ) -> Result<i128, RouterError> {
         Self::extend_ttl(&env);
+        Self::require_not_paused(&env)?;
         trader.require_auth();
         Self::require_valid_path(&path)?;
         if amount_in <= 0 {
@@ -124,6 +163,7 @@ impl Router {
         deadline: u64,
     ) -> Result<i128, RouterError> {
         Self::extend_ttl(&env);
+        Self::require_not_paused(&env)?;
         trader.require_auth();
         Self::require_valid_path(&path)?;
         if amount_out <= 0 {
@@ -330,6 +370,31 @@ impl Router {
 
     fn extend_ttl(env: &Env) {
         env.storage().instance().extend_ttl(MIN_TTL, BUMP_TO);
+    }
+
+    fn read_admin(env: &Env) -> Result<Address, RouterError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(RouterError::NotInitialized)
+    }
+
+    /// Stored-admin check shared by `pause` / `unpause`: the caller-supplied
+    /// address must equal the stored admin and must authorize the call.
+    fn require_admin(env: &Env, admin: &Address) -> Result<(), RouterError> {
+        let stored_admin = Self::read_admin(env)?;
+        if *admin != stored_admin {
+            return Err(RouterError::Unauthorized);
+        }
+        admin.require_auth();
+        Ok(())
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), RouterError> {
+        if Self::is_paused(env.clone()) {
+            return Err(RouterError::Paused);
+        }
+        Ok(())
     }
 
     fn factory_client(env: &Env) -> Result<FactoryClient<'_>, RouterError> {
@@ -558,6 +623,7 @@ mod tests {
         token4: Address,
         orphan: Address,
         factory: Address,
+        admin: Address,
     }
 
     fn setup_three_hop() -> ThreeHop {
@@ -620,6 +686,7 @@ mod tests {
             token4: tokens.get(3).unwrap(),
             orphan,
             factory: factory_addr,
+            admin,
         }
     }
 
@@ -902,5 +969,142 @@ mod tests {
         let path = soroban_sdk::vec![&s.env, s.token1.clone(), s.token2.clone()];
         let result = router.try_swap_exact_in(&s.trader, &path, &0, &0, &u64::MAX);
         assert_eq!(result, Err(Ok(RouterError::InvalidAmount)));
+    }
+
+    // -- #937: pause / unpause safety switch ----------------------------------
+
+    /// Payload of the last event the router emitted under `topic`, with the
+    /// schema-version prefix asserted and stripped.
+    fn last_router_payload(env: &Env, router: &Address, topic: soroban_sdk::Symbol) -> (Address,) {
+        use soroban_sdk::{testutils::Events as _, IntoVal};
+        let event = env
+            .events()
+            .all()
+            .iter()
+            .rfind(|e| e.0 == *router && e.1 == (topic.clone(),).into_val(env))
+            .unwrap_or_else(|| panic!("no event emitted for the requested topic"));
+        let (version, payload): (u32, (Address,)) = event.2.into_val(env);
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        payload
+    }
+
+    #[test]
+    fn test_pause_and_unpause_by_stored_admin() {
+        let s = setup_three_hop();
+        let router = RouterClient::new(&s.env, &s.router);
+        assert!(!router.is_paused());
+
+        router.pause(&s.admin);
+        // The stored admin is the address that had to authorize the call.
+        let auths = s.env.auths();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0].0, s.admin);
+        assert!(router.is_paused());
+        assert_eq!(
+            last_router_payload(&s.env, &s.router, symbol_short!("pause")),
+            (s.admin.clone(),)
+        );
+
+        router.unpause(&s.admin);
+        assert!(!router.is_paused());
+        assert_eq!(
+            last_router_payload(&s.env, &s.router, symbol_short!("unpause")),
+            (s.admin.clone(),)
+        );
+    }
+
+    #[test]
+    fn test_pause_and_unpause_reject_non_admin_address() {
+        let s = setup_three_hop();
+        let router = RouterClient::new(&s.env, &s.router);
+        let intruder = Address::generate(&s.env);
+
+        assert_eq!(
+            router.try_pause(&intruder),
+            Err(Ok(RouterError::Unauthorized))
+        );
+        assert!(!router.is_paused());
+
+        router.pause(&s.admin);
+        assert_eq!(
+            router.try_unpause(&intruder),
+            Err(Ok(RouterError::Unauthorized))
+        );
+        assert!(router.is_paused());
+    }
+
+    #[test]
+    fn test_pause_and_unpause_require_admin_authorization() {
+        let s = setup_three_hop();
+        let router = RouterClient::new(&s.env, &s.router);
+
+        // Passing the right address is not enough; the admin must sign.
+        s.env.mock_auths(&[]);
+        assert!(router.try_pause(&s.admin).is_err());
+        assert!(!router.is_paused());
+
+        s.env.mock_all_auths();
+        router.pause(&s.admin);
+        s.env.mock_auths(&[]);
+        assert!(router.try_unpause(&s.admin).is_err());
+        assert!(router.is_paused());
+    }
+
+    #[test]
+    fn test_pause_before_initialize_returns_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let router_addr = env.register_contract(None, Router);
+        let router = RouterClient::new(&env, &router_addr);
+        let admin = Address::generate(&env);
+
+        assert_eq!(
+            router.try_pause(&admin),
+            Err(Ok(RouterError::NotInitialized))
+        );
+        assert_eq!(
+            router.try_unpause(&admin),
+            Err(Ok(RouterError::NotInitialized))
+        );
+        assert!(!router.is_paused());
+    }
+
+    #[test]
+    fn test_every_swap_entrypoint_rejects_while_paused() {
+        let s = setup_three_hop();
+        let router = RouterClient::new(&s.env, &s.router);
+        let path = soroban_sdk::vec![&s.env, s.token1.clone(), s.token2.clone(), s.token3.clone()];
+        router.pause(&s.admin);
+
+        assert_eq!(
+            router.try_swap_exact_in(&s.trader, &path, &10_000, &0, &u64::MAX),
+            Err(Ok(RouterError::Paused))
+        );
+        assert_eq!(
+            router.try_swap_exact_out(&s.trader, &path, &10_000, &i128::MAX, &u64::MAX),
+            Err(Ok(RouterError::Paused))
+        );
+
+        // Unpausing restores both swap paths.
+        router.unpause(&s.admin);
+        assert!(router.swap_exact_in(&s.trader, &path, &10_000, &0, &u64::MAX) > 0);
+        assert!(router.swap_exact_out(&s.trader, &path, &10_000, &i128::MAX, &u64::MAX) > 0);
+    }
+
+    #[test]
+    fn test_read_only_views_callable_while_paused() {
+        let s = setup_three_hop();
+        let router = RouterClient::new(&s.env, &s.router);
+        let path = soroban_sdk::vec![&s.env, s.token1.clone(), s.token2.clone(), s.token3.clone()];
+        router.pause(&s.admin);
+
+        assert!(router.is_paused());
+        assert_eq!(router.get_factory(), s.factory);
+        assert!(router.is_path_routable(&path));
+        assert!(router.get_amount_out_path(&path, &10_000) > 0);
+        assert!(router.get_amount_in_path(&path, &10_000) > 0);
+        assert_eq!(router.get_amounts_out_path(&path, &10_000).len(), 3);
+        assert_eq!(router.get_amounts_in_path(&path, &10_000).len(), 3);
+        assert_eq!(router.get_pools_for_path(&path).len(), 2);
     }
 }

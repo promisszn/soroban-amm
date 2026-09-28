@@ -58,6 +58,15 @@ pub enum AggregatorError {
     UnregisteredPool = 3,
     InvalidMaxHops = 4,
     TooManyRoutingTokens = 5,
+    /// A function that reads the admin or factory was called before
+    /// `initialize`.
+    NotInitialized = 6,
+    /// A state-mutating entrypoint was called while the aggregator is paused
+    /// by its admin.
+    Paused = 7,
+    /// `pause` / `unpause` was called with an address that is not the stored
+    /// admin.
+    Unauthorized = 8,
 }
 
 #[contracttype]
@@ -101,6 +110,8 @@ pub enum DataKey {
     RoutingTokens,
     ClPoolCount,
     ClPool(u32),
+    /// `true` while mutating entrypoints are halted; absent means unpaused.
+    Paused,
 }
 
 #[contract]
@@ -132,8 +143,39 @@ impl DexAggregator {
         env.storage().instance().set(&DataKey::ClPoolCount, &0u32);
     }
 
+    /// Halt every state-mutating entrypoint (admin configuration and route
+    /// execution). Admin-only.
+    ///
+    /// Quotes (`find_best_route`, `get_quote`, `is_price_within_tolerance`)
+    /// stay callable so integrators can still price routes while paused.
+    pub fn pause(env: Env, admin: Address) -> Result<(), AggregatorError> {
+        Self::require_admin(&env, &admin)?;
+        Self::extend_ttl(&env);
+        env.storage().instance().set(&DataKey::Paused, &true);
+        soroban_amm_sdk::emit_versioned_event!(&env, (symbol_short!("pause"),), (admin,));
+        Ok(())
+    }
+
+    /// Resume state-mutating entrypoints after `pause`. Admin-only.
+    pub fn unpause(env: Env, admin: Address) -> Result<(), AggregatorError> {
+        Self::require_admin(&env, &admin)?;
+        Self::extend_ttl(&env);
+        env.storage().instance().set(&DataKey::Paused, &false);
+        soroban_amm_sdk::emit_versioned_event!(&env, (symbol_short!("unpause"),), (admin,));
+        Ok(())
+    }
+
+    /// Whether state-mutating entrypoints are currently halted.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
     pub fn set_max_hops(env: Env, max_hops: u32) -> Result<(), AggregatorError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        Self::require_not_paused(&env)?;
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
 
         if max_hops == 0 {
@@ -151,8 +193,9 @@ impl DexAggregator {
         token_a: Address,
         token_b: Address,
         fee_bps: i128,
-    ) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    ) -> Result<(), AggregatorError> {
+        Self::require_not_paused(&env)?;
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
 
         Self::extend_ttl(&env);
@@ -165,7 +208,7 @@ impl DexAggregator {
         for i in 0..count {
             let entry: ClPoolInfo = env.storage().instance().get(&DataKey::ClPool(i)).unwrap();
             if entry.pool == pool {
-                return;
+                return Ok(());
             }
         }
 
@@ -189,10 +232,12 @@ impl DexAggregator {
             (symbol_short!("cl_reg"),),
             (token_a, token_b, fee_bps, pool)
         );
+        Ok(())
     }
 
     pub fn set_routing_tokens(env: Env, tokens: Vec<Address>) -> Result<(), AggregatorError> {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        Self::require_not_paused(&env)?;
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
 
         if tokens.len() > Self::MAX_ROUTING_TOKENS {
@@ -206,8 +251,9 @@ impl DexAggregator {
         Ok(())
     }
 
-    pub fn remove_cl_pool(env: Env, pool: Address) {
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+    pub fn remove_cl_pool(env: Env, pool: Address) -> Result<(), AggregatorError> {
+        Self::require_not_paused(&env)?;
+        let admin = Self::read_admin(&env)?;
         admin.require_auth();
 
         Self::extend_ttl(&env);
@@ -232,9 +278,10 @@ impl DexAggregator {
                 env.storage()
                     .instance()
                     .set(&DataKey::ClPoolCount, &(count - 1));
-                return;
+                return Ok(());
             }
         }
+        Ok(())
     }
 
     /// Find the best route up to `max_hops` pools deep (#319).
@@ -245,6 +292,7 @@ impl DexAggregator {
         amount_in: i128,
         max_hops: u32,
     ) -> Result<RouteQuote, AggregatorError> {
+        let factory = Self::read_factory(&env)?;
         Self::extend_ttl(&env);
         assert!(token_in != token_out, "same token");
         assert!(amount_in > 0, "amount must be positive");
@@ -258,7 +306,7 @@ impl DexAggregator {
             return Err(AggregatorError::NoRouteFound);
         }
         let (quote, runner_up) =
-            Self::search_best_bfs(&env, &token_in, &token_out, amount_in, cap)?;
+            Self::search_best_bfs(&env, &factory, &token_in, &token_out, amount_in, cap)?;
 
         // The venue a route is *entered* through identifies the decision: it is
         // the pool the aggregator picked over every alternative first hop.
@@ -313,6 +361,8 @@ impl DexAggregator {
         min_out: i128,
         deadline: u64,
     ) -> Result<i128, AggregatorError> {
+        Self::require_not_paused(&env)?;
+        let factory = Self::read_factory(&env)?;
         Self::extend_ttl(&env);
         trader.require_auth();
         if route.hops.is_empty() || route.amount_out < min_out {
@@ -323,8 +373,15 @@ impl DexAggregator {
         }
         let entry = route.hops.get(0).unwrap();
         let exit = route.hops.get(route.hops.len() - 1).unwrap();
-        let amount_out =
-            Self::execute_hops(&env, &route.hops, &trader, amount_in, min_out, deadline)?;
+        let amount_out = Self::execute_hops(
+            &env,
+            &factory,
+            &route.hops,
+            &trader,
+            amount_in,
+            min_out,
+            deadline,
+        )?;
 
         // `amount_out` is what the pools actually returned, not `route.amount_out`,
         // which is only the quote the route was planned against.
@@ -372,6 +429,7 @@ impl DexAggregator {
         min_out: i128,
         deadline: u64,
     ) -> Result<i128, AggregatorError> {
+        Self::require_not_paused(&env)?;
         Self::extend_ttl(&env);
         let max_hops: u32 = env
             .storage()
@@ -431,13 +489,13 @@ impl DexAggregator {
     #[allow(clippy::type_complexity)]
     fn search_best_bfs(
         env: &Env,
+        factory: &Address,
         token_in: &Address,
         token_out: &Address,
         amount_in: i128,
         max_hops: u32,
     ) -> Result<(RouteQuote, Option<(Address, PoolKind, i128)>), AggregatorError> {
-        let factory: Address = env.storage().instance().get(&DataKey::Factory).unwrap();
-        let factory_client = FactoryClient::new(env, &factory);
+        let factory_client = FactoryClient::new(env, factory);
         let tokens = Self::discover_tokens(env, token_in, token_out);
 
         let mut best_out: i128 = 0;
@@ -567,14 +625,14 @@ impl DexAggregator {
 
     fn execute_hops(
         env: &Env,
+        factory: &Address,
         hops: &Vec<RouteHop>,
         trader: &Address,
         amount_in: i128,
         min_out: i128,
         deadline: u64,
     ) -> Result<i128, AggregatorError> {
-        let factory: Address = env.storage().instance().get(&DataKey::Factory).unwrap();
-        let factory_client = FactoryClient::new(env, &factory);
+        let factory_client = FactoryClient::new(env, factory);
 
         // Validate all hops up front before any token movement
         for hop in hops.iter() {
@@ -834,6 +892,38 @@ impl DexAggregator {
     fn extend_ttl(env: &Env) {
         env.storage().instance().extend_ttl(MIN_TTL, BUMP_TO);
     }
+
+    fn read_admin(env: &Env) -> Result<Address, AggregatorError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(AggregatorError::NotInitialized)
+    }
+
+    fn read_factory(env: &Env) -> Result<Address, AggregatorError> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Factory)
+            .ok_or(AggregatorError::NotInitialized)
+    }
+
+    /// Stored-admin check shared by `pause` / `unpause`: the caller-supplied
+    /// address must equal the stored admin and must authorize the call.
+    fn require_admin(env: &Env, admin: &Address) -> Result<(), AggregatorError> {
+        let stored_admin = Self::read_admin(env)?;
+        if *admin != stored_admin {
+            return Err(AggregatorError::Unauthorized);
+        }
+        admin.require_auth();
+        Ok(())
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), AggregatorError> {
+        if Self::is_paused(env.clone()) {
+            return Err(AggregatorError::Paused);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -854,7 +944,65 @@ mod tests {
         let a = Address::generate(&env);
         let b = Address::generate(&env);
         let result = agg.try_find_best_route(&a, &b, &100_i128, &3u32);
-        assert!(result.is_err());
+        assert_eq!(result, Err(Ok(AggregatorError::NotInitialized)));
+    }
+
+    #[test]
+    fn test_pre_init_calls_return_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let agg_addr = env.register_contract(None, DexAggregator);
+        let agg = DexAggregatorClient::new(&env, &agg_addr);
+        let a = Address::generate(&env);
+        let b = Address::generate(&env);
+        let pool = Address::generate(&env);
+        let trader = Address::generate(&env);
+
+        assert_eq!(
+            agg.try_set_max_hops(&3u32),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+        assert_eq!(
+            agg.try_register_cl_pool(&pool, &a, &b, &30_i128),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+        assert_eq!(
+            agg.try_remove_cl_pool(&pool),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+        assert_eq!(
+            agg.try_set_routing_tokens(&vec![&env, a.clone()]),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+        assert_eq!(
+            agg.try_get_quote(&a, &b, &100_i128, &3u32),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+        assert_eq!(
+            agg.try_swap_best(&trader, &a, &b, &100_i128, &0_i128, &u64::MAX),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+
+        let route = RouteQuote {
+            amount_out: 100,
+            hops: vec![
+                &env,
+                RouteHop {
+                    pool: pool.clone(),
+                    pool_kind: PoolKind::Amm,
+                    token_in: a.clone(),
+                    token_out: b.clone(),
+                    zero_for_one: true,
+                },
+            ],
+        };
+        assert_eq!(
+            agg.try_execute_route(&route, &trader, &100_i128, &0_i128, &u64::MAX),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+
+        // A bool-returning query must degrade gracefully rather than trap.
+        assert!(!agg.is_price_within_tolerance(&a, &b, &100_i128, &1_i128));
     }
 
     #[test]
@@ -1819,5 +1967,157 @@ mod tests {
             }
         }
         assert!(found_routing_token);
+    }
+
+    // -------------------------------------------------------------------------
+    // #938: pause / unpause safety switch
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_pause_and_unpause_by_stored_admin() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+        assert!(!agg.is_paused());
+
+        agg.pause(&v.admin);
+        // The stored admin is the address that had to authorize the call.
+        let auths = v.env.auths();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0].0, v.admin);
+        assert!(agg.is_paused());
+        let (admin,): (Address,) = last_payload(&v.env, &v.agg, symbol_short!("pause"));
+        assert_eq!(admin, v.admin);
+
+        agg.unpause(&v.admin);
+        assert!(!agg.is_paused());
+        let (admin,): (Address,) = last_payload(&v.env, &v.agg, symbol_short!("unpause"));
+        assert_eq!(admin, v.admin);
+    }
+
+    #[test]
+    fn test_pause_and_unpause_reject_non_admin_address() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+        let intruder = Address::generate(&v.env);
+
+        assert_eq!(
+            agg.try_pause(&intruder),
+            Err(Ok(AggregatorError::Unauthorized))
+        );
+        assert!(!agg.is_paused());
+
+        agg.pause(&v.admin);
+        assert_eq!(
+            agg.try_unpause(&intruder),
+            Err(Ok(AggregatorError::Unauthorized))
+        );
+        assert!(agg.is_paused());
+    }
+
+    #[test]
+    fn test_pause_and_unpause_require_admin_authorization() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+
+        // Passing the right address is not enough; the admin must sign.
+        v.env.mock_auths(&[]);
+        assert!(agg.try_pause(&v.admin).is_err());
+        assert!(!agg.is_paused());
+
+        v.env.mock_all_auths();
+        agg.pause(&v.admin);
+        v.env.mock_auths(&[]);
+        assert!(agg.try_unpause(&v.admin).is_err());
+        assert!(agg.is_paused());
+    }
+
+    #[test]
+    fn test_pause_before_initialize_returns_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let agg_addr = env.register_contract(None, DexAggregator);
+        let agg = DexAggregatorClient::new(&env, &agg_addr);
+        let admin = Address::generate(&env);
+
+        assert_eq!(
+            agg.try_pause(&admin),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+        assert_eq!(
+            agg.try_unpause(&admin),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+        assert!(!agg.is_paused());
+    }
+
+    #[test]
+    fn test_every_mutating_entrypoint_rejects_while_paused() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+        let quote = agg.find_best_route(&v.token_a, &v.token_b, &10_000_i128, &2u32);
+        // Registered after quoting: it has no contract behind it to quote.
+        let cl_pool = Address::generate(&v.env);
+        agg.register_cl_pool(&cl_pool, &v.token_a, &v.token_b, &30_i128);
+
+        agg.pause(&v.admin);
+
+        assert_eq!(
+            agg.try_set_max_hops(&3u32),
+            Err(Ok(AggregatorError::Paused))
+        );
+        let other_cl_pool = Address::generate(&v.env);
+        assert_eq!(
+            agg.try_register_cl_pool(&other_cl_pool, &v.token_a, &v.token_b, &100_i128),
+            Err(Ok(AggregatorError::Paused))
+        );
+        assert_eq!(
+            agg.try_set_routing_tokens(&vec![&v.env, v.token_a.clone()]),
+            Err(Ok(AggregatorError::Paused))
+        );
+        assert_eq!(
+            agg.try_remove_cl_pool(&cl_pool),
+            Err(Ok(AggregatorError::Paused))
+        );
+        assert_eq!(
+            agg.try_execute_route(&quote, &v.trader, &10_000_i128, &0_i128, &u64::MAX),
+            Err(Ok(AggregatorError::Paused))
+        );
+        assert_eq!(
+            agg.try_swap_best(
+                &v.trader,
+                &v.token_a,
+                &v.token_b,
+                &10_000_i128,
+                &0_i128,
+                &u64::MAX
+            ),
+            Err(Ok(AggregatorError::Paused))
+        );
+
+        // Unpausing restores execution.
+        agg.unpause(&v.admin);
+        assert!(agg.execute_route(&quote, &v.trader, &10_000_i128, &0_i128, &u64::MAX) > 0);
+    }
+
+    #[test]
+    fn test_read_only_views_callable_while_paused() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+        agg.pause(&v.admin);
+
+        assert!(agg.is_paused());
+        let quote = agg.find_best_route(&v.token_a, &v.token_b, &10_000_i128, &2u32);
+        assert!(quote.amount_out > 0);
+        assert_eq!(quote.hops.get(0).unwrap().pool, v.pool_ab);
+        assert_eq!(
+            agg.get_quote(&v.token_a, &v.token_b, &10_000_i128, &2u32),
+            quote
+        );
+        assert!(agg.is_price_within_tolerance(
+            &v.token_a,
+            &v.token_b,
+            &10_000_i128,
+            &quote.amount_out
+        ));
     }
 }
