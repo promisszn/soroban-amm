@@ -21,6 +21,7 @@ use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, token as sdk_token,
     Address, BytesN, Env, Symbol, Vec,
 };
+use pool_interfaces::{ClPoolClient, PoolState};
 
 // ── Typed errors ─────────────────────────────────────────────────────────────
 
@@ -46,29 +47,7 @@ pub enum FactoryError {
     NotInitialized = 12,
 }
 
-#[contracttype]
-#[derive(Clone, Debug, PartialEq)]
-pub struct PoolState {
-    pub sqrt_price: u128,
-    pub current_tick: i32,
-    pub active_liquidity: i128,
-    pub tick_spacing: i32,
-}
 
-#[contractclient(name = "ClPoolClient")]
-pub trait ClPoolInterface {
-    fn initialize(
-        env: Env,
-        admin: Address,
-        token_a: Address,
-        token_b: Address,
-        fee_bps: i128,
-        initial_tick: i32,
-        tick_spacing: i32,
-    );
-
-    fn get_pool_state(env: Env) -> PoolState;
-}
 
 #[contractclient(name = "AmmPoolClient")]
 pub trait AmmPoolInterface {

@@ -38,7 +38,7 @@ jobs:
             # Makefile so the three cannot drift apart. Change exclusions there.
             - name: Build WASM artifacts
               run: bash scripts/build_workspace.sh
-            - name: Check WASM binary sizes
+            - name: Check WASM binary sizes (network cap)
               run: bash scripts/size_report.sh --fail-on-limit
             # All six crates that were previously excluded here
             # (`concentrated_liquidity`, `dex-aggregator`, `incentive-campaigns`,
