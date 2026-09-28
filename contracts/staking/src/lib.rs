@@ -475,8 +475,6 @@ impl Staking {
             (Symbol::new(&env, "rewards_added"),),
             (admin, received)
         );
-        env.events()
-            .publish((Symbol::new(&env, "rewards_added"),), (admin, received));
         Ok(())
     }
 
@@ -498,8 +496,6 @@ impl Staking {
         }
         env.storage().instance().set(&DataKey::Paused, &true);
         soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "paused"),), (admin,));
-        env.events()
-            .publish((Symbol::new(&env, "paused"),), (admin,));
         Ok(())
     }
 
@@ -517,8 +513,6 @@ impl Staking {
         }
         env.storage().instance().set(&DataKey::Paused, &false);
         soroban_amm_sdk::emit_versioned_event!(env, (Symbol::new(&env, "unpaused"),), (admin,));
-        env.events()
-            .publish((Symbol::new(&env, "unpaused"),), (admin,));
         Ok(())
     }
 
@@ -847,9 +841,6 @@ impl Staking {
             (Symbol::new(&env, "unstaked"),),
             (staker, amount, rewards)
         );
-        (amount, rewards)
-        env.events()
-            .publish((Symbol::new(&env, "unstaked"),), (staker, amount, rewards));
         Ok((amount, rewards))
     }
 
@@ -878,8 +869,6 @@ impl Staking {
             (Symbol::new(&env, "emergency_mode"),),
             (admin, enabled)
         );
-        env.events()
-            .publish((Symbol::new(&env, "emergency_mode"),), (admin, enabled));
         Ok(())
     }
 
@@ -1519,9 +1508,6 @@ impl Staking {
             (Symbol::new(env, "claimed"),),
             (staker.clone(), pending)
         );
-        pending
-        env.events()
-            .publish((Symbol::new(env, "claimed"),), (staker.clone(), pending));
         Ok(pending)
     }
 
