@@ -73,8 +73,11 @@ COPY examples/flash_loan_receiver/Cargo.toml    examples/flash_loan_receiver/Car
 
 # Fetch all registry dependencies so the network is not needed during the
 # actual build.  rustup installs the pinned toolchain (including
-# wasm32v1-none) on first invocation via rust-toolchain.toml.
-RUN cargo fetch
+# wasm32v1-none) on first invocation via rust-toolchain.toml.  Only
+# manifests are present here, so the script stubs each target's source file
+# for the duration of the fetch.
+COPY scripts/docker_fetch_deps.sh scripts/docker_fetch_deps.sh
+RUN sh scripts/docker_fetch_deps.sh
 
 # Copy the full source tree and build.
 COPY . .
