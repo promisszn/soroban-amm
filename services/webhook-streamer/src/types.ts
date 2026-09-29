@@ -1,7 +1,12 @@
 // ── Shared types for the webhook-streamer service (issue #306) ──────────────
 
-/** Raw Soroban contract event as returned by Horizon's /events endpoint. */
-export interface HorizonEvent {
+/**
+ * Raw Soroban contract event as returned by Stellar RPC's `getEvents` method.
+ *
+ * `topic` and `value` are base64-encoded XDR `ScVal`s, not plain strings or
+ * JSON. Use `xdr.ScVal.fromXDR(..., "base64")` + `scValToNative` to decode.
+ */
+export interface RpcEvent {
   id: string;
   type: string;
   ledger: number;
@@ -19,6 +24,11 @@ export interface PoolEvent {
   eventType: string;
   ledger: number;
   timestamp: string;
+  /**
+   * Schema version carried by versioned events (see
+   * `contracts/amm-sdk/src/lib.rs`). `undefined` for legacy/unversioned events.
+   */
+  schemaVersion?: number;
   payload: Record<string, unknown>;
 }
 
