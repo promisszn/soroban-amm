@@ -11,7 +11,7 @@ crate-type = ["lib"]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 proptest = "1"
 # Arbitrary-precision reference for the CL position-path conversions (#963).
-num-bigint = "0.4"
+num-bigint = "0.5"
 
 [features]
 # Deployed-contract CL properties: `concentrated_liquidity.wasm` must exist
