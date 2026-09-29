@@ -288,6 +288,7 @@ name = "cl_position_nft"
 version = "0.1.0"
 dependencies = [
  "soroban-sdk",
+ "soroban_amm_sdk",
 ]
 
 [[package]]
@@ -652,6 +653,7 @@ dependencies = [
  "amm",
  "concentrated_liquidity",
  "governance",
+ "pool_interfaces",
  "soroban-sdk",
  "soroban_amm_sdk",
  "token",

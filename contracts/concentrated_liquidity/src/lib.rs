@@ -34,6 +34,23 @@ const POSITION_TTL_THRESHOLD: u32 = 518_400;
 // Extend a touched entry's life to this many ledgers (~180 days at 5 s/ledger).
 const POSITION_BUMP_TO: u32 = 3_110_400;
 
+// Instance-storage TTL management (issue #905).
+//
+// The instance entry holds the executable plus every `storage().instance()`
+// value: sqrt price, current tick, active liquidity, fee-growth globals, admin,
+// tokens, fee config and oracle settings. If that entry's TTL lapses the whole
+// pool is archived and every call traps — stranding every open position, since
+// the persistent position entries survive but there is no live pool to burn
+// them against. Each entrypoint therefore extends the instance entry, using the
+// same threshold/bump the persistent position entries already use so instance
+// and persistent state age at one horizon.
+//
+// Only extend when fewer than this many ledgers of life remain
+// (~30 days at 5 s/ledger); avoids redundant bumps on every access.
+const INSTANCE_TTL_THRESHOLD: u32 = POSITION_TTL_THRESHOLD;
+// Extend the instance entry's life to this many ledgers (~180 days at 5 s/ledger).
+const INSTANCE_BUMP_TO: u32 = POSITION_BUMP_TO;
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ClError {
@@ -255,6 +272,18 @@ pub struct ConcentratedLiquidity;
 
 #[contractimpl]
 impl ConcentratedLiquidity {
+    /// Extend the contract's **instance** storage TTL (issue #905).
+    ///
+    /// Called as the first statement of every public entrypoint that touches
+    /// contract state, including read-only paths: a pure quote or state read is
+    /// often the only traffic the pool sees for long stretches, and it must keep
+    /// the pool from being archived just as a swap would.
+    fn extend_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_BUMP_TO);
+    }
+
     /// One-time initialisation. Sets admin, token pair, fee, starting tick, and tick spacing.
     ///
     /// `tick_spacing` must be > 0. Only tick values that are exact multiples of
@@ -270,6 +299,7 @@ impl ConcentratedLiquidity {
         initial_tick: i32,
         tick_spacing: i32,
     ) -> Result<(), ClError> {
+        Self::extend_instance_ttl(&env);
         if env.storage().instance().has(&DataKey::TokenA) {
             return Err(ClError::AlreadyInitialized);
         }
@@ -331,6 +361,7 @@ impl ConcentratedLiquidity {
 
     /// Admin: attach or remove the oracle aggregator for swap deviation checks (#318).
     pub fn set_oracle(env: Env, admin: Address, oracle: Option<Address>) -> Result<(), ClError> {
+        Self::extend_instance_ttl(&env);
         let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
@@ -354,6 +385,7 @@ impl ConcentratedLiquidity {
     /// The NFT contract must be initialized with this pool's address as its
     /// `cl_pool`, otherwise mint/burn calls from the pool will be rejected.
     pub fn set_position_nft(env: Env, admin: Address, nft: Option<Address>) -> Result<(), ClError> {
+        Self::extend_instance_ttl(&env);
         let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
@@ -382,6 +414,7 @@ impl ConcentratedLiquidity {
 
     /// Returns the wired-in position-NFT contract, if any.
     pub fn position_nft(env: Env) -> Option<Address> {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::PositionNft)
@@ -396,6 +429,7 @@ impl ConcentratedLiquidity {
         lower_tick: i32,
         upper_tick: i32,
     ) -> Option<u64> {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::PositionNftToken(provider, lower_tick, upper_tick))
@@ -404,6 +438,7 @@ impl ConcentratedLiquidity {
     /// Resolves an NFT `token_id` back to its `(provider, lower_tick,
     /// upper_tick)` position, or `None` if unknown.
     pub fn position_of_token(env: Env, token_id: u64) -> Option<(Address, i32, i32)> {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::NftTokenToPosition(token_id))
@@ -415,6 +450,7 @@ impl ConcentratedLiquidity {
         admin: Address,
         max_deviation_bps: i128,
     ) -> Result<(), ClError> {
+        Self::extend_instance_ttl(&env);
         let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
@@ -431,6 +467,7 @@ impl ConcentratedLiquidity {
 
     /// Pause all minting and swapping. Admin-only.
     pub fn pause(env: Env, admin: Address) -> Result<(), ClError> {
+        Self::extend_instance_ttl(&env);
         let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
@@ -442,6 +479,7 @@ impl ConcentratedLiquidity {
 
     /// Resume minting and swapping. Admin-only.
     pub fn unpause(env: Env, admin: Address) -> Result<(), ClError> {
+        Self::extend_instance_ttl(&env);
         let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
@@ -452,6 +490,7 @@ impl ConcentratedLiquidity {
     }
 
     pub fn propose_admin(env: Env, admin: Address, new_admin: Address) -> Result<(), ClError> {
+        Self::extend_instance_ttl(&env);
         let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
@@ -464,6 +503,7 @@ impl ConcentratedLiquidity {
     }
 
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), ClError> {
+        Self::extend_instance_ttl(&env);
         let pending: Option<Address> = env
             .storage()
             .instance()
@@ -485,6 +525,7 @@ impl ConcentratedLiquidity {
         recipient: Address,
         bps: i128,
     ) -> Result<(), ClError> {
+        Self::extend_instance_ttl(&env);
         let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
@@ -501,6 +542,7 @@ impl ConcentratedLiquidity {
     }
 
     pub fn withdraw_protocol_fees(env: Env, admin: Address) -> Result<(), ClError> {
+        Self::extend_instance_ttl(&env);
         let stored = Self::read_admin(&env)?;
         if admin != stored {
             return Err(ClError::Unauthorized);
@@ -549,6 +591,7 @@ impl ConcentratedLiquidity {
 
     /// Returns true when the pool is paused.
     pub fn is_paused(env: Env) -> bool {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::Paused)
@@ -653,6 +696,7 @@ impl ConcentratedLiquidity {
         min_b: i128,
         deadline: u64,
     ) -> Result<(i128, i128), ClError> {
+        Self::extend_instance_ttl(&env);
         // Reading the token pair first doubles as the initialization check,
         // so this hot path pays for no extra storage lookup.
         let (token_a, token_b) = Self::read_tokens(&env)?;
@@ -834,6 +878,7 @@ impl ConcentratedLiquidity {
         min_b: i128,
         deadline: u64,
     ) -> Result<(i128, i128), ClError> {
+        Self::extend_instance_ttl(&env);
         Self::require_initialized(&env)?;
         if env.ledger().timestamp() > deadline {
             return Err(ClError::DeadlineExpired);
@@ -998,6 +1043,7 @@ impl ConcentratedLiquidity {
         min_liquidity: i128,
         deadline: u64,
     ) -> Result<SingleTokenDepositResult, ClError> {
+        Self::extend_instance_ttl(&env);
         Self::require_initialized(&env)?;
         if env.ledger().timestamp() > deadline {
             return Err(ClError::DeadlineExpired);
@@ -1256,6 +1302,7 @@ impl ConcentratedLiquidity {
         token_in: Address,
         amount_in: i128,
     ) -> Result<SingleTokenDepositResult, ClError> {
+        Self::extend_instance_ttl(&env);
         Self::require_initialized(&env)?;
         if lower_tick >= upper_tick {
             return Err(ClError::TickOutOfRange);
@@ -1372,6 +1419,7 @@ impl ConcentratedLiquidity {
         min_liquidity: i128,
         deadline: u64,
     ) -> Result<SingleTokenDepositResult, ClError> {
+        Self::extend_instance_ttl(&env);
         Self::require_initialized(&env)?;
         let current_tick: i32 = env
             .storage()
@@ -1451,6 +1499,7 @@ impl ConcentratedLiquidity {
         lower_tick: i32,
         upper_tick: i32,
     ) -> Result<RangeOrderStatus, ClError> {
+        Self::extend_instance_ttl(&env);
         Self::require_initialized(&env)?;
         // Verify the position exists and is tagged as a range order.
         let _pos: Position = env
@@ -1504,6 +1553,7 @@ impl ConcentratedLiquidity {
         upper_tick: i32,
         liquidity: i128,
     ) -> Result<(i128, i128), ClError> {
+        Self::extend_instance_ttl(&env);
         Self::require_initialized(&env)?;
         // No pause guard — LPs must always be able to exit.
         provider.require_auth();
@@ -1527,6 +1577,7 @@ impl ConcentratedLiquidity {
         token_id: u64,
         liquidity: i128,
     ) -> Result<(i128, i128), ClError> {
+        Self::extend_instance_ttl(&env);
         Self::require_initialized(&env)?;
         let (provider, lower_tick, upper_tick) =
             Self::resolve_token_owner(&env, &caller, token_id)?;
@@ -1561,6 +1612,7 @@ impl ConcentratedLiquidity {
         lower_tick: i32,
         upper_tick: i32,
     ) -> Result<(i128, i128), ClError> {
+        Self::extend_instance_ttl(&env);
         Self::require_initialized(&env)?;
         // No pause guard — LPs must always be able to collect fees.
         provider.require_auth();
@@ -1575,6 +1627,7 @@ impl ConcentratedLiquidity {
         caller: Address,
         token_id: u64,
     ) -> Result<(i128, i128), ClError> {
+        Self::extend_instance_ttl(&env);
         Self::require_initialized(&env)?;
         let (provider, lower_tick, upper_tick) =
             Self::resolve_token_owner(&env, &caller, token_id)?;
@@ -1881,6 +1934,7 @@ impl ConcentratedLiquidity {
         lower_tick: i32,
         upper_tick: i32,
     ) -> Result<Position, ClError> {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .persistent()
             .get(&DataKey::Position(provider, lower_tick, upper_tick))
@@ -1888,6 +1942,7 @@ impl ConcentratedLiquidity {
     }
 
     pub fn current_tick(env: Env) -> Result<i32, ClError> {
+        Self::extend_instance_ttl(&env);
         Self::read_current_tick(&env)
     }
 
@@ -1901,10 +1956,12 @@ impl ConcentratedLiquidity {
     ///
     /// Returns `ClError::NotInitialized` if the pool has not been initialized.
     pub fn get_tokens(env: Env) -> Result<(Address, Address), ClError> {
+        Self::extend_instance_ttl(&env);
         Self::read_tokens(&env)
     }
 
     pub fn active_liquidity(env: Env) -> i128 {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::ActiveLiquidity)
@@ -1912,6 +1969,7 @@ impl ConcentratedLiquidity {
     }
 
     pub fn get_pool_state(env: Env) -> PoolState {
+        Self::extend_instance_ttl(&env);
         let current_tick: i32 = env
             .storage()
             .instance()
@@ -1950,6 +2008,7 @@ impl ConcentratedLiquidity {
     /// registry) look this pool up via `Factory::get_cl_pool(token_a, token_b,
     /// fee_bps)` without needing the fee tier supplied out of band.
     pub fn fee_bps(env: Env) -> Result<i128, ClError> {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::FeeBps)
@@ -1962,6 +2021,7 @@ impl ConcentratedLiquidity {
     /// Returns `ClError::TickNotInitialized` if the tick has never been touched by a position.
     /// Requires no auth.
     pub fn get_tick_info(env: Env, tick: i32) -> Result<TickInfo, ClError> {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::Tick(tick))
@@ -1971,6 +2031,7 @@ impl ConcentratedLiquidity {
     /// Returns `true` when the tick currently has non-zero gross liquidity.
     /// Requires no auth.
     pub fn is_tick_initialized(env: Env, tick: i32) -> bool {
+        Self::extend_instance_ttl(&env);
         env.storage().instance().has(&DataKey::Tick(tick))
     }
 
@@ -1980,6 +2041,7 @@ impl ConcentratedLiquidity {
     /// Uses the compressed tick bitmap for O(1)–O(log N) lookup.
     /// Returns `None` when no higher initialized tick exists.
     pub fn next_initialized_tick_pub(env: Env, tick: i32) -> Option<i32> {
+        Self::extend_instance_ttl(&env);
         Self::next_initialized_tick(&env, tick, false)
     }
 
@@ -1987,6 +2049,7 @@ impl ConcentratedLiquidity {
     /// Uses the compressed tick bitmap for O(1)–O(log N) lookup.
     /// Returns `None` when no lower initialized tick exists.
     pub fn prev_initialized_tick_pub(env: Env, tick: i32) -> Option<i32> {
+        Self::extend_instance_ttl(&env);
         Self::next_initialized_tick(&env, tick, true)
     }
 
@@ -2037,6 +2100,7 @@ impl ConcentratedLiquidity {
     /// add `liquidity_net` to active liquidity.  When crossing **downward**
     /// (zero_for_one = true), subtract it.  Returns 0 for uninitialized ticks.
     pub fn get_liquidity_net_at_tick(env: Env, tick: i32) -> i128 {
+        Self::extend_instance_ttl(&env);
         Self::get_tick(&env, tick).liquidity_net
     }
 
@@ -2052,6 +2116,7 @@ impl ConcentratedLiquidity {
         tick: i32,
         zero_for_one: bool,
     ) -> i128 {
+        Self::extend_instance_ttl(&env);
         let net = Self::get_tick(&env, tick).liquidity_net;
         if zero_for_one {
             (current_liquidity - net).max(0)
@@ -2069,6 +2134,7 @@ impl ConcentratedLiquidity {
         min_amount_out: i128,
         deadline: u64,
     ) -> Result<i128, ClError> {
+        Self::extend_instance_ttl(&env);
         // Reading the token pair first doubles as the initialization check,
         // so this hot path pays for no extra storage lookup.
         let (token_a, token_b) = Self::read_tokens(&env)?;
@@ -2829,6 +2895,7 @@ impl ConcentratedLiquidity {
         max_amount_in: i128,
         deadline: u64,
     ) -> Result<i128, ClError> {
+        Self::extend_instance_ttl(&env);
         Self::require_initialized(&env)?;
         if env.ledger().timestamp() > deadline {
             return Err(ClError::DeadlineExpired);
@@ -3055,6 +3122,7 @@ impl ConcentratedLiquidity {
         amount_out: i128,
         sqrt_price_limit_x96: u128,
     ) -> Result<i128, ClError> {
+        Self::extend_instance_ttl(&env);
         Self::require_initialized(&env)?;
         if amount_out <= 0 {
             return Err(ClError::ZeroAmounts);
@@ -3118,6 +3186,7 @@ impl ConcentratedLiquidity {
         amount_in: i128,
         sqrt_price_limit_x96: u128,
     ) -> Result<PriceImpactEstimate, ClError> {
+        Self::extend_instance_ttl(&env);
         Self::require_initialized(&env)?;
         if amount_in <= 0 {
             return Err(ClError::ZeroAmounts);
@@ -3186,6 +3255,7 @@ impl ConcentratedLiquidity {
 
     /// Returns raw (tick_cumulative, last_timestamp) for external consumers.
     pub fn get_tick_cumulative(env: Env) -> (i64, u64) {
+        Self::extend_instance_ttl(&env);
         let cum: i64 = env
             .storage()
             .instance()
@@ -3204,6 +3274,7 @@ impl ConcentratedLiquidity {
     /// between the nearest bracketing snapshots (issue #512).
     /// `seconds_ago == 0` returns the current cumulative value (extrapolated to now).
     pub fn observe(env: Env, seconds_ago: u64) -> i64 {
+        Self::extend_instance_ttl(&env);
         let cum: i64 = env
             .storage()
             .instance()
@@ -3322,6 +3393,7 @@ impl ConcentratedLiquidity {
 
     /// Returns all open position tick-range pairs for `provider`.
     pub fn get_positions(env: Env, provider: Address) -> Vec<(i32, i32)> {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .persistent()
             .get(&DataKey::PositionList(provider))
@@ -3336,6 +3408,7 @@ impl ConcentratedLiquidity {
         upper_tick: i32,
         liquidity: i128,
     ) -> Result<(i128, i128), ClError> {
+        Self::extend_instance_ttl(&env);
         Self::require_initialized(&env)?;
         if lower_tick >= upper_tick {
             return Err(ClError::TickOutOfRange);
@@ -3362,6 +3435,7 @@ impl ConcentratedLiquidity {
     }
 
     pub fn fee_growth_inside(env: Env, lower_tick: i32, upper_tick: i32) -> (i128, i128) {
+        Self::extend_instance_ttl(&env);
         let current_tick: i32 = env
             .storage()
             .instance()
@@ -4039,7 +4113,9 @@ impl ConcentratedLiquidity {
 mod tests {
     use super::*;
     use soroban_sdk::token::StellarAssetClient;
-    use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Env};
+    use soroban_sdk::{
+        testutils::storage::Instance as _, testutils::Address as _, testutils::Ledger as _, Env,
+    };
 
     #[allow(dead_code)]
     struct TestEnv<'a> {
@@ -4092,6 +4168,69 @@ mod tests {
             sac_a,
             sac_b,
         }
+    }
+
+    // ── instance-TTL regression coverage (issue #905) ──────────────────────
+
+    fn cl_instance_ttl(env: &Env, cl_addr: &Address) -> u32 {
+        env.as_contract(cl_addr, || env.storage().instance().get_ttl())
+    }
+
+    /// Advance the ledger far enough that the instance entry's remaining TTL
+    /// drops below the extension threshold, so the next entrypoint call has to
+    /// restore it.
+    fn lower_instance_ttl_below_min(env: &Env, cl_addr: &Address) {
+        env.ledger()
+            .with_mut(|l| l.sequence_number += INSTANCE_BUMP_TO - INSTANCE_TTL_THRESHOLD + 1);
+        let ttl = cl_instance_ttl(env, cl_addr);
+        assert!(
+            ttl < INSTANCE_TTL_THRESHOLD,
+            "test setup should lower instance TTL below the threshold, got {ttl}"
+        );
+    }
+
+    fn assert_instance_ttl_bumped(env: &Env, cl_addr: &Address) {
+        let ttl = cl_instance_ttl(env, cl_addr);
+        assert!(
+            ttl >= INSTANCE_BUMP_TO - 1,
+            "instance TTL {ttl} should be bumped toward INSTANCE_BUMP_TO"
+        );
+    }
+
+    #[test]
+    fn test_initialize_extends_instance_ttl() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 30_i128, 0_i32);
+        assert_instance_ttl_bumped(&env, &te.cl_addr);
+    }
+
+    #[test]
+    fn test_read_entrypoint_restores_lapsed_instance_ttl() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 30_i128, 0_i32);
+
+        lower_instance_ttl_below_min(&env, &te.cl_addr);
+
+        // A read-only pool-state query is often the only traffic the pool sees
+        // for long stretches; it must still respond and restore the TTL rather
+        // than let the pool drift into archival.
+        let _ = te.client.get_pool_state();
+        assert_instance_ttl_bumped(&env, &te.cl_addr);
+    }
+
+    #[test]
+    fn test_write_entrypoint_restores_lapsed_instance_ttl() {
+        let env = Env::default();
+        let te = setup_test_env(&env, 30_i128, 0_i32);
+
+        lower_instance_ttl_below_min(&env, &te.cl_addr);
+
+        // `pause` writes only instance state, isolating the write-path TTL bump
+        // from the persistent position entries.
+        te.client.pause(&te.admin);
+
+        assert!(te.client.is_paused());
+        assert_instance_ttl_bumped(&env, &te.cl_addr);
     }
 
     #[test]

@@ -80,6 +80,7 @@ impl PolVestingContract {
         governance: Address,
         treasury: Address,
     ) -> Result<(), VestingError> {
+        Self::extend_ttl(&env);
         if env.storage().instance().has(&DataKey::Governance) {
             return Err(VestingError::AlreadyInitialized);
         }
@@ -99,6 +100,7 @@ impl PolVestingContract {
         current_governance: Address,
         new_governance: Address,
     ) -> Result<(), VestingError> {
+        Self::extend_ttl(&env);
         current_governance.require_auth();
         Self::require_governance(&env, &current_governance)?;
 
@@ -119,6 +121,7 @@ impl PolVestingContract {
     /// Only the nominated address can accept. On success, governance is updated,
     /// the pending nominee is cleared, and a transfer event is emitted.
     pub fn accept_governance(env: Env, new_governance: Address) -> Result<(), VestingError> {
+        Self::extend_ttl(&env);
         let pending: Option<Address> = env
             .storage()
             .instance()
@@ -149,11 +152,13 @@ impl PolVestingContract {
 
     /// Return the active governance address.
     pub fn get_governance(env: Env) -> Address {
+        Self::extend_ttl(&env);
         env.storage().instance().get(&DataKey::Governance).unwrap()
     }
 
     /// Return the pending governance nominee, if any.
     pub fn get_pending_governance(env: Env) -> Option<Address> {
+        Self::extend_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::PendingGovernance)
@@ -169,6 +174,7 @@ impl PolVestingContract {
         governance: Address,
         new_treasury: Address,
     ) -> Result<(), VestingError> {
+        Self::extend_ttl(&env);
         governance.require_auth();
         Self::require_governance(&env, &governance)?;
 
@@ -189,6 +195,7 @@ impl PolVestingContract {
     /// Only the nominated address can accept. On success, treasury is updated,
     /// the pending nominee is cleared, and an event is emitted.
     pub fn accept_treasury(env: Env, new_treasury: Address) -> Result<(), VestingError> {
+        Self::extend_ttl(&env);
         let pending: Option<Address> = env
             .storage()
             .instance()
@@ -219,11 +226,13 @@ impl PolVestingContract {
 
     /// Return the active treasury address.
     pub fn get_treasury(env: Env) -> Address {
+        Self::extend_ttl(&env);
         env.storage().instance().get(&DataKey::Treasury).unwrap()
     }
 
     /// Return the pending treasury nominee, if any.
     pub fn get_pending_treasury(env: Env) -> Option<Address> {
+        Self::extend_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::PendingTreasury)
@@ -249,6 +258,7 @@ impl PolVestingContract {
         cliff_ledger: u32,
         end_ledger: u32,
     ) -> Result<u32, VestingError> {
+        Self::extend_ttl(&env);
         governance.require_auth();
         Self::require_governance(&env, &governance)?;
 
@@ -302,6 +312,7 @@ impl PolVestingContract {
 
     /// Release all currently vested (but unreleased) LP tokens to the beneficiary.
     pub fn release(env: Env, beneficiary: Address, schedule_id: u32) -> Result<i128, VestingError> {
+        Self::extend_ttl(&env);
         beneficiary.require_auth();
 
         let key = DataKey::Vesting(beneficiary.clone(), schedule_id);
@@ -348,6 +359,7 @@ impl PolVestingContract {
         beneficiary: Address,
         schedule_id: u32,
     ) -> Result<PolVesting, VestingError> {
+        Self::extend_ttl(&env);
         env.storage()
             .persistent()
             .get(&DataKey::Vesting(beneficiary, schedule_id))
@@ -365,6 +377,7 @@ impl PolVestingContract {
         old_schedule_id: u32,
         new_beneficiary: Address,
     ) -> Result<u32, VestingError> {
+        Self::extend_ttl(&env);
         governance.require_auth();
         Self::require_governance(&env, &governance)?;
 
@@ -420,6 +433,7 @@ impl PolVestingContract {
         beneficiary: Address,
         schedule_id: u32,
     ) -> Result<(), VestingError> {
+        Self::extend_ttl(&env);
         governance.require_auth();
         Self::require_governance(&env, &governance)?;
 
@@ -463,6 +477,28 @@ impl PolVestingContract {
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /// Extend the contract's **instance** storage TTL.
+    ///
+    /// The instance entry holds the executable plus every `storage().instance()`
+    /// value (governance, treasury and the two pending nominees). Vesting
+    /// schedules are long-lived by construction — a year-long schedule is
+    /// precisely the case where the instance entry lapses from disuse between
+    /// claims — so every entrypoint, including read-only ones, extends it. If
+    /// the entry is archived a returning beneficiary finds the contract
+    /// unreachable and cannot release vested tokens until it is restored
+    /// (issue #908).
+    ///
+    /// Reuses the module-level `MIN_TTL` / `BUMP_TO` already applied to the
+    /// persistent schedule entries, so instance and persistent state age at one
+    /// horizon. At the ~5s/ledger Stellar cadence:
+    /// - `MIN_TTL` = 241_920 ledgers ≈ 14 days: only rewrite when less than two
+    ///   weeks of life remains.
+    /// - `BUMP_TO` = 3_110_400 ledgers ≈ 180 days: renew toward the maximum
+    ///   persistent rent window, so one call keeps the contract live for months.
+    fn extend_ttl(env: &Env) {
+        env.storage().instance().extend_ttl(MIN_TTL, BUMP_TO);
+    }
+
     fn require_governance(env: &Env, caller: &Address) -> Result<(), VestingError> {
         let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
         if gov != *caller {
@@ -501,7 +537,7 @@ impl PolVestingContract {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
+        testutils::{storage::Instance as _, Address as _, Ledger},
         token::{StellarAssetClient, TokenClient},
         Env,
     };
@@ -1014,5 +1050,71 @@ mod tests {
         assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
         assert_eq!(version, 1);
         assert_eq!(data, (s.beneficiary.clone(), schedule_id, 250_000, 750_000));
+    }
+
+    // ── Instance TTL regression (issue #908) ────────────────────────────────
+    // Vesting schedules are long-lived, so the instance entry (governance,
+    // treasury and pending nominees) is exactly the entry that lapses from
+    // disuse between claims. If it is archived a returning beneficiary finds
+    // the contract unreachable. These tests drive the ledger past the instance
+    // TTL, then confirm entrypoints still respond and re-extend it.
+
+    fn instance_ttl(s: &Setup) -> u32 {
+        s.env
+            .as_contract(&s.contract_id, || s.env.storage().instance().get_ttl())
+    }
+
+    fn lower_instance_ttl_below_min(s: &Setup) {
+        s.env
+            .ledger()
+            .with_mut(|l| l.sequence_number += BUMP_TO - MIN_TTL + 1);
+        let ttl = instance_ttl(s);
+        assert!(
+            ttl < MIN_TTL,
+            "test setup should lower instance TTL below MIN_TTL, got {ttl}"
+        );
+    }
+
+    fn assert_instance_ttl_bumped(s: &Setup) {
+        let ttl = instance_ttl(s);
+        assert!(
+            ttl >= BUMP_TO - 1,
+            "instance TTL {ttl} should be bumped toward BUMP_TO"
+        );
+    }
+
+    #[test]
+    fn test_initialize_extends_instance_ttl() {
+        let s = setup();
+        assert_instance_ttl_bumped(&s);
+    }
+
+    #[test]
+    fn test_read_entrypoint_restores_lapsed_instance_ttl() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+
+        lower_instance_ttl_below_min(&s);
+
+        // A returning beneficiary or integrator often reads governance/treasury
+        // first; that pure read must still respond and restore the instance TTL.
+        assert_eq!(client.get_governance(), s.governance);
+        assert_instance_ttl_bumped(&s);
+    }
+
+    #[test]
+    fn test_write_entrypoint_restores_lapsed_instance_ttl() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+        let new_treasury = Address::generate(&s.env);
+
+        lower_instance_ttl_below_min(&s);
+
+        // `propose_treasury` writes only instance state, isolating the write
+        // path's TTL bump from the persistent schedule entries.
+        client.propose_treasury(&s.governance, &new_treasury);
+
+        assert_eq!(client.get_pending_treasury(), Some(new_treasury));
+        assert_instance_ttl_bumped(&s);
     }
 }
