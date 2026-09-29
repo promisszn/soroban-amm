@@ -201,6 +201,7 @@ Defined in [contracts/concentrated_liquidity/src/lib.rs](../contracts/concentrat
 | 22 | `RangeOrderExists` | Range order already active on specified range for caller. | Withdraw existing range order before placing a new one. |
 | 23 | `ExactOutNotFullyFilled` | `swap_exact_out` or `quote_exact_out` (#696) could not fill the requested `amount_out` in full before running out of initialized ticks or hitting `sqrt_price_limit_x96`. Exact-out has no meaningful partial fill. | Reduce `amount_out`, widen `sqrt_price_limit_x96`, or add liquidity to the range being traded against. |
 | 24 | `NotInitialized` | A function that depends on pool state (tokens, admin, current tick) was called before `initialize`. This covers the admin setters, every liquidity/swap/quote entrypoint, and the `current_tick`, `get_tokens`, and `fee_bps` views. | Call `initialize` first. |
+| 25 | `MathOverflow` | A position amount or liquidity figure computed by `mint_position`, `mint_position_single_token`, `quote_single_token_deposit`, `modify_position`, `burn_position` or `quote_position` does not fit in an `i128`, or an intermediate of its 256-bit evaluation does not fit in a `u128`. Reported instead of a truncated value (#963). | Use a smaller amount or liquidity, or a wider tick range. |
 
 `swap_exact_out(env, sender, zero_for_one, amount_out, sqrt_price_limit_x96,
 max_amount_in, deadline)` (#696) is the mirror of `swap`: it fixes the
@@ -608,6 +609,7 @@ Defined in [contracts/twap_consumer/src/lib.rs](../contracts/twap_consumer/src/l
 | 11 | `PriceManipulated` | Spot price deviates from TWAP beyond allowed threshold. | Reject the trade/valuation or retry with current market prices. |
 | 12 | `InvalidRetentionPolicy` | `max_age_seconds` is shorter than the minimum supported TWAP window (`LONGEST_TWAP_WINDOW`). | Set `max_age_seconds` to at least `LONGEST_TWAP_WINDOW` or 0 (disabled). |
 | 13 | `Unauthorized` | Non-keeper/admin address attempted an administrative action. | Submit the transaction authenticated by the configured keeper/admin. |
+| 14 | `CrossContractCallFailed` | A call into a pool's oracle failed: the pool does not implement the interface its tracked type implies (`get_price_cumulative` for `Amm`, `get_tick_cumulative` for `Cl`), the address is not a contract, or the callee panicked. Returned by the snapshot and TWAP reads, including `get_twap_all`, instead of a host trap (#964). | Check the pool address and type with `get_tracked_pools_typed`. A legacy entry that is really a CL pool is re-typed by calling `save_cl_snapshot` for it. |
 
 ---
 

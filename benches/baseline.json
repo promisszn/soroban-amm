@@ -1,9 +1,16 @@
 {
   "metrics": [
     { "name": "amm.swap", "cpu_instructions": 779265, "mem_bytes": 103813 },
-    { "name": "amm.add_liquidity", "cpu_instructions": 914412, "mem_bytes": 130680 },
-    { "name": "amm.remove_liquidity", "cpu_instructions": 959794, "mem_bytes": 136404 },
+    { "name": "amm.add_liquidity", "cpu_instructions": 962928, "mem_bytes": 137512 },
+    { "name": "amm.remove_liquidity", "cpu_instructions": 1032568, "mem_bytes": 146652 },
     { "name": "amm.flash_loan", "cpu_instructions": 1046594, "mem_bytes": 138653 },
+    { "name": "cl.mint_position", "cpu_instructions": 828482, "mem_bytes": 108615 },
+    { "name": "cl.swap", "cpu_instructions": 760795, "mem_bytes": 103172 },
+    { "name": "batch.settle_batch", "cpu_instructions": 71468, "mem_bytes": 7795 },
+    { "name": "governance.propose", "cpu_instructions": 296043, "mem_bytes": 47328 },
+    { "name": "governance.vote", "cpu_instructions": 532638, "mem_bytes": 96558 },
+    { "name": "governance.execute", "cpu_instructions": 442287, "mem_bytes": 73475 },
+    { "name": "staking.stake", "cpu_instructions": 621806, "mem_bytes": 96132 },
     { "name": "cl.mint_position", "cpu_instructions": 761384, "mem_bytes": 95274 },
     { "name": "cl.swap", "cpu_instructions": 695105, "mem_bytes": 88658 },
     { "name": "batch.settle_batch", "cpu_instructions": 71468, "mem_bytes": 7795 },

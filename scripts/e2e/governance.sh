@@ -24,16 +24,11 @@
 #    network. Set GOVERNANCE_SKIP_EXECUTE=1 to assert only Active ->
 #    Defeated/Queued and skip the execute step and its multi-hour sleep.
 #
-# 2. vote() requires the LP token's `Locker` to already point at this
-#    governance instance (LpToken::lock() checks `locker.require_auth()`),
-#    but LpToken::set_locker() requires auth from the LP token's `admin`,
-#    which is the AMM pool CONTRACT itself, not an externally-owned key —
-#    no plain `stellar contract invoke --source <key>` can satisfy that on
-#    a live network. scripts/deploy/governance.sh already has this same
-#    gap (it best-effort calls set_locker and only warns on failure). If
-#    set_locker does not succeed here, `vote` will fail with a locker/auth
-#    error; this is a pre-existing wiring gap in the deploy scripts, not
-#    something introduced by this flow.
+# 2. vote() requires the LP token's `Locker` to point at this governance
+#    instance (LpToken::lock() checks `locker.require_auth()`). Only the pool
+#    can change the locker, so the flow asks it to through the pool's
+#    admin-gated `set_lp_locker`, signed by the pool admin, then reads the
+#    locker back before proposing (issue #986).
 set -Eeuo pipefail
 
 run_governance_flow() {
@@ -103,16 +98,13 @@ run_governance_flow() {
     --min_proposer_stake_bps "$min_proposer_stake_bps" >/dev/null
   pass "governance: deployed and initialized isolated governance: $governance"
 
-  # Best-effort locker wiring — see constraint (2) in the header comment.
-  # LP_admin is the pool contract itself, so this call is expected to fail
-  # against a live network; kept here (matching scripts/deploy/governance.sh)
-  # so the flow still works in any environment where it does succeed (e.g. a
-  # future fix, or a network where auth is mocked).
-  if invoke "$lp_token" set_locker --locker "$governance" >/dev/null 2>&1; then
-    pass "governance: set LP token locker to governance instance"
-  else
-    fail "governance: set_locker failed (expected on live network — LP token admin is the pool contract, see header comment). vote() will fail without this."
-  fi
+  # ── LP token locker -> governance ─────────────────────────────────────────
+  # The isolated pool's admin is the factory admin (this account), so it can
+  # have the pool delegate the locker directly.
+  invoke "$pool_addr" set_lp_locker --locker "$governance" >/dev/null
+  local locker
+  locker=$(invoke "$lp_token" locker | extract_contract_id)
+  assert_eq "governance: LP token locker is the governance instance" "$locker" "$governance"
 
   # ── propose ──────────────────────────────────────────────────────────────
   local proposal_id
@@ -135,13 +127,18 @@ run_governance_flow() {
   invoke "$governance" vote --voter "$admin" --proposal_id "$proposal_id" --choice '{"For":[]}' >/dev/null
   pass "governance: voted For on proposal $proposal_id"
 
+  local locked lp_balance
+  locked=$(invoke "$lp_token" locked_balance --id "$admin" | parse_i128)
+  lp_balance=$(invoke "$lp_token" balance --id "$admin" | parse_i128)
+  assert_eq "governance: voter's LP balance is locked by the vote" "$locked" "$lp_balance"
+
   # ── advance past voting period ───────────────────────────────────────────
   sleep "$(( voting_period + 1 ))"
 
   status=$(invoke "$governance" proposal_status --proposal_id "$proposal_id")
   pass "governance: proposal status after voting period: $status"
   if [[ "$status" == *"Defeated"* ]]; then
-    die "governance: proposal was Defeated — voting power/quorum setup is wrong (locker likely never got wired, see header comment)"
+    die "governance: proposal was Defeated — voting power/quorum setup is wrong"
   fi
 
   if [[ "${GOVERNANCE_SKIP_EXECUTE:-0}" == "1" ]]; then
@@ -179,6 +176,12 @@ run_governance_flow() {
   local new_fee_bps
   new_fee_bps=$(invoke "$pool_addr" get_info | field_value fee_bps)
   assert_eq "governance: pool fee_bps updated by executed proposal" "$new_fee_bps" "25"
+
+  # unlock_vote releases the LP tokens through LpToken::unlock, authorised by
+  # governance as the locker that locked them.
+  invoke "$governance" unlock_vote --voter "$admin" --proposal_id "$proposal_id" >/dev/null
+  locked=$(invoke "$lp_token" locked_balance --id "$admin" | parse_i128)
+  assert_eq "governance: LP balance unlocked after execution" "$locked" "0"
 }
 
 # A throwaway token for the isolated governance pool, independent of the

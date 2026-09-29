@@ -39,6 +39,12 @@
 > with `--target wasm32v1-none` and warns if stale `wasm32-unknown-unknown`
 > artifacts are present.
 
+> **bash 4+ is required.** macOS ships `/bin/bash` 3.2, which does not support
+> associative arrays. `scripts/deploy/common.sh` checks the version at startup
+> and exits immediately with a clear error and install instructions if bash 3.2
+> is detected. Install bash 4+ via Homebrew (`brew install bash`) and invoke
+> the script with the full path: `/opt/homebrew/bin/bash scripts/deploy.sh`.
+
 The pinned Stellar CLI version (25.1.0) is the version used in CI and in the
 `Dockerfile` (`rust:1.93.0-slim` base). Newer CLI versions may change `stellar
 contract upload` / `invoke` flag names — pin to avoid silent breakage.
@@ -101,13 +107,16 @@ exist (testnet only).
 cargo build --release --target wasm32v1-none
 # Or via Make:
 make build
-# To shrink binaries 20–40% for upload limits:
+# Optimize artifacts (20–40% smaller) — REQUIRED for concentrated_liquidity
+# and factory, both of which exceed the 131 072-byte network cap unoptimized:
 make optimize
 ```
 
-The deploy script also builds automatically if any expected
-`target/wasm32v1-none/release/*.wasm` file is missing, but pre-building lets
-you verify the build succeeds before touching the network.
+The deploy script also builds automatically if any expected artifact is
+missing. **Run `make optimize` before deploying** — `scripts/deploy.sh` now
+prefers the optimized artifacts under `optimized-artifacts/` when they exist,
+and enforces the 131 072-byte network cap before each upload (failing early
+with a clear message instead of surfacing `TxSorobanInvalid` from the RPC).
 
 Expected artifacts (18 deployable crates):
 
@@ -158,8 +167,9 @@ governance ──► staking (needs LP token + reward token) ──────�
        ├──► pol_vesting (needs governance + treasury)             │
        └──► reserve_manager (needs governance + factory)          │
                                                                 │
-factory ──► router, batch_router, dex_aggregator (needs factory)  │
+factory ──► router, dex_aggregator (needs factory)                │
 admin ──► batch_auction (needs admin + window)                    │
+            └──► batch_router (fronts the auction; needs factory) │
 pools ──► v2_to_v3_migration (needs both V2 and V3 pool)          │
 ```
 
@@ -173,16 +183,17 @@ pools ──► v2_to_v3_migration (needs both V2 and V3 pool)          │
 | 4 | **Pools via Factory** (`create_pool`, `create_cl_pool`) | Factory + Token A/B | Factory deploys LP token (admin = pool) and AMM pool in one tx, enforces pair uniqueness, registers in `Pool(token_a,token_b) → pool`. CL pool needs `initial_tick` and `tick_spacing` derived from fee tier. Pools are **never** deployed directly — the factory path guarantees `Pool → LpToken` linkage and indexing for `dex_aggregator`. |
 | 5 | **Governance** | AMM pool + LP token | LP-weighted voting: `balance_at` snapshots need the LP token's checkpoint history. Governance becomes the LP token's `locker` so `vote` can lock shares during the voting window. Factory wiring: if pools were created with a `governance_wasm_hash`, factory already deployed governance; otherwise deploy here. |
 | 6 | **Oracle Aggregator** | Admin only | Standalone median-price aggregator over fresh, agreeing sources. No pool dependency for deployment, but pools can later `set_oracle` to wire it. Deploy early so pools can be configured with it immediately after. |
-| 7 | **TWAP Consumer / TWAL Consumer** | Keeper (admin) + pools (optional) | Read `get_price_cumulative` / `get_liquidity_cumulative` from pools and store snapshots. Initialized with a `keeper` address authorized to call `save_snapshot`. No pool required at init — keeper can start snapshotting after. |
+| 7 | **TWAP Consumer / TWAL Consumer** | Keeper (admin) + pools | Read `get_price_cumulative` / `get_liquidity_cumulative` from pools and store snapshots. Initialized with a `keeper` address authorized to call `save_snapshot`. No pool required at init, but they run after the pools so `deploy.sh` can register the AMM and CL pools with the TWAL consumer (`add_tracked_pool`) straight away. |
 | 8 | **Staking** | LP token + Reward token + admin | Users stake LP tokens for reward-token emissions. Boost-lock config (`min_boost=1x`, `max_boost=2.5x`, `min_lock=7d`, `max_lock=4y`) is set at init. Needs LP token address to transfer stakes. |
 | 9 | **Incentive Campaigns** | Governance | Governance creates time-based campaigns with `reward_rate * duration <= funding`. Needs governance address so only governance can call `create_campaign`. |
 | 10 | **POL Vesting** | Governance + Treasury | Linear vesting of POL LP tokens between `cliff_ledger` and `end_ledger`. Governance creates/revokes, treasury receives revoked tokens. |
 | 11 | **Reserve Manager** | Governance + Factory | Off-chain gate `check_reserves(pool)` — reads `get_info()` and compares to `min_reserve` per pair. No AMM hook (see issue #518); bots/dashboards call it before migration. |
-| 12 | **Router / Batch Router** | Factory | Multi-hop `swap_exact_in` across pools discovered via `factory.get_pool`. Atomic batch of swaps/liquidity ops. |
+| 12 | **Router** | Factory | Multi-hop `swap_exact_in` across pools discovered via `factory.get_pool`. |
 | 13 | **DEX Aggregator** | Factory + Admin + CL pools | Cross-venue best-execution router over AMM + CL pools. Initialized with `MaxHops=4`, `MAX_CL_POOLS=50`, `CL_FEE_TIERS=[30,100,500]`. CL pools must be `register_cl_pool`ed before they participate in routing. |
 | 14 | **Batch Auction** | Admin + `batch_window_secs` | Collects orders for `batch_window_secs` then `settle_batch` atomically. Needs no pool at init — validates `pool_matches_pair` at `submit_order`. |
-| 15 | **CL Position NFT** | CL pool | ERC-721 receipt for CL positions. Only `cl_pool` may `mint`/`burn`. After deploy, `cl_pool.set_position_nft(nft)` wires it so positions automatically mint an NFT. |
-| 16 | **V2 → V3 Migration** | V2 pool + V3 pool + admin | Burns V2 LP shares and mints a CL position in one tx. Verifies `token_a/token_b` match or reverts `TokenMismatch`. |
+| 15 | **Batch Router** | Factory (+ Batch Auction) | Atomic batch of swaps/liquidity ops resolved through the factory. Deployed right after the auction it fronts, so a deployment never ends up with an auction and no router. |
+| 16 | **CL Position NFT** | CL pool | ERC-721 receipt for CL positions. Only `cl_pool` may `mint`/`burn`. After deploy, `cl_pool.set_position_nft(nft)` wires it so positions automatically mint an NFT. |
+| 17 | **V2 → V3 Migration** | V2 pool + V3 pool + admin | Burns V2 LP shares and mints a CL position in one tx. Verifies `token_a/token_b` match or reverts `TokenMismatch`. |
 
 Within `scripts/deploy.sh` these steps are executed by `deploy_tokens`, `deploy_factory`,
 `deploy_pools`, `deploy_governance`, etc., each respecting `--only`/`--skip`.
@@ -330,6 +341,10 @@ Needs `MIN_VALID_SOURCES=2` fresh, agreeing sources to return non-zero confidenc
 | `keeper` | `ADMIN_ADDRESS` | Authorized to `save_snapshot(pool)` / `save_cl_snapshot`. Run a cron (e.g. every 60s) calling `save_snapshot`. |
 | `SNAPSHOT_TTL_LEDGERS` | `120960` (~7 days at 5s/ledger) | Snapshots evicted after TTL — keeper must snapshot frequently enough that `get_twap_price(pool, window)` can always find `now_ts - window`. |
 
+When `ADMIN_ADDRESS` is the deploying account, `deploy.sh` also registers the
+deployed AMM pool (`Amm`) and CL pool (`Cl`) with the TWAL consumer. With a
+separate keeper it prints the `add_tracked_pool` commands for the keeper to run.
+
 TWAP is `(cum_a_now - cum_a_then) / window` scaled by `1_000_000`. CL path uses `get_tick_cumulative`. TWAL differences `active_liquidity * elapsed`.
 
 ### 3.12 Router / Batch Router / DEX Aggregator / Batch Auction
@@ -360,11 +375,26 @@ TWAP is `(cum_a_now - cum_a_then) / window` scaled by `1_000_000`. CL path uses 
 | `v2_pool` | `AMM_POOL_CONTRACT_ID` |
 | `v3_pool` | `CL_POOL_CONTRACT_ID` |
 
-Verifies `token_a/token_b` match or reverts `TokenMismatch`. Sentinel ticks `i32::MIN`/`MAX` map to `current_tick ± width` for single-sided migration.
+Verifies `token_a/token_b` match in either order or reverts `TokenMismatch`. The
+migration mints the CL position directly for the LP and maps token amounts into
+the V3 pool's order. Sentinel ticks `i32::MIN`/`MAX` derive bounds from
+`current_tick ± width`, round outward to `tick_spacing`, and clamp to the usable
+CL tick range. Explicit ticks must already be aligned. Configure the two deposit
+minimums in V3 token order; the result reports actual deposits, LP-held
+leftovers, final ticks, and the optional position NFT token ID.
 
 ---
 
 ## 4. Post-Deployment Verification
+
+> **Initialization window:** `token::initialize` performs no authorization
+> check — it only checks that the contract is not already initialized. Between
+> the deploy transaction and the initialize transaction there is a window in
+> which a third party could call `initialize` first and set themselves as admin.
+> `scripts/deploy/token.sh` closes this window by calling `initialize` in the
+> immediately following transaction and then asserting the admin with
+> `verify_token`, which now fails fatally on a mismatch. Factory-deployed pools
+> are not affected (factory deploys and initializes in one invocation).
 
 A deployment that "succeeded" (zero exit code) but left a contract
 uninitialized costs the most to debug later. Run these checks manually or rely
@@ -377,7 +407,7 @@ After each `initialize`, the script reads state and asserts:
 
 | Contract | Verification call | Asserts |
 |----------|-------------------|---------|
-| Token A/B/Reward | `name`, `total_supply`, `admin` | `admin == $SOURCE_PUBLIC_KEY`, `name` readable |
+| Token A/B/Reward | `admin` | `admin == $SOURCE_PUBLIC_KEY`; mismatch is **fatal** — indicates a front-run |
 | Factory | `get_pool_count`, `get_pools` | Hashes registered, count readable; `creation_paused == false` (unless paused) |
 | AMM Pool (via factory) | `get_info` | `token_a/b == expected`, `fee_bps == 30`, `total_shares == 0`, `admin == gov or factory_admin` |
 | LP Token | `admin` | `admin == AMM_POOL_CONTRACT_ID` |
@@ -386,16 +416,24 @@ After each `initialize`, the script reads state and asserts:
 | LP locker | `locker` on LP token | `locker == GOVERNANCE_CONTRACT_ID` |
 | Staking | `get_pool_info` | `lp_token == LP_TOKEN`, `reward_token == REWARD_TOKEN` |
 | Oracle Aggregator | `get_sources` / `get_admin` | `admin == ADMIN_ADDRESS` |
-| TWAP/TWAL Consumer | `get_keeper` | `keeper == ADMIN_ADDRESS` |
-| Router/Batch Router | `get_factory` (if exposed) | `factory == FACTORY_CONTRACT_ID` |
+| TWAP Consumer | `get_keeper` | `keeper == ADMIN_ADDRESS` |
+| TWAL Consumer | `get_keeper`, `is_tracked` | `keeper == ADMIN_ADDRESS`; each registered pool reports tracked |
+| Router | `get_factory` (if exposed) | `factory == FACTORY_CONTRACT_ID` |
+| Batch Router | `simulate_batch([])` | Returns `[]`. There is no factory getter; the call loads the stored factory, so it only succeeds once `initialize` has run |
 | DEX Aggregator | `get_factory` / `get_admin` | matches |
 | Batch Auction | `get_admin` / `get_batch_window` | matches |
 | CL Position NFT | `get_admin` / `next_token_id` | `admin == ADMIN_ADDRESS` |
 | POL Vesting | `get_governance` | `governance == GOVERNANCE_CONTRACT_ID` |
 | Reserve Manager | `get_governance` | `governance == GOVERNANCE_CONTRACT_ID` |
 
-On failure the script prints `[deploy][warn]` but does not abort — review the
-log for warnings and re-run with `--force` after fixing the cause.
+For most contracts, failure prints `[deploy][warn]` but does not abort — review
+the log and re-run with `--force` after fixing the cause. **Token admin
+verification is an exception**: a mismatch is treated as a fatal error and
+aborts the deploy, because it indicates the contract was front-run between
+deploy and initialize. See §1 for notes on the initialization window.
+The Batch Router and TWAL Consumer steps are also strict: a failed
+`initialize` or read-back aborts the run without recording the step as done,
+so a re-run retries it.
 
 ### 4.2 Manual verification (operator checklist)
 
@@ -864,6 +902,12 @@ scripts/deploy.sh --skip governance,staking,incentive_campaigns
 # Mainnet (explicit source and network)
 NETWORK=mainnet SOURCE_ACCOUNT=mainnet-deployer scripts/deploy.sh --force
 ```
+
+Every deployable contract in the workspace has a module in `scripts/deploy/`
+and a step in `ALL_CONTRACTS` (`scripts/deploy/common.sh`), which is also the
+list `deploy.sh` loads its modules from. `scripts/check_deploy_scripts.sh`
+(`make check-deploy-scripts`, run in CI) fails when a contract crate has no
+module, is missing from `ALL_CONTRACTS`, or is never called from `main()`.
 
 ### Env file contract
 

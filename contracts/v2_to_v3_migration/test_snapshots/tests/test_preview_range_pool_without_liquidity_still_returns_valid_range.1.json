@@ -1602,7 +1602,7 @@
             },
             "ext": "v0"
           },
-          4095
+          2419200
         ]
       ],
       [
@@ -1649,10 +1649,7 @@
                           ]
                         },
                         "val": {
-                          "i128": {
-                            "hi": 0,
-                            "lo": 1
-                          }
+                          "u64": 0
                         }
                       },
                       {
@@ -2438,7 +2435,7 @@
             },
             "ext": "v0"
           },
-          518400
+          2419200
         ]
       ]
     ]
@@ -4394,7 +4391,7 @@
                 "bytes": "0000000000000000000000000000000000000000000000000000000000000008"
               },
               {
-                "symbol": "get_current_tick"
+                "symbol": "get_pool_state"
               }
             ],
             "data": "void"
@@ -4415,11 +4412,50 @@
                 "symbol": "fn_return"
               },
               {
-                "symbol": "get_current_tick"
+                "symbol": "get_pool_state"
               }
             ],
             "data": {
-              "i32": 0
+              "map": [
+                {
+                  "key": {
+                    "symbol": "active_liquidity"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 0
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "current_tick"
+                  },
+                  "val": {
+                    "i32": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "sqrt_price"
+                  },
+                  "val": {
+                    "u128": {
+                      "hi": 0,
+                      "lo": 0
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "tick_spacing"
+                  },
+                  "val": {
+                    "i32": 1
+                  }
+                }
+              ]
             }
           }
         }

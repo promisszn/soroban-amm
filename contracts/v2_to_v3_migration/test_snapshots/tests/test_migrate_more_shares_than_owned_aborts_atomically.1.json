@@ -1611,7 +1611,7 @@
             },
             "ext": "v0"
           },
-          4095
+          2419200
         ]
       ],
       [
@@ -1658,10 +1658,7 @@
                           ]
                         },
                         "val": {
-                          "i128": {
-                            "hi": 0,
-                            "lo": 1
-                          }
+                          "u64": 0
                         }
                       },
                       {
@@ -2447,7 +2444,7 @@
             },
             "ext": "v0"
           },
-          518400
+          2419200
         ]
       ]
     ]
@@ -4565,6 +4562,12 @@
                   }
                 },
                 {
+                  "i128": {
+                    "hi": 0,
+                    "lo": 0
+                  }
+                },
+                {
                   "u64": 18446744073709551615
                 }
               ]
@@ -4777,6 +4780,92 @@
                 },
                 {
                   "address": "CDLDVFKHEZ2RVB3NG4UQA4VPD3TSHV6XMHXMHP2BSGCJ2IIWVTOHGDSG"
+                }
+              ]
+            }
+          }
+        }
+      },
+      "failed_call": true
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000009",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_call"
+              },
+              {
+                "bytes": "0000000000000000000000000000000000000000000000000000000000000008"
+              },
+              {
+                "symbol": "get_pool_state"
+              }
+            ],
+            "data": "void"
+          }
+        }
+      },
+      "failed_call": true
+    },
+    {
+      "event": {
+        "ext": "v0",
+        "contract_id": "0000000000000000000000000000000000000000000000000000000000000008",
+        "type_": "diagnostic",
+        "body": {
+          "v0": {
+            "topics": [
+              {
+                "symbol": "fn_return"
+              },
+              {
+                "symbol": "get_pool_state"
+              }
+            ],
+            "data": {
+              "map": [
+                {
+                  "key": {
+                    "symbol": "active_liquidity"
+                  },
+                  "val": {
+                    "i128": {
+                      "hi": 0,
+                      "lo": 0
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "current_tick"
+                  },
+                  "val": {
+                    "i32": 0
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "sqrt_price"
+                  },
+                  "val": {
+                    "u128": {
+                      "hi": 0,
+                      "lo": 0
+                    }
+                  }
+                },
+                {
+                  "key": {
+                    "symbol": "tick_spacing"
+                  },
+                  "val": {
+                    "i32": 1
+                  }
                 }
               ]
             }
@@ -5104,6 +5193,12 @@
                     },
                     {
                       "i32": 500
+                    },
+                    {
+                      "i128": {
+                        "hi": 0,
+                        "lo": 0
+                      }
                     },
                     {
                       "i128": {

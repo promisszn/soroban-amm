@@ -104,11 +104,12 @@ make test-all   # run tests for the whole workspace
 make fmt        # cargo fmt --all
 make lint       # cargo clippy --all -- -D warnings
 make check-docs # verify docs/error-codes.md matches #[contracterror] enums
+make check-deploy-scripts # fail if a contract has no scripts/deploy/ module
 make size       # print a WASM size report for all built contracts
 make size-check # fail if any contract WASM exceeds the size limit
 make doc        # build workspace docs with warnings denied
 make audit      # run a security audit of dependencies (cargo-audit)
-make check      # fmt + lint + test + check-docs + size-check + doc (run before pushing)
+make check      # fmt + lint + test + check-docs + check-deploy-scripts + size-check + doc (run before pushing)
 make bench      # hot-path benchmarks
 make deploy     # deploy contracts via scripts/deploy.sh
 make e2e        # run the end-to-end test suite
@@ -140,6 +141,12 @@ This is intended to track the same set of checks CI enforces in
   build it, then `npm run lint` there (or `make lint-js` for all of them).
   Rules are errors or deliberately off with a reason in the config; there is
   no warn-only tier.
+- **Node version**: `.nvmrc` pins the Node major that CI runs every JS package
+  on. Each package declares it as `engines.node`, and any `@types/node`
+  dependency uses the same major, so `tsc` cannot accept an API the CI runtime
+  lacks. `make check-node-versions` (run in CI) fails on any mismatch. Moving to
+  a new Node major means changing `.nvmrc`, every `@types/node` and every
+  `engines.node` together, in one PR, with the lockfiles regenerated.
 - **WASM size**: contract binaries are size-constrained — CI fails any WASM over
   the configured limit. Prefer minimal dependencies and avoid unnecessary
   allocations in hot paths.

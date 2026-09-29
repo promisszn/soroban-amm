@@ -80,16 +80,13 @@ deploy_governance() {
         log "governance initialized"
       fi
       persist_var "GOVERNANCE_INITIALIZED" "1"
-
-      # Wire LP token locker to governance so voting can lock tokens
-      CURRENT_STEP="set_locker (LP token -> governance)"
-      log "setting LP token locker to governance"
-      if ! invoke "$LP_TOKEN_CONTRACT_ID" set_locker --locker "$GOVERNANCE_CONTRACT_ID" >/dev/null 2>&1; then
-        warn "failed to set LP token locker — may already be set"
-      else
-        log "LP token locker set to governance"
-      fi
     fi
+  fi
+
+  # Runs on every deploy, not only the first: it is idempotent, and a rerun
+  # must still fail if an earlier run left the locker unwired.
+  if should_deploy "governance"; then
+    wire_lp_locker "$AMM_POOL_CONTRACT_ID" "$LP_TOKEN_CONTRACT_ID" "$GOVERNANCE_CONTRACT_ID"
   fi
 
   CURRENT_STEP="verify governance"
@@ -98,4 +95,42 @@ deploy_governance() {
   else
     log "verified governance points at correct pool/lp"
   fi
+}
+
+# Point the LP token's locker at governance, then read it back. vote() locks
+# LP tokens through LpToken::lock, which the locker must authorise, so a
+# governance deployment whose locker is anything else cannot record a single
+# vote (issue #986). Exits the deploy on failure.
+#
+# Only the pool can change the locker (it is the LP token's admin), so the
+# change always goes through the pool's admin-gated set_lp_locker:
+# - pool admin is this account: call set_lp_locker directly;
+# - pool admin is governance (factory create_pool with governance): ask
+#   governance to call it via claim_lp_locker.
+wire_lp_locker() {
+  local pool="$1" lp="$2" gov="$3"
+  local current
+  CURRENT_STEP="read LP token locker"
+  current=$(invoke_read "$lp" locker | extract_contract_id || true)
+  if [[ "$current" == "$gov" ]]; then
+    log "LP token locker already set to governance"
+    return 0
+  fi
+
+  CURRENT_STEP="set LP token locker to governance"
+  log "setting LP token locker to governance (was ${current:-<unknown>})"
+  local out
+  if ! out=$(invoke "$pool" set_lp_locker --locker "$gov" 2>&1); then
+    log "pool set_lp_locker as $SOURCE_PUBLIC_KEY failed, trying governance claim_lp_locker: $out"
+    if ! out=$(invoke "$gov" claim_lp_locker 2>&1); then
+      die "could not set LP token locker to governance: neither this account nor governance is the pool admin: $out"
+    fi
+  fi
+
+  CURRENT_STEP="verify LP token locker"
+  current=$(invoke_read "$lp" locker | extract_contract_id || true)
+  if [[ "$current" != "$gov" ]]; then
+    die "LP token locker is ${current:-<unreadable>} after wiring, expected governance $gov — vote() would trap"
+  fi
+  log "verified LP token locker is governance"
 }

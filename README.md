@@ -121,6 +121,7 @@ The core V2 constant-product pool (`x * y = k`). It manages reserves for a token
 - **Flash loans**: Single-transaction borrowing from pool reserves repayable within the receiver callback with configurable fees (`flash_loan`). Borrowers must implement the [`FlashLoanReceiver`](examples/flash_loan_receiver/README.md) callback interface.
 - **Protocol fees**: Configurable protocol fee share routed to a dedicated recipient address.
 - **Admin & Safety**: Two-step admin transfer (`propose_admin` / `accept_admin`), emergency pause/unpause, and single-block price deviation circuit breaker.
+- **LP locker delegation**: `set_lp_locker(locker)` lets the pool admin authorize a contract (normally governance) as the LP token's locker, so `governance::vote` can lock LP tokens. Requires admin auth.
 - **Interface & Schema**: See [`docs/abi.json`](docs/abi.json) under `"amm"` for complete function definitions (`initialize`, `swap`, `add_liquidity`, `remove_liquidity`, `flash_loan`, `get_amount_out`, `get_info`, etc.).
 
 #### Flash Loan Receiver Interface
@@ -162,7 +163,7 @@ Located in [`contracts/governance/src/lib.rs`](contracts/governance/src/lib.rs).
 Enables on-chain parameter management governed by LP token holders.
 
 - **Proposals**: LP token holders meeting the minimum stake threshold can propose fee and parameter changes.
-- **Voting**: Votes are weighted by the voter's LP token balance at the time of voting; tokens are locked until proposal resolution.
+- **Voting**: Votes are weighted by the voter's LP token balance at the time of voting; tokens are locked until proposal resolution. Locking requires governance to be the LP token's locker — `claim_lp_locker()` makes this contract the locker while it is the pool admin, and `factory::create_pool` calls it automatically when deploying governance.
 - **Execution & Safety**: Passed proposals require a timelock delay before execution, and support emergency cancellation and veto mechanics.
 - **Interface & Schema**: See [`docs/abi.json`](docs/abi.json) under `"governance"`.
 
@@ -460,7 +461,7 @@ docker run --rm -v $(pwd):/app soroban-amm-build
 ```
 
 - **Base Image**: `rust:1.98.1-slim-bookworm` (matches `rust-toolchain.toml`)
-- **Stellar CLI**: `25.1.0`
+- **Stellar CLI**: `27.1.0`
 
 ### Deploy via Factory
 

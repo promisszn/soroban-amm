@@ -53,6 +53,7 @@ pub trait LpTokenInterface {
     fn mint(env: Env, to: Address, amount: i128);
     fn burn(env: Env, from: Address, amount: i128);
     fn balance(env: Env, id: Address) -> i128;
+    fn set_locker(env: Env, locker: Address);
 }
 
 /// Lifetime of a multisig emergency-withdraw proposal before it expires.
@@ -503,6 +504,29 @@ impl AmmPool {
         let admin: Address = Self::read_admin(&env)?;
         admin.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
+        Ok(())
+    }
+
+    /// Admin-only: make `locker` the LP token's locker (issue #986).
+    ///
+    /// The LP token's admin is this pool, so `LpToken::set_locker` can only be
+    /// authorised by the pool itself; no external account can call it. This
+    /// entrypoint is how the pool admin delegates that authority, most often
+    /// to point the locker at the governance contract so `governance::vote`
+    /// can lock voting LP tokens. When governance is itself the pool admin
+    /// (pools created by the factory with governance), governance invokes
+    /// this through `claim_lp_locker`.
+    pub fn set_lp_locker(env: Env, locker: Address) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
+        let admin: Address = Self::read_admin(&env)?;
+        admin.require_auth();
+        let lp_token = Self::read_lp_token(&env)?;
+        LpTokenClient::new(&env, &lp_token).set_locker(&locker);
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "lp_locker_set"),),
+            (lp_token, locker)
+        );
         Ok(())
     }
 

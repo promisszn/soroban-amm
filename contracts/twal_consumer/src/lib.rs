@@ -52,16 +52,31 @@ pub enum TwalError {
 #[contracttype]
 pub enum DataKey {
     Keeper,
-    LiquiditySnapshot(Address, u64),
     TrackedPoolsPersistent,
-    /// Sorted (ascending, deduplicated) ledger timestamps at which a
-    /// liquidity snapshot was saved for this pool. Lets `get_twal_*`
-    /// binary-search for the most recent snapshot at or before an arbitrary
-    /// `then_ts` instead of requiring an exact-timestamp hit (issue #469).
-    SnapshotTimestamps(Address),
+    /// Every retained liquidity snapshot for a pool, in one entry, sorted by
+    /// ascending (deduplicated) ledger timestamp. Readers binary-search it for
+    /// the most recent snapshot at or before an arbitrary `then_ts` (issue
+    /// #469).
+    ///
+    /// Keyed by pool only (issue #985). Snapshots used to live under
+    /// `LiquiditySnapshot(pool, ledger_timestamp)`, but a Soroban
+    /// transaction's footprint is fixed at simulation, against an earlier
+    /// ledger with an earlier timestamp, so on a real network every save wrote
+    /// a key outside its footprint and trapped. Reads had the same flaw: the
+    /// snapshot they loaded was chosen by the current timestamp. No storage
+    /// key in this contract may depend on the ledger timestamp or sequence;
+    /// `scripts/check_storage_keys.sh` enforces that in CI.
+    Snapshots(Address),
     /// Running liquidity-cumulative state for a CL pool (see `save_cl_snapshot`).
     ClAccumulator(Address),
 }
+
+/// One retained snapshot as stored under [`DataKey::Snapshots`]:
+/// `(ledger_ts, cum_liquidity, pool_ts)`. A tuple rather than
+/// [`LiquiditySnapshot`] because it encodes at roughly half the size, which
+/// is what lets [`TwalConsumer::MAX_SNAPSHOTS_PER_POOL`] snapshots fit in a
+/// single ledger entry.
+type SnapshotEntry = (u64, i128, u64);
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -137,7 +152,37 @@ impl TwalConsumer {
     /// predictable regardless of caller-supplied input.
     pub const MAX_WINDOW_SECONDS: u64 = 7_776_000;
 
+    /// Ceiling on snapshots retained per pool. All of a pool's snapshots
+    /// share one ledger entry, and ledger entries are size-limited (64 KiB on
+    /// public networks); at about 56 bytes per snapshot this keeps a full
+    /// entry near 28 KiB. Once reached, each save drops the oldest snapshot,
+    /// so a keeper saving every `MAX_WINDOW_SECONDS / MAX_SNAPSHOTS_PER_POOL`
+    /// (about 4.2 hours) or less often keeps the full 90-day window, and one
+    /// saving every 3 minutes still keeps a full day.
+    pub const MAX_SNAPSHOTS_PER_POOL: u32 = 512;
+
+    /// Instance-storage TTL maintenance.
+    ///
+    /// `twal_consumer` keeps the keeper address in instance storage, so the
+    /// instance entry holds the contract's executable together with its only
+    /// instance datum. A sporadically-read oracle surface is the most likely
+    /// contract in the workspace to have its instance entry lapse; if it does,
+    /// every call — including the read paths integrators depend on — traps
+    /// instead of returning a typed error. Every public entrypoint therefore
+    /// bumps the instance TTL. The persistent snapshot entries keep their own,
+    /// longer TTL bumps on the write paths (see `SNAPSHOT_TTL_LEDGERS`).
+    ///
+    /// Threshold and bump are expressed in ledgers. At ~5 s per ledger, 172_800
+    /// ledgers is about 10 days (top up when less than this remains) and
+    /// 518_400 ledgers is about 30 days (the target live-until). These match
+    /// the `amm` reference contract so the workspace ages its instance entries
+    /// on one schedule.
+    fn extend_ttl(env: &Env) {
+        env.storage().instance().extend_ttl(172_800, 518_400);
+    }
+
     pub fn initialize(env: Env, keeper: Address) -> Result<(), TwalError> {
+        Self::extend_ttl(&env);
         if env.storage().instance().has(&DataKey::Keeper) {
             return Err(TwalError::AlreadyInitialized);
         }
@@ -146,6 +191,7 @@ impl TwalConsumer {
     }
 
     pub fn get_keeper(env: Env) -> Result<Address, TwalError> {
+        Self::extend_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::Keeper)
@@ -158,22 +204,11 @@ impl TwalConsumer {
     }
 
     pub fn save_snapshot(env: Env, pool: Address) -> Result<(), TwalError> {
+        Self::extend_ttl(&env);
         Self::require_keeper(&env)?;
         let (cum, pool_ts) = AmmPoolLiquidityClient::new(&env, &pool).get_liquidity_cumulative();
-        let ledger_ts = env.ledger().timestamp();
-        let snapshot = LiquiditySnapshot {
-            cum_liquidity: cum,
-            pool_ts,
-        };
-        let key = DataKey::LiquiditySnapshot(pool.clone(), ledger_ts);
-        env.storage().persistent().set(&key, &snapshot);
-        env.storage().persistent().extend_ttl(
-            &key,
-            Self::SNAPSHOT_TTL_LEDGERS / 2,
-            Self::SNAPSHOT_TTL_LEDGERS,
-        );
         Self::register_tracked_pool(&env, &pool, PoolType::Amm)?;
-        Self::record_snapshot_timestamp(&env, &pool, ledger_ts);
+        Self::record_snapshot(&env, &pool, cum, pool_ts);
         Ok(())
     }
 
@@ -195,21 +230,16 @@ impl TwalConsumer {
         );
     }
 
-    /// Record `ts` in the pool's sorted snapshot-timestamp index. Ledger
-    /// timestamps are non-decreasing across calls, so appending keeps the
-    /// index sorted; skip if `ts` is already the most recent entry so a
-    /// keeper re-saving within the same ledger doesn't create a duplicate.
-    fn record_snapshot_timestamp(env: &Env, pool: &Address, ts: u64) {
-        let key = DataKey::SnapshotTimestamps(pool.clone());
-        let mut timestamps: Vec<u64> = env
-            .storage()
+    fn load_snapshots(env: &Env, pool: &Address) -> Vec<SnapshotEntry> {
+        env.storage()
             .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(env));
-        if timestamps.last() != Some(ts) {
-            timestamps.push_back(ts);
-        }
-        env.storage().persistent().set(&key, &timestamps);
+            .get(&DataKey::Snapshots(pool.clone()))
+            .unwrap_or_else(|| Vec::new(env))
+    }
+
+    fn store_snapshots(env: &Env, pool: &Address, snapshots: &Vec<SnapshotEntry>) {
+        let key = DataKey::Snapshots(pool.clone());
+        env.storage().persistent().set(&key, snapshots);
         env.storage().persistent().extend_ttl(
             &key,
             Self::SNAPSHOT_TTL_LEDGERS / 2,
@@ -217,47 +247,56 @@ impl TwalConsumer {
         );
     }
 
-    fn remove_snapshot_timestamp(env: &Env, pool: &Address, ts: u64) {
-        let key = DataKey::SnapshotTimestamps(pool.clone());
-        let timestamps: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or_else(|| Vec::new(env));
-        let mut updated: Vec<u64> = Vec::new(env);
-        for i in 0..timestamps.len() {
-            let t = timestamps.get(i).unwrap();
-            if t != ts {
-                updated.push_back(t);
-            }
+    /// Record a snapshot at the current ledger time. Ledger timestamps never
+    /// decrease, so appending keeps the list sorted; a second save within the
+    /// same ledger replaces the first. Past [`Self::MAX_SNAPSHOTS_PER_POOL`]
+    /// the oldest snapshot is dropped.
+    ///
+    /// Every key touched here is fixed given `pool`, so the footprint a
+    /// client simulates is the footprint the transaction applies with, even
+    /// though the ledger timestamp moves on in between (issue #985).
+    fn record_snapshot(env: &Env, pool: &Address, cum_liquidity: i128, pool_ts: u64) {
+        let ledger_ts = env.ledger().timestamp();
+        let entry: SnapshotEntry = (ledger_ts, cum_liquidity, pool_ts);
+        let mut snapshots = Self::load_snapshots(env, pool);
+        match snapshots.last() {
+            Some(last) if last.0 == ledger_ts => snapshots.set(snapshots.len() - 1, entry),
+            _ => snapshots.push_back(entry),
         }
-        env.storage().persistent().set(&key, &updated);
+        while snapshots.len() > Self::MAX_SNAPSHOTS_PER_POOL {
+            snapshots.pop_front();
+        }
+        Self::store_snapshots(env, pool, &snapshots);
     }
 
-    /// Binary-search the pool's snapshot-timestamp index for the most recent
-    /// entry at or before `then_ts` (the "floor"). Returns `None` if no
-    /// snapshot that old exists.
-    fn floor_snapshot_ts(env: &Env, pool: &Address, then_ts: u64) -> Option<u64> {
-        let timestamps: Vec<u64> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::SnapshotTimestamps(pool.clone()))
-            .unwrap_or_else(|| Vec::new(env));
+    /// Binary-search the pool's snapshots for the most recent one at or
+    /// before `then_ts` (the "floor"). Returns `None` if no snapshot that old
+    /// exists.
+    fn floor_snapshot(env: &Env, pool: &Address, then_ts: u64) -> Option<LiquiditySnapshot> {
+        let snapshots = Self::load_snapshots(env, pool);
         let mut lo: u32 = 0;
-        let mut hi: u32 = timestamps.len();
+        let mut hi: u32 = snapshots.len();
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if timestamps.get(mid).unwrap() <= then_ts {
+            if snapshots.get(mid).unwrap().0 <= then_ts {
                 lo = mid + 1;
             } else {
                 hi = mid;
             }
         }
         if lo == 0 {
-            None
-        } else {
-            Some(timestamps.get(lo - 1).unwrap())
+            return None;
         }
+        let (_, cum_liquidity, pool_ts) = snapshots.get(lo - 1).unwrap();
+        Some(LiquiditySnapshot {
+            cum_liquidity,
+            pool_ts,
+        })
+    }
+
+    /// Returns the number of snapshots retained for `pool`.
+    pub fn get_snapshot_count(env: Env, pool: Address) -> u32 {
+        Self::load_snapshots(&env, &pool).len()
     }
 
     fn first_tracked_index(tracked: &Vec<TrackedPool>, pool: &Address) -> Option<u32> {
@@ -285,14 +324,18 @@ impl TwalConsumer {
             pool_type,
         });
         Self::store_tracked(env, &tracked);
-        env.events()
-            .publish((Symbol::new(env, "pool_add"),), pool.clone());
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(env, "pool_add"),),
+            pool.clone()
+        );
         Ok(())
     }
 
     /// Adds `pool` to the tracked set as the given `pool_type`. Keeper-only,
     /// idempotent, rejects growth past `MAX_TRACKED_POOLS`.
     pub fn add_tracked_pool(env: Env, pool: Address, pool_type: PoolType) -> Result<(), TwalError> {
+        Self::extend_ttl(&env);
         Self::require_keeper(&env)?;
         Self::register_tracked_pool(&env, &pool, pool_type)
     }
@@ -301,29 +344,36 @@ impl TwalConsumer {
     /// the remaining pools. Keeper-only. Errors with `NotTracked` if the pool
     /// was never in the set.
     pub fn remove_tracked_pool(env: Env, pool: Address) -> Result<(), TwalError> {
+        Self::extend_ttl(&env);
         Self::require_keeper(&env)?;
         let mut tracked = Self::load_tracked(&env);
         let idx = Self::first_tracked_index(&tracked, &pool).ok_or(TwalError::NotTracked)?;
         tracked.remove(idx);
         Self::store_tracked(&env, &tracked);
-        env.events()
-            .publish((Symbol::new(&env, "pool_remove"),), pool);
+        soroban_amm_sdk::emit_versioned_event!(
+            &env,
+            (Symbol::new(&env, "pool_remove"),),
+            pool
+        );
         Ok(())
     }
 
     /// Returns whether `pool` is currently in the tracked set.
     pub fn is_tracked(env: Env, pool: Address) -> bool {
+        Self::extend_ttl(&env);
         Self::first_tracked_index(&Self::load_tracked(&env), &pool).is_some()
     }
 
     /// Returns the number of currently tracked pools.
     pub fn get_tracked_pool_count(env: Env) -> u32 {
+        Self::extend_ttl(&env);
         Self::load_tracked(&env).len()
     }
 
     /// Returns up to `limit` tracked pool addresses starting at `offset`.
     /// `limit == 0` and `offset >= count` both return an empty `Vec`.
     pub fn get_tracked_pools_paginated(env: Env, offset: u32, limit: u32) -> Vec<Address> {
+        Self::extend_ttl(&env);
         let tracked = Self::load_tracked(&env);
         let len = tracked.len();
         let mut out = Vec::new(&env);
@@ -365,14 +415,8 @@ impl TwalConsumer {
         // No snapshot at or before the window start: the pool's recorded
         // history does not reach back far enough, mirroring
         // `get_twal_liquidity`'s treatment of the same condition.
-        let floor_ts =
-            Self::floor_snapshot_ts(env, pool, then_ts).ok_or(TwalError::InsufficientHistory)?;
-        // The timestamp index named a snapshot that is not in storage.
-        let snapshot: LiquiditySnapshot = env
-            .storage()
-            .persistent()
-            .get(&DataKey::LiquiditySnapshot(pool.clone(), floor_ts))
-            .ok_or(TwalError::NoSnapshotFound)?;
+        let snapshot =
+            Self::floor_snapshot(env, pool, then_ts).ok_or(TwalError::InsufficientHistory)?;
         let accumulator: ClLiquidityAccumulator = env
             .storage()
             .persistent()
@@ -439,16 +483,8 @@ impl TwalConsumer {
                     return fail(TwalError::InsufficientHistory);
                 }
                 let then_ts = ledger_ts_now - window_seconds;
-                let Some(floor_ts) = Self::floor_snapshot_ts(env, &pool, then_ts) else {
+                let Some(snapshot) = Self::floor_snapshot(env, &pool, then_ts) else {
                     return fail(TwalError::NoSnapshotFound);
-                };
-                let snapshot: LiquiditySnapshot = match env
-                    .storage()
-                    .persistent()
-                    .get(&DataKey::LiquiditySnapshot(pool.clone(), floor_ts))
-                {
-                    Some(s) => s,
-                    None => return fail(TwalError::NoSnapshotFound),
                 };
 
                 let delta = (cum_now as u128).wrapping_sub(snapshot.cum_liquidity as u128) as i128;
@@ -483,6 +519,7 @@ impl TwalConsumer {
         pool: Address,
         window_seconds: u64,
     ) -> Result<i128, TwalError> {
+        Self::extend_ttl(&env);
         if window_seconds == 0 {
             return Err(TwalError::ZeroWindow);
         }
@@ -496,13 +533,8 @@ impl TwalConsumer {
             return Err(TwalError::InsufficientHistory);
         }
         let then_ts = ledger_ts_now - window_seconds;
-        let floor_ts =
-            Self::floor_snapshot_ts(&env, &pool, then_ts).ok_or(TwalError::InsufficientHistory)?;
-        let snapshot: LiquiditySnapshot = env
-            .storage()
-            .persistent()
-            .get(&DataKey::LiquiditySnapshot(pool, floor_ts))
-            .ok_or(TwalError::NoSnapshotFound)?;
+        let snapshot =
+            Self::floor_snapshot(&env, &pool, then_ts).ok_or(TwalError::InsufficientHistory)?;
 
         let delta = (cum_now as u128).wrapping_sub(snapshot.cum_liquidity as u128) as i128;
         let elapsed = (pool_ts_now - snapshot.pool_ts) as i128;
@@ -517,6 +549,7 @@ impl TwalConsumer {
     /// usable snapshot, a non-contract address, or a panicking callee yields
     /// `ok: false` in its slot rather than aborting the call.
     pub fn get_twal_all_safe(env: Env, window_seconds: u64) -> Vec<TwalEntry> {
+        Self::extend_ttl(&env);
         let tracked = Self::load_tracked(&env);
         let mut out = Vec::new(&env);
         for i in 0..tracked.len() {
@@ -541,6 +574,7 @@ impl TwalConsumer {
         pools: Vec<(Address, PoolType)>,
         window_seconds: u64,
     ) -> Result<Vec<TwalEntry>, TwalError> {
+        Self::extend_ttl(&env);
         if pools.len() > Self::MAX_TRACKED_POOLS {
             return Err(TwalError::TooManyPools);
         }
@@ -565,6 +599,7 @@ impl TwalConsumer {
     /// prefer `get_twal_all_safe` for per-pool detail; unlike this
     /// function, it never aborts the whole batch on one bad pool.
     pub fn get_twal_all(env: Env, window_seconds: u64) -> Result<Vec<(Address, i128)>, TwalError> {
+        Self::extend_ttl(&env);
         let entries = Self::get_twal_all_safe(env.clone(), window_seconds);
         let mut results: Vec<(Address, i128)> = Vec::new(&env);
         for i in 0..entries.len() {
@@ -579,6 +614,7 @@ impl TwalConsumer {
 
     /// Returns the full tracked-pool set, including each pool's type.
     pub fn get_tracked_pools(env: Env) -> Vec<TrackedPool> {
+        Self::extend_ttl(&env);
         Self::load_tracked(&env)
     }
 
@@ -591,6 +627,7 @@ impl TwalConsumer {
     /// in the snapshot, so `get_cl_twal` can difference two snapshots to recover
     /// an average liquidity *level* rather than a rate of change (issue #462).
     pub fn save_cl_snapshot(env: Env, pool: Address) -> Result<(), TwalError> {
+        Self::extend_ttl(&env);
         Self::require_keeper(&env)?;
         let active = ClPoolLiquidityClient::new(&env, &pool).active_liquidity();
         let ledger_ts = env.ledger().timestamp();
@@ -623,33 +660,27 @@ impl TwalConsumer {
 
         // Store the running cumulative (and the ledger time it corresponds to)
         // so a later query can difference two points of the integral.
-        let snapshot = LiquiditySnapshot {
-            cum_liquidity: cum,
-            pool_ts: ledger_ts,
-        };
-        let key = DataKey::LiquiditySnapshot(pool.clone(), ledger_ts);
-        env.storage().persistent().set(&key, &snapshot);
-        env.storage().persistent().extend_ttl(
-            &key,
-            Self::SNAPSHOT_TTL_LEDGERS / 2,
-            Self::SNAPSHOT_TTL_LEDGERS,
-        );
         Self::register_tracked_pool(&env, &pool, PoolType::Cl)?;
-        Self::record_snapshot_timestamp(&env, &pool, ledger_ts);
+        Self::record_snapshot(&env, &pool, cum, ledger_ts);
         Ok(())
     }
 
     /// Deletes a stored liquidity snapshot from persistent storage. Keeper-only.
     pub fn delete_snapshot(env: Env, pool: Address, ledger_ts: u64) -> Result<(), TwalError> {
+        Self::extend_ttl(&env);
         Self::require_keeper(&env)?;
-        let key = DataKey::LiquiditySnapshot(pool.clone(), ledger_ts);
-        if !env.storage().persistent().has(&key) {
-            return Err(TwalError::NoSnapshotFound);
-        }
-        env.storage().persistent().remove(&key);
-        Self::remove_snapshot_timestamp(&env, &pool, ledger_ts);
-        env.events()
-            .publish((Symbol::new(&env, "snapshot_deleted"),), (pool, ledger_ts));
+        let mut snapshots = Self::load_snapshots(&env, &pool);
+        let index = snapshots
+            .iter()
+            .position(|entry| entry.0 == ledger_ts)
+            .ok_or(TwalError::NoSnapshotFound)?;
+        snapshots.remove(index as u32);
+        Self::store_snapshots(&env, &pool, &snapshots);
+        soroban_amm_sdk::emit_versioned_event!(
+            &env,
+            (Symbol::new(&env, "snapshot_deleted"),),
+            (pool, ledger_ts)
+        );
         Ok(())
     }
     /// Returns the time-weighted average active liquidity for a CL pool over
@@ -673,23 +704,23 @@ impl TwalConsumer {
     ///   [`TwalConsumer::MAX_WINDOW_SECONDS`].
     /// - [`TwalError::InsufficientHistory`] — the ledger clock predates the
     ///   window, or no snapshot exists at or before the window start.
-    /// - [`TwalError::NoSnapshotFound`] — the snapshot the timestamp index
-    ///   named is absent from storage.
     /// - [`TwalError::MissingClAccumulator`] — no `ClAccumulator` for the
     ///   pool; call `save_cl_snapshot` first.
     /// - [`TwalError::ElapsedZero`] — pool time did not advance across the
     ///   window.
     pub fn get_cl_twal(env: Env, pool: Address, window_seconds: u64) -> Result<i128, TwalError> {
+        Self::extend_ttl(&env);
         Self::get_cl_twal_checked(&env, &pool, window_seconds)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
     use amm::{AmmPool, AmmPoolClient};
     use soroban_sdk::{
-        testutils::{Address as _, Ledger},
+        testutils::{storage::Instance as _, Address as _, Events as _, Ledger},
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
         Address, Env,
     };
@@ -1572,25 +1603,25 @@ mod tests {
     }
 
     #[test]
-    fn test_cl_twal_missing_snapshot_entry_returns_no_snapshot_found() {
+    fn test_cl_twal_missing_snapshot_history_returns_insufficient_history() {
         let env = Env::default();
         let (pool_addr, consumer) = setup_cl_pool(&env);
         let consumer_addr = consumer.address.clone();
 
         env.ledger().with_mut(|l| l.timestamp = 10_600);
 
-        // Drop the snapshot entry itself while leaving the timestamp index
-        // pointing at it -- the index names a floor snapshot that storage no
-        // longer holds.
+        // Snapshots and their timestamps now share one entry, so an index
+        // naming a missing snapshot can no longer happen; losing the entry
+        // just means there is no history to read.
         env.as_contract(&consumer_addr, || {
             env.storage()
                 .persistent()
-                .remove(&DataKey::LiquiditySnapshot(pool_addr.clone(), 10_000));
+                .remove(&DataKey::Snapshots(pool_addr.clone()));
         });
 
         assert_eq!(
             consumer.try_get_cl_twal(&pool_addr, &600),
-            Err(Ok(TwalError::NoSnapshotFound))
+            Err(Ok(TwalError::InsufficientHistory))
         );
     }
 
@@ -1626,18 +1657,12 @@ mod tests {
         // Backdate nothing but the floor snapshot pool_ts to *now*, so the
         // averaging span collapses to zero.
         env.as_contract(&consumer_addr, || {
-            let snapshot: LiquiditySnapshot = env
-                .storage()
-                .persistent()
-                .get(&DataKey::LiquiditySnapshot(pool_addr.clone(), 10_000))
-                .unwrap();
-            env.storage().persistent().set(
-                &DataKey::LiquiditySnapshot(pool_addr.clone(), 10_000),
-                &LiquiditySnapshot {
-                    cum_liquidity: snapshot.cum_liquidity,
-                    pool_ts: 10_600,
-                },
-            );
+            let key = DataKey::Snapshots(pool_addr.clone());
+            let mut snapshots: Vec<SnapshotEntry> = env.storage().persistent().get(&key).unwrap();
+            let (ledger_ts, cum_liquidity, _) = snapshots.get(0).unwrap();
+            assert_eq!(ledger_ts, 10_000);
+            snapshots.set(0, (ledger_ts, cum_liquidity, 10_600));
+            env.storage().persistent().set(&key, &snapshots);
         });
 
         assert_eq!(
@@ -1688,5 +1713,270 @@ mod tests {
             consumer.try_get_cl_twal(&pool_addr, &600),
             Err(Ok(TwalError::MissingClAccumulator))
         );
+    }
+
+    /// Stub AMM pool whose liquidity cumulative grows with ledger time. In
+    /// its own module so its generated symbols don't collide with the other
+    /// stub pools'.
+    mod stub_amm_pool {
+        use soroban_sdk::{contract, contractimpl, Env};
+
+        #[contract]
+        pub struct StubAmmPool;
+
+        #[contractimpl]
+        impl StubAmmPool {
+            pub fn get_liquidity_cumulative(env: Env) -> (i128, u64) {
+                let ts = env.ledger().timestamp();
+                (ts as i128 * 1_000, ts)
+            }
+        }
+    }
+    use stub_amm_pool::StubAmmPool;
+
+    /// A consumer plus a stub AMM pool, with the clock at 10_000.
+    fn setup_amm_pool(env: &Env) -> (Address, TwalConsumerClient<'_>) {
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+        let (_keeper, consumer) = setup_consumer(env);
+        (env.register_contract(None, StubAmmPool), consumer)
+    }
+
+    /// Every contract storage key in the ledger. A Soroban transaction may only
+    /// touch keys its simulated footprint lists, so the keys a save writes
+    /// must not change with the ledger clock (issue #985).
+    fn contract_data_keys(env: &Env) -> std::collections::BTreeSet<soroban_sdk::xdr::LedgerKey> {
+        env.to_snapshot()
+            .ledger
+            .ledger_entries
+            .into_iter()
+            .map(|(key, _)| *key)
+            // Auth nonces (from `mock_all_auths`) are not contract storage.
+            .filter(|key| {
+                matches!(key, soroban_sdk::xdr::LedgerKey::ContractData(data)
+                    if !matches!(data.key, soroban_sdk::xdr::ScVal::LedgerKeyNonce(_)))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn save_snapshot_keys_do_not_depend_on_ledger_time() {
+        let env = Env::default();
+        let (pool, consumer) = setup_amm_pool(&env);
+        consumer.save_snapshot(&pool);
+        let keys_before = contract_data_keys(&env);
+        let start = env.ledger().timestamp();
+        for dt in [5, 60, 90_000] {
+            env.ledger().with_mut(|l| l.timestamp = start + dt);
+            consumer.save_snapshot(&pool);
+            assert_eq!(
+                contract_data_keys(&env),
+                keys_before,
+                "save at +{dt}s wrote a new key"
+            );
+        }
+    }
+
+    #[test]
+    fn save_cl_snapshot_keys_do_not_depend_on_ledger_time() {
+        let env = Env::default();
+        let (pool, consumer) = setup_cl_pool(&env);
+        let keys_before = contract_data_keys(&env);
+        let start = env.ledger().timestamp();
+        for dt in [1, 600, 86_400] {
+            env.ledger().with_mut(|l| l.timestamp = start + dt);
+            consumer.save_cl_snapshot(&pool);
+            assert_eq!(
+                contract_data_keys(&env),
+                keys_before,
+                "save at +{dt}s wrote a new key"
+            );
+        }
+    }
+
+    #[test]
+    fn full_history_is_capped_fits_one_entry_and_stays_within_budget() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        let (pool, consumer) = setup_amm_pool(&env);
+        let cap = TwalConsumer::MAX_SNAPSHOTS_PER_POOL;
+        let start = env.ledger().timestamp();
+        for i in 0..cap + 25 {
+            env.ledger()
+                .with_mut(|l| l.timestamp = start + 60 * i as u64);
+            consumer.save_snapshot(&pool);
+        }
+        assert_eq!(consumer.get_snapshot_count(&pool), cap);
+
+        let (oldest, encoded) = env.as_contract(&consumer.address, || {
+            let snapshots: Vec<SnapshotEntry> = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Snapshots(pool.clone()))
+                .unwrap();
+            use soroban_sdk::xdr::ToXdr;
+            (snapshots.get(0).unwrap().0, snapshots.to_xdr(&env).len())
+        });
+        assert_eq!(oldest, start + 60 * 25);
+        assert!(
+            encoded < 48 * 1024,
+            "full history encodes to {encoded} bytes"
+        );
+
+        env.budget().reset_default();
+        env.ledger()
+            .with_mut(|l| l.timestamp = start + 60 * (cap + 25) as u64);
+        consumer.save_snapshot(&pool);
+        assert_eq!(consumer.get_snapshot_count(&pool), cap);
+    }
+
+    // ── Issue #919: every twal_consumer event carries EVENT_SCHEMA_VERSION ────
+    //
+    // These publish sites used to call `env.events().publish(...)` directly, so
+    // their payloads were not version-stamped and an indexer reading
+    // `(version, ...rest)` would have decoded the first real field as the
+    // version number. Each test below pins the stamp for one topic.
+
+    /// Fetch the payload of the most recent event `contract` published under the
+    /// single-symbol `topic`, decoded as a version-stamped `(u32, T)` pair.
+    fn last_versioned_event<T>(env: &Env, contract: &Address, topic: &str) -> (u32, T)
+    where
+        T: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>,
+    {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::IntoVal;
+
+        let wanted: soroban_sdk::Vec<soroban_sdk::Val> =
+            (Symbol::new(env, topic),).into_val(env);
+        let evt = env
+            .events()
+            .all()
+            .iter()
+            .rfind(|e| &e.0 == contract && e.1 == wanted)
+            .unwrap_or_else(|| panic!("no `{topic}` event found"));
+        evt.2.into_val(env)
+    }
+
+    #[test]
+    fn test_pool_add_emits_versioned_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_keeper, consumer) = setup_consumer(&env);
+        let pool = Address::generate(&env);
+
+        consumer.add_tracked_pool(&pool, &PoolType::Amm);
+
+        let (version, data): (u32, Address) =
+            last_versioned_event(&env, &consumer.address, "pool_add");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(version, 1);
+        assert_eq!(data, pool);
+    }
+
+    #[test]
+    fn test_pool_remove_emits_versioned_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_keeper, consumer) = setup_consumer(&env);
+        let pool = Address::generate(&env);
+
+        consumer.add_tracked_pool(&pool, &PoolType::Amm);
+        consumer.remove_tracked_pool(&pool);
+
+        let (version, data): (u32, Address) =
+            last_versioned_event(&env, &consumer.address, "pool_remove");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(version, 1);
+        assert_eq!(data, pool);
+    }
+
+    #[test]
+    fn test_snapshot_deleted_emits_versioned_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+
+        let admin = Address::generate(&env);
+        let amm_addr = env.register_contract(None, AmmPool);
+        let lp_addr = env.register_contract(None, LpToken);
+        let consumer_addr = env.register_contract(None, TwalConsumer);
+
+        token::LpTokenClient::new(&env, &lp_addr).initialize(
+            &amm_addr,
+            &soroban_sdk::String::from_str(&env, "LP"),
+            &soroban_sdk::String::from_str(&env, "LP"),
+            &7u32,
+        );
+
+        let (ta, ta_sac) = create_sac(&env, &admin);
+        let (tb, tb_sac) = create_sac(&env, &admin);
+        AmmPoolClient::new(&env, &amm_addr).initialize(
+            &admin,
+            &ta.address,
+            &tb.address,
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &0_i128,
+        );
+
+        let provider = Address::generate(&env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        AmmPoolClient::new(&env, &amm_addr).add_liquidity(
+            &provider,
+            &1_000_000_i128,
+            &1_000_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+
+        let consumer = TwalConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&admin);
+        consumer.save_snapshot(&amm_addr);
+        consumer.delete_snapshot(&amm_addr, &10_000_u64);
+
+        let (version, data): (u32, (Address, u64)) =
+            last_versioned_event(&env, &consumer.address, "snapshot_deleted");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(version, 1);
+        assert_eq!(data, (amm_addr, 10_000_u64));
+    }
+
+    // ── #911: instance TTL is extended on every entrypoint ───────────────────
+
+    /// Advancing the ledger far past the default instance-entry TTL and then
+    /// calling entrypoints must keep the contract responsive rather than
+    /// trapping on an archived instance entry. The keeper lives in instance
+    /// storage, so an archived instance entry means every call — including the
+    /// read paths integrators depend on — traps. Each entrypoint now bumps the
+    /// instance TTL; this walks the ledger forward in steps smaller than the
+    /// bump window, calling in between, and asserts the reads still return.
+    /// Without the extension the first call after the advance would trap.
+    #[test]
+    fn instance_ttl_is_extended_on_access_across_ledger_advance() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| {
+            l.sequence_number = 1_000;
+            l.max_entry_ttl = 6_312_000;
+        });
+
+        let admin = Address::generate(&env);
+        let consumer_addr = env.register_contract(None, TwalConsumer);
+        let consumer = TwalConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&admin);
+
+        let pool = Address::generate(&env);
+
+        // Step forward in increments smaller than the TTL bump (518_400),
+        // calling an entrypoint each step. Each call re-bumps, so the next step
+        // stays live rather than trapping on an evicted instance entry.
+        for _ in 0..4 {
+            env.ledger().with_mut(|l| l.sequence_number += 400_000);
+            assert_eq!(consumer.get_keeper(), admin);
+            assert_eq!(consumer.get_tracked_pool_count(), 0);
+            assert!(!consumer.is_tracked(&pool));
+        }
     }
 }

@@ -3,10 +3,13 @@
 # pre-installed toolchain is reused rather than replaced on every build.
 FROM rust:1.98.1-slim-bookworm
 
-# Install system dependencies
+# Install system dependencies. libdbus-1-dev and libudev-dev are needed to
+# build stellar-cli from source on Linux (its keyring and Ledger support).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     libssl-dev \
+    libdbus-1-dev \
+    libudev-dev \
     build-essential \
     ca-certificates \
     curl \
@@ -20,17 +23,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # so rustup will install it automatically when cargo first runs.  There is
 # no need (and it would be wrong) to add wasm32-unknown-unknown here.
 
-# Install the Stellar CLI from its prebuilt release binary rather than
-# `cargo install`: compiling it ties the CLI to this image's compiler, and
-# stellar-cli 25.1.0's locked `ethnum` no longer builds on Rust 1.98. The
-# version stays the one documented in README.md and the deployment runbook
-# (unifying the pins is #955). The binary links libdbus and libudev
-# (installed above) and needs glibc >= 2.34.
-ARG STELLAR_CLI_VERSION=25.1.0
-RUN arch="$(uname -m)" \
-    && curl -fsSL "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-${arch}-unknown-linux-gnu.tar.gz" \
-    | tar -xz -C /usr/local/bin stellar \
-    && stellar --version
+# Install Stellar CLI pinned to the same version documented in README.md,
+# release.yml and smoke-test.yml. `--locked` builds its own Cargo.lock with
+# this image's compiler, so the pin must be a release whose locked tree still
+# compiles on the toolchain above: 25.1.0 locks ethnum 1.5.2, which Rust
+# 1.98.1 rejects (E0512, cannot transmute between types of different sizes);
+# 27.1.0 locks ethnum 1.5.3, the version this workspace already builds with.
+RUN cargo install stellar-cli --version 27.1.0 --locked
 
 WORKDIR /app
 
@@ -73,11 +72,30 @@ COPY examples/flash_loan_receiver/Cargo.toml    examples/flash_loan_receiver/Car
 
 # Fetch all registry dependencies so the network is not needed during the
 # actual build.  rustup installs the pinned toolchain (including
-# wasm32v1-none) on first invocation via rust-toolchain.toml.  Only
-# manifests are present here, so the script stubs each target's source file
-# for the duration of the fetch.
-COPY scripts/docker_fetch_deps.sh scripts/docker_fetch_deps.sh
-RUN sh scripts/docker_fetch_deps.sh
+# wasm32v1-none) on first invocation via rust-toolchain.toml.
+#
+# Cargo will not load a manifest whose targets have no source file, so each
+# member first gets an empty placeholder for the files its manifest implies:
+# every explicit `path = "..."` target, plus src/lib.rs for a [lib] crate or
+# src/main.rs for a binary-only one. The placeholders are deleted in the same
+# step, so none reach the image; `COPY . .` below brings the real sources.
+RUN set -eu; \
+    stubs=$(mktemp); \
+    for manifest in $(find . -name Cargo.toml -not -path ./Cargo.toml); do \
+        dir=$(dirname "$manifest"); \
+        { sed -n 's/^path *= *"\(.*\)"/\1/p' "$manifest"; \
+          if grep -q '^\[lib\]' "$manifest"; then echo src/lib.rs; else echo src/main.rs; fi; \
+        } | sort -u | while read -r file; do \
+            if [ ! -e "$dir/$file" ]; then \
+                mkdir -p "$dir/$(dirname "$file")"; \
+                : > "$dir/$file"; \
+                echo "$dir/$file" >> "$stubs"; \
+            fi; \
+        done; \
+    done; \
+    cargo fetch; \
+    xargs rm -f < "$stubs"; \
+    rm -f "$stubs"
 
 # Copy the full source tree and build.
 COPY . .

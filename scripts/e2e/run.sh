@@ -8,7 +8,7 @@
 #   bash scripts/e2e/run.sh --skip factory
 #
 # Two kinds of flow:
-#   - shared flows (v2 factory cl governance staking) run against the
+#   - shared flows (v2 factory cl governance staking twap) run against the
 #     addresses deploy.sh writes to $DEPLOY_ENV;
 #   - self-contained flows (token router dex_aggregator oracle_aggregator
 #     cl_position_nft pol_vesting twap_consumer) deploy their own instances
@@ -24,7 +24,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/e2e/common.sh
 source "$ROOT_DIR/e2e/common.sh"
 
-SHARED_FLOWS=(v2 factory cl governance staking)
+SHARED_FLOWS=(v2 factory cl governance staking twap)
 SELF_CONTAINED_FLOWS=(token router dex_aggregator oracle_aggregator cl_position_nft pol_vesting twap_consumer)
 ALL_FLOWS=("${SHARED_FLOWS[@]}" "${SELF_CONTAINED_FLOWS[@]}")
 
@@ -108,6 +108,8 @@ source "$ROOT_DIR/e2e/cl.sh"
 source "$ROOT_DIR/e2e/governance.sh"
 # shellcheck source=scripts/e2e/staking.sh
 source "$ROOT_DIR/e2e/staking.sh"
+# shellcheck source=scripts/e2e/twap.sh
+source "$ROOT_DIR/e2e/twap.sh"
 # shellcheck source=scripts/e2e/token.sh
 source "$ROOT_DIR/e2e/token.sh"
 # shellcheck source=scripts/e2e/router.sh
@@ -158,6 +160,7 @@ run_flow_isolated factory run_factory_flow
 run_flow_isolated cl run_cl_flow
 run_flow_isolated governance run_governance_flow
 run_flow_isolated staking run_staking_flow
+run_flow_isolated twap run_twap_flow
 run_flow_isolated token run_token_flow
 run_flow_isolated router run_router_flow
 run_flow_isolated dex_aggregator run_dex_aggregator_flow

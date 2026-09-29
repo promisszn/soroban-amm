@@ -6,7 +6,7 @@ WASM_DIR := target/wasm32v1-none/release
 
 SHELL := bash
 
-.PHONY: all help build release-build optimize test test-all fmt lint lint-js check check-docs \
+.PHONY: all help build release-build optimize test test-all fmt lint lint-js check-node-versions check check-docs check-storage-keys check-deploy-scripts \
         size size-check doc audit bench deploy e2e clean fuzz-cl
 
 # Bare `make` explains itself instead of building.
@@ -57,8 +57,17 @@ lint: ## cargo clippy --all -- -D warnings
 lint-js: ## ESLint every JS/TS workspace (run `npm ci` at the root and in each workspace first)
 	npm run lint
 
+check-node-versions: ## Verify every JS package's @types/node and engines.node match .nvmrc
+	node scripts/check_node_versions.mjs
+
 check-docs: ## Verify docs/error-codes.md matches #[contracterror] enums
 	bash scripts/check_error_docs.sh
+
+check-storage-keys: ## Fail if a TWAP/TWAL storage key is built from the ledger timestamp or sequence
+	bash scripts/check_storage_keys.sh
+
+check-deploy-scripts: ## Fail if a deployable contract has no scripts/deploy/ module wired into deploy.sh
+	bash scripts/check_deploy_scripts.sh
 
 size: ## Print a WASM size report for all built contracts
 	bash scripts/size_report.sh
@@ -76,7 +85,7 @@ audit: ## Run a security audit of dependencies (cargo install cargo-audit if mis
 	}
 	cargo audit
 
-check: fmt lint test check-docs size-check doc ## Run the checks CI enforces before pushing
+check: fmt lint test check-docs check-storage-keys check-deploy-scripts size-check doc ## Run the checks CI enforces before pushing
 
 bench: ## Run hot-path benchmarks
 	cargo run -p benches -- --check

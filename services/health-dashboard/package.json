@@ -4,6 +4,9 @@
   "private": true,
   "type": "module",
   "description": "Off-chain pool health monitoring dashboard for the Soroban AMM",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "npx serve . -p 3000",
     "build": "tsc -p tsconfig.json && test -f styles.css",
