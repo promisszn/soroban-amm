@@ -48,6 +48,7 @@ unstake independently.
 |---|---|
 | `add_rewards(admin, amount)` | Transfer reward tokens into the pool; admin only |
 | `update_rewards(admin, new_rewards)` | Distribute new rewards across all stakers via the accumulator; admin only |
+| `reconcile_reward_accounting(admin, offset, limit, done)` | Repair legacy reward accounting on a deployed pool (see issue #1045); admin only, paginated |
 | `claim(staker) → rewards` | Claim accrued rewards without unstaking |
 | `pending_rewards(staker) → i128` | Read a staker's unclaimed rewards |
 
@@ -55,6 +56,7 @@ unstake independently.
 
 | Function | Description |
 |---|---|
-| `get_pool_info() → PoolInfo` | Read pool state: token addresses, admin, total effective staked, reward pool balance, and accumulated rewards per share |
+| `get_pool_info() → PoolInfo` | Read pool state: token addresses, admin, total effective staked, undistributed reward balance, and accumulated rewards per share |
+| `get_owed_rewards() → i128` | Read rewards already assigned to stakers but not yet paid out (#1045) |
 | `get_staker_info(staker) → StakerInfo` | Read a staker's raw and effective amounts, rewards debt, lock expiry, and boost multiplier |
 | `get_locked_position(staker) → LockedPosition` | Read a staker's locked amount, lock expiry, and boost multiplier |

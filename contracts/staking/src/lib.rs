@@ -128,8 +128,32 @@ pub enum DataKey {
     StakerAmount(Address),
     /// Staker info: rewards debt (to track already-distributed rewards)
     StakerRewardsDebt(Address),
-    /// Remaining reward tokens available in pool
+    /// Undistributed reward tokens: funded by `add_rewards`, not yet assigned
+    /// to stakers via the accumulator. `update_rewards` moves an amount out of
+    /// here and into `OwedRewards` (#1045).
+    ///
+    /// Legacy note (issue #1045): on contracts deployed before the fix this
+    /// key held a single counter that was decremented both when rewards were
+    /// distributed and when they were paid out, so it drifted negative and
+    /// stranded every reward cycle after the first. `reconcile_reward_accounting`
+    /// repairs such deployments; on fresh contracts the invariant
+    /// `token_balance >= UndistributedRewards + OwedRewards` always holds.
     RewardPoolBalance,
+    /// Reward tokens already assigned to stakers through
+    /// `AccumulatedRewardsPerShare` but not yet paid out (#1045).
+    /// `update_rewards` adds to it; `claim`/`unstake`/`_settle_pending_at`
+    /// subtract exactly what they transfer.
+    OwedRewards,
+    /// Accounting reconcile accumulator (#1045). Maps a staker address to the
+    /// portion of `OwedRewards` already re-credited by a partially-completed
+    /// `reconcile_reward_accounting` run, so a large staker index can be
+    /// walked across many paginated calls without double-counting. Fully
+    /// cleared once the reconcile completes.
+    ReconcileState(Address),
+    /// Running cross-page total for a partially-completed
+    /// `reconcile_reward_accounting` run (#1045); cleared when the run is
+    /// finalized.
+    ReconcileTotal,
     /// Lock expiry timestamp (seconds) for a staker; 0 = no lock
     LockExpiry(Address),
     /// Boost multiplier for a staker (scaled by BOOST_SCALE); default = BOOST_SCALE (1Ãƒâ€”)
@@ -186,6 +210,10 @@ pub struct PoolInfo {
     pub reward_token: Address,
     pub admin: Address,
     pub total_effective_staked: i128,
+    /// Undistributed rewards: funded by `add_rewards`, not yet assigned to
+    /// stakers via the accumulator (#1045). This struct keeps its historical
+    /// field name for ABI compatibility; before the #1045 fix it could
+    /// report a corrupted negative value. It is never negative now.
     pub reward_pool_balance: i128,
     pub accumulated_rewards_per_share: i128,
 }
@@ -197,6 +225,41 @@ pub struct Staking;
 
 #[contractimpl]
 impl Staking {
+    /// Undistributed rewards: funded by `add_rewards`, not yet assigned to
+    /// stakers through the per-share accumulator (#1045).
+    ///
+    /// `update_rewards` is the only entrypoint that moves tokens out of this
+    /// counter — it debits what it distributes and credits `OwedRewards`.
+    /// Claims and settlements pay from `OwedRewards` and never touch it, and
+    /// the `ConfigMaxRewardPoolBalance` cap is enforced against it.
+    fn _undistributed_rewards(env: &Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::RewardPoolBalance)
+            .unwrap_or(0)
+    }
+
+    /// Rewards already assigned to stakers through
+    /// `AccumulatedRewardsPerShare` but not yet paid out (#1045).
+    ///
+    /// Increases in `update_rewards` (by the distributed amount), decreases
+    /// in `_claim_rewards`/`_settle_pending_at` (by exactly what is paid) and
+    /// in `emergency_withdraw` (forfeited pending rewards). The chain-wide
+    /// invariant is
+    /// `reward_token.balance(contract) >= UndistributedRewards + OwedRewards`
+    /// — the slack is the rounding dust left behind by the per-share integer
+    /// division, plus anything `add_rewards` measured (transfers may deliver
+    /// slightly less than requested). The dust is small and permanently
+    /// unclaimable by construction; the contract never pays out more than
+    /// stakers were credited for.
+    pub fn get_owed_rewards(env: Env) -> i128 {
+        Self::extend_instance_ttl(&env);
+        env.storage()
+            .instance()
+            .get(&DataKey::OwedRewards)
+            .unwrap_or(0)
+    }
+
     /// Initialize the staking contract.
     pub fn initialize(
         env: Env,
@@ -222,6 +285,7 @@ impl Staking {
         env.storage()
             .instance()
             .set(&DataKey::RewardPoolBalance, &0i128);
+        env.storage().instance().set(&DataKey::OwedRewards, &0i128);
         // ConfigMaxRewardPoolBalance initialized above
         Self::_write_boost_config(
             &env,
@@ -269,6 +333,7 @@ impl Staking {
         env.storage()
             .instance()
             .set(&DataKey::RewardPoolBalance, &0i128);
+        env.storage().instance().set(&DataKey::OwedRewards, &0i128);
         env.storage()
             .instance()
             .set(&DataKey::ConfigMaxRewardPoolBalance, &0i128);
@@ -450,25 +515,24 @@ impl Staking {
         // Record postÃ¢â‚¬â€˜transfer token balance to determine actual received amount
         let post_balance: i128 = token_client.balance(&pool_addr);
         let received: i128 = post_balance - pre_balance;
-        // Update reward pool balance with the actual received amount
-        let current_balance: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::RewardPoolBalance)
-            .unwrap_or(0);
-        let new_balance = current_balance + received;
+        // #1045: `add_rewards` funds only the undistributed side of the
+        // accounting. The cap is enforced against this counter — claims pay
+        // out of `OwedRewards` and cannot exceed it, so they can never push
+        // funding past the cap.
+        let current_undistributed = Self::_undistributed_rewards(&env);
+        let new_undistributed = current_undistributed + received;
         // Enforce optional max reward pool balance cap (0 = no cap)
         let max_balance: i128 = env
             .storage()
             .instance()
             .get(&DataKey::ConfigMaxRewardPoolBalance)
             .unwrap_or(0);
-        if max_balance != 0 && new_balance > max_balance {
+        if max_balance != 0 && new_undistributed > max_balance {
             return Err(StakingError::MaxRewardPoolExceeded);
         }
         env.storage()
             .instance()
-            .set(&DataKey::RewardPoolBalance, &new_balance);
+            .set(&DataKey::RewardPoolBalance, &new_undistributed);
         // Emit event with the actual amount added
         soroban_amm_sdk::emit_versioned_event!(
             env,
@@ -873,6 +937,12 @@ impl Staking {
     }
 
     /// Set the optional maximum reward pool balance. Admin only.
+    ///
+    /// The cap is defined against the pool's **undistributed** rewards —
+    /// tokens funded by `add_rewards` but not yet assigned to stakers through
+    /// the accumulator (#1045). Tokens already owed to stakers do not count
+    /// toward the cap, and claims never touch the capped counter, so the cap
+    /// limits funding only and is unaffected by claims.
     pub fn set_max_reward_pool_balance(
         env: Env,
         admin: Address,
@@ -888,11 +958,7 @@ impl Staking {
         if admin != stored_admin {
             return Err(StakingError::Unauthorized);
         }
-        let current_balance: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::RewardPoolBalance)
-            .unwrap_or(0);
+        let current_balance = Self::_undistributed_rewards(&env);
         // 0 means no cap; otherwise ensure the new cap is not below current balance
         if max_balance != 0 && max_balance < current_balance {
             return Err(StakingError::InvalidMaxBalance);
@@ -958,6 +1024,14 @@ impl Staking {
             .instance()
             .set(&DataKey::TotalEffectiveStaked, &(total - effective).max(0));
 
+        // #1045: forfeited pending rewards leave the owed counter. The
+        // underlying tokens stay in the contract undistributed, so the
+        // accounting invariant balance >= undistributed + owed is preserved
+        // and the cap (defined against undistributed rewards) is unaffected.
+        // Read before the debt is zeroed below, which is what zeroes
+        // `pending_rewards`.
+        let forfeited = Self::pending_rewards(env.clone(), staker.clone()).max(0);
+
         // Zero out the staker's position, debt, boost, and lock.
         env.storage()
             .persistent()
@@ -971,6 +1045,13 @@ impl Staking {
         env.storage()
             .persistent()
             .set(&DataKey::LockExpiry(staker.clone()), &0u64);
+
+        if forfeited > 0 {
+            let owed = Self::get_owed_rewards(env.clone());
+            env.storage()
+                .instance()
+                .set(&DataKey::OwedRewards, &(owed - forfeited).max(0));
+        }
 
         // #699: fully exiting via emergency_withdraw also empties the
         // position, so drop from the staker index the same as unstake does.
@@ -1373,6 +1454,164 @@ impl Staking {
         Ok(())
     }
 
+    /// Repair legacy reward accounting on an already-deployed contract (admin
+    /// only, #1045).
+    ///
+    /// Contracts deployed before the #1045 fix kept a single
+    /// `RewardPoolBalance` counter that was decremented both when rewards
+    /// were distributed (`update_rewards`) and when they were paid out
+    /// (`claim`/`unstake`/settlement). The counter therefore went negative
+    /// after the first payout cycle, `update_rewards` clamped to it and
+    /// distributed nothing, and every subsequently funded reward was stranded
+    /// in the contract.
+    ///
+    /// This entrypoint re-derives both counters from ground truth:
+    ///
+    /// - `undistributed := reward_token.balance(contract) - owed`, with `owed`
+    ///   recomputed from the stakers themselves, so no per-share rounding dust
+    ///   is double-counted and the result is never negative;
+    /// - `owed := Σ (effective * acc_per_share / SCALE - rewards_debt)` over
+    ///   every currently-staked address found through the staker index.
+    ///
+    /// The reward-token balance (not the old corrupted counter) is the source
+    /// of truth for what the contract actually holds, which is what repairs a
+    /// deployment whose storage was seeded with the negative value.
+    ///
+    /// Paginated: the staker index can be large, so one call processes at
+    /// most `MAX_BATCH_SIZE` entries, starting at `offset`. A partially
+    /// completed run is resume-safe — each processed staker's credited
+    /// portion of `OwedRewards` is checkpointed under
+    /// `DataKey::ReconcileState` so later pages add only the remainder, and
+    /// no double-count is possible even if pages overlap. The caller passes
+    /// `done = true` on the final page (when `offset + limit >= index len`)
+    /// to finalize the run: it clamps the recomputed owed total to the actual
+    /// token balance, writes the undistributed remainder, clears the
+    /// reconcile state, and emits `rewards_reconciled` with before/after
+    /// values. A pool whose stakers were migrated via
+    /// `register_existing_stakers` must backfill the index first, or the
+    /// recomputed `owed` will miss those stakers.
+    ///
+    /// The run itself moves no tokens and touches no staker position: rewards
+    /// a staker is credited for stay claimable through the normal
+    /// `claim`/`unstake` paths, which then decrement `OwedRewards` the usual
+    /// way. Returns the final `(undistributed, owed)` pair once the run is
+    /// complete; intermediate pages return the running `(0, owed)`.
+    pub fn reconcile_reward_accounting(
+        env: Env,
+        admin: Address,
+        offset: u32,
+        limit: u32,
+        done: bool,
+    ) -> Result<(i128, i128), StakingError> {
+        Self::extend_instance_ttl(&env);
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(StakingError::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(StakingError::Unauthorized);
+        }
+        if limit == 0 || limit > MAX_BATCH_SIZE {
+            return Err(StakingError::BatchTooLarge);
+        }
+
+        let acc_per_share: i128 = env
+            .storage()
+            .instance()
+            .get(&DataKey::AccumulatedRewardsPerShare)
+            .unwrap_or(0);
+
+        // Recompute owed from the stakers on this page. This is a pure
+        // computation: credited rewards stay where they are (still claimable
+        // through the staker's own debt accounting) and are merely counted
+        // into the global `OwedRewards` total on the final page.
+        let index = Self::_index_load(&env);
+        let len = index.len();
+        let mut owed_total: i128 = 0;
+        let start = offset.min(len);
+        let end = offset.saturating_add(limit).min(len);
+        let mut i = start;
+        while i < end {
+            let staker = index.get(i).unwrap();
+            let raw: i128 = env
+                .storage()
+                .persistent()
+                .get(&DataKey::StakerAmount(staker.clone()))
+                .unwrap_or(0);
+            let credited = if raw > 0 {
+                let effective = Self::_staker_effective(&env, &staker);
+                let rewards_debt: i128 = env
+                    .storage()
+                    .persistent()
+                    .get(&DataKey::StakerRewardsDebt(staker.clone()))
+                    .unwrap_or(0);
+                (effective * acc_per_share / SCALE_FACTOR - rewards_debt).max(0)
+            } else {
+                0
+            };
+            let already = env
+                .storage()
+                .instance()
+                .get(&DataKey::ReconcileState(staker.clone()))
+                .unwrap_or(0);
+            if credited > already {
+                owed_total += credited - already;
+            }
+            env.storage()
+                .instance()
+                .set(&DataKey::ReconcileState(staker.clone()), &credited);
+            i += 1;
+        }
+
+        // Carry any earlier pages' checkpointed totals.
+        let key_state = DataKey::ReconcileTotal;
+        let carried: i128 = env.storage().instance().get(&key_state).unwrap_or(0);
+        owed_total += carried;
+        env.storage().instance().set(&key_state, &owed_total);
+
+        if !done {
+            // Not finalizing yet: report the running totals.
+            return Ok((0, owed_total));
+        }
+
+        // Final page: clamp the owed total to what the contract actually
+        // holds (legacy storage may report more than exists), then write both
+        // counters from ground truth and emit the before/after event.
+        let reward_token: Address = env.storage().instance().get(&DataKey::RewardToken).unwrap();
+        let pool_addr = env.current_contract_address();
+        let token_balance = SepTokenClient::new(&env, &reward_token).balance(&pool_addr);
+
+        let old_undistributed = Self::_undistributed_rewards(&env);
+        let old_owed = Self::get_owed_rewards(env.clone());
+
+        let owed = owed_total.min(token_balance);
+        let undistributed = (token_balance - owed).max(0);
+
+        env.storage()
+            .instance()
+            .set(&DataKey::RewardPoolBalance, &undistributed);
+        env.storage().instance().set(&DataKey::OwedRewards, &owed);
+
+        // Clear the per-staker checkpoints and the running total.
+        let mut j = start;
+        while j < end {
+            env.storage()
+                .instance()
+                .remove(&DataKey::ReconcileState(index.get(j).unwrap()));
+            j += 1;
+        }
+        env.storage().instance().remove(&key_state);
+
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "rewards_reconciled"),),
+            (admin, old_undistributed, old_owed, undistributed, owed)
+        );
+        Ok((undistributed, owed))
+    }
+
     /// Distribute new rewards across all stakers. Admin only.
     pub fn update_rewards(env: Env, admin: Address, new_rewards: i128) -> Result<(), StakingError> {
         Self::extend_instance_ttl(&env);
@@ -1414,11 +1653,7 @@ impl Staking {
             .get(&DataKey::AccumulatedRewardsPerShare)
             .unwrap_or(0);
 
-        let pool_balance: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::RewardPoolBalance)
-            .unwrap_or(0);
+        let pool_balance: i128 = Self::_undistributed_rewards(&env);
 
         // Clamp the distributable rewards to what's actually in the pool.
         let distributable: i128 = if new_rewards <= pool_balance {
@@ -1443,9 +1678,21 @@ impl Staking {
                 .instance()
                 .set(&DataKey::AccumulatedRewardsPerShare, &acc_per_share);
 
+            // #1045: what is distributed here stops being undistributed and
+            // becomes owed. Claims pay out of the owed side only, so a cycle
+            // of add_rewards → update_rewards → claim leaves the undistributed
+            // balance at 0 instead of decrementing it twice.
             env.storage()
                 .instance()
                 .set(&DataKey::RewardPoolBalance, &(pool_balance - distributable));
+            let owed: i128 = env
+                .storage()
+                .instance()
+                .get(&DataKey::OwedRewards)
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&DataKey::OwedRewards, &(owed + distributable));
 
             soroban_amm_sdk::emit_versioned_event!(
                 env,
@@ -1494,14 +1741,18 @@ impl Staking {
 
         SepTokenClient::new(env, &reward_token).transfer(&pool_addr, staker, &pending);
 
-        let pool_balance: i128 = env
+        // #1045: paying a claim decrements only the owed side. The
+        // undistributed counter was already debited when the rewards were
+        // distributed in `update_rewards`; decrementing it here as well was
+        // the double-count that stranded every reward cycle after the first.
+        let owed: i128 = env
             .storage()
             .instance()
-            .get(&DataKey::RewardPoolBalance)
+            .get(&DataKey::OwedRewards)
             .unwrap_or(0);
         env.storage()
             .instance()
-            .set(&DataKey::RewardPoolBalance, &(pool_balance - pending));
+            .set(&DataKey::OwedRewards, &(owed - pending).max(0));
 
         soroban_amm_sdk::emit_versioned_event!(
             env,
@@ -1703,14 +1954,16 @@ impl Staking {
 
         SepTokenClient::new(env, &reward_token).transfer(&pool_addr, staker, &pending);
 
-        let pool_balance: i128 = env
+        // #1045: same as _claim_rewards — settlement pays out of the owed
+        // side only and never touches the undistributed counter.
+        let owed: i128 = env
             .storage()
             .instance()
-            .get(&DataKey::RewardPoolBalance)
+            .get(&DataKey::OwedRewards)
             .unwrap_or(0);
         env.storage()
             .instance()
-            .set(&DataKey::RewardPoolBalance, &(pool_balance - pending));
+            .set(&DataKey::OwedRewards, &(owed - pending).max(0));
 
         soroban_amm_sdk::emit_versioned_event!(
             env,
@@ -3387,5 +3640,478 @@ mod tests {
 
         // Old admin still in control
         assert_eq!(staking.get_admin(), admin);
+    }
+
+    // ── Issue #1045: reward accounting is decremented exactly once ─────────
+    //
+    // Main decremented the single RewardPoolBalance counter both when rewards
+    // were distributed (update_rewards) and when they were paid out (claim,
+    // unstake, _settle_pending_at). The counter went negative after the first
+    // payout, update_rewards clamped to it and distributed nothing, and every
+    // reward cycle after the first was stranded in the contract.
+
+    /// The reproduction from the issue: add_rewards(10_000), stake(1_000),
+    /// update_rewards(10_000), claim(). Must end with a non-negative
+    /// balance equal to 0 undistributed and 0 owed. Fails on main, where the
+    /// final balance reads -10_000.
+    #[test]
+    fn test_reward_balance_not_double_decremented_repro_1045() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staker, staking) = setup(&env);
+
+        // The issue's reproduction: `setup` already funded and escrowed
+        // 10_000 reward tokens; stake, distribute them, then claim.
+        staking.stake(&staker, &1_000_i128);
+        staking.update_rewards(&admin, &10_000_i128);
+
+        let pool = staking.get_pool_info();
+        assert_eq!(
+            pool.reward_pool_balance, 0,
+            "after distribution everything is owed, nothing undistributed"
+        );
+        assert_eq!(staking.get_owed_rewards(), 10_000);
+
+        let claimed = staking.claim(&staker);
+        assert_eq!(claimed, 10_000);
+
+        let pool = staking.get_pool_info();
+        assert_eq!(
+            pool.reward_pool_balance, 0,
+            "claims must never touch the undistributed counter"
+        );
+        assert_eq!(
+            staking.get_owed_rewards(),
+            0,
+            "paying the claim must zero the owed counter"
+        );
+    }
+
+    /// The stranded-cycle regression: with three rounds of
+    /// add_rewards(X) → update_rewards(X) → claim by two stakers, each round
+    /// distributes exactly X (± per-share dust). On main the second round
+    /// distributes 0 because the double-decremented balance had gone
+    /// negative, so this test fails there.
+    #[test]
+    fn test_multi_cycle_rewards_distribute_every_round() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let staking_addr = env.register_contract(None, Staking);
+        let (lp_token, lp_sac) = create_sac(&env, &admin);
+        let (reward_token, reward_sac) = create_sac(&env, &admin);
+        let staking = StakingClient::new(&env, &staking_addr);
+        staking.initialize(&lp_token.address, &reward_token.address, &admin);
+        reward_sac.mint(&admin, &100_000_i128);
+
+        let staker_a = Address::generate(&env);
+        let staker_b = Address::generate(&env);
+        lp_sac.mint(&staker_a, &1_000_i128);
+        lp_sac.mint(&staker_b, &3_000_i128);
+        staking.stake(&staker_a, &1_000_i128);
+        staking.stake(&staker_b, &3_000_i128);
+
+        let reward_client = StellarTokenClient::new(&env, &reward_token.address);
+        let mut paid_total: i128 = 0;
+        for _round in 0..3u32 {
+            let x = 10_000_i128;
+            staking.add_rewards(&admin, &x);
+            staking.update_rewards(&admin, &x);
+
+            let pool = staking.get_pool_info();
+            assert_eq!(
+                pool.reward_pool_balance, 0,
+                "each round distributes exactly X, so nothing is left undistributed"
+            );
+            assert_eq!(staking.get_owed_rewards(), x);
+
+            paid_total += staking.claim(&staker_a) + staking.claim(&staker_b);
+            assert_eq!(staking.get_owed_rewards(), 0);
+            assert_eq!(staking.get_pool_info().reward_pool_balance, 0);
+        }
+
+        // 30_000 distributed across 1:3 shares; 10_000 over 4_000 effective
+        // is exactly 2.5 per share, so every round pays out in full with no
+        // rounding dust at all.
+        assert_eq!(paid_total, 30_000);
+        assert_eq!(reward_client.balance(&staker_a), 7_500);
+        assert_eq!(reward_client.balance(&staker_b), 22_500);
+    }
+
+    /// Property-style soak: 300+ random operations over 3+ stakers covering
+    /// stake, unstake, lock, extend_lock, claim, add_rewards,
+    /// update_rewards, and emergency_withdraw. After every step the
+    /// accounting invariant balance >= undistributed + owed holds and neither
+    /// counter is negative. On main this fails almost immediately: claims
+    /// decrement the same counter update_rewards already debited, so the
+    /// balance drops below undistributed + owed (and below 0).
+    #[test]
+    fn test_accounting_invariant_over_randomized_operations_1045() {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let staking_addr = env.register_contract(None, Staking);
+        let (lp_token, lp_sac) = create_sac(&env, &admin);
+        let (reward_token, reward_sac) = create_sac(&env, &admin);
+        let staking = StakingClient::new(&env, &staking_addr);
+        staking.initialize(&lp_token.address, &reward_token.address, &admin);
+        reward_sac.mint(&admin, &1_000_000_i128);
+
+        let stakers: [Address; 4] = [
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        ];
+        for s in stakers.iter() {
+            lp_sac.mint(s, &100_000_i128);
+        }
+        let reward_client = StellarTokenClient::new(&env, &reward_token.address);
+
+        let mut rng_state: u64 = 0x1045_1045;
+        for step in 0..320u32 {
+            // 320 host-invoked operations blow the default cumulative CPU
+            // budget long before step 300 even though every individual call
+            // is cheap; the budget is a harness concern, not part of the
+            // invariant under test, so refresh it periodically.
+            if step > 0 && step % 64 == 0 {
+                env.budget().reset_default();
+            }
+            let r = next_rand(&mut rng_state);
+            let who = (r % 4) as usize;
+            let action = (r / 4) % 8;
+            let staker = &stakers[who];
+
+            match action {
+                0 => {
+                    let amount = 100 + (r % 900) as i128;
+                    staking.stake(staker, &amount);
+                }
+                1 => {
+                    let amount = 100 + (r % 900) as i128;
+                    let span = MAX_LOCK_DURATION - MIN_LOCK_DURATION;
+                    let dur = MIN_LOCK_DURATION + (r % (span + 1));
+                    staking.stake_locked(staker, &amount, &dur);
+                }
+                2 => {
+                    // advance time so locks expire in the background
+                    let delta = 1 + (r % (MIN_LOCK_DURATION / 2));
+                    env.ledger().with_mut(|l| l.timestamp += delta);
+                }
+                3 => {
+                    if staking.total_effective_staked() > 0 {
+                        let amount = 10 + (r % 500) as i128;
+                        staking.add_rewards(&admin, &amount);
+                        staking.update_rewards(&admin, &amount);
+                    }
+                }
+                4 => {
+                    if staking.pending_rewards(staker) > 0 {
+                        staking.claim(staker);
+                    }
+                }
+                5 => {
+                    // extend_lock on a live lock
+                    let expiry = staking.boost_expires_at(staker);
+                    if expiry > env.ledger().timestamp() {
+                        staking.extend_lock(staker, &MIN_LOCK_DURATION);
+                    }
+                }
+                6 => {
+                    // partial unstake, lock permitting
+                    let staked = staking.get_staker_info(staker).staked_amount;
+                    let expiry = staking.boost_expires_at(staker);
+                    if staked > 0 && env.ledger().timestamp() >= expiry {
+                        let amount = 1 + (r % (staked as u64).max(1)) as i128;
+                        staking.unstake(staker, &amount.min(staked));
+                    }
+                }
+                _ => {
+                    // emergency_withdraw forfeits pending rewards
+                    if staking.get_staker_info(staker).staked_amount > 0 {
+                        staking.set_emergency_mode(&admin, &true);
+                        staking.emergency_withdraw(staker);
+                        staking.set_emergency_mode(&admin, &false);
+                    }
+                }
+            }
+
+            // ---- The #1045 invariant, after every step ----
+            let undistributed = staking.get_pool_info().reward_pool_balance;
+            let owed = staking.get_owed_rewards();
+            assert!(
+                undistributed >= 0,
+                "step {step}: undistributed went negative ({undistributed})"
+            );
+            assert!(owed >= 0, "step {step}: owed went negative ({owed})");
+            let balance = reward_client.balance(&staking_addr);
+            assert!(
+                balance >= undistributed + owed,
+                "step {step}: balance {balance} < undistributed {undistributed} + owed {owed}"
+            );
+        }
+
+        // Nothing was lost, either: the final step's invariant already
+        // compared the contract's token balance against both counters.
+        let undistributed = staking.get_pool_info().reward_pool_balance;
+        let owed = staking.get_owed_rewards();
+        assert!(
+            reward_client.balance(&staking_addr) >= undistributed + owed,
+            "final invariant violated"
+        );
+    }
+
+    /// The cap limits undistributed funding only: claims must not affect it.
+    #[test]
+    fn test_cap_limits_undistributed_funding_and_is_unaffected_by_claims() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let staking_addr = env.register_contract(None, Staking);
+        let (lp_token, lp_sac) = create_sac(&env, &admin);
+        let (reward_token, reward_sac) = create_sac(&env, &admin);
+        let staking = StakingClient::new(&env, &staking_addr);
+        staking.initialize(&lp_token.address, &reward_token.address, &admin);
+        reward_sac.mint(&admin, &100_000_i128);
+        staking.set_max_reward_pool_balance(&admin, &5_000_i128);
+
+        let staker = Address::generate(&env);
+        lp_sac.mint(&staker, &1_000_i128);
+        staking.stake(&staker, &1_000_i128);
+
+        // Funding up to the cap is fine.
+        staking.add_rewards(&admin, &5_000_i128);
+        // Exceeding it is rejected...
+        assert_eq!(
+            staking.try_add_rewards(&admin, &1_i128),
+            Err(Ok(StakingError::MaxRewardPoolExceeded))
+        );
+
+        // ...and after distributing and claiming, the undistributed side is
+        // zero, so the full cap headroom is available again: claims never
+        // consumed cap capacity on main's corrupted counter.
+        staking.update_rewards(&admin, &5_000_i128);
+        let claimed = staking.claim(&staker);
+        assert_eq!(claimed, 5_000);
+        staking.add_rewards(&admin, &5_000_i128);
+        assert_eq!(staking.get_pool_info().reward_pool_balance, 5_000);
+
+        // Lowering the cap onto a pool with only owed rewards (nothing
+        // undistributed) is allowed — the cap is defined against
+        // undistributed rewards, not the corrupted main counter.
+        staking.update_rewards(&admin, &5_000_i128);
+        staking.set_max_reward_pool_balance(&admin, &1_i128);
+        assert_eq!(staking.get_owed_rewards(), 5_000);
+    }
+
+    /// The cap view (`reward_pool_balance`) stays accurate while owed rewards
+    /// are outstanding — under main's double-decrement this read went
+    /// negative.
+    #[test]
+    fn test_pool_info_balance_never_negative_with_outstanding_owed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staker, staking) = setup(&env);
+
+        staking.stake(&staker, &1_000_i128);
+        staking.update_rewards(&admin, &9_000_i128);
+
+        let pool = staking.get_pool_info();
+        assert!(pool.reward_pool_balance >= 0);
+        assert_eq!(pool.reward_pool_balance, 1_000);
+        assert_eq!(staking.get_owed_rewards(), 9_000);
+    }
+
+    /// Settlements (stake / extend_lock / settle_boost) decrement the owed
+    /// counter exactly like claims do, and never the undistributed side.
+    #[test]
+    fn test_settlement_decrements_owed_not_undistributed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staker, staking) = setup(&env);
+
+        staking.stake(&staker, &1_000_i128);
+        staking.update_rewards(&admin, &500_i128);
+        assert_eq!(staking.get_owed_rewards(), 500);
+        assert_eq!(staking.get_pool_info().reward_pool_balance, 9_500);
+
+        // stake_locked settles pending rewards before changing the position.
+        staking.stake_locked(&staker, &1_000_i128, &MIN_LOCK_DURATION);
+        assert_eq!(
+            staking.get_owed_rewards(),
+            0,
+            "settlement must decrement owed"
+        );
+        assert_eq!(
+            staking.get_pool_info().reward_pool_balance,
+            9_500,
+            "settlement must not touch undistributed"
+        );
+    }
+
+    /// `emergency_withdraw` forfeits pending rewards, which must leave the
+    /// owed counter: those tokens revert to undistributed and the invariant
+    /// keeps holding.
+    #[test]
+    fn test_emergency_withdraw_forfeits_pending_out_of_owed_1045() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staker, staking) = setup(&env);
+        let reward_token = staking.get_pool_info().reward_token;
+        let reward_client = StellarTokenClient::new(&env, &reward_token);
+
+        staking.stake(&staker, &1_000_i128);
+        staking.update_rewards(&admin, &500_i128);
+        assert_eq!(staking.get_owed_rewards(), 500);
+
+        staking.set_emergency_mode(&admin, &true);
+        staking.emergency_withdraw(&staker);
+
+        assert_eq!(
+            staking.get_owed_rewards(),
+            0,
+            "forfeited pending must leave the owed counter"
+        );
+        assert_eq!(
+            staking.get_pool_info().reward_pool_balance,
+            9_500,
+            "forfeiture must not change the undistributed side"
+        );
+        // balance (10_000, untouched by emergency_withdraw) >= 9_500 + 0.
+        assert!(reward_client.balance(&staking.address) >= 9_500);
+    }
+
+    /// `reconcile_reward_accounting` repairs a contract whose storage was
+    /// seeded with main's corrupted negative value.
+    #[test]
+    fn test_reconcile_reward_accounting_repairs_corrupted_storage() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, staker, staking) = setup(&env);
+        let reward_token = staking.get_pool_info().reward_token;
+        let reward_client = StellarTokenClient::new(&env, &reward_token);
+
+        staking.stake(&staker, &1_000_i128);
+        staking.update_rewards(&admin, &500_i128);
+        assert_eq!(staking.get_owed_rewards(), 500);
+
+        // Seed the legacy corruption directly: a negative RewardPoolBalance,
+        // as observed on main after the first payout cycle, plus a missing
+        // OwedRewards entry (pre-fix deployments never had one).
+        env.as_contract(&staking.address, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::RewardPoolBalance, &(-10_000_i128));
+            env.storage().instance().remove(&DataKey::OwedRewards);
+        });
+        assert_eq!(staking.get_pool_info().reward_pool_balance, -10_000);
+
+        // The contract holds 10_000 tokens (nothing paid out yet); one
+        // staker is owed 500 of them, so 9_500 are undistributed.
+        let (undistributed, owed) = staking.reconcile_reward_accounting(&admin, &0, &50, &true);
+        assert_eq!((undistributed, owed), (9_500, 500));
+        assert_eq!(staking.get_pool_info().reward_pool_balance, 9_500);
+        assert_eq!(staking.get_owed_rewards(), 500);
+
+        // The repaired contract is fully functional again: the staker can
+        // claim the owed 500, and a fresh cycle distributes normally.
+        assert_eq!(staking.claim(&staker), 500);
+        assert_eq!(staking.get_owed_rewards(), 0);
+        assert_eq!(
+            staking.get_pool_info().reward_pool_balance,
+            9_500,
+            "claim must not touch the undistributed side"
+        );
+        assert_eq!(reward_client.balance(&staker), 500);
+    }
+
+    /// `reconcile_reward_accounting` is admin-only.
+    #[test]
+    fn test_reconcile_reward_accounting_is_admin_only() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, staker, staking) = setup(&env);
+        assert_eq!(
+            staking.try_reconcile_reward_accounting(&staker, &0, &50, &true),
+            Err(Ok(StakingError::Unauthorized))
+        );
+        // And it rejects out-of-range page sizes.
+        let admin = staking.get_admin();
+        assert_eq!(
+            staking.try_reconcile_reward_accounting(&admin, &0, &0, &true),
+            Err(Ok(StakingError::BatchTooLarge))
+        );
+        assert_eq!(
+            staking.try_reconcile_reward_accounting(&admin, &0, &(MAX_BATCH_SIZE + 1), &true),
+            Err(Ok(StakingError::BatchTooLarge))
+        );
+    }
+
+    /// Paginated reconcile over multiple stakers: partial pages checkpoint
+    /// their total, and the final page writes both counters. No staker loses
+    /// a credited reward to the repair.
+    #[test]
+    fn test_reconcile_reward_accounting_paginates_over_stakers() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let staking_addr = env.register_contract(None, Staking);
+        let (lp_token, lp_sac) = create_sac(&env, &admin);
+        let (reward_token, reward_sac) = create_sac(&env, &admin);
+        let staking = StakingClient::new(&env, &staking_addr);
+        staking.initialize(&lp_token.address, &reward_token.address, &admin);
+        reward_sac.mint(&admin, &10_000_i128);
+
+        // Three equal stakers, one 3_000 distribution.
+        let stakers: [Address; 3] = [
+            Address::generate(&env),
+            Address::generate(&env),
+            Address::generate(&env),
+        ];
+        for s in stakers.iter() {
+            lp_sac.mint(s, &1_000_i128);
+            staking.stake(s, &1_000_i128);
+        }
+        staking.add_rewards(&admin, &3_000_i128);
+        staking.update_rewards(&admin, &3_000_i128);
+
+        // Corrupt the legacy counter the way main did.
+        env.as_contract(&staking_addr, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::RewardPoolBalance, &(-5_i128));
+            env.storage().instance().remove(&DataKey::OwedRewards);
+        });
+
+        // Page 1 (1 staker), then the final page with the rest.
+        let running = staking.reconcile_reward_accounting(&admin, &0, &1, &false);
+        assert_eq!(running.1, 1_000, "page 1 checkpoints one staker's credit");
+        let (undistributed, owed) = staking.reconcile_reward_accounting(&admin, &1, &50, &true);
+        assert_eq!((undistributed, owed), (0, 3_000));
+
+        // Every staker can claim their full credit afterward.
+        for s in stakers.iter() {
+            assert_eq!(staking.claim(s), 1_000);
+        }
+        assert_eq!(staking.get_owed_rewards(), 0);
+        assert_eq!(staking.get_pool_info().reward_pool_balance, 0);
+    }
+
+    /// A no-op reconcile (nothing staked, nothing owed) leaves a healthy
+    /// pool's accounting untouched and is safe to run at any time.
+    #[test]
+    fn test_reconcile_reward_accounting_is_noop_on_healthy_pool() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (admin, _staker, staking) = setup(&env);
+
+        // `setup` funded 10_000; nobody staked, so nothing is owed. The
+        // reconcile rewrites both counters from the token balance (10_000)
+        // and the recomputed owed (0), leaving a healthy pool untouched.
+        let (undistributed, owed) = staking.reconcile_reward_accounting(&admin, &0, &50, &true);
+        assert_eq!((undistributed, owed), (10_000, 0));
+        assert_eq!(staking.get_pool_info().reward_pool_balance, 10_000);
+        assert_eq!(staking.get_owed_rewards(), 0);
     }
 }

@@ -427,8 +427,8 @@ Defined in [contracts/staking/src/lib.rs](../contracts/staking/src/lib.rs) as `S
 | 13 | `NothingToStake` | A stake call supplied neither a positive amount nor a lock duration. | Pass a positive amount, a lock duration, or both. |
 | 14 | `InvalidBoostConfig` | The boost bounds were non-positive, or the max was below the min. | Pass `0 < min_boost <= max_boost`. |
 | 15 | `InvalidLockDuration` | The lock-duration bounds were non-positive, or the max was below the min. | Pass `0 < min_lock_duration <= max_lock_duration`. |
-| 16 | `MaxRewardPoolExceeded` | `add_rewards` would push the pool balance above the configured cap. | Lower the amount added, or raise the cap with `set_max_reward_pool_balance`. |
-| 17 | `InvalidMaxBalance` | A new max-balance cap was set below the current pool balance. | Use a cap of `0` (no cap) or one at least the current balance. |
+| 16 | `MaxRewardPoolExceeded` | `add_rewards` would push the undistributed reward balance above the configured cap. | Lower the amount added, or raise the cap with `set_max_reward_pool_balance`. |
+| 17 | `InvalidMaxBalance` | A new max-balance cap was set below the current undistributed reward balance. | Use a cap of `0` (no cap) or one at least the current undistributed balance. |
 | 18 | `NoStakers` | `update_rewards` was called while the pool has no effective stake. | Wait until at least one address has staked. |
 | 19 | `BatchTooLarge` | `settle_boost_batch` or `register_existing_stakers` was given more than `MAX_BATCH_SIZE` (50) addresses. | Split the list into chunks of at most 50 addresses per call. |
 | 20 | `NoPendingAdmin` | `accept_admin` was called when no admin transfer is in progress. | Call `propose_admin` first to nominate a successor. |

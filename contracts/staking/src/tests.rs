@@ -309,4 +309,14 @@ mod versioned_events {
         c.settle_boost(&f.staker);
         assert_topic_versioned(&f.env, &f.contract, "boost_exp");
     }
+
+    // ── #1045: the reconcile repair emits a versioned event ──────────────────
+
+    #[test]
+    fn rewards_reconciled_event_is_versioned() {
+        let f = setup();
+        let c = StakingClient::new(&f.env, &f.contract);
+        c.reconcile_reward_accounting(&f.admin, &0, &50, &true);
+        assert_topic_versioned(&f.env, &f.contract, "rewards_reconciled");
+    }
 }

@@ -819,6 +819,21 @@
                         "key": {
                           "vec": [
                             {
+                              "symbol": "OwedRewards"
+                            }
+                          ]
+                        },
+                        "val": {
+                          "i128": {
+                            "hi": 0,
+                            "lo": 1
+                          }
+                        }
+                      },
+                      {
+                        "key": {
+                          "vec": [
+                            {
                               "symbol": "RewardPoolBalance"
                             }
                           ]
@@ -826,7 +841,7 @@
                         "val": {
                           "i128": {
                             "hi": 0,
-                            "lo": 2001
+                            "lo": 6000
                           }
                         }
                       },
@@ -2195,13 +2210,20 @@
             "data": {
               "vec": [
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                  "u32": 1
                 },
                 {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 10000
-                  }
+                  "vec": [
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM"
+                    },
+                    {
+                      "i128": {
+                        "hi": 0,
+                        "lo": 10000
+                      }
+                    }
+                  ]
                 }
               ]
             }
@@ -2466,22 +2488,29 @@
             "data": {
               "vec": [
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                  "u32": 1
                 },
                 {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 4000
-                  }
-                },
-                {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 10071
-                  }
-                },
-                {
-                  "u64": 604800
+                  "vec": [
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                    },
+                    {
+                      "i128": {
+                        "hi": 0,
+                        "lo": 4000
+                      }
+                    },
+                    {
+                      "i128": {
+                        "hi": 0,
+                        "lo": 10071
+                      }
+                    },
+                    {
+                      "u64": 604800
+                    }
+                  ]
                 }
               ]
             }
@@ -2562,10 +2591,17 @@
             "data": {
               "vec": [
                 {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 4000
-                  }
+                  "u32": 1
+                },
+                {
+                  "vec": [
+                    {
+                      "i128": {
+                        "hi": 0,
+                        "lo": 4000
+                      }
+                    }
+                  ]
                 }
               ]
             }
@@ -2787,13 +2823,20 @@
             "data": {
               "vec": [
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                  "u32": 1
                 },
                 {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 3999
-                  }
+                  "vec": [
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                    },
+                    {
+                      "i128": {
+                        "hi": 0,
+                        "lo": 3999
+                      }
+                    }
+                  ]
                 }
               ]
             }
@@ -2817,16 +2860,23 @@
             "data": {
               "vec": [
                 {
-                  "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                  "u32": 1
                 },
                 {
-                  "i128": {
-                    "hi": 0,
-                    "lo": 25000
-                  }
-                },
-                {
-                  "u64": 126144000
+                  "vec": [
+                    {
+                      "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAK3IM"
+                    },
+                    {
+                      "i128": {
+                        "hi": 0,
+                        "lo": 25000
+                      }
+                    },
+                    {
+                      "u64": 126144000
+                    }
+                  ]
                 }
               ]
             }
@@ -2983,7 +3033,7 @@
                   "val": {
                     "i128": {
                       "hi": 0,
-                      "lo": 2001
+                      "lo": 6000
                     }
                   }
                 },

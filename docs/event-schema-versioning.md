@@ -379,11 +379,16 @@ on-wire data shape `(schema_version, payload)`.
 | `emergency_mode` | — | `(admin: Address, enabled: bool)` |
 | `emergency_withdraw` | — | `(staker: Address, amount: i128)` |
 | `boost_exp` | — | `(staker: Address, previous_boost: i128, settled_boost: i128)` |
+| `rewards_reconciled` | — | `(admin: Address, old_undistributed: i128, old_owed: i128, new_undistributed: i128, new_owed: i128)` |
 
 `boost_exp` (issue #699) is emitted by `settle_boost`/`settle_boost_batch`
 only when a lock's stored boost is actually reduced from a stale
 post-expiry value down to `min_boost` -- it does not fire on a no-op call
 (active lock, already-settled staker, or unknown address).
+
+`rewards_reconciled` (issue #1045) is emitted once per completed
+`reconcile_reward_accounting` run, with the undistributed/owed counters
+before and after the repair.
 
 ### Consumer rules
 
