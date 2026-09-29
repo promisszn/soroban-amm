@@ -62,9 +62,40 @@ you'd like to work on and we'll help you find a starting point.
     To move the toolchain, bump `channel` in that file in its own PR rather
     than upgrading locally — otherwise your build and CI's diverge.
 
-- **Stellar CLI** (for building optimized WASM and deploying) — see the
-  [Stellar CLI install guide](https://developers.stellar.org/docs/tools/developer-tools/cli/install-cli).
+- **Stellar CLI** (for building optimized WASM and deploying) — the exact
+  version is pinned in [`.stellar-version`](.stellar-version) and is read by the
+  `Dockerfile`. Install that version rather than the latest release:
+
+    ```bash
+    cargo install --locked stellar-cli --version "$(cat .stellar-version)"
+    ```
+
+    The pin is deliberate — see
+    [Why the Stellar CLI version is pinned](#why-the-stellar-cli-version-is-pinned).
+    To move it, bump the single line in `.stellar-version` in its own PR; the
+    container follows from it, and `release.yml` pins the same version
+    through the `stellar/stellar-cli` action.
 - `make` (optional but recommended — the `Makefile` wraps the common commands).
+
+### Why the Stellar CLI version is pinned
+
+`stellar contract optimize` turns the workspace WASM into the artifacts published
+in a GitHub release, so the CLI version decides the bytes users deploy. It used
+to be written out in three places — `Dockerfile` (25.1.0), `release.yml`
+(23.0.0) and `smoke-test.yml` (27.1.0) — so the optimizer that produced a
+release artifact and the CLI the smoke test deployed it with were four major
+versions apart, and `stellar contract optimize` output changing between them
+would have gone unnoticed. That is the same hazard `rust-toolchain.toml` guards
+against for the compiler, so the CLI version now lives in one file that the
+container reads, with `release.yml` pinning the same version explicitly.
+
+The version is chosen deliberately rather than by taking the newest release.
+`27.1.0` is what this image can build: `--locked` compiles the CLI's own
+`Cargo.lock` with the toolchain above, and `25.1.0` locks `ethnum 1.5.2`,
+which Rust 1.98.1 rejects with E0512 (`cannot transmute between types of
+different sizes`). `27.1.0` locks `ethnum 1.5.3`, the version this workspace
+already builds with, so the container, the release optimizer and the smoke
+test all agree on a CLI that compiles here.
 
 ---
 
@@ -235,3 +266,4 @@ that violate this standard.
 
 By contributing, you agree that your contributions will be licensed under the
 [MIT License](LICENSE) that covers this project.
+

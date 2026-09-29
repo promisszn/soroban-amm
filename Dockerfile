@@ -23,13 +23,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # so rustup will install it automatically when cargo first runs.  There is
 # no need (and it would be wrong) to add wasm32-unknown-unknown here.
 
-# Install Stellar CLI pinned to the same version documented in README.md,
-# release.yml and smoke-test.yml. `--locked` builds its own Cargo.lock with
-# this image's compiler, so the pin must be a release whose locked tree still
-# compiles on the toolchain above: 25.1.0 locks ethnum 1.5.2, which Rust
-# 1.98.1 rejects (E0512, cannot transmute between types of different sizes);
-# 27.1.0 locks ethnum 1.5.3, the version this workspace already builds with.
-RUN cargo install stellar-cli --version 27.1.0 --locked
+# Install the Stellar CLI at the repo-wide pinned version. `.stellar-version`
+# is the single source of truth for this pin (also read by
+# .github/workflows/release.yml and .github/workflows/smoke-test.yml), so the
+# optimizer that produces release artifacts, the container contributors build
+# in, and the smoke test that verifies a deploy cannot drift to different
+# versions. `--locked` builds its own Cargo.lock with this image's compiler,
+# so the pinned version must be a release whose locked tree still compiles on
+# the toolchain above: 25.1.0 locks ethnum 1.5.2, which Rust 1.98.1 rejects
+# (E0512, cannot transmute between types of different sizes); 27.1.0 locks
+# ethnum 1.5.3, the version this workspace already builds with.
+COPY .stellar-version /tmp/.stellar-version
+RUN cargo install stellar-cli --version "$(cat /tmp/.stellar-version)" --locked
 
 WORKDIR /app
 
