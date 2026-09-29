@@ -4,18 +4,17 @@
 //! to a V3 concentrated-liquidity pool in a single transaction.
 //!
 //! Flow:
-//!   1. LP approves this contract to act on their behalf.
+//!   1. LP authorizes the migration call and its nested pool calls.
 //!   2. LP calls `migrate` with their V2 LP share amount and desired V3 range.
-//!   3. Contract burns V2 shares → receives token_a + token_b.
-//!   4. Contract deposits into V3 pool at the computed optimal range.
-//!   5. Any leftover tokens (due to range asymmetry) are returned to the LP.
-//!   6. A migration-incentive fee discount is applied: the V3 deposit fee is
-//!      waived for migrating LPs (enforced via a discount flag on the V3 pool).
+//!   3. The V2 pool burns the shares and returns token_a + token_b to the LP.
+//!   4. The CL pool pulls only the amounts needed for the selected range
+//!      directly from the LP and records the position under the LP's address.
+//!   5. Any leftover tokens remain in the LP's wallet.
 
 #![no_std]
 
+use pool_interfaces::ConcentratedLiquidityClient;
 use soroban_amm_sdk::emit_versioned_event;
-use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, Address, Env,
 };
@@ -46,6 +45,8 @@ pub enum DataKey {
 
 const MIN_TTL: u32 = 172_800;
 const BUMP_TO: u32 = 518_400;
+const MIN_TICK: i32 = -887_272;
+const MAX_TICK: i32 = 887_272;
 
 // ── External interfaces ───────────────────────────────────────────────────────
 
@@ -80,49 +81,25 @@ pub struct V2PoolInfo {
     pub lp_rebate_bps: i128,
 }
 
-/// Minimal V3 concentrated-liquidity interface needed for migration.
-#[contractclient(name = "V3PoolClient")]
-pub trait V3PoolInterface {
-    /// Add liquidity within a price range [tick_lower, tick_upper].
-    /// Returns the LP NFT position ID minted to `provider`.
-    #[allow(clippy::too_many_arguments)]
-    fn add_liquidity_range(
-        env: Env,
-        provider: Address,
-        amount_a: i128,
-        amount_b: i128,
-        tick_lower: i32,
-        tick_upper: i32,
-        min_shares: i128,
-        deadline: u64,
-        fee_discount: bool,
-    ) -> Result<i128, soroban_sdk::Error>;
-
-    fn get_current_tick(env: Env) -> i32;
-
-    /// Returns the V3 pool's token pair (token_a, token_b).
-    fn get_tokens(env: Env) -> (Address, Address);
-}
-
 // ── Migration result ──────────────────────────────────────────────────────────
 
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct MigrationResult {
-    /// V3 position ID (LP NFT) minted to the migrating LP.
-    pub position_id: i128,
-    /// Amount of token_a deposited into V3.
+    /// Amount of the V3 pool's token_a deposited into the CL position.
     pub deposited_a: i128,
-    /// Amount of token_b deposited into V3.
+    /// Amount of the V3 pool's token_b deposited into the CL position.
     pub deposited_b: i128,
-    /// Leftover token_a returned to the LP (range asymmetry dust).
-    pub refund_a: i128,
-    /// Leftover token_b returned to the LP.
-    pub refund_b: i128,
-    /// Optimal tick_lower computed for the V3 range.
+    /// Amount of the V3 pool's token_a that remained with the LP.
+    pub leftover_a: i128,
+    /// Amount of the V3 pool's token_b that remained with the LP.
+    pub leftover_b: i128,
+    /// Final lower tick used for the V3 range.
     pub tick_lower: i32,
-    /// Optimal tick_upper computed for the V3 range.
+    /// Final upper tick used for the V3 range.
     pub tick_upper: i32,
+    /// Receipt NFT minted by the CL pool, if position NFTs are configured.
+    pub position_token_id: Option<u64>,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -161,7 +138,7 @@ impl MigrationContract {
         let v2_client = V2PoolClient::new(&env, &v2_pool);
         let v2_info = v2_client.get_info();
 
-        let v3_client = V3PoolClient::new(&env, &v3_pool);
+        let v3_client = ConcentratedLiquidityClient::new(&env, &v3_pool);
         let (v3_token_a, v3_token_b) = v3_client.get_tokens();
 
         if !((v2_info.token_a == v3_token_a && v2_info.token_b == v3_token_b)
@@ -192,12 +169,13 @@ impl MigrationContract {
     ///                      Pass `i32::MAX` to auto-compute an optimal range.
     /// - `range_width_ticks` – Half-width of the auto-computed range (ignored when
     ///                         explicit ticks are provided).
-    /// - `min_v3_shares`  – Minimum V3 position size (slippage guard on deposit).
+    /// - `min_deposit_a`  – Minimum V3 token_a deposited (slippage guard).
+    /// - `min_deposit_b`  – Minimum V3 token_b deposited (slippage guard).
     /// - `deadline`       – Latest ledger timestamp at which this call is valid.
     ///
     /// # Returns
-    /// A [`MigrationResult`] describing what was deposited, the V3 position ID,
-    /// and any dust refunded to the LP.
+    /// A [`MigrationResult`] describing what was deposited and left with the LP,
+    /// the final range, and the optional V3 position NFT ID.
     #[allow(clippy::too_many_arguments)]
     pub fn migrate(
         env: Env,
@@ -208,7 +186,8 @@ impl MigrationContract {
         tick_lower: i32,
         tick_upper: i32,
         range_width_ticks: i32,
-        min_v3_shares: i128,
+        min_deposit_a: i128,
+        min_deposit_b: i128,
         deadline: u64,
     ) -> Result<MigrationResult, MigrationError> {
         extend_ttl(&env);
@@ -233,86 +212,53 @@ impl MigrationContract {
         let token_a = pool_info.token_a.clone();
         let token_b = pool_info.token_b.clone();
 
-        let v3_client = V3PoolClient::new(&env, &v3_pool);
+        let v3_client = ConcentratedLiquidityClient::new(&env, &v3_pool);
         let (v3_token_a, v3_token_b) = v3_client.get_tokens();
 
-        if !((token_a == v3_token_a && token_b == v3_token_b)
-            || (token_a == v3_token_b && token_b == v3_token_a))
-        {
+        let reversed = if token_a == v3_token_a && token_b == v3_token_b {
+            false
+        } else if token_a == v3_token_b && token_b == v3_token_a {
+            true
+        } else {
             return Err(MigrationError::TokenMismatch);
-        }
+        };
 
-        // ── Step 1: withdraw from V2 ─────────────────────────────────────────
+        // Validate the range before burning shares or moving any funds.
+        let (final_tick_lower, final_tick_upper) =
+            Self::compute_range(&v3_client, tick_lower, tick_upper, range_width_ticks)?;
+
+        // The V2 pool returns the withdrawn assets directly to the LP.
         let (received_a, received_b) =
             v2_client.remove_liquidity(&provider, &v2_shares, &min_a, &min_b, &deadline);
 
-        // ── Step 2: compute optimal V3 tick range ────────────────────────────
-        let (final_tick_lower, final_tick_upper) =
-            Self::compute_range(&env, &v3_client, tick_lower, tick_upper, range_width_ticks)?;
+        // Map the withdrawal into the CL pool's canonical token order.
+        let (desired_a, desired_b) = if reversed {
+            (received_b, received_a)
+        } else {
+            (received_a, received_b)
+        };
 
-        // ── Step 3: deposit into V3 with fee discount for migrating LPs ─────
-        // Provider transfers tokens to this contract so we can forward them.
-        let ta_client = TokenClient::new(&env, &token_a);
-        let tb_client = TokenClient::new(&env, &token_b);
-        let contract_addr = env.current_contract_address();
-
-        // Snapshot balances before this migration's funds land, so the refund
-        // step below only ever returns the delta attributable to this call —
-        // never any balance already sitting at this shared contract address.
-        let balance_a_before = ta_client.balance(&contract_addr);
-        let balance_b_before = tb_client.balance(&contract_addr);
-
-        ta_client.transfer(&provider, &contract_addr, &received_a);
-        tb_client.transfer(&provider, &contract_addr, &received_b);
-
-        // Approve V3 pool to pull from this contract.
-        // live_until_ledger must be >= current ledger sequence when amount > 0.
-        // Adding a small lookahead is sufficient because the approval is consumed
-        // in the very next call (add_liquidity_range) within the same transaction.
-        let approve_expiry = env.ledger().sequence() + 100;
-
-        ta_client.approve(&contract_addr, &v3_pool, &received_a, &approve_expiry);
-
-        tb_client.approve(&contract_addr, &v3_pool, &received_b, &approve_expiry);
-
-        let position_id = v3_client.add_liquidity_range(
-            &contract_addr,
-            &received_a,
-            &received_b,
+        // Mint under the LP's address. The signed auth tree authorizes the
+        // nested V2 withdrawal, CL mint, and token transfers from the LP.
+        let (deposited_a, deposited_b) = v3_client.mint_position(
+            &provider,
             &final_tick_lower,
             &final_tick_upper,
-            &min_v3_shares,
+            &desired_a,
+            &desired_b,
+            &min_deposit_a,
+            &min_deposit_b,
             &deadline,
-            &true, // fee_discount: migration incentive
         );
 
-        // ── Revoke approvals granted to v3_pool (fix #542) ───────────────────
-        // Setting amount=0 with any expiry revokes the allowance. A ledger of 0
-        // is only valid when the amount is 0 (SEP-41 permits it), so we use the
-        // current ledger sequence which is always valid.
-        let revoke_expiry = env.ledger().sequence();
-
-        ta_client.approve(&contract_addr, &v3_pool, &0, &revoke_expiry);
-
-        tb_client.approve(&contract_addr, &v3_pool, &0, &revoke_expiry);
-
-        // ── Step 4: refund leftover dust to provider ──────────────────────────
-        // Computed as the call-scoped delta, not the contract's absolute
-        // balance, so pre-existing tokens at this shared address are never
-        // swept up and misattributed to this migration.
-        let refund_a = ta_client.balance(&contract_addr) - balance_a_before;
-        let refund_b = tb_client.balance(&contract_addr) - balance_b_before;
-
-        if refund_a > 0 {
-            ta_client.transfer(&contract_addr, &provider, &refund_a);
-        }
-
-        if refund_b > 0 {
-            tb_client.transfer(&contract_addr, &provider, &refund_b);
-        }
-
-        let deposited_a = received_a - refund_a;
-        let deposited_b = received_b - refund_b;
+        let leftover_a = desired_a
+            .checked_sub(deposited_a)
+            .ok_or(MigrationError::MigrationFailed)?;
+        let leftover_b = desired_b
+            .checked_sub(deposited_b)
+            .ok_or(MigrationError::MigrationFailed)?;
+        let position_token_id =
+            v3_client.position_token_id(&provider, &final_tick_lower, &final_tick_upper);
 
         emit_versioned_event!(
             env,
@@ -321,20 +267,20 @@ impl MigrationContract {
                 v2_shares,
                 deposited_a,
                 deposited_b,
-                position_id,
-                refund_a,
-                refund_b,
+                position_token_id,
+                leftover_a,
+                leftover_b,
             )
         );
 
         Ok(MigrationResult {
-            position_id,
             deposited_a,
             deposited_b,
-            refund_a,
-            refund_b,
+            leftover_a,
+            leftover_b,
             tick_lower: final_tick_lower,
             tick_upper: final_tick_upper,
+            position_token_id,
         })
     }
 
@@ -356,9 +302,9 @@ impl MigrationContract {
 
         let v3_pool: Address = env.storage().instance().get(&DataKey::V3Pool).unwrap();
 
-        let v3_client = V3PoolClient::new(&env, &v3_pool);
+        let v3_client = ConcentratedLiquidityClient::new(&env, &v3_pool);
 
-        Self::compute_range(&env, &v3_client, tick_lower, tick_upper, range_width_ticks)
+        Self::compute_range(&v3_client, tick_lower, tick_upper, range_width_ticks)
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────
@@ -373,47 +319,48 @@ impl MigrationContract {
     /// it is never silently discarded, even when the other bound is a
     /// sentinel.
     fn compute_range(
-        env: &Env,
-        v3_client: &V3PoolClient,
+        v3_client: &ConcentratedLiquidityClient,
         tick_lower: i32,
         tick_upper: i32,
         range_width_ticks: i32,
     ) -> Result<(i32, i32), MigrationError> {
         let lower_auto = tick_lower == i32::MIN;
         let upper_auto = tick_upper == i32::MAX;
+        let state = v3_client.get_pool_state();
+        let tick_spacing = state.tick_spacing;
 
-        let _ = env; // suppress unused warning
-
-        // Both explicit: keep the caller-provided values exactly as-is.
-        if !lower_auto && !upper_auto {
-            if tick_lower >= tick_upper {
-                return Err(MigrationError::InvalidRange);
-            }
-
-            return Ok((tick_lower, tick_upper));
-        }
-
-        // At least one side is auto-computed, so a positive width is required.
-        if range_width_ticks <= 0 {
+        if tick_spacing <= 0 {
             return Err(MigrationError::InvalidRange);
         }
 
-        let current_tick = v3_client.get_current_tick();
+        if (!lower_auto && !Self::is_valid_explicit_tick(tick_lower, tick_spacing))
+            || (!upper_auto && !Self::is_valid_explicit_tick(tick_upper, tick_spacing))
+        {
+            return Err(MigrationError::InvalidRange);
+        }
+
+        if (lower_auto || upper_auto) && range_width_ticks <= 0 {
+            return Err(MigrationError::InvalidRange);
+        }
+
+        let spacing = i64::from(tick_spacing);
+        let min_usable_tick = Self::align_up(i64::from(MIN_TICK), spacing);
+        let max_usable_tick = Self::align_down(i64::from(MAX_TICK), spacing);
+        let current_tick = i64::from(state.current_tick);
+        let width = i64::from(range_width_ticks);
 
         // Only compute the bounds that were explicitly marked with sentinels.
         // An explicit lower/upper bound must never be silently overwritten.
         let lower = if lower_auto {
-            current_tick
-                .checked_sub(range_width_ticks)
-                .ok_or(MigrationError::InvalidRange)?
+            Self::align_down(current_tick - width, spacing).clamp(min_usable_tick, max_usable_tick)
+                as i32
         } else {
             tick_lower
         };
 
         let upper = if upper_auto {
-            current_tick
-                .checked_add(range_width_ticks)
-                .ok_or(MigrationError::InvalidRange)?
+            Self::align_up(current_tick + width, spacing).clamp(min_usable_tick, max_usable_tick)
+                as i32
         } else {
             tick_upper
         };
@@ -424,6 +371,23 @@ impl MigrationContract {
 
         Ok((lower, upper))
     }
+
+    fn is_valid_explicit_tick(tick: i32, tick_spacing: i32) -> bool {
+        (MIN_TICK..=MAX_TICK).contains(&tick) && tick % tick_spacing == 0
+    }
+
+    fn align_down(tick: i64, tick_spacing: i64) -> i64 {
+        tick.div_euclid(tick_spacing) * tick_spacing
+    }
+
+    fn align_up(tick: i64, tick_spacing: i64) -> i64 {
+        let quotient = tick.div_euclid(tick_spacing);
+        if tick.rem_euclid(tick_spacing) == 0 {
+            quotient * tick_spacing
+        } else {
+            (quotient + 1) * tick_spacing
+        }
+    }
 }
 
 #[cfg(test)]
@@ -431,21 +395,25 @@ mod tests {
     use super::*;
     use amm::{AmmPool, AmmPoolClient};
     extern crate std;
+    use pool_interfaces::PoolState;
     use soroban_sdk::testutils::{Address as _, Events, Ledger as _, MockAuth, MockAuthInvoke};
     use soroban_sdk::token::{StellarAssetClient, TokenClient};
     use soroban_sdk::{IntoVal, String, Symbol, TryFromVal};
     use token::{LpToken, LpTokenClient};
 
-    /// Minimal V3 pool stub: `get_current_tick` is needed to exercise
-    /// `compute_range` via the public `preview_range` entry point, and
-    /// `get_tokens` is needed so `initialize`'s token-pair validation passes.
+    /// Minimal CL state stub used only by the range helper tests.
     #[contract]
-    struct MockV3Pool;
+    struct RangePool;
 
     #[contractimpl]
-    impl MockV3Pool {
-        pub fn get_current_tick(_env: Env) -> i32 {
-            1_000
+    impl RangePool {
+        pub fn get_pool_state(_env: Env) -> PoolState {
+            PoolState {
+                sqrt_price: 0,
+                current_tick: 1_000,
+                active_liquidity: 0,
+                tick_spacing: 1,
+            }
         }
 
         pub fn get_tokens(env: Env) -> (Address, Address) {
@@ -503,8 +471,8 @@ mod tests {
         let v2_pool = env.register_contract(None, MockV2Pool);
         MockV2PoolClient::new(&env, &v2_pool).set_v2_tokens(&token_a, &token_b);
 
-        let v3_pool = env.register_contract(None, MockV3Pool);
-        MockV3PoolClient::new(&env, &v3_pool).set_tokens(&token_a, &token_b);
+        let v3_pool = env.register_contract(None, RangePool);
+        RangePoolClient::new(&env, &v3_pool).set_tokens(&token_a, &token_b);
 
         let contract_addr = env.register_contract(None, MigrationContract);
 
@@ -607,19 +575,8 @@ mod tests {
     // `transfer_from`, and LpToken `mint`/`burn` — all run against deployed
     // contracts rather than hand-rolled stubs.
     //
-    // The V3 side is the one documented interface gap: the migration contract
-    // talks to a synthetic `V3PoolInterface` (`add_liquidity_range`,
-    // `get_current_tick`), which the real `ConcentratedLiquidity` contract does
-    // NOT expose (calling those symbols against it panics). Mirroring the
-    // repo's integration tests (`integration-tests/tests/v2_to_v3_migration.rs`),
-    // a tiny registered harness contract satisfies exactly that interface, pulls
-    // tokens through the SEP-41 approval the migration grants, records real
-    // positions with concrete balances and ticks, and can be driven to fail so
-    // that the migration's atomicity is observable.
-    /// The harness is declared in its own module so the `#[contractimpl]`
-    /// macro-generated helper names (e.g. `__get_current_tick`) do not collide
-    /// with those of the `MockV2Pool`/`MockV3Pool` stubs above, which expose
-    /// the same method names and therefore live in the same namespace.
+    // A small CL-ABI harness keeps the unit tests focused; the integration suite
+    // registers the real ConcentratedLiquidity contract for end-to-end coverage.
     mod test_v3_pool {
         use super::*;
 
@@ -642,7 +599,8 @@ mod tests {
             TokensB,
             CurrentTick,
             NextPositionId,
-            Position(i128),
+            Position(u64),
+            PositionId(Address, i32, i32),
         }
 
         #[contractimpl]
@@ -655,18 +613,25 @@ mod tests {
                     .set(&V3DataKey::CurrentTick, &initial_tick);
                 env.storage()
                     .instance()
-                    .set(&V3DataKey::NextPositionId, &1_i128);
+                    .set(&V3DataKey::NextPositionId, &0_u64);
             }
 
             pub fn set_current_tick(env: Env, tick: i32) {
                 env.storage().instance().set(&V3DataKey::CurrentTick, &tick);
             }
 
-            pub fn get_current_tick(env: Env) -> i32 {
-                env.storage()
+            pub fn get_pool_state(env: Env) -> PoolState {
+                let current_tick = env
+                    .storage()
                     .instance()
                     .get(&V3DataKey::CurrentTick)
-                    .unwrap_or(0)
+                    .unwrap_or(0);
+                PoolState {
+                    sqrt_price: 0,
+                    current_tick,
+                    active_liquidity: 0,
+                    tick_spacing: 1,
+                }
             }
 
             pub fn get_tokens(env: Env) -> (Address, Address) {
@@ -675,7 +640,7 @@ mod tests {
                 (token_a, token_b)
             }
 
-            pub fn position(env: Env, position_id: i128) -> V3Position {
+            pub fn position(env: Env, position_id: u64) -> V3Position {
                 env.storage()
                     .instance()
                     .get(&V3DataKey::Position(position_id))
@@ -684,32 +649,33 @@ mod tests {
 
             /// Number of positions minted so far (0 before the first deposit).
             pub fn position_count(env: Env) -> i128 {
-                let next: i128 = env
+                let next: u64 = env
                     .storage()
                     .instance()
                     .get(&V3DataKey::NextPositionId)
-                    .unwrap_or(1);
-                next - 1
+                    .unwrap_or(0);
+                i128::from(next)
             }
 
-            /// Mirrors `V3PoolInterface::add_liquidity_range`: pulls `amount_a`
-            /// and `amount_b` out of `provider`'s SEP-41 allowance to this pool
-            /// (exactly as the real design intends), enforces `min_shares` on
-            /// the resulting position size, and mints a position NFT.
+            /// Mirrors the real CL `mint_position` surface and direct-provider
+            /// token flow while keeping the unit-test math deterministic.
             #[allow(clippy::too_many_arguments)]
-            pub fn add_liquidity_range(
+            pub fn mint_position(
                 env: Env,
                 provider: Address,
-                amount_a: i128,
-                amount_b: i128,
                 tick_lower: i32,
                 tick_upper: i32,
-                min_shares: i128,
+                amount_a: i128,
+                amount_b: i128,
+                min_a: i128,
+                min_b: i128,
                 _deadline: u64,
-                _fee_discount: bool,
-            ) -> Result<i128, soroban_sdk::Error> {
+            ) -> Result<(i128, i128), soroban_sdk::Error> {
                 if tick_lower >= tick_upper {
                     return Err(soroban_sdk::Error::from_contract_error(1));
+                }
+                if amount_a < min_a || amount_b < min_b {
+                    return Err(soroban_sdk::Error::from_contract_error(2));
                 }
                 provider.require_auth();
 
@@ -718,24 +684,17 @@ mod tests {
                 let self_addr = env.current_contract_address();
 
                 if amount_a > 0 {
-                    TokenClient::new(&env, &token_a)
-                        .transfer_from(&self_addr, &provider, &self_addr, &amount_a);
+                    TokenClient::new(&env, &token_a).transfer(&provider, &self_addr, &amount_a);
                 }
                 if amount_b > 0 {
-                    TokenClient::new(&env, &token_b)
-                        .transfer_from(&self_addr, &provider, &self_addr, &amount_b);
+                    TokenClient::new(&env, &token_b).transfer(&provider, &self_addr, &amount_b);
                 }
 
-                let liquidity = amount_a + amount_b;
-                if liquidity < min_shares {
-                    return Err(soroban_sdk::Error::from_contract_error(2));
-                }
-
-                let next: i128 = env
+                let next: u64 = env
                     .storage()
                     .instance()
                     .get(&V3DataKey::NextPositionId)
-                    .unwrap_or(1);
+                    .unwrap_or(0);
                 env.storage().instance().set(
                     &V3DataKey::Position(next),
                     &V3Position {
@@ -749,8 +708,23 @@ mod tests {
                 env.storage()
                     .instance()
                     .set(&V3DataKey::NextPositionId, &(next + 1));
+                env.storage().instance().set(
+                    &V3DataKey::PositionId(provider, tick_lower, tick_upper),
+                    &next,
+                );
 
-                Ok(next)
+                Ok((amount_a, amount_b))
+            }
+
+            pub fn position_token_id(
+                env: Env,
+                provider: Address,
+                tick_lower: i32,
+                tick_upper: i32,
+            ) -> Option<u64> {
+                env.storage()
+                    .instance()
+                    .get(&V3DataKey::PositionId(provider, tick_lower, tick_upper))
             }
         }
     }
@@ -928,7 +902,8 @@ mod tests {
         let client = MigrationContractClient::new(&env, &contract_addr);
 
         let result = client.try_migrate(
-            &provider, &1_i128, &0_i128, &0_i128, &100_i32, &200_i32, &0_i32, &0_i128, &DEADLINE,
+            &provider, &1_i128, &0_i128, &0_i128, &100_i32, &200_i32, &0_i32, &0_i128, &0_i128,
+            &DEADLINE,
         );
         assert!(
             matches!(result, Err(Ok(MigrationError::NotInitialized))),
@@ -1031,6 +1006,7 @@ mod tests {
             &i32::MAX,
             &500_i32,
             &0_i128,
+            &0_i128,
             &DEADLINE,
         );
 
@@ -1040,8 +1016,8 @@ mod tests {
 
         // The registered V3 pool minted a real, queryable position at the
         // range auto-computed around the harness's current tick (default 0).
-        let pos = f.v3.position(&result.position_id);
-        assert_eq!(pos.provider, f.migration_addr);
+        let pos = f.v3.position(&result.position_token_id.unwrap());
+        assert_eq!(pos.provider, f.lp);
         assert_eq!(pos.tick_lower, -500);
         assert_eq!(pos.tick_upper, 500);
         assert_eq!(pos.deposited_a, 1_000_000_i128);
@@ -1063,13 +1039,14 @@ mod tests {
             &i32::MAX,
             &500_i32,
             &0_i128,
+            &0_i128,
             &DEADLINE,
         );
 
         assert_eq!(result.deposited_a, 1_000_000_i128);
         assert_eq!(result.deposited_b, 1_000_000_i128);
-        assert_eq!(result.refund_a, 0_i128);
-        assert_eq!(result.refund_b, 0_i128);
+        assert_eq!(result.leftover_a, 0_i128);
+        assert_eq!(result.leftover_b, 0_i128);
 
         // Both tokens physically landed in the V3 pool.
         assert_eq!(f.ta.balance(&f.v3_pool), 1_000_000_i128);
@@ -1090,6 +1067,7 @@ mod tests {
             &i32::MAX,
             &500_i32,
             &0_i128,
+            &0_i128,
             &DEADLINE,
         );
 
@@ -1102,14 +1080,8 @@ mod tests {
         assert_eq!(f.tb.balance(&f.migration_addr), 0_i128);
 
         // ...and 100% of the withdrawn tokens sit in the V3 pool.
-        assert_eq!(
-            f.ta.balance(&f.v3_pool),
-            result.deposited_a + result.refund_a
-        );
-        assert_eq!(
-            f.tb.balance(&f.v3_pool),
-            result.deposited_b + result.refund_b
-        );
+        assert_eq!(f.ta.balance(&f.v3_pool), result.deposited_a);
+        assert_eq!(f.tb.balance(&f.v3_pool), result.deposited_b);
 
         // Per-token conservation: nothing was created or destroyed.
         let lp_original_a = 1_000_000_i128;
@@ -1141,6 +1113,7 @@ mod tests {
             &i32::MIN,
             &i32::MAX,
             &500_i32,
+            &0_i128,
             &0_i128,
             &DEADLINE,
         );
@@ -1180,17 +1153,18 @@ mod tests {
             &i32::MAX,
             &500_i32,
             &0_i128,
+            &0_i128,
             &DEADLINE,
         );
 
         assert_eq!((result.tick_lower, result.tick_upper), (500, 1_500));
 
-        let pos = f.v3.position(&result.position_id);
+        let pos = f.v3.position(&result.position_token_id.unwrap());
         assert_eq!((pos.tick_lower, pos.tick_upper), (500, 1_500));
     }
 
     #[test]
-    fn test_migrate_revokes_v3_pool_approval_and_retains_no_tokens() {
+    fn test_migration_contract_never_holds_or_approves_tokens() {
         let env = Env::default();
         let f = fixture(&env);
 
@@ -1203,10 +1177,11 @@ mod tests {
             &i32::MAX,
             &500_i32,
             &0_i128,
+            &0_i128,
             &DEADLINE,
         );
 
-        // Approvals granted to the V3 pool were revoked (fix #542).
+        // The direct LP-to-CL flow never creates migration-contract approvals.
         assert_eq!(f.ta.allowance(&f.migration_addr, &f.v3_pool), 0_i128);
         assert_eq!(f.tb.allowance(&f.migration_addr, &f.v3_pool), 0_i128);
 
@@ -1252,6 +1227,7 @@ mod tests {
             &i32::MAX,
             &500_i32,
             &0_i128,
+            &0_i128,
             &DEADLINE,
         );
         assert!(matches!(result, Err(Ok(MigrationError::ZeroShares))));
@@ -1264,6 +1240,7 @@ mod tests {
             &i32::MIN,
             &i32::MAX,
             &500_i32,
+            &0_i128,
             &0_i128,
             &DEADLINE,
         );
@@ -1287,6 +1264,7 @@ mod tests {
             &i32::MIN,
             &i32::MAX,
             &500_i32,
+            &0_i128,
             &0_i128,
             &DEADLINE,
         );
@@ -1321,6 +1299,7 @@ mod tests {
             &i32::MAX,
             &500_i32,
             &0_i128,
+            &0_i128,
             &999_u64,
         );
         assert!(result.is_err(), "expired deadline must abort the migration");
@@ -1348,6 +1327,7 @@ mod tests {
             &i32::MAX,
             &500_i32,
             &0_i128,
+            &0_i128,
             &DEADLINE,
         );
         assert!(result.is_err(), "impossible V2 slippage must revert");
@@ -1360,7 +1340,7 @@ mod tests {
 
     /// The atomicity guarantee under the issue's exact scenario: the V2 side
     /// fully succeeds (shares burned and tokens withdrawn by the real AMM), but
-    /// the V3 deposit later fails on `min_v3_shares` — the whole migration must
+    /// the V3 deposit later fails on `min_deposit_a` — the whole migration must
     /// roll back to exactly the pre-call state, including re-minting the burned
     /// V2 LP shares and restoring every token balance.
     #[test]
@@ -1386,11 +1366,12 @@ mod tests {
             &i32::MAX,
             &500_i32,
             &i128::MAX, // impossible: no position can satisfy this floor
+            &0_i128,
             &DEADLINE,
         );
         assert!(
             result.is_err(),
-            "a V3 deposit below min_v3_shares must abort the migration"
+            "a V3 deposit below min_deposit_a must abort the migration"
         );
 
         // Zero state changes: the burned shares were re-minted by the rollback.
@@ -1420,6 +1401,7 @@ mod tests {
             &i32::MAX,
             &500_i32,
             &0_i128,
+            &0_i128,
             &DEADLINE,
         );
         assert_eq!(f.v2_lp.balance(&f.lp), 0_i128);
@@ -1440,8 +1422,8 @@ mod tests {
 
         let v2_mock = env.register_contract(None, MockV2Pool);
         MockV2PoolClient::new(&env, &v2_mock).set_v2_tokens(&ta, &tb);
-        let v3_mock = env.register_contract(None, MockV3Pool);
-        MockV3PoolClient::new(&env, &v3_mock).set_tokens(&ta, &tb);
+        let v3_mock = env.register_contract(None, RangePool);
+        RangePoolClient::new(&env, &v3_mock).set_tokens(&ta, &tb);
 
         let contract_addr = env.register_contract(None, MigrationContract);
         let client = MigrationContractClient::new(&env, &contract_addr);
@@ -1478,6 +1460,7 @@ mod tests {
                     200_i32,
                     0_i32,
                     0_i128,
+                    0_i128,
                     DEADLINE,
                 )
                     .into_val(&env),
@@ -1485,7 +1468,8 @@ mod tests {
             },
         }]);
         let result = client.try_migrate(
-            &provider, &1_i128, &0_i128, &0_i128, &100_i32, &200_i32, &0_i32, &0_i128, &DEADLINE,
+            &provider, &1_i128, &0_i128, &0_i128, &100_i32, &200_i32, &0_i32, &0_i128, &0_i128,
+            &DEADLINE,
         );
         assert!(
             result.is_err(),
@@ -1496,18 +1480,7 @@ mod tests {
         assert_eq!(client.preview_range(&100, &200, &0), (100, 200));
     }
 
-    /// Genuine gap uncovered while building this suite (kept as a failing,
-    /// ignored regression anchor per the issue's rules — file a separate issue):
-    ///
-    /// `migrate` validates a reversed V2/V3 token pair order-insensitively, but
-    /// then forwards the V2-side withdrawal amounts WITHOUT swapping them into
-    /// the V3 pool's own token order, and approves each token for its V2-side
-    /// amount. For a reversed pair the amounts are therefore mislabeled, so the
-    /// harness's SEP-41 pulls either exceed a token's allowance or deposit the
-    /// wrong side — meaning a reversed pair can never migrate correctly as
-    /// written. The migration contract should swap `amount_a`/`amount_b` (and
-    /// the matching approvals) when `v3_token_a != v2_token_a`.
-    #[ignore = "genuine bug: migrate does not swap amounts for a reversed V3 token pair"]
+    /// Reversed V2/V3 token pairs are mapped into the CL pool's token order.
     #[test]
     fn test_migrate_reversed_v3_token_order_maps_amounts_correctly() {
         let env = Env::default();
@@ -1528,6 +1501,7 @@ mod tests {
             &i32::MAX,
             &500_i32,
             &0_i128,
+            &0_i128,
             &DEADLINE,
         );
 
@@ -1536,7 +1510,7 @@ mod tests {
         assert_eq!(result.deposited_a, 1_142_857_i128);
         assert_eq!(result.deposited_b, 1_000_000_i128);
 
-        let pos = f.v3.position(&result.position_id);
+        let pos = f.v3.position(&result.position_token_id.unwrap());
         assert_eq!(pos.deposited_a, 1_142_857_i128);
         assert_eq!(pos.deposited_b, 1_000_000_i128);
 
@@ -1562,6 +1536,7 @@ mod tests {
             &i32::MAX,
             &50_i32,
             &0_i128,
+            &0_i128,
             &DEADLINE,
         );
 
@@ -1584,8 +1559,12 @@ mod tests {
         );
 
         let event = migrated_events.last().unwrap();
-        let (version, (_v2_shares, _deposited_a, _deposited_b, _position_id, _refund_a, _refund_b)): (u32, (i128, i128, i128, i128, i128, i128)) =
-            <(u32, (i128, i128, i128, i128, i128, i128))>::try_from_val(&env, &event.2).expect("must decode event with version prefix");
+        type MigratedEvent = (u32, (i128, i128, i128, Option<u64>, i128, i128));
+        let (
+            version,
+            (_v2_shares, _deposited_a, _deposited_b, _position_token_id, _leftover_a, _leftover_b),
+        ): MigratedEvent = MigratedEvent::try_from_val(&env, &event.2)
+            .expect("must decode event with version prefix");
         assert_eq!(
             version,
             soroban_amm_sdk::EVENT_SCHEMA_VERSION,

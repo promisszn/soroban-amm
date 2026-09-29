@@ -169,8 +169,8 @@ pub struct PriceImpactEstimate {
     pub active_liquidity_after: i128,
 }
 
-/// The subset of `concentrated_liquidity::ConcentratedLiquidity`'s interface
-/// called by `batch_auction`.
+/// The shared subset of `concentrated_liquidity::ConcentratedLiquidity` used
+/// by contracts that call a CL pool without linking its contract crate.
 #[contractclient(name = "ConcentratedLiquidityClient")]
 pub trait ConcentratedLiquidityInterface {
     #[allow(clippy::too_many_arguments)]
@@ -185,6 +185,28 @@ pub trait ConcentratedLiquidityInterface {
     ) -> Result<i128, ClError>;
 
     fn get_tokens(env: Env) -> (Address, Address);
+
+    fn get_pool_state(env: Env) -> PoolState;
+
+    #[allow(clippy::too_many_arguments)]
+    fn mint_position(
+        env: Env,
+        provider: Address,
+        lower_tick: i32,
+        upper_tick: i32,
+        amount_a_desired: i128,
+        amount_b_desired: i128,
+        min_a: i128,
+        min_b: i128,
+        deadline: u64,
+    ) -> Result<(i128, i128), ClError>;
+
+    fn position_token_id(
+        env: Env,
+        provider: Address,
+        lower_tick: i32,
+        upper_tick: i32,
+    ) -> Option<u64>;
 
     fn fee_bps(env: Env) -> i128;
 

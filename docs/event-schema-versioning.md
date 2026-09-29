@@ -280,7 +280,7 @@ a representative call sequence and asserts every pool event carries the leading
 
 | Event | Topics | Payload |
 |---|---|---|
-| `migrated` | `provider` | `(v2_shares: i128, deposited_a: i128, deposited_b: i128, position_id: i128, refund_a: i128, refund_b: i128)` |
+| `migrated` | `provider` | `(v2_shares: i128, deposited_a: i128, deposited_b: i128, position_token_id: Option<u64>, leftover_a: i128, leftover_b: i128)` |
 
 ### BatchRouter — `contracts/batch_router/src/lib.rs`
 

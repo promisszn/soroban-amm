@@ -375,7 +375,13 @@ TWAP is `(cum_a_now - cum_a_then) / window` scaled by `1_000_000`. CL path uses 
 | `v2_pool` | `AMM_POOL_CONTRACT_ID` |
 | `v3_pool` | `CL_POOL_CONTRACT_ID` |
 
-Verifies `token_a/token_b` match or reverts `TokenMismatch`. Sentinel ticks `i32::MIN`/`MAX` map to `current_tick ± width` for single-sided migration.
+Verifies `token_a/token_b` match in either order or reverts `TokenMismatch`. The
+migration mints the CL position directly for the LP and maps token amounts into
+the V3 pool's order. Sentinel ticks `i32::MIN`/`MAX` derive bounds from
+`current_tick ± width`, round outward to `tick_spacing`, and clamp to the usable
+CL tick range. Explicit ticks must already be aligned. Configure the two deposit
+minimums in V3 token order; the result reports actual deposits, LP-held
+leftovers, final ticks, and the optional position NFT token ID.
 
 ---
 
