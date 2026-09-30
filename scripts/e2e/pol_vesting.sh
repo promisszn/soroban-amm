@@ -84,6 +84,11 @@ run_pol_vesting_flow() {
     "$(invoke "$vest" get_vesting --beneficiary "$beneficiary" --schedule_id "$schedule_id" | json_num released)" "$released"
 
   # ── revoke_vesting: remaining tokens split, total conserved ─────────────
+  # revoke_vesting pays the beneficiary vested - released only when it is
+  # positive. Simulated on the ledger release just landed in, that is 0, so the
+  # beneficiary transfer is left out of the footprint, and applying one ledger
+  # later (when more has vested) traps on it. Wait for a later ledger first.
+  sleep 6
   local bal1 treasury0 to_beneficiary to_treasury
   bal1=$(balance_of "$lp" "$beneficiary")
   treasury0=$(balance_of "$lp" "$treasury")
