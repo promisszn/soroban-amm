@@ -39,7 +39,9 @@ run_governance_flow() {
   fi
 
   local admin="$SOURCE_PUBLIC_KEY"
-  local voting_period="${GOVERNANCE_VOTING_PERIOD_SECS:-5}"
+  # Long enough for propose, a status read and vote to land before voting
+  # closes: each is its own transaction, and testnet closes a ledger ~5s.
+  local voting_period="${GOVERNANCE_VOTING_PERIOD_SECS:-60}"
   local timelock="${GOVERNANCE_TIMELOCK_SECS:-5}"
   local quorum_bps="${GOVERNANCE_QUORUM_BPS:-1000}"
   local min_proposer_stake_bps="${GOVERNANCE_MIN_PROPOSER_STAKE_BPS:-1}"
@@ -134,7 +136,14 @@ run_governance_flow() {
   assert_eq "governance: voter's LP balance is locked by the vote" "$locked" "$lp_balance"
 
   # ── advance past voting period ───────────────────────────────────────────
-  sleep "$(( voting_period + 1 ))"
+  # Wait on the proposal's own vote_end rather than voting_period, since part
+  # of the window was spent above; +6s lets a ledger past vote_end close.
+  local vote_end
+  vote_end=$(invoke "$governance" get_proposal --proposal_id "$proposal_id" | field_value vote_end)
+  local vote_wait=$(( vote_end - $(date +%s) + 6 ))
+  if (( vote_wait > 0 )); then
+    sleep "$vote_wait"
+  fi
 
   status=$(invoke "$governance" proposal_status --proposal_id "$proposal_id")
   pass "governance: proposal status after voting period: $status"
