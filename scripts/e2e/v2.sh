@@ -12,11 +12,11 @@ run_v2_flow() {
   local swap_amount_in="${SWAP_AMOUNT_IN:-100000}"
   local min_swap_out="${MIN_SWAP_OUT:-150000}"
   local max_swap_out="${MAX_SWAP_OUT:-200000}"
-  local dust_limit="${DUST_LIMIT:-10}"
 
+  # add_liquidity spends all of amount_a, so mint the swap input on top.
   invoke "$TOKEN_A_CONTRACT_ID" mint \
     --to "$SOURCE_PUBLIC_KEY" \
-    --amount "$amount_a" >/dev/null
+    --amount "$(( amount_a + swap_amount_in ))" >/dev/null
   pass "v2: minted token A to test account"
 
   invoke "$TOKEN_B_CONTRACT_ID" mint \
@@ -62,6 +62,15 @@ run_v2_flow() {
   fi
   assert_between "v2: swap output" "$swap_out" "$min_swap_out" "$max_swap_out"
 
+  # The first deposit permanently locks MINIMUM_LIQUIDITY shares, so removing
+  # every share this flow holds leaves the pool with the locked shares and
+  # their pro-rata slice of the reserves, not an empty pool.
+  local pre_info pre_reserve_a pre_reserve_b pre_total
+  pre_info="$(invoke "$AMM_CONTRACT_ID" get_info)"
+  pre_reserve_a="$(printf '%s\n' "$pre_info" | field_value reserve_a)"
+  pre_reserve_b="$(printf '%s\n' "$pre_info" | field_value reserve_b)"
+  pre_total="$(printf '%s\n' "$pre_info" | field_value total_shares)"
+
   deadline=$(( $(date +%s) + 300 ))
 
   invoke "$AMM_CONTRACT_ID" remove_liquidity \
@@ -72,10 +81,16 @@ run_v2_flow() {
     --deadline "$deadline" >/dev/null
   pass "v2: removed all LP shares"
 
-  local final_info final_reserve_a final_reserve_b
+  local final_info final_reserve_a final_reserve_b final_total remaining
   final_info="$(invoke "$AMM_CONTRACT_ID" get_info)"
   final_reserve_a="$(printf '%s\n' "$final_info" | field_value reserve_a)"
   final_reserve_b="$(printf '%s\n' "$final_info" | field_value reserve_b)"
-  assert_lte_abs "v2: final reserve A" "$final_reserve_a" "$dust_limit"
-  assert_lte_abs "v2: final reserve B" "$final_reserve_b" "$dust_limit"
+  final_total="$(printf '%s\n' "$final_info" | field_value total_shares)"
+  remaining=$(( pre_total - lp_shares ))
+  assert_eq "v2: total_shares after removing this flow's shares" "$final_total" "$remaining"
+  # Payouts round down, so the pool keeps at most one extra unit per reserve.
+  local keep_a=$(( pre_reserve_a * remaining / pre_total ))
+  local keep_b=$(( pre_reserve_b * remaining / pre_total ))
+  assert_between "v2: final reserve A is the remaining shares' slice" "$final_reserve_a" "$keep_a" "$(( keep_a + 1 ))"
+  assert_between "v2: final reserve B is the remaining shares' slice" "$final_reserve_b" "$keep_b" "$(( keep_b + 1 ))"
 }

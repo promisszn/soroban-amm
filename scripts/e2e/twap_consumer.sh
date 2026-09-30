@@ -43,7 +43,7 @@ run_twap_consumer_flow() {
   assert_eq "twap_consumer: no snapshots before the first save" \
     "$(invoke "$twap" get_snapshot_count --pool "$pool" | parse_i128)" "0"
   expect_fail "twap_consumer: save_snapshot without keeper auth is rejected" \
-    invoke_as "$outsider_key" "$twap" save_snapshot --pool "$pool"
+    invoke_signed_only_by "$outsider_key" "$twap" save_snapshot --pool "$pool"
 
   invoke "$twap" save_snapshot --pool "$pool" >/dev/null
   assert_eq "twap_consumer: snapshot count after save" \

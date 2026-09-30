@@ -49,23 +49,13 @@ deploy_v2_to_v3_migration() {
     else
       CURRENT_STEP="initialize v2_to_v3_migration"
       log "initializing v2_to_v3_migration admin=$ADMIN_ADDRESS v2=$AMM_POOL_CONTRACT_ID v3=$CL_POOL_CONTRACT_ID"
+      # The contract exposes no getters to read the init state back, so a
+      # failed initialize is fatal rather than assumed to be a rerun.
       if ! invoke "$V2_TO_V3_MIGRATION_CONTRACT_ID" initialize --admin "$ADMIN_ADDRESS" --v2_pool "$AMM_POOL_CONTRACT_ID" --v3_pool "$CL_POOL_CONTRACT_ID" >/dev/null 2>&1; then
-        if invoke_read "$V2_TO_V3_MIGRATION_CONTRACT_ID" -- get_admin 2>&1 | grep -q "$ADMIN_ADDRESS" || invoke_read "$V2_TO_V3_MIGRATION_CONTRACT_ID" -- get_v2_pool 2>&1 | grep -q "$AMM_POOL_CONTRACT_ID"; then
-          log "v2_to_v3_migration already initialized"
-        else
-          warn "failed to initialize v2_to_v3_migration"
-        fi
-      else
-        log "v2_to_v3_migration initialized"
+        die "failed to initialize v2_to_v3_migration at $V2_TO_V3_MIGRATION_CONTRACT_ID"
       fi
+      log "v2_to_v3_migration initialized"
       persist_var "V2_TO_V3_MIGRATION_INITIALIZED" "1"
     fi
-  fi
-
-  CURRENT_STEP="verify v2_to_v3_migration"
-  if invoke_read "$V2_TO_V3_MIGRATION_CONTRACT_ID" -- get_admin >/dev/null 2>&1; then
-    log "verified v2_to_v3_migration liveness"
-  else
-    warn "v2_to_v3_migration verification warning"
   fi
 }

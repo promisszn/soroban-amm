@@ -125,14 +125,14 @@ deploy_factory() {
       log "initializing factory admin=$ADMIN_ADDRESS"
       # Check if already initialized by reading admin (liveness)
       local pre
-      pre=$(invoke_read "$FACTORY_CONTRACT_ID" -- get_pool_count 2>&1 || true)
+      pre=$(invoke_read "$FACTORY_CONTRACT_ID" get_pool_count 2>/dev/null || true)
       # Try initialize; if AlreadyInitialized error, treat as success for idempotency
       if ! invoke "$FACTORY_CONTRACT_ID" initialize \
           --admin "$ADMIN_ADDRESS" \
           --amm_wasm_hash "$AMM_WASM_HASH" \
           --token_wasm_hash "$TOKEN_WASM_HASH" >/dev/null 2>&1; then
         # Check if error is AlreadyInitialized
-        if echo "$pre" | grep -qE '[0-9]+' || invoke_read "$FACTORY_CONTRACT_ID" -- get_pool_count >/dev/null 2>&1; then
+        if echo "$pre" | grep -qE '[0-9]+' || invoke_read "$FACTORY_CONTRACT_ID" get_pool_count >/dev/null 2>/dev/null; then
           log "factory already initialized (idempotent)"
         else
           die "failed to initialize factory"

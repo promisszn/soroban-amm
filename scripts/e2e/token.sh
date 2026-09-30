@@ -44,7 +44,7 @@ run_token_flow() {
   assert_eq "token: total_supply after mint" "$(invoke "$token" total_supply | parse_i128)" "$minted"
 
   expect_fail "token: mint by a non-admin is rejected" \
-    invoke_as "$spender_key" "$token" mint --to "$spender" --amount 1
+    invoke_signed_only_by "$spender_key" "$token" mint --to "$spender" --amount 1
 
   # ── transfer ────────────────────────────────────────────────────────────
   local sent=250000

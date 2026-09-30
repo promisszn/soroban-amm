@@ -48,7 +48,7 @@ deploy_pol_vesting() {
       CURRENT_STEP="initialize pol_vesting"
       log "initializing pol_vesting governance=$GOVERNANCE_CONTRACT_ID treasury=$ADMIN_ADDRESS"
       if ! invoke "$POL_VESTING_CONTRACT_ID" initialize --governance "$GOVERNANCE_CONTRACT_ID" --treasury "$ADMIN_ADDRESS" >/dev/null 2>&1; then
-        if invoke_read "$POL_VESTING_CONTRACT_ID" -- get_governance 2>&1 | grep -q "$GOVERNANCE_CONTRACT_ID"; then
+        if invoke_read "$POL_VESTING_CONTRACT_ID" get_governance 2>/dev/null | grep -q "$GOVERNANCE_CONTRACT_ID"; then
           log "pol_vesting already initialized"
         else
           warn "failed to initialize pol_vesting"
@@ -61,7 +61,7 @@ deploy_pol_vesting() {
   fi
 
   CURRENT_STEP="verify pol_vesting"
-  if invoke_read "$POL_VESTING_CONTRACT_ID" -- get_governance >/dev/null 2>&1; then
+  if invoke_read "$POL_VESTING_CONTRACT_ID" get_governance >/dev/null 2>/dev/null; then
     log "verified pol_vesting liveness"
   else
     warn "pol_vesting verification warning"

@@ -34,21 +34,25 @@ deploy_pools() {
     else
       CURRENT_STEP="factory.create_pool (AMM)"
       log "creating AMM pool via factory: token_a=$TOKEN_A_CONTRACT_ID token_b=$TOKEN_B_CONTRACT_ID fee_tier=$DEFAULT_FEE_TIER"
-      local out pool_addr lp_addr governance_opt
-      # create_pool returns (Address, Option<Address>); we capture stdout and parse
+      local out err pool_addr lp_addr governance_opt
+      # create_pool returns (pool, Option<governance>). Only stdout holds that
+      # value: stderr carries the CLI's event log, whose first contract id is
+      # the factory's own, so it is kept apart and shown only on failure.
+      err=$(mktemp)
       out=$(invoke "$FACTORY_CONTRACT_ID" create_pool \
         --caller "$ADMIN_ADDRESS" \
         --token_a "$TOKEN_A_CONTRACT_ID" \
         --token_b "$TOKEN_B_CONTRACT_ID" \
-        --fee_tier "$DEFAULT_FEE_TIER" 2>&1) || {
+        --fee_tier "$DEFAULT_FEE_TIER" 2>"$err") || {
+        out="$out$(printf '\n'; cat "$err")"
         # Check if pool already exists (idempotent retry: lookup existing)
         local existing
-        existing=$(invoke_read "$FACTORY_CONTRACT_ID" -- get_pool --token_a "$TOKEN_A_CONTRACT_ID" --token_b "$TOKEN_B_CONTRACT_ID" 2>&1 | grep -Eo 'C[A-Z0-9]{55}' | tail -n 1 || true)
+        existing=$(invoke_read "$FACTORY_CONTRACT_ID" get_pool --token_a "$TOKEN_A_CONTRACT_ID" --token_b "$TOKEN_B_CONTRACT_ID" 2>/dev/null | grep -Eo 'C[A-Z0-9]{55}' | tail -n 1 || true)
         if [[ -n "$existing" ]]; then
           log "AMM pool already exists: $existing (idempotent)"
           pool_addr="$existing"
           # Lookup LP token
-          lp_addr=$(invoke_read "$FACTORY_CONTRACT_ID" -- get_lp_token --pool "$pool_addr" 2>&1 | grep -Eo 'C[A-Z0-9]{55}' | tail -n 1 || echo "")
+          lp_addr=$(invoke_read "$FACTORY_CONTRACT_ID" get_lp_token --pool "$pool_addr" 2>/dev/null | grep -Eo 'C[A-Z0-9]{55}' | tail -n 1 || echo "")
         else
           printf '[deploy] create_pool failed:\n%s\n' "$out" >&2
           die "failed to create AMM pool"
@@ -61,9 +65,11 @@ deploy_pools() {
         # Continue to verification
         out=""
       }
+      rm -f "$err"
       if [[ -n "$out" ]]; then
-        # Parse both addresses from output — first is pool, second may be LP or governance
-        pool_addr=$(printf '%s\n' "$out" | grep -Eo 'C[A-Z0-9]{55}' | head -n 1)
+        # First address in the returned tuple is the pool; the second, when
+        # present, is its governance contract.
+        pool_addr=$(printf '%s\n' "$out" | grep -Eo 'C[A-Z2-7]{55}' | head -n 1 || true)
         # LP token is deterministic second contract; also query factory registry
         if [[ -z "$pool_addr" ]]; then
           die "could not parse AMM pool address from create_pool output: $out"
@@ -71,7 +77,7 @@ deploy_pools() {
         AMM_POOL_CONTRACT_ID="$pool_addr"
         persist_var "AMM_POOL_CONTRACT_ID" "$AMM_POOL_CONTRACT_ID"
         # LP_TOKEN is created by factory; query it
-        lp_addr=$(invoke_read "$FACTORY_CONTRACT_ID" -- get_lp_token --pool "$AMM_POOL_CONTRACT_ID" 2>&1 | grep -Eo 'C[A-Z0-9]{55}' | tail -n 1 || echo "")
+        lp_addr=$(invoke_read "$FACTORY_CONTRACT_ID" get_lp_token --pool "$AMM_POOL_CONTRACT_ID" 2>/dev/null | grep -Eo 'C[A-Z0-9]{55}' | tail -n 1 || echo "")
         if [[ -n "$lp_addr" ]]; then
           LP_TOKEN_CONTRACT_ID="$lp_addr"
           persist_var "LP_TOKEN_CONTRACT_ID" "$LP_TOKEN_CONTRACT_ID"
@@ -93,7 +99,7 @@ deploy_pools() {
     # Verify LP token admin is pool
     if [[ -n "${LP_TOKEN_CONTRACT_ID:-}" ]]; then
       local lp_admin_out lp_admin
-      lp_admin_out=$(invoke_read "$LP_TOKEN_CONTRACT_ID" -- admin 2>&1 || true)
+      lp_admin_out=$(invoke_read "$LP_TOKEN_CONTRACT_ID" admin 2>/dev/null || true)
       lp_admin=$(printf '%s\n' "$lp_admin_out" | grep -Eo 'C[A-Z0-9]{55}' | tail -n 1 || true)
       if [[ "$lp_admin" == "$AMM_POOL_CONTRACT_ID" ]]; then
         log "verified LP token admin is AMM pool"
@@ -118,16 +124,19 @@ deploy_pools() {
     else
       CURRENT_STEP="factory.create_cl_pool"
       log "creating CL pool via factory: fee_bps=30 initial_tick=0"
-      local cl_out cl_addr
+      local cl_out cl_err cl_addr
+      # As with create_pool, parse the returned address from stdout only.
+      cl_err=$(mktemp)
       cl_out=$(invoke "$FACTORY_CONTRACT_ID" create_cl_pool \
         --caller "$ADMIN_ADDRESS" \
         --token_a "$TOKEN_A_CONTRACT_ID" \
         --token_b "$TOKEN_B_CONTRACT_ID" \
         --fee_bps 30 \
-        --initial_tick 0 2>&1) || {
+        --initial_tick 0 2>"$cl_err") || {
+        cl_out="$cl_out$(printf '\n'; cat "$cl_err")"
         # Check if CL pool already exists
         local existing_cl
-        existing_cl=$(invoke_read "$FACTORY_CONTRACT_ID" -- get_cl_pool --token_a "$TOKEN_A_CONTRACT_ID" --token_b "$TOKEN_B_CONTRACT_ID" --fee_bps 30 2>&1 | grep -Eo 'C[A-Z0-9]{55}' | tail -n 1 || true)
+        existing_cl=$(invoke_read "$FACTORY_CONTRACT_ID" get_cl_pool --token_a "$TOKEN_A_CONTRACT_ID" --token_b "$TOKEN_B_CONTRACT_ID" --fee_bps 30 2>/dev/null | grep -Eo 'C[A-Z0-9]{55}' | tail -n 1 || true)
         if [[ -n "$existing_cl" ]]; then
           log "CL pool already exists: $existing_cl"
           CL_POOL_CONTRACT_ID="$existing_cl"
@@ -141,6 +150,7 @@ deploy_pools() {
           cl_out=""
         fi
       }
+      rm -f "$cl_err"
       if [[ -n "$cl_out" ]]; then
         cl_addr=$(printf '%s\n' "$cl_out" | grep -Eo 'C[A-Z0-9]{55}' | tail -n 1 || echo "")
         if [[ -n "$cl_addr" ]]; then
@@ -158,7 +168,7 @@ deploy_pools() {
   if [[ -n "${CL_POOL_CONTRACT_ID:-}" ]]; then
     CURRENT_STEP="verify CL pool"
     local cl_info
-    cl_info=$(invoke_read "$CL_POOL_CONTRACT_ID" -- get_pool_state 2>&1 || invoke_read "$CL_POOL_CONTRACT_ID" -- current_tick 2>&1 || true)
+    cl_info=$(invoke_read "$CL_POOL_CONTRACT_ID" get_pool_state 2>/dev/null || invoke_read "$CL_POOL_CONTRACT_ID" current_tick 2>/dev/null || true)
     if echo "$cl_info" | grep -qE '[0-9]+'; then
       log "verified CL pool liveness: $cl_info"
     else

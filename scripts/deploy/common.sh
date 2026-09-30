@@ -262,7 +262,12 @@ invoke() {
     -- "$@"
 }
 
-# invoke_read — same but without --source (for read-only queries; pass --source anyway for consistency)
+# invoke_read — invoke for a read-only query. Like invoke, it adds the `--`
+# itself, so pass the function name straight after the contract id. Stdout is
+# only the returned value: the CLI's stderr (progress lines, event logs, and
+# usage errors, all of which can echo contract ids) is left on stderr so a
+# caller parsing an address or number out of the result cannot pick one up
+# from there instead.
 invoke_read() {
   local contract_id="$1"
   shift
@@ -270,7 +275,7 @@ invoke_read() {
     --id "$contract_id" \
     --network "$NETWORK" \
     --source "$SOURCE_ACCOUNT" \
-    -- "$@" 2>&1
+    -- "$@"
 }
 
 # ── WASM path helpers ─────────────────────────────────────────────────────
@@ -353,8 +358,8 @@ ensure_wasm_built() {
 
 # verify_token CONTRACT_ID EXPECTED_ADMIN
 # Reads the admin from the token contract and asserts it equals EXPECTED_ADMIN.
-# Calls the CLI directly (rather than via invoke_read, which merges stderr
-# into stdout) so a failed/panicking simulation — e.g. the RPC node hasn't yet
+# Calls the CLI directly (rather than via invoke_read) and keeps stderr apart
+# so a failed/panicking simulation — e.g. the RPC node hasn't yet
 # caught up with the initialize tx that just landed, so admin()'s storage read
 # panics — can be detected by exit code instead of having its diagnostic
 # output (which echoes the contract's own C… address in event-log lines)
@@ -400,7 +405,7 @@ verify_amm_pool() {
   local expected_token_b="$3"
   local expected_fee_bps="$4"
   local out
-  out=$(invoke_read "$pool_id" -- get_info 2>&1 || true)
+  out=$(invoke_read "$pool_id" get_info 2>/dev/null || true)
   if echo "$out" | grep -q "$expected_token_a" && echo "$out" | grep -q "$expected_token_b"; then
     log "verified pool $pool_id get_info contains expected tokens"
   else
@@ -421,7 +426,7 @@ verify_factory_hashes() {
   # Factory stores hashes in instance storage; no direct getter for WASM hashes in all versions.
   # Perform liveness check via get_pool_count and all_pools
   local out
-  out=$(invoke_read "$factory_id" -- get_pool_count 2>&1 || true)
+  out=$(invoke_read "$factory_id" get_pool_count 2>/dev/null || true)
   if echo "$out" | grep -qE '[0-9]+'; then
     log "verified factory $factory_id liveness (get_pool_count readable: $out)"
     return 0
@@ -435,13 +440,13 @@ verify_governance() {
   local expected_pool="$2"
   local expected_lp="$3"
   local out
-  out=$(invoke_read "$gov_id" -- get_params 2>&1 || true)
+  out=$(invoke_read "$gov_id" get_params 2>/dev/null || true)
   if echo "$out" | grep -q "$expected_pool" || echo "$out" | grep -q "$expected_lp"; then
     log "verified governance $gov_id points at pool/lp"
     return 0
   fi
   # Fallback liveness: try get_proposal or proposal_status
-  out=$(invoke_read "$gov_id" -- get_params 2>&1 || true)
+  out=$(invoke_read "$gov_id" get_params 2>/dev/null || true)
   if echo "$out" | grep -qE 'voting|quorum|Voting'; then
     log "verified governance $gov_id liveness"
     return 0

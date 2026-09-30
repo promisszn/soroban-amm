@@ -54,7 +54,7 @@ run_governance_flow() {
     --caller "$admin" \
     --token_a "$ta" \
     --token_b "$tb" \
-    --fee_bps 30 2>&1 | extract_contract_id)
+    --fee_bps 30 | extract_contract_id)
   if [[ -z "$pool_addr" ]]; then
     die "governance: failed to create isolated AMM pool"
   fi
@@ -79,12 +79,13 @@ run_governance_flow() {
   pass "governance: seeded LP supply on isolated pool"
 
   # ── isolated governance instance ─────────────────────────────────────────
-  local gov_wasm="$ROOT_DIR/target/wasm32v1-none/release/governance.wasm"
+  local gov_wasm
+  gov_wasm=$(e2e_wasm governance)
   local governance
   governance=$(stellar contract deploy \
     --wasm "$gov_wasm" \
     --network "$NETWORK" \
-    --source "$SOURCE_ACCOUNT" 2>&1 | extract_contract_id)
+    --source "$SOURCE_ACCOUNT" | extract_contract_id)
   if [[ -z "$governance" ]]; then
     die "governance: failed to deploy isolated governance instance"
   fi
@@ -110,7 +111,7 @@ run_governance_flow() {
   local proposal_id
   proposal_id=$(invoke "$governance" propose \
     --proposer "$admin" \
-    --kind '{"UpdateFee": 25}' | parse_i128)
+    --kind '{"UpdateFee":"25"}' | parse_i128)
   if [[ -z "$proposal_id" ]]; then
     die "governance: propose did not return a proposal id"
   fi
@@ -189,12 +190,13 @@ run_governance_flow() {
 deploy_throwaway_token() {
   local symbol="$1"
   local admin="$SOURCE_PUBLIC_KEY"
-  local wasm="$ROOT_DIR/target/wasm32v1-none/release/token.wasm"
+  local wasm
+  wasm=$(e2e_wasm token)
   local id
   id=$(stellar contract deploy \
     --wasm "$wasm" \
     --network "$NETWORK" \
-    --source "$SOURCE_ACCOUNT" 2>&1 | extract_contract_id)
+    --source "$SOURCE_ACCOUNT" | extract_contract_id)
   if [[ -z "$id" ]]; then
     die "governance: failed to deploy throwaway token $symbol"
   fi

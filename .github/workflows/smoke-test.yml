@@ -25,6 +25,7 @@ on:
       - "scripts/e2e.sh"
       - "scripts/e2e/**"
       - "scripts/build_workspace.sh"
+      - "scripts/optimize_contracts.sh"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -118,6 +119,11 @@ jobs:
       - name: Run e2e script
         id: e2e
         shell: bash
+        env:
+          # governance::execute() cannot run until a hardcoded 24h veto
+          # window after voting closes, far past this job's timeout; the
+          # flow still checks propose, vote, the LP lock and the tally.
+          GOVERNANCE_SKIP_EXECUTE: "1"
         run: |
           set -o pipefail
           bash scripts/e2e.sh 2>&1 | tee "$RUNNER_TEMP/e2e.log"

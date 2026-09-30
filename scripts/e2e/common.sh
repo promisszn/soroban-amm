@@ -39,20 +39,18 @@ require_cmd() {
 invoke() {
   local contract_id="$1"
   shift
-  stellar contract invoke \
-    --id "$contract_id" \
-    --network "$NETWORK" \
-    --source "$SOURCE_ACCOUNT" \
-    -- "$@"
+  invoke_as "$SOURCE_ACCOUNT" "$contract_id" "$@"
 }
 
 parse_i128() {
   grep -Eo -- '-?[0-9]+' | tail -n 1
 }
 
+# field_value FIELD — last numeric value of FIELD in stdin. The CLI prints
+# i128/u128 values as quoted JSON strings, so the quote is optional.
 field_value() {
   local field="$1"
-  grep -Eo "\"?${field}\"?[[:space:]]*[:=][[:space:]]*-?[0-9]+" | grep -Eo -- '-?[0-9]+' | tail -n 1
+  grep -Eo "\"?${field}\"?[[:space:]]*[:=][[:space:]]*\"?-?[0-9]+" | grep -Eo -- '-?[0-9]+' | tail -n 1
 }
 
 extract_contract_id() {
@@ -195,7 +193,47 @@ assert_not_contains() {
 }
 
 # invoke_as ACCOUNT CONTRACT_ID FN ARGS... — invoke with a different signer.
+#
+# A transaction rejected with ResourceLimitExceeded is simulated and sent once
+# more. The token contract appends a balance checkpoint the first time an
+# account's balance changes in a ledger and overwrites it on later changes in
+# the same ledger, so a call simulated on the ledger that just applied the
+# account's previous transfer is budgeted for the overwrite, runs one ledger
+# later as an append, and writes more bytes than it declared. The rejected
+# transaction changes no state, and the new simulation runs on a later ledger.
 invoke_as() {
+  local account="$1"
+  local contract_id="$2"
+  shift 2
+  local err out rc attempt
+  err=$(mktemp)
+  for attempt in 1 2; do
+    rc=0
+    out=$(stellar contract invoke \
+      --id "$contract_id" \
+      --network "$NETWORK" \
+      --source "$account" \
+      -- "$@" 2>"$err") || rc=$?
+    cat "$err" >&2
+    if [[ "$rc" -eq 0 || "$attempt" -eq 2 ]] || ! grep -q 'ResourceLimitExceeded' "$err"; then
+      break
+    fi
+    printf '[retry] %s rejected with ResourceLimitExceeded; simulating and sending again\n' "$1" >&2
+  done
+  rm -f "$err"
+  printf '%s\n' "$out"
+  return "$rc"
+}
+
+# invoke_signed_only_by ACCOUNT CONTRACT_ID FN ARGS... — like invoke_as, but
+# the transaction carries ACCOUNT's signatures only. invoke and invoke_as let
+# the CLI sign every auth entry whose address has a key in the local keystore,
+# which includes the admin, pool and keeper keys these flows create, so a
+# "rejected without X's auth" check made through them passes or fails
+# regardless of what the contract enforces. Use this for those checks.
+invoke_signed_only_by() {
+  local -
+  set -o pipefail
   local account="$1"
   local contract_id="$2"
   shift 2
@@ -203,7 +241,11 @@ invoke_as() {
     --id "$contract_id" \
     --network "$NETWORK" \
     --source "$account" \
-    -- "$@"
+    --build-only \
+    -- "$@" \
+    | stellar tx simulate --network "$NETWORK" --source "$account" \
+    | stellar tx sign --network "$NETWORK" --sign-with-key "$account" \
+    | stellar tx send --network "$NETWORK"
 }
 
 # expect_fail LABEL CMD... — CMD must exit non-zero (e.g. an auth or

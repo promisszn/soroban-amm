@@ -42,7 +42,7 @@ deploy_twap_consumer() {
       CURRENT_STEP="initialize twap_consumer"
       log "initializing twap_consumer keeper=$ADMIN_ADDRESS"
       if ! invoke "$TWAP_CONSUMER_CONTRACT_ID" initialize --keeper "$ADMIN_ADDRESS" >/dev/null 2>&1; then
-        if invoke_read "$TWAP_CONSUMER_CONTRACT_ID" -- get_keeper 2>&1 | grep -q "$ADMIN_ADDRESS"; then
+        if invoke_read "$TWAP_CONSUMER_CONTRACT_ID" get_keeper 2>/dev/null | grep -q "$ADMIN_ADDRESS"; then
           log "twap_consumer already initialized"
         else
           warn "failed to initialize twap_consumer"
@@ -55,7 +55,7 @@ deploy_twap_consumer() {
   fi
 
   CURRENT_STEP="verify twap_consumer"
-  if invoke_read "$TWAP_CONSUMER_CONTRACT_ID" -- get_keeper >/dev/null 2>&1; then
+  if invoke_read "$TWAP_CONSUMER_CONTRACT_ID" get_keeper >/dev/null 2>/dev/null; then
     log "verified twap_consumer keeper"
   else
     warn "twap_consumer verification warning"
