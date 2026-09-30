@@ -57,9 +57,13 @@ run_factory_flow() {
   local amount_a=500000
   local amount_b=1000000
   local swap_amount_in=10000
+  # amount_a/amount_b are in the pool's token order, not ta/tb's.
+  local pool_ta pool_tb
+  pool_ta=$(pool_token "$pool_addr" token_a)
+  pool_tb=$(pool_token "$pool_addr" token_b)
   # add_liquidity spends all of amount_a, so mint the swap input on top.
-  invoke "$TOKEN_A_CONTRACT_ID" mint --to "$admin" --amount "$(( amount_a + swap_amount_in ))" >/dev/null
-  invoke "$TOKEN_B_CONTRACT_ID" mint --to "$admin" --amount "$amount_b" >/dev/null
+  invoke "$pool_ta" mint --to "$admin" --amount "$(( amount_a + swap_amount_in ))" >/dev/null
+  invoke "$pool_tb" mint --to "$admin" --amount "$amount_b" >/dev/null
 
   local deadline add_output lp_shares
   deadline=$(( $(date +%s) + 300 ))
@@ -76,7 +80,7 @@ run_factory_flow() {
   local swap_output swap_out
   swap_output=$(invoke "$pool_addr" swap \
     --trader "$admin" \
-    --token_in "$TOKEN_A_CONTRACT_ID" \
+    --token_in "$pool_ta" \
     --amount_in "$swap_amount_in" \
     --min_out 0 \
     --deadline "$deadline")

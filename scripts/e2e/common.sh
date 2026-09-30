@@ -388,6 +388,14 @@ e2e_new_seeded_pool() {
   printf '%s' "$pool"
 }
 
+# pool_token POOL FIELD — the AMM pool's token_a or token_b. The factory
+# stores a pair sorted by address, so a pool's token_a is not necessarily the
+# token a flow passed as token_a, and add_liquidity's amount_a/amount_b follow
+# the pool's order. Flows that deposit unequal amounts must mint by it.
+pool_token() {
+  invoke "$1" get_info | grep -Eo "\"$2\":\"C[A-Z2-7]{55}\"" | parse_address
+}
+
 # balance_of TOKEN ADDRESS — token balance as an integer.
 balance_of() {
   invoke "$1" balance --id "$2" | parse_i128

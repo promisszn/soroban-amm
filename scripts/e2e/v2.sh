@@ -13,13 +13,18 @@ run_v2_flow() {
   local min_swap_out="${MIN_SWAP_OUT:-150000}"
   local max_swap_out="${MAX_SWAP_OUT:-200000}"
 
+  # amount_a/amount_b are in the pool's token order, not TOKEN_A/TOKEN_B's.
+  local tok_a tok_b
+  tok_a=$(pool_token "$AMM_CONTRACT_ID" token_a)
+  tok_b=$(pool_token "$AMM_CONTRACT_ID" token_b)
+
   # add_liquidity spends all of amount_a, so mint the swap input on top.
-  invoke "$TOKEN_A_CONTRACT_ID" mint \
+  invoke "$tok_a" mint \
     --to "$SOURCE_PUBLIC_KEY" \
     --amount "$(( amount_a + swap_amount_in ))" >/dev/null
   pass "v2: minted token A to test account"
 
-  invoke "$TOKEN_B_CONTRACT_ID" mint \
+  invoke "$tok_b" mint \
     --to "$SOURCE_PUBLIC_KEY" \
     --amount "$amount_b" >/dev/null
   pass "v2: minted token B to test account"
@@ -52,7 +57,7 @@ run_v2_flow() {
   local swap_output swap_out
   swap_output="$(invoke "$AMM_CONTRACT_ID" swap \
     --trader "$SOURCE_PUBLIC_KEY" \
-    --token_in "$TOKEN_A_CONTRACT_ID" \
+    --token_in "$tok_a" \
     --amount_in "$swap_amount_in" \
     --min_out 0 \
     --deadline "$deadline")"

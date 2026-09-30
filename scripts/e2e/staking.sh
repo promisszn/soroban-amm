@@ -27,8 +27,9 @@ run_staking_flow() {
   local reward_amount="${STAKING_REWARD_AMOUNT:-100000}"
 
   # ── obtain LP tokens by adding liquidity to the shared AMM pool ─────────
-  invoke "$TOKEN_A_CONTRACT_ID" mint --to "$staker" --amount "$amount_a" >/dev/null
-  invoke "$TOKEN_B_CONTRACT_ID" mint --to "$staker" --amount "$amount_b" >/dev/null
+  # amount_a/amount_b are in the pool's token order, not TOKEN_A/TOKEN_B's.
+  invoke "$(pool_token "$AMM_POOL_CONTRACT_ID" token_a)" mint --to "$staker" --amount "$amount_a" >/dev/null
+  invoke "$(pool_token "$AMM_POOL_CONTRACT_ID" token_b)" mint --to "$staker" --amount "$amount_b" >/dev/null
 
   local deadline add_output lp_shares
   deadline=$(( $(date +%s) + 300 ))
