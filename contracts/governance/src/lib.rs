@@ -19,7 +19,9 @@ pub const WASM: &[u8] = include_bytes!(concat!(
     "/../../target/wasm32v1-none/release/governance.wasm"
 ));
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec,
+};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -595,6 +597,32 @@ impl Governance {
             env,
             (Symbol::new(&env, "admin_changed"),),
             (new_admin,)
+        );
+        Ok(())
+    }
+
+    /// Admin-only: replace this contract's WASM with a new version.
+    ///
+    /// `admin` must be the stored governance admin and must authorize the
+    /// call; any other address is rejected with `Unauthorized`. The new WASM
+    /// must already be uploaded to the network. Storage is preserved and
+    /// `initialize` is not re-run; only the bytecode is replaced.
+    pub fn upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), GovernanceError> {
+        let stored = Self::read_admin(&env)?;
+        if admin != stored {
+            return Err(GovernanceError::Unauthorized);
+        }
+        admin.require_auth();
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "upgraded"),),
+            (new_wasm_hash,)
         );
         Ok(())
     }

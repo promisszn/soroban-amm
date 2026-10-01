@@ -101,6 +101,8 @@ pub trait AmmPoolInterface {
     fn get_amount_in(env: Env, token_out: Address, amount_out: i128) -> Result<i128, AmmError>;
 
     fn get_info(env: Env) -> PoolInfo;
+
+    fn is_paused(env: Env) -> bool;
 }
 
 // ── factory ──────────────────────────────────────────────────────────────────
@@ -187,6 +189,8 @@ pub trait ConcentratedLiquidityInterface {
     fn get_tokens(env: Env) -> (Address, Address);
 
     fn get_pool_state(env: Env) -> PoolState;
+
+    fn is_paused(env: Env) -> bool;
 
     #[allow(clippy::too_many_arguments)]
     fn mint_position(

@@ -46,24 +46,31 @@ deploy_router() {
       log "skipping router initialize (--only/--skip filter)"
     else
       CURRENT_STEP="initialize router"
-      log "initializing router factory=$FACTORY_CONTRACT_ID"
-      if ! invoke "$ROUTER_CONTRACT_ID" initialize --factory "$FACTORY_CONTRACT_ID" >/dev/null 2>&1; then
-        warn "failed to initialize router — may already be initialized"
-        if invoke_read "$ROUTER_CONTRACT_ID" -- get_factory 2>&1 | grep -q "$FACTORY_CONTRACT_ID" || true; then
-          log "router already initialized"
-        fi
-      else
+      log "initializing router admin=$ADMIN_ADDRESS factory=$FACTORY_CONTRACT_ID"
+      if invoke "$ROUTER_CONTRACT_ID" initialize --admin "$ADMIN_ADDRESS" --factory "$FACTORY_CONTRACT_ID" >/dev/null 2>&1; then
         log "router initialized"
+      elif router_factory_is "$ROUTER_CONTRACT_ID" "$FACTORY_CONTRACT_ID"; then
+        # A previous run initialized it but died before persisting the marker.
+        log "router already initialized"
+      else
+        die "failed to initialize router at $ROUTER_CONTRACT_ID"
       fi
       persist_var "ROUTER_INITIALIZED" "1"
     fi
   fi
 
   CURRENT_STEP="verify router"
-  if invoke_read "$ROUTER_CONTRACT_ID" -- get_factory >/dev/null 2>&1 || invoke_read "$ROUTER_CONTRACT_ID" -- get_pool >/dev/null 2>&1; then
-    log "verified router liveness"
+  if router_factory_is "$ROUTER_CONTRACT_ID" "$FACTORY_CONTRACT_ID"; then
+    log "verified router $ROUTER_CONTRACT_ID points at factory $FACTORY_CONTRACT_ID"
   else
-    warn "router verification: read failed (may not expose getter)"
-    log "router deployed at $ROUTER_CONTRACT_ID (liveness via deploy ok)"
+    die "router $ROUTER_CONTRACT_ID verification failed: get_factory does not return $FACTORY_CONTRACT_ID"
   fi
+}
+
+# router_factory_is ID FACTORY — true when the router's get_factory is FACTORY.
+# get_factory errors until initialize has run, so this also probes init state.
+router_factory_is() {
+  local out
+  out=$(invoke_read "$1" get_factory 2>/dev/null || true)
+  [[ "$(printf '%s\n' "$out" | extract_contract_id)" == "$2" ]]
 }

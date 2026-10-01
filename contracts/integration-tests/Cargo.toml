@@ -33,6 +33,7 @@ twal_consumer    = { path = "../twal_consumer",    features = ["testutils"] }
 dex_aggregator   = { path = "../dex_aggregator",   features = ["testutils"] }
 incentive_campaigns = { path = "../incentive_campaigns", features = ["testutils"] }
 v2_to_v3_migration   = { path = "../v2_to_v3_migration",   features = ["testutils"] }
+oracle_aggregator    = { path = "../oracle_aggregator",    features = ["testutils"] }
 
 [[test]]
 name = "v2_to_v3_migration"

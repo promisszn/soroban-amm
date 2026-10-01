@@ -39,7 +39,7 @@ run_cl_position_nft_flow() {
 
   # ── mint (pool-only) ────────────────────────────────────────────────────
   expect_fail "cl_position_nft: mint without the pool's auth is rejected" \
-    invoke "$nft" mint --to "$owner" --pool "$pool" --lower_tick="$lower" --upper_tick="$upper"
+    invoke_signed_only_by "$SOURCE_ACCOUNT" "$nft" mint --to "$owner" --pool "$pool" --lower_tick="$lower" --upper_tick="$upper"
 
   local id0 id1
   id0=$(invoke_as "$pool_key" "$nft" mint \
@@ -82,7 +82,7 @@ run_cl_position_nft_flow() {
 
   # ── burn (pool-only) ────────────────────────────────────────────────────
   expect_fail "cl_position_nft: burn without the pool's auth is rejected" \
-    invoke "$nft" burn --token_id "$id1"
+    invoke_signed_only_by "$SOURCE_ACCOUNT" "$nft" burn --token_id "$id1"
   invoke_as "$pool_key" "$nft" burn --token_id "$id1" >/dev/null
   expect_fail "cl_position_nft: owner_of a burned token fails" \
     invoke "$nft" owner_of --token_id "$id1"

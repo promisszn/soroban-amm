@@ -12,7 +12,16 @@
 
 #![no_std]
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, Symbol, Vec,
+};
+
+// Export compiled WASM for tests/dev usage when the `testutils` feature is enabled.
+#[cfg(feature = "testutils")]
+pub const WASM: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../target/wasm32v1-none/release/staking.wasm"
+));
 
 use soroban_sdk::token::Client as SepTokenClient;
 
@@ -619,6 +628,35 @@ impl Staking {
             .set(&DataKey::PendingAdmin, &Option::<Address>::None);
         env.events()
             .publish((Symbol::new(&env, "admin_changed"),), (new_admin,));
+        Ok(())
+    }
+
+    /// Replace this contract's WASM with a new version. Admin only.
+    ///
+    /// `admin` must be the stored admin and must authorize the call; any other
+    /// address is rejected with `Unauthorized`. The new WASM must already be
+    /// uploaded to the network. Stakes, reward accounting and configuration
+    /// are preserved and `initialize` is not re-run; only the bytecode is
+    /// replaced.
+    pub fn upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), StakingError> {
+        Self::extend_instance_ttl(&env);
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(StakingError::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(StakingError::Unauthorized);
+        }
+        admin.require_auth();
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        env.events()
+            .publish((Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
         Ok(())
     }
 

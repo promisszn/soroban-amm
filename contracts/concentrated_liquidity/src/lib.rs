@@ -8,7 +8,7 @@ pub mod tick_bitmap;
 use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
-    Env, Vec,
+    BytesN, Env, Vec,
 };
 
 #[cfg(feature = "testutils")]
@@ -516,6 +516,24 @@ impl ConcentratedLiquidity {
         new_admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage().instance().remove(&DataKey::PendingAdmin);
+        Ok(())
+    }
+
+    /// Admin: replace this pool's WASM with a new version.
+    ///
+    /// `admin` must be the stored pool admin and must authorize the call; any
+    /// other address is rejected with `Unauthorized`. The new WASM must
+    /// already be uploaded to the network. Pool, tick and position storage is
+    /// preserved and `initialize` is not re-run; only the bytecode is replaced.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), ClError> {
+        let stored = Self::read_admin(&env)?;
+        if admin != stored {
+            return Err(ClError::Unauthorized);
+        }
+        admin.require_auth();
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("upgraded"),), (new_wasm_hash,));
         Ok(())
     }
 

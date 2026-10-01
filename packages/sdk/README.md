@@ -143,6 +143,104 @@ let result = await router.swapExactOut({
 });
 ```
 
+### GovernanceClient
+
+Every method below maps onto a real entrypoint of `contracts/governance`. Methods
+whose name is a contract function are marked with the entrypoint they send; the
+rest are **client-side compositions** that page or fan out over real
+entrypoints, cost more than one RPC call, and say so in their JSDoc.
+
+```ts
+import { GovernanceClient } from "@soroban-amm/sdk";
+
+const gov = new GovernanceClient({
+  rpcUrl: "https://soroban-testnet.stellar.org",
+  networkPassphrase: "Test SDF Network ; September 2015",
+  contractId: "C...",
+});
+
+// ── Reads ─────────────────────────────────────────────────────────────────────
+
+const params = await gov.getParams();            // get_params
+console.log(params.quorumBps, params.vetoMultisig, params.quorumDecayRateBpsPerDay);
+
+const count = await gov.getProposalCount();      // get_proposal_count
+
+// The contract's Proposal struct has no `status` field: status is derived from
+// the stored fields plus the current ledger clock and returned separately.
+const proposal = await gov.getProposal(7);      // get_proposal  -> ProposalData
+const status = await gov.proposalStatus(7);     // proposal_status
+
+// Both at once (two RPC calls).
+const full = await gov.getProposalWithStatus(7);
+console.log(full.kind, full.status);
+
+const quorum = await gov.getEffectiveQuorum(7); // get_effective_quorum
+const balance = await gov.getSnapshotBalance(7, voter); // get_snapshot_balance
+const audit = await gov.getVetoAudit(7);        // get_veto_audit -> VetoAudit | null
+const record = await gov.getVoteInfo(7, voter); // get_vote_info -> VoteRecord
+const to = await gov.getDelegate(voter);        // get_delegate -> string | null
+
+// Client-side composition: pages get_proposals_paginated.
+const page = await gov.listProposals(0, 50);   // get_proposals_paginated
+const newest = await gov.listProposalsDesc(0, 10);
+const active = await gov.getActiveProposalIds(); // one proposal_status per proposal
+
+// ── Writes ────────────────────────────────────────────────────────────────────
+// The *Params builders return `xdr.ScVal[]` ready to hand to a transaction.
+
+gov.proposeParams(proposer, { kind: "UpdateFee", newFeeBps: 30n });
+gov.proposeParams(proposer, { kind: "PausePool" });
+gov.proposeParams(proposer, { kind: "TransferAdmin", newAdmin: newAdmin });
+gov.proposeParams(proposer, {
+  kind: "UpdateClProtocolFee",
+  params: { clPool, recipient, bps: 10n },
+});
+
+gov.voteParams(voter, 7, "For");        // vote(voter, proposal_id, choice)
+gov.executeParams(7);                   // execute(proposal_id)
+gov.cancelParams(7, proposer);          // cancel_proposal(proposal_id, proposer)
+gov.unlockVoteParams(voter, 7);         // unlock_vote(voter, proposal_id)
+gov.vetoParams(7);                      // veto(proposal_id)
+gov.delegateParams(from, to);           // delegate(from, to)
+gov.undelegateParams(from);             // undelegate(from)
+```
+
+#### Enum encodings
+
+The governance contract's enums are `#[contracttype]` enums, so a unit variant
+is a `scvVec` whose head is a `scvSymbol` — not a bare symbol or string. The SDK
+encodes and decodes them for you:
+
+| Contract type | Encoding | Helper |
+|---|---|---|
+| `Vote` | `scvVec([scvSymbol("For")])` | `encodeVote` |
+| `ProposalStatus` | `scvVec([scvSymbol("Queued")])` | `encodeProposalStatus` |
+| `ProposalKind` | `scvVec([scvSymbol("UpdateFee"), scvI128(30n)])` | `encodeProposalKind` |
+| `VoteRecord` | `scvVec([scvSymbol("VotedFor")])` | `encodeVoteRecord` |
+
+`ProposalKind` covers all 18 variants of the contract enum; the exported
+`PROPOSAL_KIND_VARIANTS` list is asserted against the Rust `enum ProposalKind` in
+`governance.test.ts`, so it cannot fall behind the contract.
+
+Errors returned by the contract decode into a typed `GovernanceContractError`
+carrying the `GovernanceError` discriminant and its symbolic name:
+
+```ts
+import { GovernanceContractError } from "@soroban-amm/sdk";
+
+try {
+  await gov.getProposal(999);
+} catch (err) {
+  if (err instanceof GovernanceContractError && err.variant === "ProposalNotFound") {
+    // ...
+  }
+}
+```
+
+`tryGetProposal` returns `null` for an unknown id instead of throwing; every
+other failure still propagates.
+
 ## Exported types
 
 | Type | Description |
@@ -161,3 +259,11 @@ let result = await router.swapExactOut({
 | `LockedPosition` | Locked staking position |
 | `Campaign` | Incentive campaign data |
 | `DistributionRecord` | Reward distribution record |
+| `GovernanceParams` | Governance configuration from `get_params` |
+| `ProposalData` | Stored proposal — contract `Proposal` struct, no status |
+| `Proposal` | `ProposalData` plus the derived `status` |
+| `ProposalKind` | Discriminated union over all 18 `ProposalKind` variants |
+| `ProposalStatus` | `Active` … `Vetoed` (9 variants) |
+| `VoteChoice` / `VoteRecord` | Contract `Vote` / `VoteRecord` variants |
+| `VetoAudit` | Veto audit record from `get_veto_audit` |
+| `GovernanceContractError` | Typed contract error with `code` and `variant` |

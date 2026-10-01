@@ -210,7 +210,7 @@ Soroban contracts partition state across storage tiers based on lifetime and acc
 **Upgrade Considerations:**
 - **Storage Immutability**: Critical parameters (e.g., token pair addresses and LP token contract identity) are established at initialization and remain immutable.
 - **DataKey Stability**: State is keyed by the binary representation of `DataKey` enums. Modifying variant order, discriminants, or payload types is a breaking storage change.
-- **Code Upgrades**: Logic upgrades are performed via `upgrade(new_wasm_hash)`. Changing storage layout or migrating tiers requires explicit migration procedures. See the **[Deployment Runbook](docs/deployment-runbook.md)** for upgrade guides and checklists.
+- **Code Upgrades**: Logic upgrades replace a contract's WASM in place via `env.deployer().update_current_contract_wasm`. The address and all storage are kept, and `initialize` is not re-run. `amm`, `factory` and `token` expose `upgrade(new_wasm_hash)`, authorized by the stored admin. `governance`, `concentrated_liquidity`, `oracle_aggregator` and `staking` expose `upgrade(admin, new_wasm_hash)`: `admin` must match the stored admin (otherwise the contract's typed `Unauthorized` / `NotAdmin` error is returned) and must sign. Each upgrade is authorized by that contract's single admin address, not by a governance vote; use a multisig account as the admin for multi-party control. Changing storage layout or migrating tiers requires explicit migration procedures. See the **[Deployment Runbook](docs/deployment-runbook.md#5-upgrade-procedure)** for upgrade steps, verification and rollback.
 
 ---
 

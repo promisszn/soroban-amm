@@ -43,7 +43,7 @@ deploy_tokens() {
         --name "Soroban AMM Token A" \
         --symbol "SAMA" \
         --decimals 7 >/dev/null 2>&1 || {
-          if invoke_read "$TOKEN_A_CONTRACT_ID" -- name >/dev/null 2>&1; then
+          if invoke_read "$TOKEN_A_CONTRACT_ID" name >/dev/null 2>/dev/null; then
             log "Token A already initialized (verified via name read)"
           else
             die "failed to initialize Token A"
@@ -78,7 +78,7 @@ deploy_tokens() {
         --name "Soroban AMM Token B" \
         --symbol "SAMB" \
         --decimals 7 >/dev/null 2>&1 || {
-          if invoke_read "$TOKEN_B_CONTRACT_ID" -- name >/dev/null 2>&1; then
+          if invoke_read "$TOKEN_B_CONTRACT_ID" name >/dev/null 2>/dev/null; then
             log "Token B already initialized"
           else
             die "failed to initialize Token B"
@@ -112,7 +112,7 @@ deploy_tokens() {
         --name "Soroban AMM Reward" \
         --symbol "SAMR" \
         --decimals 7 >/dev/null 2>&1 || {
-          if invoke_read "$REWARD_TOKEN_CONTRACT_ID" -- name >/dev/null 2>&1; then
+          if invoke_read "$REWARD_TOKEN_CONTRACT_ID" name >/dev/null 2>/dev/null; then
             log "Reward Token already initialized"
           else
             die "failed to initialize Reward Token"

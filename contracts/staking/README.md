@@ -60,3 +60,9 @@ unstake independently.
 | `get_owed_rewards() → i128` | Read rewards already assigned to stakers but not yet paid out (#1045) |
 | `get_staker_info(staker) → StakerInfo` | Read a staker's raw and effective amounts, rewards debt, lock expiry, and boost multiplier |
 | `get_locked_position(staker) → LockedPosition` | Read a staker's locked amount, lock expiry, and boost multiplier |
+
+### Admin
+
+| Function | Description |
+|---|---|
+| `upgrade(admin, new_wasm_hash)` | Replace the contract WASM in place; `admin` must be the stored admin and sign. All staking state is preserved. See the [deployment runbook](../../docs/deployment-runbook.md#55-governance-concentrated-liquidity-oracle-aggregator-and-staking) |

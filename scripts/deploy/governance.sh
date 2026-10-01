@@ -17,10 +17,10 @@ deploy_governance() {
     # Try to discover from factory if available
     if [[ -n "${FACTORY_CONTRACT_ID:-}" ]]; then
       local disc_pool
-      disc_pool=$(invoke_read "$FACTORY_CONTRACT_ID" -- get_pool --token_a "$TOKEN_A_CONTRACT_ID" --token_b "$TOKEN_B_CONTRACT_ID" 2>&1 | grep -Eo 'C[A-Z0-9]{55}' | tail -n 1 || echo "")
+      disc_pool=$(invoke_read "$FACTORY_CONTRACT_ID" get_pool --token_a "$TOKEN_A_CONTRACT_ID" --token_b "$TOKEN_B_CONTRACT_ID" 2>/dev/null | grep -Eo 'C[A-Z0-9]{55}' | tail -n 1 || echo "")
       if [[ -n "$disc_pool" ]]; then
         AMM_POOL_CONTRACT_ID="$disc_pool"
-        LP_TOKEN_CONTRACT_ID=$(invoke_read "$FACTORY_CONTRACT_ID" -- get_lp_token --pool "$disc_pool" 2>&1 | grep -Eo 'C[A-Z0-9]{55}' | tail -n 1 || echo "")
+        LP_TOKEN_CONTRACT_ID=$(invoke_read "$FACTORY_CONTRACT_ID" get_lp_token --pool "$disc_pool" 2>/dev/null | grep -Eo 'C[A-Z0-9]{55}' | tail -n 1 || echo "")
         export AMM_POOL_CONTRACT_ID LP_TOKEN_CONTRACT_ID
       fi
     fi
@@ -71,7 +71,7 @@ deploy_governance() {
           --timelock_secs "$DEFAULT_TIMELOCK_SECS" \
           --quorum_bps "$DEFAULT_QUORUM_BPS" \
           --min_proposer_stake_bps "$DEFAULT_MIN_PROPOSER_STAKE_BPS" >/dev/null 2>&1; then
-        if invoke_read "$GOVERNANCE_CONTRACT_ID" -- get_params >/dev/null 2>&1; then
+        if invoke_read "$GOVERNANCE_CONTRACT_ID" get_params >/dev/null 2>/dev/null; then
           log "governance already initialized"
         else
           die "failed to initialize governance"

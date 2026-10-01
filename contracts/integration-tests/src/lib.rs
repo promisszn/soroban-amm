@@ -16,6 +16,9 @@ mod factory_test;
 mod upgrade_integration_test;
 
 #[cfg(test)]
+mod core_contract_upgrade_test;
+
+#[cfg(test)]
 mod multisig_emergency_withdraw_test;
 
 #[cfg(test)]

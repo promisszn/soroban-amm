@@ -39,20 +39,18 @@ require_cmd() {
 invoke() {
   local contract_id="$1"
   shift
-  stellar contract invoke \
-    --id "$contract_id" \
-    --network "$NETWORK" \
-    --source "$SOURCE_ACCOUNT" \
-    -- "$@"
+  invoke_as "$SOURCE_ACCOUNT" "$contract_id" "$@"
 }
 
 parse_i128() {
   grep -Eo -- '-?[0-9]+' | tail -n 1
 }
 
+# field_value FIELD — last numeric value of FIELD in stdin. The CLI prints
+# i128/u128 values as quoted JSON strings, so the quote is optional.
 field_value() {
   local field="$1"
-  grep -Eo "\"?${field}\"?[[:space:]]*[:=][[:space:]]*-?[0-9]+" | grep -Eo -- '-?[0-9]+' | tail -n 1
+  grep -Eo "\"?${field}\"?[[:space:]]*[:=][[:space:]]*\"?-?[0-9]+" | grep -Eo -- '-?[0-9]+' | tail -n 1
 }
 
 extract_contract_id() {
@@ -195,7 +193,61 @@ assert_not_contains() {
 }
 
 # invoke_as ACCOUNT CONTRACT_ID FN ARGS... — invoke with a different signer.
+#
+# Two transient failures get one more attempt:
+#
+# - Simulation failing. The public RPC endpoint is load-balanced, and the node
+#   that simulates can be a ledger behind the one that confirmed the caller's
+#   previous transaction, so a call that spends what that transaction minted
+#   sees the old balance. The retry waits a ledger first. A genuine failure
+#   fails again; expect_fail turns this off (E2E_SIM_RETRY=0) so negative
+#   checks don't pay for the wait.
+# - ResourceLimitExceeded on submit. The token contract appends a balance checkpoint the first time an
+# account's balance changes in a ledger and overwrites it on later changes in
+# the same ledger, so a call simulated on the ledger that just applied the
+# account's previous transfer is budgeted for the overwrite, runs one ledger
+# later as an append, and writes more bytes than it declared. The rejected
+# transaction changes no state, and the new simulation runs on a later ledger.
 invoke_as() {
+  local account="$1"
+  local contract_id="$2"
+  shift 2
+  local err out rc attempt
+  err=$(mktemp)
+  for attempt in 1 2; do
+    rc=0
+    out=$(stellar contract invoke \
+      --id "$contract_id" \
+      --network "$NETWORK" \
+      --source "$account" \
+      -- "$@" 2>"$err") || rc=$?
+    cat "$err" >&2
+    if [[ "$rc" -eq 0 || "$attempt" -eq 2 ]]; then
+      break
+    fi
+    if grep -q 'ResourceLimitExceeded' "$err"; then
+      printf '[retry] %s rejected with ResourceLimitExceeded; simulating and sending again\n' "$1" >&2
+    elif [[ "${E2E_SIM_RETRY:-1}" == "1" ]] && grep -q 'transaction simulation failed' "$err"; then
+      printf '[retry] %s simulation failed; waiting a ledger in case the RPC node lags, then retrying\n' "$1" >&2
+      sleep 6
+    else
+      break
+    fi
+  done
+  rm -f "$err"
+  printf '%s\n' "$out"
+  return "$rc"
+}
+
+# invoke_signed_only_by ACCOUNT CONTRACT_ID FN ARGS... — like invoke_as, but
+# the transaction carries ACCOUNT's signatures only. invoke and invoke_as let
+# the CLI sign every auth entry whose address has a key in the local keystore,
+# which includes the admin, pool and keeper keys these flows create, so a
+# "rejected without X's auth" check made through them passes or fails
+# regardless of what the contract enforces. Use this for those checks.
+invoke_signed_only_by() {
+  local -
+  set -o pipefail
   local account="$1"
   local contract_id="$2"
   shift 2
@@ -203,7 +255,11 @@ invoke_as() {
     --id "$contract_id" \
     --network "$NETWORK" \
     --source "$account" \
-    -- "$@"
+    --build-only \
+    -- "$@" \
+    | stellar tx simulate --network "$NETWORK" --source "$account" \
+    | stellar tx sign --network "$NETWORK" --sign-with-key "$account" \
+    | stellar tx send --network "$NETWORK"
 }
 
 # expect_fail LABEL CMD... — CMD must exit non-zero (e.g. an auth or
@@ -212,7 +268,7 @@ expect_fail() {
   local label="$1"
   shift
   local out rc=0
-  out=$(trap - ERR; "$@" 2>&1) || rc=$?
+  out=$(trap - ERR; E2E_SIM_RETRY=0 "$@" 2>&1) || rc=$?
   if [[ "$rc" -eq 0 ]]; then
     die "$label: expected the call to be rejected, but it succeeded: $out"
   fi
@@ -330,6 +386,14 @@ e2e_new_seeded_pool() {
     --min_shares 0 \
     --deadline "$deadline" >/dev/null
   printf '%s' "$pool"
+}
+
+# pool_token POOL FIELD — the AMM pool's token_a or token_b. The factory
+# stores a pair sorted by address, so a pool's token_a is not necessarily the
+# token a flow passed as token_a, and add_liquidity's amount_a/amount_b follow
+# the pool's order. Flows that deposit unequal amounts must mint by it.
+pool_token() {
+  invoke "$1" get_info | grep -Eo "\"$2\":\"C[A-Z2-7]{55}\"" | parse_address
 }
 
 # balance_of TOKEN ADDRESS — token balance as an integer.

@@ -22,8 +22,29 @@ export { SIMULATION_SOURCE_ACCOUNT } from "./internal/simulate.js";
 export { TokenClient } from "./token.js";
 export { FactoryClient } from "./factory.js";
 export type { CreatePoolResult } from "./factory.js";
-export { GovernanceClient } from "./governance.js";
-export type { GovernanceParams, Proposal, ProposalStatus, VoteChoice, VoteRecord } from "./governance.js";
+export { GovernanceClient, GovernanceContractError, decodeGovernanceError, encodeVote, encodeProposalKind, encodeProposalStatus, encodeVoteRecord, decodeProposalKind, PROPOSAL_KIND_VARIANTS, GovernanceErrorNames } from "./governance.js";
+export type {
+  GovernanceErrorCode,
+  GovernanceErrorName,
+  GovernanceParams,
+  VetoAudit,
+  ProposalData,
+  Proposal,
+  ProposalKind,
+  ProposalStatus,
+  ProposalStatusPage,
+  VoteChoice,
+  VoteRecord,
+  UpdateProtocolFeeParams,
+  UpdateFactoryTreasuryParams,
+  UpdateFactoryGlobalFeeParams,
+  UpdateClOracleParams,
+  UpdateClMaxOracleDeviationParams,
+  UpdateClProtocolFeeParams,
+  TransferClPoolAdminParams,
+  SetClPositionNftParams,
+  CreatePolVestingParams,
+} from "./governance.js";
 export { ConcentratedLiquidityClient } from "./cl.js";
 export type { Position, ClPoolState, PositionQuote, PriceImpactEstimate } from "./cl.js";
 export * from "./types.js";

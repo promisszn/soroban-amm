@@ -54,7 +54,7 @@ deploy_staking() {
           --lp_token "$LP_TOKEN_CONTRACT_ID" \
           --reward_token "$REWARD_TOKEN_CONTRACT_ID" \
           --admin "$ADMIN_ADDRESS" >/dev/null 2>&1; then
-        if invoke_read "$STAKING_CONTRACT_ID" -- get_pool_info >/dev/null 2>&1; then
+        if invoke_read "$STAKING_CONTRACT_ID" get_pool_info >/dev/null 2>/dev/null; then
           log "staking already initialized"
         else
           die "failed to initialize staking"
@@ -68,7 +68,7 @@ deploy_staking() {
 
   CURRENT_STEP="verify staking"
   local out
-  out=$(invoke_read "$STAKING_CONTRACT_ID" -- get_pool_info 2>&1 || true)
+  out=$(invoke_read "$STAKING_CONTRACT_ID" get_pool_info 2>/dev/null || true)
   if echo "$out" | grep -q "$LP_TOKEN_CONTRACT_ID"; then
     log "verified staking pool_info contains LP token"
   else

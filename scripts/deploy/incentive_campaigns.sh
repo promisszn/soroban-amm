@@ -50,7 +50,7 @@ deploy_incentive_campaigns() {
       if ! invoke "$INCENTIVE_CAMPAIGNS_CONTRACT_ID" initialize --governance "$GOVERNANCE_CONTRACT_ID" >/dev/null 2>&1; then
         warn "failed to initialize incentive_campaigns — may already be initialized"
         # Verify liveness as fallback
-        if invoke_read "$INCENTIVE_CAMPAIGNS_CONTRACT_ID" -- list_campaigns >/dev/null 2>&1 || invoke_read "$INCENTIVE_CAMPAIGNS_CONTRACT_ID" -- get_next_campaign_id >/dev/null 2>&1; then
+        if invoke_read "$INCENTIVE_CAMPAIGNS_CONTRACT_ID" list_campaigns >/dev/null 2>/dev/null || invoke_read "$INCENTIVE_CAMPAIGNS_CONTRACT_ID" get_next_campaign_id >/dev/null 2>/dev/null; then
           log "incentive_campaigns already initialized (liveness ok)"
         fi
       else
@@ -61,7 +61,7 @@ deploy_incentive_campaigns() {
   fi
 
   CURRENT_STEP="verify incentive_campaigns"
-  if invoke_read "$INCENTIVE_CAMPAIGNS_CONTRACT_ID" -- get_next_campaign_id >/dev/null 2>&1 || invoke_read "$INCENTIVE_CAMPAIGNS_CONTRACT_ID" -- list_campaigns >/dev/null 2>&1; then
+  if invoke_read "$INCENTIVE_CAMPAIGNS_CONTRACT_ID" get_next_campaign_id >/dev/null 2>/dev/null || invoke_read "$INCENTIVE_CAMPAIGNS_CONTRACT_ID" list_campaigns >/dev/null 2>/dev/null; then
     log "verified incentive_campaigns liveness"
   else
     warn "incentive_campaigns verification: read failed"

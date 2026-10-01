@@ -531,6 +531,13 @@ Contracts are upgradeable via `upgrade(new_wasm_hash)` (or factory's
 bytecode is replaced. **Storage layout is immutable** — changing `DataKey`
 variants or types without a migration bricks the contract.
 
+Two signatures exist:
+
+| Contract | Entrypoint | Authorized by |
+|---|---|---|
+| `amm`, `factory`, `token` | `upgrade(new_wasm_hash)` | stored `admin` (`require_auth`) |
+| `governance`, `concentrated_liquidity`, `oracle_aggregator`, `staking` | `upgrade(admin, new_wasm_hash)` | `admin` must equal the stored admin **and** `require_auth` — see §5.5 |
+
 ### 5.1 Prerequisites
 
 1. The new WASM must already be uploaded: `stellar contract upload --wasm
@@ -598,6 +605,70 @@ with the old hash. Test upgrades on testnet first and keep a multisig
 - **Verification:** After `upgrade`, call a read-only getter (`get_info`,
   `get_params`, `get_pool_count`) and confirm it still returns the expected
   state. Query the RPC for the `upgraded` event topic to audit the hash change.
+
+### 5.5 Governance, concentrated liquidity, oracle aggregator and staking
+
+These four contracts expose `upgrade(admin, new_wasm_hash)`, following the same
+explicit-`admin` convention as their other admin entrypoints (`pause`,
+`propose_admin`, `set_protocol_fee`, ...):
+
+1. The stored admin is read from instance storage (`DataKey::Admin`). An
+   uninitialized contract returns its `NotInitialized` error.
+2. The `admin` argument must equal the stored admin, otherwise the call fails
+   with the contract's typed error (below). The contract is not modified.
+3. `admin.require_auth()` — the admin key (or multisig account) must sign.
+4. `env.deployer().update_current_contract_wasm(new_wasm_hash)` swaps the
+   bytecode in place, and an `upgraded` event carrying the new hash is emitted.
+
+| Contract | Admin set by | Wrong `admin` error |
+|---|---|---|
+| `governance` | `initialize(admin, ...)`; rotate with `propose_admin`/`accept_admin` | `GovernanceError::Unauthorized` (25) |
+| `concentrated_liquidity` | `initialize(admin, ...)` (the factory admin for factory-created pools) | `ClError::Unauthorized` (12) |
+| `oracle_aggregator` | `initialize(admin, ...)` | `OracleError::NotAdmin` (3) |
+| `staking` | `initialize(..., admin)` | `StakingError::Unauthorized` (3) |
+
+Authority is the single stored admin address of each contract. **Upgrades are
+not voted on**: there is no governance `ProposalKind` for WASM upgrades, and
+the `governance` contract's own upgrade is signed by its admin, not by LP
+holders. For multi-party control, set the admin to a multisig account and
+rotate it with `propose_admin`/`accept_admin` (§7).
+
+`upgrade` never re-runs `initialize` and writes no storage, so admin,
+configuration, proposals and votes, pool/tick/position state, oracle sources,
+and stakes/locks/reward accounting all carry over unchanged. The new WASM must
+read the same `DataKey` layout; any layout change needs its own migration.
+
+```sh
+source .soroban-amm.deploy.env
+
+# Upload the new WASM (repeat per contract)
+stellar contract upload --wasm target/wasm32v1-none/release/governance.wasm --network $NETWORK --source $SOURCE_ACCOUNT
+# -> NEW_HASH=...
+
+# Upgrade — the admin is passed explicitly and must sign
+stellar contract invoke --id $GOVERNANCE_CONTRACT_ID --network $NETWORK --source $ADMIN_ADDRESS -- upgrade --admin $ADMIN_ADDRESS --new_wasm_hash $NEW_HASH
+stellar contract invoke --id $CL_POOL_CONTRACT_ID --network $NETWORK --source $ADMIN_ADDRESS -- upgrade --admin $ADMIN_ADDRESS --new_wasm_hash $NEW_HASH
+stellar contract invoke --id $ORACLE_AGGREGATOR_CONTRACT_ID --network $NETWORK --source $ADMIN_ADDRESS -- upgrade --admin $ADMIN_ADDRESS --new_wasm_hash $NEW_HASH
+stellar contract invoke --id $STAKING_CONTRACT_ID --network $NETWORK --source $ADMIN_ADDRESS -- upgrade --admin $ADMIN_ADDRESS --new_wasm_hash $NEW_HASH
+```
+
+Verify each upgrade by snapshotting state **before** the upgrade and comparing
+it **after**:
+
+| Contract | Read before and after |
+|---|---|
+| `governance` | `get_params`, `get_proposal_count`, `get_proposal --proposal_id <open id>` |
+| `concentrated_liquidity` | `get_pool_state`, `get_tokens`, `fee_bps`, `get_position` for a known LP |
+| `oracle_aggregator` | `get_admin`, `list_sources`, `get_max_staleness`, `get_max_deviation_bps` |
+| `staking` | `get_pool_info`, `get_staker_info` / `pending_rewards` for a known staker |
+
+Then confirm the `upgraded` event with `NEW_HASH` on the RPC, and roll back per
+§5.3 if anything differs (pass `--admin` as above). The in-process test
+`contracts/integration-tests/src/core_contract_upgrade_test.rs` checks this for
+all four contracts: it swaps each one onto a different WASM, shows the new code
+is running at the same address against the old storage, restores the original,
+checks that all prior state matches and still works, and checks the typed
+rejection of a non-admin caller.
 
 ---
 

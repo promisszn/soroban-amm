@@ -34,6 +34,7 @@ run_cl_flow() {
   # ── mint_position ────────────────────────────────────────────────────────
   local mint_output
   mint_output=$(invoke "$pool" mint_position \
+    --deadline "$(( $(date +%s) + 300 ))" \
     --provider "$provider" \
     --lower_tick "$lower_tick" \
     --upper_tick "$upper_tick" \

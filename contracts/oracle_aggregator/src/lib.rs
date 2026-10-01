@@ -21,8 +21,15 @@
 use soroban_amm_sdk::emit_versioned_event;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
-    symbol_short, Address, Env, Vec,
+    symbol_short, Address, BytesN, Env, Vec,
 };
+
+// Export compiled WASM for tests/dev usage when the `testutils` feature is enabled.
+#[cfg(feature = "testutils")]
+pub const WASM: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../target/wasm32v1-none/release/oracle_aggregator.wasm"
+));
 
 // ── Public types ────────────────────────────────────────────────────────────
 
@@ -201,6 +208,19 @@ impl OracleAggregator {
             (soroban_sdk::Symbol::new(&env, "admin_changed"),),
             (new_admin,)
         );
+    }
+
+    /// Admin: replace this contract's WASM with a new version.
+    ///
+    /// `admin` must be the stored admin and must authorize the call; any other
+    /// address is rejected with `NotAdmin`. The new WASM must already be
+    /// uploaded to the network. Sources and configuration are preserved and
+    /// `initialize` is not re-run; only the bytecode is replaced.
+    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) {
+        require_admin(&env, &admin);
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        soroban_amm_sdk::emit_versioned_event!(env, (symbol_short!("upgraded"),), (new_wasm_hash,));
     }
 
     pub fn pause(env: Env, admin: Address) {

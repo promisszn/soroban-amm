@@ -135,8 +135,12 @@ Defined in [contracts/batch_router/src/lib.rs](../contracts/batch_router/src/lib
 | 3 | `BatchTooLarge` | `ops.len()` exceeds `MAX_BATCH_OPS` (200), the ceiling returned by `max_batch_ops`. | Split the batch into multiple calls, each within the ceiling. |
 | 4 | `DeadlineExpired` | `env.ledger().timestamp() > deadline` at batch time. | Re-submit the batch with a future deadline. |
 | 5 | `InvalidAmount` | A `Swap`/`AddLiquidity`/`RemoveLiquidity` op carried a non-positive `amount_in`/`amount_a`/`amount_b`/`shares`. | Ensure every op amount is strictly positive. |
-| 6 | `PoolNotFound` | An op named a pool the configured factory does not recognize (`get_pool_tokens` returned `None`). | Target only pools registered with the batch router's factory. |
+| 6 | `PoolNotFound` | An AMM op named a pool the factory does not recognize (`get_pool_tokens` returned `None`), or a CL op named a pool for which `is_cl_pool` is `false`. | Target only pools registered with the batch router's factory, and match `pool_kind` to the venue. |
 | 7 | `SlippageExceeded` | The simulated or executed output/shares fell below the op's `min_out`/`min_shares`/`min_a`/`min_b` guard. | Loosen the slippage guard or resubmit against fresher pool state. |
+| 8 | `PoolPaused` | The target AMM or CL pool is paused, so `execute_batch` would reject the op. Returned by `simulate_batch`/`validate_batch` instead of a raw pool error. | Wait for the pool admin to unpause, or drop the op. |
+| 9 | `UnsimulatableChain` | `simulate_batch` reached a second concentrated-liquidity op on a pool an earlier op already touched, so its local snapshot is stale. | Split the batch, or place the CL op first and re-quote afterwards. |
+| 10 | `InsufficientLiquidity` | The AMM swap's output would meet or exceed the output reserve (mirrors `amm::swap`'s guard). Not reachable through valid constant-product math, but simulated for parity. | Reduce the swap size. |
+| 11 | `InsufficientShares` | A first deposit would mint no more than `MINIMUM_LIQUIDITY` (1 000) shares, all of which are permanently locked, leaving the provider with none (mirrors `amm::add_liquidity`). | Deposit enough that `isqrt(amount_a * amount_b) > 1 000`. |
 
 ---
 

@@ -57,7 +57,7 @@ deploy_dex_aggregator() {
   fi
 
   CURRENT_STEP="verify dex_aggregator"
-  if invoke_read "$DEX_AGGREGATOR_CONTRACT_ID" -- get_factory 2>&1 | grep -q "$FACTORY_CONTRACT_ID" || invoke_read "$DEX_AGGREGATOR_CONTRACT_ID" -- get_admin 2>&1 | grep -q "$ADMIN_ADDRESS"; then
+  if invoke_read "$DEX_AGGREGATOR_CONTRACT_ID" get_factory 2>/dev/null | grep -q "$FACTORY_CONTRACT_ID" || invoke_read "$DEX_AGGREGATOR_CONTRACT_ID" get_admin 2>/dev/null | grep -q "$ADMIN_ADDRESS"; then
     log "verified dex_aggregator factory/admin"
   else
     # Liveness fallback

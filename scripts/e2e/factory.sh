@@ -25,9 +25,9 @@ run_factory_flow() {
     --caller "$admin" \
     --token_a "$ta" \
     --token_b "$tb" \
-    --fee_bps 25 2>&1) || {
+    --fee_bps 25) || {
     # Idempotent: a prior run may have already created this pair's pool.
-    pool_addr=$(invoke "$FACTORY_CONTRACT_ID" get_pool --token_a "$ta" --token_b "$tb" 2>&1 | extract_contract_id || true)
+    pool_addr=$(invoke "$FACTORY_CONTRACT_ID" get_pool --token_a "$ta" --token_b "$tb" | extract_contract_id || true)
     if [[ -z "$pool_addr" ]]; then
       die "factory: create_pool_with_fee_bps failed and no existing pool found: $out"
     fi
@@ -42,12 +42,12 @@ run_factory_flow() {
 
   # ── get_pool resolves the pair to the new address ──────────────────────
   local resolved
-  resolved=$(invoke "$FACTORY_CONTRACT_ID" get_pool --token_a "$ta" --token_b "$tb" 2>&1 | extract_contract_id)
+  resolved=$(invoke "$FACTORY_CONTRACT_ID" get_pool --token_a "$ta" --token_b "$tb" | extract_contract_id)
   assert_eq "factory: get_pool resolves pair to created pool" "$resolved" "$pool_addr"
 
   # ── get_lp_token returns a real LP token ────────────────────────────────
   local lp_token
-  lp_token=$(invoke "$FACTORY_CONTRACT_ID" get_lp_token --pool "$pool_addr" 2>&1 | extract_contract_id)
+  lp_token=$(invoke "$FACTORY_CONTRACT_ID" get_lp_token --pool "$pool_addr" | extract_contract_id)
   if [[ -z "$lp_token" ]]; then
     die "factory: get_lp_token returned no address for pool $pool_addr"
   fi
@@ -56,8 +56,14 @@ run_factory_flow() {
   # ── run the liquidity/swap flow against the factory-created pool ───────
   local amount_a=500000
   local amount_b=1000000
-  invoke "$TOKEN_A_CONTRACT_ID" mint --to "$admin" --amount "$amount_a" >/dev/null
-  invoke "$TOKEN_B_CONTRACT_ID" mint --to "$admin" --amount "$amount_b" >/dev/null
+  local swap_amount_in=10000
+  # amount_a/amount_b are in the pool's token order, not ta/tb's.
+  local pool_ta pool_tb
+  pool_ta=$(pool_token "$pool_addr" token_a)
+  pool_tb=$(pool_token "$pool_addr" token_b)
+  # add_liquidity spends all of amount_a, so mint the swap input on top.
+  invoke "$pool_ta" mint --to "$admin" --amount "$(( amount_a + swap_amount_in ))" >/dev/null
+  invoke "$pool_tb" mint --to "$admin" --amount "$amount_b" >/dev/null
 
   local deadline add_output lp_shares
   deadline=$(( $(date +%s) + 300 ))
@@ -74,8 +80,8 @@ run_factory_flow() {
   local swap_output swap_out
   swap_output=$(invoke "$pool_addr" swap \
     --trader "$admin" \
-    --token_in "$TOKEN_A_CONTRACT_ID" \
-    --amount_in 10000 \
+    --token_in "$pool_ta" \
+    --amount_in "$swap_amount_in" \
     --min_out 0 \
     --deadline "$deadline")
   swap_out=$(printf '%s\n' "$swap_output" | parse_i128)
@@ -112,7 +118,7 @@ run_factory_flow() {
     --caller "$admin" \
     --token_a "$ta" \
     --token_b "$other_tb" \
-    --fee_bps 25 2>&1 | extract_contract_id)
+    --fee_bps 25 | extract_contract_id)
   if [[ -z "$resumed" ]]; then
     die "factory: pool creation did not resume after unpause_creation"
   fi
@@ -123,12 +129,13 @@ run_factory_flow() {
 # does not collide with the pool created earlier in this flow.
 invoke_read_new_token_pair() {
   local admin="$SOURCE_PUBLIC_KEY"
-  local wasm="$ROOT_DIR/target/wasm32v1-none/release/token.wasm"
+  local wasm
+  wasm=$(e2e_wasm token)
   local id
   id=$(stellar contract deploy \
     --wasm "$wasm" \
     --network "$NETWORK" \
-    --source "$SOURCE_ACCOUNT" 2>&1 | extract_contract_id)
+    --source "$SOURCE_ACCOUNT" | extract_contract_id)
   if [[ -z "$id" ]]; then
     die "factory: failed to deploy throwaway token for pause/unpause check"
   fi
