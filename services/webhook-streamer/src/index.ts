@@ -1,7 +1,7 @@
 /**
  * Webhook Streamer — entry point (issue #306)
  *
- * Starts an HTTP management API on PORT (default 3001) and a Horizon poller
+ * Starts an HTTP management API on PORT (default 3001) and a Soroban RPC poller
  * that fans contract events out to registered webhooks.
  *
  * Management API:
@@ -11,7 +11,8 @@
  *   GET    /health            – liveness probe
  *
  * Environment variables:
- *   HORIZON_URL      – Horizon base URL (default: https://horizon-testnet.stellar.org)
+ *   SOROBAN_RPC_URL  – Soroban RPC base URL (required; must answer getHealth)
+ *   HORIZON_URL      – deprecated alias for SOROBAN_RPC_URL (removed next release)
  *   CONTRACT_IDS     – comma-separated list of contract IDs to watch
  *   POLL_INTERVAL_MS – polling interval in ms (default: 5000)
  *   PORT             – HTTP port (default: 3001)
@@ -23,12 +24,30 @@ import { InvalidWebhookUrlError } from "./url-validation.js";
 import { WebhookDispatcher } from "./dispatcher.js";
 import { DeadLetterQueue } from "./dead-letter.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
-import { HorizonPoller } from "./horizon-poller.js";
+import { RpcPoller } from "./rpc-poller.js";
 import type { PoolEvent } from "./types.js";
 
+const DEFAULT_SOROBAN_RPC_URL = "https://soroban-testnet.stellar.org";
+
 const PORT = Number(process.env["PORT"] ?? 3001);
-const HORIZON_URL =
-  process.env["HORIZON_URL"] ?? "https://horizon-testnet.stellar.org";
+const SOROBAN_RPC_URL = process.env["SOROBAN_RPC_URL"];
+const HORIZON_URL = process.env["HORIZON_URL"];
+
+if (!SOROBAN_RPC_URL && HORIZON_URL) {
+  console.warn(
+    "[webhook-streamer] HORIZON_URL is deprecated; use SOROBAN_RPC_URL instead. " +
+      "HORIZON_URL will be removed in a future release.",
+  );
+}
+
+const RPC_URL = SOROBAN_RPC_URL ?? HORIZON_URL ?? DEFAULT_SOROBAN_RPC_URL;
+
+if (!SOROBAN_RPC_URL && !HORIZON_URL) {
+  console.warn(
+    `[webhook-streamer] SOROBAN_RPC_URL is not set; defaulting to ${DEFAULT_SOROBAN_RPC_URL}.`,
+  );
+}
+
 const CONTRACT_IDS = (process.env["CONTRACT_IDS"] ?? "")
   .split(",")
   .map((s) => s.trim())
@@ -50,11 +69,13 @@ const dispatcher = new WebhookDispatcher(defaultRegistry, {
   }),
 });
 
-// ── Horizon poller ──────────────────────────────────────────────────────────
+// ── Soroban RPC poller ──────────────────────────────────────────────────────
+
+let poller: RpcPoller | undefined;
 
 if (CONTRACT_IDS.length > 0) {
-  const poller = new HorizonPoller(
-    { horizonUrl: HORIZON_URL, contractIds: CONTRACT_IDS, pollIntervalMs: POLL_INTERVAL_MS },
+  poller = new RpcPoller(
+    { rpcUrl: RPC_URL, contractIds: CONTRACT_IDS, pollIntervalMs: POLL_INTERVAL_MS },
     async (event: PoolEvent) => {
       const results = await dispatcher.dispatch(event);
       const failed = results.filter((r) => !r.success);
@@ -63,10 +84,23 @@ if (CONTRACT_IDS.length > 0) {
       }
     },
   );
-  poller.start();
-  console.log(
-    `[poller] watching ${CONTRACT_IDS.length} contract(s) via ${HORIZON_URL}`,
-  );
+
+  // Fail fast at startup if the RPC endpoint does not answer getHealth.
+  poller
+    .checkHealth()
+    .then(() => {
+      poller!.start();
+      console.log(
+        `[poller] watching ${CONTRACT_IDS.length} contract(s) via ${RPC_URL}`,
+      );
+    })
+    .catch((err: unknown) => {
+      console.error(
+        `[poller] RPC endpoint ${RPC_URL} failed getHealth; refusing to start:`,
+        err,
+      );
+      process.exit(1);
+    });
 } else {
   console.warn("[poller] no CONTRACT_IDS set — poller not started");
 }
@@ -94,7 +128,11 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
 
   // GET /health
   if (method === "GET" && url === "/health") {
-    return json(res, 200, { status: "ok", webhooks: defaultRegistry.size });
+    return json(res, 200, {
+      status: poller?.lastError ? "degraded" : "ok",
+      webhooks: defaultRegistry.size,
+      poller: poller?.health() ?? { running: false },
+    });
   }
 
   // GET /webhooks — includes each subscription's circuit state.
@@ -200,4 +238,4 @@ server.listen(PORT, () => {
   console.log(`[webhook-streamer] management API listening on port ${PORT}`);
 });
 
-export { server, dispatcher, defaultRegistry };
+export { server, dispatcher, defaultRegistry, poller };

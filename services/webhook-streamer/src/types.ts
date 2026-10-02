@@ -1,15 +1,30 @@
 // ── Shared types for the webhook-streamer service (issue #306) ──────────────
 
-/** Raw Soroban contract event as returned by Horizon's /events endpoint. */
-export interface HorizonEvent {
+/**
+ * Raw Soroban contract event as returned by Stellar RPC's `getEvents` method.
+ *
+ * `topic` and `value` are base64-encoded XDR `ScVal`s, not plain strings or
+ * JSON. Use `xdr.ScVal.fromXDR(..., "base64")` + `scValToNative` to decode.
+ */
+export interface RpcEvent {
   id: string;
   type: string;
   ledger: number;
-  ledgerClosedAt: string;
-  contractId: string;
-  topic: string[];
-  value: string;
-  pagingToken: string;
+  /** ISO-8601 close time of `ledger`, as reported by RPC. */
+  ledgerClosedAt?: string;
+  contractId?: string;
+  /** Hash of the transaction that emitted the event. */
+  txHash?: string;
+  /**
+   * Per-event pagination cursor. Soroban RPC paginates events by this token;
+   * the poller falls back to it when a response carries no top-level cursor,
+   * which is what keeps a poll from replaying or skipping events.
+   */
+  pagingToken?: string;
+  /** Base64 XDR ScVals: the first is the event name, the rest are indexed data. */
+  topic?: string[];
+  /** Base64 XDR ScVal holding the event body (see `types.ts`'s PoolEvent). */
+  value?: string;
 }
 
 /** Normalised pool event forwarded to webhooks. */
@@ -19,7 +34,17 @@ export interface PoolEvent {
   eventType: string;
   ledger: number;
   timestamp: string;
+  /**
+   * Schema version carried by versioned events (see
+   * `contracts/amm-sdk/src/lib.rs`). `undefined` for legacy/unversioned events.
+   */
+  schemaVersion?: number;
   payload: Record<string, unknown>;
+  /**
+   * Hash of the transaction that emitted the event, when the RPC endpoint
+   * reports one. Subscribers use it to link an event back to its transaction.
+   */
+  txHash?: string;
 }
 
 /** A registered webhook subscription. */
