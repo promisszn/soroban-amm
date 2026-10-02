@@ -1,24 +1,6 @@
 import { xdr, scValToNative } from "@stellar/stellar-sdk";
 
-import type { PoolEvent } from "./types.js";
-
-/**
- * Topics emitted by the contracts via `emit_versioned_event!`.
- * This list is built from the contract source and kept in sync with
- * the actual emitted topics. Unknown topics still pass through.
- */
-export const KNOWN_TOPICS: Readonly<string[]> = [
-  "swap",
-  "add_liquidity",
-  "remove_liquidity",
-  "deposit",
-  "withdraw",
-  "transfer",
-  "mint",
-  "burn",
-  "approve",
-  "claim",
-];
+import type { PoolEvent, RpcEvent } from "./types.js";
 
 export interface Logger {
   info(msg: string, ...args: unknown[]): void;
@@ -29,27 +11,33 @@ export interface Logger {
 export interface RpcPollerOptions {
   rpcUrl: string;
   contractIds: string[];
-  fetchFn: typeof fetch;
-  logger: Logger;
-  /** Called when an RPC error is surfaced. */
+  /** Defaults to the global `fetch`. */
+  fetchFn?: typeof fetch;
+  /** Defaults to `console`. */
+  logger?: Logger;
+  /** Called when an RPC or dispatch error is surfaced. */
   onError?: (err: Error) => void;
+  /** Interval between poll ticks, in ms. Defaults to 5000. */
+  pollIntervalMs?: number;
 }
 
-export interface RawRpcEvent {
-  id: string;
-  type: string;
-  ledger: number;
-  ledgerCloseTime?: string;
-  contractId?: string;
-  txHash: string;
-  topic?: string[];
-  value?: string;
-}
-
+/**
+ * One page of `getEvents` output. `cursor` and `latestLedger` are optional
+ * because a response that ends on an empty page may report neither.
+ */
 export interface RawGetEventsResult {
-  events: RawRpcEvent[];
+  events: RpcEvent[];
   cursor?: string;
   latestLedger?: number;
+}
+
+export interface RpcPollerHealth {
+  running: boolean;
+  pollIntervalMs: number;
+  contracts: number;
+  ticks: number;
+  eventsEmitted: number;
+  lastError: string | null;
 }
 
 export interface JsonRpcError {
@@ -69,7 +57,7 @@ export class RawRpcError extends Error {
   constructor(
     message: string,
     public readonly code?: number,
-    public readonly data?: unknown,
+    public readonly data?: unknown
   ) {
     super(message);
     this.name = "RawRpcError";
@@ -82,6 +70,11 @@ export class RawRpcError extends Error {
  * The poller maintains a per-contract cursor map. On the first poll for a
  * contract it sends a positive `startLedger` (RPC rejects requests without
  * one). After that it sends the cursor returned by the previous response.
+ *
+ * `poll()` performs a single pass over every contract and returns the decoded
+ * events. `start()` drives `poll()` on `pollIntervalMs` and hands each event to
+ * the `onEvent` callback passed to the constructor, which is what a long-lived
+ * service uses; `poll()` is the entry point for tests and one-shot catch-ups.
  */
 export class RpcPoller {
   private readonly rpcUrl: string;
@@ -89,18 +82,35 @@ export class RpcPoller {
   private readonly fetchFn: typeof fetch;
   private readonly logger: Logger;
   private readonly onError?: (err: Error) => void;
+  private readonly onEvent?: (event: PoolEvent) => void | Promise<void>;
+  private readonly pollIntervalMs: number;
   private readonly cursors: Map<string, string> = new Map();
   private readonly startLedger: number;
   private requestId = 0;
-  private lastError: Error | undefined;
+  private timer: NodeJS.Timeout | undefined;
+  private polling = false;
+  private running = false;
+  private ticks = 0;
+  private eventsEmitted = 0;
+  private lastErrorValue: Error | undefined;
 
-  constructor(options: RectPollerOptions) {
+  constructor(
+    options: RpcPollerOptions,
+    onEvent?: (event: PoolEvent) => void | Promise<void>
+  ) {
     this.rpcUrl = options.rpcUrl;
     this.contractIds = options.contractIds;
     this.fetchFn = options.fetchFn ?? fetch;
-    this.logger = options.logger;
+    this.logger = options.logger ?? console;
     this.onError = options.onError;
-    this.startLedger = Math.max(1, Number(process.env.START_LEDGER ?? 1));
+    this.onEvent = onEvent;
+    this.pollIntervalMs = options.pollIntervalMs ?? 5_000;
+    this.startLedger = Math.max(1, Number(process.env["START_LEDGER"] ?? 1));
+  }
+
+  /** The most recent error the poller surfaced, if any. */
+  get lastError(): Error | undefined {
+    return this.lastErrorValue;
   }
 
   /** Returns the cursor for a contract, or undefined if none was seen. */
@@ -110,7 +120,48 @@ export class RpcPoller {
 
   /** Last error surfaced by the poller, if any. */
   getLastError(): Error | undefined {
-    return this.lastError;
+    return this.lastErrorValue;
+  }
+
+  /** Point-in-time view of the poller, for `/health`. */
+  health(): RpcPollerHealth {
+    return {
+      running: this.running,
+      pollIntervalMs: this.pollIntervalMs,
+      contracts: this.contractIds.length,
+      ticks: this.ticks,
+      eventsEmitted: this.eventsEmitted,
+      lastError: this.lastErrorValue?.message ?? null,
+    };
+  }
+
+  /**
+   * Ask the RPC endpoint for `getHealth`. Rejects when it answers with an RPC
+   * error, so a service can refuse to start against a broken endpoint.
+   */
+  async checkHealth(): Promise<{ status: string }> {
+    return this.call<{ status: string }>("getHealth", {});
+  }
+
+  /** Begin polling every `pollIntervalMs`; safe to call more than once. */
+  start(): void {
+    if (this.running) return;
+    this.running = true;
+    this.timer = setInterval(() => {
+      void this.tick();
+    }, this.pollIntervalMs);
+    // Never hold the process open on the poller's own account.
+    this.timer.unref();
+    void this.tick();
+  }
+
+  /** Stop polling. Safe to call when not running. */
+  stop(): void {
+    this.running = false;
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
   }
 
   /** Poll all configured contracts once. */
@@ -121,15 +172,38 @@ export class RpcPoller {
         const events = await this.pollContract(contractId);
         out.push(...events);
       } catch (err) {
-        const e = err instanceof Error ? err : new Error(String(err));
-        this.lastError = e;
-        this.logger.error(
-          `RPC getEvents failed for contract ${contractId}: ${e.message}`,
-        );
-        this.onErros?.(e);
+        this.recordError(err, `RPC getEvents failed for contract ${contractId}`);
       }
     }
     return out;
+  }
+
+  private async tick(): Promise<void> {
+    // Skip a tick rather than overlap with the previous one, so a slow RPC
+    // endpoint cannot queue up an unbounded number of concurrent requests.
+    if (this.polling) return;
+    this.polling = true;
+    try {
+      this.ticks += 1;
+      const events = await this.poll();
+      for (const event of events) {
+        this.eventsEmitted += 1;
+        try {
+          await this.onEvent?.(event);
+        } catch (err) {
+          this.recordError(err, "event handler failed");
+        }
+      }
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  private recordError(err: unknown, context: string): void {
+    const e = err instanceof Error ? err : new Error(String(err));
+    this.lastErrorValue = e;
+    this.logger.error(`[rpc-poller] ${context}: ${e.message}`);
+    this.onError?.(e);
   }
 
   private async pollContract(contractId: string): Promise<PoolEvent[]> {
@@ -139,12 +213,12 @@ export class RpcPoller {
       limit: 1000,
     };
     if (cursor) {
-      params.cursor = cursor;
+      params["cursor"] = cursor;
     } else {
-      params.startLedger = this.startLedger;
+      params["startLedger"] = this.startLedger;
     }
 
-    const result = await this.call("getEvents", params);
+    const result = await this.call<RawGetEventsResult>("getEvents", params);
     const events = result.events ?? [];
     const decoded: PoolEvent[] = [];
     for (const raw of events) {
@@ -155,26 +229,40 @@ export class RpcPoller {
     }
     if (result.cursor) {
       this.cursors.set(contractId, result.cursor);
+    } else {
+      // RPC paginates by event id, so the last event of the page is the cursor
+      // for the next one. Reading it from the event keeps a response that
+      // omits the top-level cursor from replaying the whole page next tick.
+      const last = events.at(-1);
+      if (last?.pagingToken) {
+        this.cursors.set(contractId, last.pagingToken);
+      }
     }
     return decoded;
   }
 
-  private async call<T>(method: string, params: Record<string, unknown>): Promise<T> {
+  private async call<T>(
+    method: string,
+    params: Record<string, unknown>
+  ): Promise<T> {
     const id = ++this.requestId;
     const resp = await this.fetchFn(this.rpcUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params: params }),
+      body: JSON.stringify({ jsonrpc: "2.0", id, method, params }),
     });
     if (!resp.ok) {
-      throw new RawRpcError(`HTTP ${resp.status} from RP@ ${method}`, resp.status);
+      throw new RawRpcError(
+        `HTTP ${resp.status} from RPC ${method}`,
+        resp.status
+      );
     }
     const json = (await resp.json()) as JsonRpcResponse<T>;
     if (json.error) {
       throw new RawRpcError(
         `RPC error ${json.error.code}: ${json.error.message}`,
         json.error.code,
-        json.error.data,
+        json.error.data
       );
     }
     if (json.result === undefined) {
@@ -185,13 +273,14 @@ export class RpcPoller {
 }
 
 /**
- * Decode a single RawRpcEvent into a PoolEvent.
+ * Decode a single RPC event into a PoolEvent.
  *
  * Topics and values are base64 XDR ScVals. The first topic is the
  * event name; the value is an event envelope. Versioned events carry
- * `(EVENT_SCHEMA_VERSION, payload)` as their data.
+ * `(EVENT_SCHEMA_VERSION, payload)` as their data. Events that carry no topic
+ * at all are skipped rather than forwarded with an empty type.
  */
-export function decodeEvent(raw: RawRpcEvent): PoolEvent | undefined {
+export function decodeEvent(raw: RpcEvent): PoolEvent | undefined {
   const topics = raw.topic ?? [];
   if (topics.length === 0) {
     return undefined;
@@ -199,19 +288,22 @@ export function decodeEvent(raw: RawRpcEvent): PoolEvent | undefined {
   const eventType = decodeTopicName(topics[0]);
   const { schemaVersion, payload } = decodeValue(raw.value);
   return {
+    id: raw.id,
     contractId: raw.contractId ?? "",
     eventType,
     schemaVersion,
     payload,
     ledger: raw.ledger,
+    timestamp: raw.ledgerClosedAt ?? "",
     txHash: raw.txHash,
-    cursor: raw.id,
   };
 }
 
 export function decodeTopicName(topic: string): string {
   try {
-    const native = scValToNative(xdr.ScVal.fromXDR(topic, "base64"));
+    // `scValToNative` is untyped, so narrow it here rather than leaking the
+    // library's `any` through the rest of the decoding helpers.
+    const native = scValToNative(xdr.ScVal.fromXDR(topic, "base64")) as unknown;
     if (typeof native === "string") {
       return native;
     }
@@ -229,7 +321,7 @@ export function decodeValue(value?: string): {
     return { schemaVersion: 0, payload: {} };
   }
   try {
-    const native = scValToNative(xdr.ScVal.fromXDR(value, "base64"));
+    const native = scValToNative(xdr.ScVal.fromXDR(value, "base64")) as unknown;
     return unwrapVersionedEnvelope(native);
   } catch {
     return { schemaVersion: 0, payload: { raw: value } };
@@ -242,7 +334,8 @@ export function unwrapVersionedEnvelope(native: unknown): {
 } {
   if (Array.isArray(native) && native.length === 2) {
     const [version, body] = native as [unknown, unknown];
-    const schemaVersion = typeof version === "number" ? version : Number(version);
+    const schemaVersion =
+      typeof version === "number" ? version : Number(version);
     return {
       schemaVersion: Number.isFinite(schemaVersion) ? schemaVersion : 0,
       payload: toPlainObject(body),
