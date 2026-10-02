@@ -12,19 +12,24 @@
 //! see issue #518.
 //!
 //! Governance is a single address that may update requirements. The address
-//! can be a multisig or DAO contract for on-chain governance.
+//! can be a multisig or DAO contract for on-chain governance. The legacy
+//! `admin` entrypoints (`propose_admin` / `accept_admin` / `get_admin` /
+//! `get_pending_admin`) are thin aliases over the same single role; there is
+//! no separate admin authority that could outlive a governance handover.
 //!
 //! Both pool kinds in this workspace are supported: constant-product V2 pools
 //! (`contracts/amm`) and concentrated-liquidity pools
 //! (`contracts/concentrated_liquidity`). V2 reserves come from the pool's
 //! `get_info()`; CL pools have no such function and no scalar reserves, so
 //! their reserves are the token balances the pool contract actually holds.
-//! `check_reserves` auto-detects which path to take, and governance may record
-//! a pool's kind with `set_pool_kind` to skip the probe.
+//! `check_reserves`, `check_reserves_detailed`, and `check_reserves_batch`
+//! all auto-detect which path to take, and governance may record a pool's
+//! kind with `set_pool_kind` to skip the probe.
 //!
 //! Flow:
 //!   1. Deploy this contract.
 //!   2. Call `initialize` with the governance address and the factory address.
+//!      `initialize` requires governance auth.
 //!   3. Governance calls `set_min_reserve` to configure per-pair requirements.
 //!   4. Optionally, governance calls `set_pool_kind` to record a pool's kind.
 //!   5. **Off-chain** callers query `check_reserves(pool)` to gate actions
@@ -32,8 +37,9 @@
 //!      The AMM itself does **not** call this contract on-chain; integrating
 //!      pool exits with minimum guards is the responsibility of callers
 //!      (off-chain bots, multisig governance, the off-chain router).
-//!   6. Governance may call `propose_governance` / `accept_governance` to
-//!      securely hand off control.
+//!   6. Governance may call `propose_governance` / `accept_governance` (or the
+//!      admin aliases) to securely hand off control. Both paths write the same
+//!      single role and clear the same pending nominee.
 
 #![no_std]
 
@@ -165,16 +171,25 @@ pub struct ReserveReport {
 
 #[contracttype]
 pub enum DataKey {
+    /// Legacy alias for the single governance/admin role. Written once at
+    /// `initialize` for backward compatibility; all role logic reads and
+    /// writes [`DataKey::Governance`] instead so a rotated-out address can
+    /// never retain a second authority.
     Admin,
-    /// Pending admin nominee for two-step handover.
+    /// Pending admin nominee for two-step handover. Retained in the enum for
+    /// backward compatibility; the live pending nominee is stored under
+    /// [`DataKey::PendingGovernance`].
     PendingAdmin,
+    /// The single governance/admin role — source of truth for auth.
     Governance,
-    /// Pending governance nominee for two-step handover.
+    /// Pending governance/admin nominee for two-step handover. Both the
+    /// governance and admin entrypoints read and clear this key.
     PendingGovernance,
     Factory,
     /// Normalized (smaller_addr, larger_addr) → ReserveRequirement.
     MinReserve(Address, Address),
     /// Pool address → PoolKind. Optional; absence means "auto-detect".
+    /// Stored in **persistent** storage with TTL bumps.
     PoolKind(Address),
     /// Insertion-ordered index of every pair that currently has a non-zero
     /// requirement, stored normalised as (smaller_addr, larger_addr).
@@ -219,7 +234,18 @@ impl ReserveManager {
     // ── Setup ─────────────────────────────────────────────────────────────────
 
     /// One-time setup. `governance` is the only address permitted to call
-    /// `set_min_reserve` and `transfer_governance`.
+    /// `set_min_reserve` and the handover entrypoints.
+    ///
+    /// Does not require `governance`'s own auth: governance is typically a
+    /// contract address (a DAO/voting contract) with no `__check_auth`, so
+    /// requiring its signature here would make every real deployment fail
+    /// (see the deploy script, which passes the governance contract's
+    /// address while signing as the deployer). This matches the sibling
+    /// `pol_vesting`/`incentive_campaigns` contracts, which initialize the
+    /// same way. The one-time `AlreadyInitialized` guard below is the only
+    /// protection against re-initialization; whoever can call this contract
+    /// before the deploy script does controls the initial governance
+    /// address, same as those sibling contracts.
     pub fn initialize(
         env: Env,
         governance: Address,
@@ -232,6 +258,8 @@ impl ReserveManager {
         env.storage()
             .instance()
             .set(&DataKey::Governance, &governance);
+        // Legacy write kept so any raw reader of `Admin` still sees the same
+        // starting address; role logic uses `Governance` exclusively.
         env.storage().instance().set(&DataKey::Admin, &governance);
         env.storage().instance().set(&DataKey::Factory, &factory);
         Ok(())
@@ -242,29 +270,43 @@ impl ReserveManager {
     /// Nominate a new governance address.
     ///
     /// The nominee must call `accept_governance` to complete the two-step
-    /// handover. Requires current governance auth.
+    /// handover. Requires current governance auth and an unpaused contract.
     pub fn propose_governance(
         env: Env,
         current_governance: Address,
         new_governance: Address,
     ) -> Result<(), ReserveManagerError> {
-        Self::extend_instance_ttl(&env);
-        if Self::is_paused(env.clone()) {
-            return Err(ReserveManagerError::Paused);
-        }
-        let stored: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
-        if current_governance != stored {
-            return Err(ReserveManagerError::Unauthorized);
-        }
-        stored.require_auth();
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingGovernance, &Some(new_governance.clone()));
+        Self::do_propose_governance(&env, current_governance.clone(), new_governance.clone())?;
         emit_versioned_event!(
             env,
             (Symbol::new(&env, "governance_proposed"),),
             (current_governance, new_governance)
         );
+        Ok(())
+    }
+
+    /// Shared implementation behind `propose_governance`/`propose_admin`:
+    /// both nominate the next holder of the single governance role and
+    /// differ only in which event they emit. Keeping one implementation
+    /// means a change to this logic can't silently diverge between the two
+    /// public entrypoints.
+    fn do_propose_governance(
+        env: &Env,
+        current: Address,
+        new_governance: Address,
+    ) -> Result<(), ReserveManagerError> {
+        Self::extend_instance_ttl(env);
+        if Self::is_paused(env.clone()) {
+            return Err(ReserveManagerError::Paused);
+        }
+        let stored: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
+        if current != stored {
+            return Err(ReserveManagerError::Unauthorized);
+        }
+        stored.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingGovernance, &Some(new_governance));
         Ok(())
     }
 
@@ -274,7 +316,22 @@ impl ReserveManager {
     /// transaction. On success the stored governance is updated, the pending
     /// nominee is cleared, and a `governance_transferred` event is emitted.
     pub fn accept_governance(env: Env, new_governance: Address) -> Result<(), ReserveManagerError> {
-        Self::extend_instance_ttl(&env);
+        Self::do_accept_governance(&env, new_governance.clone())?;
+        emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "governance_transferred"),),
+            (new_governance,)
+        );
+        Ok(())
+    }
+
+    /// Shared implementation behind `accept_governance`/`accept_admin`: both
+    /// complete the handover of the single governance role, differing only
+    /// in which event they emit and (for `accept_admin`, which maps this
+    /// function's generic errors to its own variants) which error type they
+    /// surface.
+    fn do_accept_governance(env: &Env, new_governance: Address) -> Result<(), ReserveManagerError> {
+        Self::extend_instance_ttl(env);
         if Self::is_paused(env.clone()) {
             return Err(ReserveManagerError::Paused);
         }
@@ -294,11 +351,6 @@ impl ReserveManager {
         env.storage()
             .instance()
             .set(&DataKey::PendingGovernance, &Option::<Address>::None);
-        emit_versioned_event!(
-            env,
-            (Symbol::new(&env, "governance_transferred"),),
-            (new_governance,)
-        );
         Ok(())
     }
 
@@ -333,25 +385,19 @@ impl ReserveManager {
             .get(&DataKey::Paused)
             .unwrap_or(false)
     }
-    /// Nominate a new admin. The nominee must call `accept_admin` to complete the transfer.
+
+    /// Nominate a new admin. Delegates to the same implementation
+    /// `propose_governance` uses — admin and governance are one role — and
+    /// emits `admin_nominated` instead of `governance_proposed` so
+    /// integrators using the admin vocabulary keep seeing the event they
+    /// expect. A future change to the shared propose logic can't diverge
+    /// between the two entrypoints, since there is only one implementation.
     pub fn propose_admin(
         env: Env,
         admin: Address,
         new_admin: Address,
     ) -> Result<(), ReserveManagerError> {
-        let stored: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .or_else(|| env.storage().instance().get(&DataKey::Governance))
-            .unwrap();
-        if admin != stored {
-            return Err(ReserveManagerError::Unauthorized);
-        }
-        admin.require_auth();
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingAdmin, &Some(new_admin.clone()));
+        Self::do_propose_governance(&env, admin.clone(), new_admin.clone())?;
         emit_versioned_event!(
             env,
             (Symbol::new(&env, "admin_nominated"),),
@@ -360,42 +406,36 @@ impl ReserveManager {
         Ok(())
     }
 
-    /// Accept the pending admin nomination. Caller becomes the new admin.
+    /// Accept the pending admin nomination. Delegates to the same
+    /// implementation `accept_governance` uses, translating its generic
+    /// error variants to the admin-specific ones the public API has always
+    /// returned, and emits `admin_changed` instead of
+    /// `governance_transferred`.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), ReserveManagerError> {
-        let pending: Option<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::PendingAdmin)
-            .unwrap_or(None);
-        let nominee = pending.ok_or(ReserveManagerError::NoPendingAdmin)?;
-        if new_admin != nominee {
-            return Err(ReserveManagerError::WrongAdmin);
-        }
-        new_admin.require_auth();
-        env.storage().instance().set(&DataKey::Admin, &new_admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::Governance, &new_admin);
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingAdmin, &Option::<Address>::None);
+        Self::do_accept_governance(&env, new_admin.clone()).map_err(|e| match e {
+            ReserveManagerError::NoPendingGovernance => ReserveManagerError::NoPendingAdmin,
+            ReserveManagerError::Unauthorized => ReserveManagerError::WrongAdmin,
+            other => other,
+        })?;
         emit_versioned_event!(env, (Symbol::new(&env, "admin_changed"),), (new_admin,));
         Ok(())
     }
 
-    /// Return the active admin address.
+    /// Return the active admin address. Reads [`DataKey::Governance`] — the
+    /// single source of truth — so `get_admin() == get_governance()` after
+    /// any handover through either entrypoint.
     pub fn get_admin(env: Env) -> Option<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .or_else(|| env.storage().instance().get(&DataKey::Governance))
+        Self::extend_instance_ttl(&env);
+        env.storage().instance().get(&DataKey::Governance)
     }
 
-    /// Return the pending admin nominee, if any.
+    /// Return the pending admin nominee, if any. Reads
+    /// [`DataKey::PendingGovernance`], the same key both handover paths use.
     pub fn get_pending_admin(env: Env) -> Option<Address> {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
-            .get(&DataKey::PendingAdmin)
+            .get(&DataKey::PendingGovernance)
             .unwrap_or(None)
     }
 
@@ -536,19 +576,16 @@ impl ReserveManager {
     /// failed probe and its wasted cross-contract call.
     ///
     /// Returns `true` if the pool meets or exceeds its requirements, or if no
-    /// requirement has been set for that pair. Returns `false` otherwise.
+    /// requirement has been set for that pair. Returns `false` otherwise —
+    /// including when the pool could not be read through either path.
     ///
     /// Does not modify any state.
     pub fn check_reserves(env: Env, pool: Address) -> bool {
         Self::extend_instance_ttl(&env);
-        let (token_a, token_b, reserve_a, reserve_b) = match Self::pool_kind_of(&env, &pool) {
-            Some(PoolKind::Amm) => Self::read_amm_reserves(&env, &pool),
-            Some(PoolKind::ConcentratedLiquidity) => Self::read_balance_reserves(&env, &pool),
-            // Unregistered: probe the V2 shape, fall back to token balances.
-            None => match AmmPoolClient::new(&env, &pool).try_get_info() {
-                Ok(Ok(info)) => (info.token_a, info.token_b, info.reserve_a, info.reserve_b),
-                _ => Self::read_balance_reserves(&env, &pool),
-            },
+        let Some((token_a, token_b, reserve_a, reserve_b)) =
+            Self::resolve_pool_reserves(&env, &pool)
+        else {
+            return false;
         };
 
         let (ta, tb) = Self::normalize(token_a.clone(), token_b.clone());
@@ -577,6 +614,11 @@ impl ReserveManager {
     ///
     /// This is optional: `check_reserves` auto-detects unregistered pools.
     /// Registering a kind only avoids the cost of a failed `get_info` probe.
+    ///
+    /// The kind is written to **persistent** storage with a TTL bump. A legacy
+    /// instance-storage entry (written before kinds moved to persistent) is
+    /// still honoured — see [`Self::pool_kind_of`] — and is migrated to
+    /// persistent storage on first touch.
     pub fn set_pool_kind(
         env: Env,
         pool: Address,
@@ -588,9 +630,11 @@ impl ReserveManager {
         }
         let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
         gov.require_auth();
+        let key = DataKey::PoolKind(pool);
+        env.storage().persistent().set(&key, &kind);
         env.storage()
-            .instance()
-            .set(&DataKey::PoolKind(pool), &kind);
+            .persistent()
+            .extend_ttl(&key, MIN_PERSISTENT_TTL, PERSISTENT_TTL_BUMP_TO);
         Ok(())
     }
 
@@ -604,26 +648,35 @@ impl ReserveManager {
     /// actual numbers instead of a bare boolean.
     ///
     /// `healthy` always agrees with `check_reserves` for the same pool. Like
-    /// `check_reserves`, this call propagates a failure of the pool's
-    /// `get_info()`; use [`ReserveManager::check_reserves_batch`] for
-    /// fault-isolated reads.
+    /// `check_reserves`, this call dispatches on the pool's recorded kind (or
+    /// auto-detects unregistered pools), so it works for both AMM and CL
+    /// pools. A pool that could not be read through either path yields an
+    /// unreadable report (`healthy: false`, zeroed amounts) rather than
+    /// trapping.
     ///
     /// Does not modify any state.
     pub fn check_reserves_detailed(env: Env, pool: Address) -> ReserveReport {
         Self::extend_instance_ttl(&env);
-        let info = AmmPoolClient::new(&env, &pool).get_info();
-        Self::build_report(&env, &pool, &info)
+        match Self::resolve_pool_reserves(&env, &pool) {
+            Some(resolved) => Self::build_report(&env, &pool, resolved),
+            None => Self::unreadable_report(&pool),
+        }
     }
 
     /// Health-check up to [`MAX_PAGE`] pools in one call.
     ///
-    /// The read of each pool is fault-isolated: a pool whose `get_info()` call
-    /// fails (not an AMM pool, archived, panicking) is reported with
-    /// `healthy: false` and zeroed amounts instead of aborting the whole batch.
+    /// The read of each pool is fault-isolated and pool-kind aware: each pool
+    /// is resolved through the same recorded-kind → V2-probe → balance-fallback
+    /// path as [`Self::check_reserves`]. A pool that fails **both** the V2
+    /// probe and the balance fallback is reported with `healthy: false` and
+    /// zeroed amounts instead of aborting the whole batch. Healthy CL pools
+    /// are reported as healthy — they are not treated as unreadable just
+    /// because they lack `get_info()`.
     ///
     /// When at least one pool is unhealthy a `res_warn` event is emitted
-    /// carrying the offending pool addresses, so keepers can subscribe rather
-    /// than poll.
+    /// carrying the offending pool addresses (pools below their floor, and
+    /// pools that could not be read), so keepers can subscribe rather than
+    /// poll.
     ///
     /// Returns [`ReserveManagerError::BatchTooLarge`] when `pools.len()` exceeds
     /// `MAX_PAGE`; truncating silently would hide pools from a health check.
@@ -640,9 +693,9 @@ impl ReserveManager {
         let mut unhealthy: Vec<Address> = Vec::new(&env);
 
         for pool in pools.iter() {
-            let report = match AmmPoolClient::new(&env, &pool).try_get_info() {
-                Ok(Ok(info)) => Self::build_report(&env, &pool, &info),
-                _ => Self::unreadable_report(&pool),
+            let report = match Self::resolve_pool_reserves(&env, &pool) {
+                Some(resolved) => Self::build_report(&env, &pool, resolved),
+                None => Self::unreadable_report(&pool),
             };
             if !report.healthy {
                 unhealthy.push_back(pool.clone());
@@ -729,14 +782,40 @@ impl ReserveManager {
         }
     }
 
-    /// Build a report from a pool's own `PoolInfo`, expressed in the pool's
-    /// token order.
-    fn build_report(env: &Env, pool: &Address, info: &PoolInfo) -> ReserveReport {
-        let token_a_is_first = info.token_a < info.token_b;
+    /// Resolve `(token_a, token_b, reserve_a, reserve_b)` for a pool.
+    ///
+    /// Dispatch order:
+    /// 1. Recorded [`PoolKind`] — try that implementation's reader first.
+    /// 2. Unregistered pools: probe the V2 `get_info` path.
+    /// 3. Fall back to the CL path (SEP-41 balances of `get_tokens()`).
+    ///
+    /// Returns `None` only when **both** readers fail, which means the pool is
+    /// not readable as either kind (archived, panicking, or not a pool at all).
+    /// Used by `check_reserves`, `check_reserves_detailed`, and
+    /// `check_reserves_batch` so all three agree on what a pool's reserves are.
+    fn resolve_pool_reserves(env: &Env, pool: &Address) -> Option<(Address, Address, i128, i128)> {
+        let try_amm = || Self::try_read_amm_reserves(env, pool);
+        let try_cl = || Self::try_read_balance_reserves(env, pool);
+        match Self::pool_kind_of(env, pool) {
+            Some(PoolKind::Amm) => try_amm().or_else(try_cl),
+            Some(PoolKind::ConcentratedLiquidity) => try_cl().or_else(try_amm),
+            None => try_amm().or_else(try_cl),
+        }
+    }
+
+    /// Build a report from a resolved `(token_a, token_b, reserve_a, reserve_b)`
+    /// tuple, expressed in the pool's own token order.
+    fn build_report(
+        env: &Env,
+        pool: &Address,
+        resolved: (Address, Address, i128, i128),
+    ) -> ReserveReport {
+        let (token_a, token_b, reserve_a, reserve_b) = resolved;
+        let token_a_is_first = token_a < token_b;
         let (ta, tb) = if token_a_is_first {
-            (info.token_a.clone(), info.token_b.clone())
+            (token_a.clone(), token_b.clone())
         } else {
-            (info.token_b.clone(), info.token_a.clone())
+            (token_b.clone(), token_a.clone())
         };
 
         let req: ReserveRequirement = env
@@ -756,15 +835,15 @@ impl ReserveManager {
             (req.min_reserve_b, req.min_reserve_a)
         };
 
-        let shortfall_a = (min_a - info.reserve_a).max(0);
-        let shortfall_b = (min_b - info.reserve_b).max(0);
+        let shortfall_a = (min_a - reserve_a).max(0);
+        let shortfall_b = (min_b - reserve_b).max(0);
 
         ReserveReport {
             pool: pool.clone(),
-            token_a: info.token_a.clone(),
-            token_b: info.token_b.clone(),
-            reserve_a: info.reserve_a,
-            reserve_b: info.reserve_b,
+            token_a,
+            token_b,
+            reserve_a,
+            reserve_b,
             min_a,
             min_b,
             healthy: shortfall_a == 0 && shortfall_b == 0,
@@ -773,7 +852,8 @@ impl ReserveManager {
         }
     }
 
-    /// Placeholder report for a pool whose `get_info()` could not be read.
+    /// Placeholder report for a pool that could not be read through either
+    /// the V2 probe or the balance fallback.
     ///
     /// The pool address stands in for the unknown token pair so the struct stays
     /// a plain `#[contracttype]` without optional fields.
@@ -793,30 +873,64 @@ impl ReserveManager {
     }
 
     /// Recorded kind for `pool`, or `None` when it should be auto-detected.
+    ///
+    /// Reads persistent storage first; a legacy instance-storage entry is
+    /// migrated to persistent (with a TTL bump) on first touch so new writes
+    /// and old deployments converge on one location.
     fn pool_kind_of(env: &Env, pool: &Address) -> Option<PoolKind> {
-        env.storage()
-            .instance()
-            .get(&DataKey::PoolKind(pool.clone()))
+        let key = DataKey::PoolKind(pool.clone());
+        let kind: Option<PoolKind> = env.storage().persistent().get(&key);
+        if kind.is_some() {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, MIN_PERSISTENT_TTL, PERSISTENT_TTL_BUMP_TO);
+            return kind;
+        }
+        let legacy: Option<PoolKind> = env.storage().instance().get(&key);
+        if let Some(kind) = legacy {
+            env.storage().persistent().set(&key, &kind);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, MIN_PERSISTENT_TTL, PERSISTENT_TTL_BUMP_TO);
+            return Some(kind);
+        }
+        None
     }
 
-    /// Read `(token_a, token_b, reserve_a, reserve_b)` from a V2 pool's
-    /// `get_info()`.
-    fn read_amm_reserves(env: &Env, pool: &Address) -> (Address, Address, i128, i128) {
-        let info = AmmPoolClient::new(env, pool).get_info();
-        (info.token_a, info.token_b, info.reserve_a, info.reserve_b)
+    /// Try to read `(token_a, token_b, reserve_a, reserve_b)` from a V2 pool's
+    /// `get_info()`. `None` when the call fails or the result cannot be
+    /// converted (e.g. the address is not a V2 pool).
+    fn try_read_amm_reserves(env: &Env, pool: &Address) -> Option<(Address, Address, i128, i128)> {
+        match AmmPoolClient::new(env, pool).try_get_info() {
+            Ok(Ok(info)) => Some((info.token_a, info.token_b, info.reserve_a, info.reserve_b)),
+            _ => None,
+        }
     }
 
-    /// Read `(token_a, token_b, reserve_a, reserve_b)` from a CL pool by
+    /// Try to read `(token_a, token_b, reserve_a, reserve_b)` from a CL pool by
     /// querying the SEP-41 balance of each token held by the pool itself.
     ///
     /// This sidesteps mirroring CL's internal tick/liquidity accounting and
     /// gives a signal that is meaningful for both pool kinds: how much of each
-    /// token the pool can actually pay out.
-    fn read_balance_reserves(env: &Env, pool: &Address) -> (Address, Address, i128, i128) {
-        let (token_a, token_b) = ClPoolClient::new(env, pool).get_tokens();
-        let reserve_a = TokenBalanceClient::new(env, &token_a).balance(pool);
-        let reserve_b = TokenBalanceClient::new(env, &token_b).balance(pool);
-        (token_a, token_b, reserve_a, reserve_b)
+    /// token the pool can actually pay out. `None` when `get_tokens` or either
+    /// balance read fails.
+    fn try_read_balance_reserves(
+        env: &Env,
+        pool: &Address,
+    ) -> Option<(Address, Address, i128, i128)> {
+        let (token_a, token_b) = match ClPoolClient::new(env, pool).try_get_tokens() {
+            Ok(Ok(tokens)) => tokens,
+            _ => return None,
+        };
+        let reserve_a = match TokenBalanceClient::new(env, &token_a).try_balance(pool) {
+            Ok(Ok(bal)) => bal,
+            _ => return None,
+        };
+        let reserve_b = match TokenBalanceClient::new(env, &token_b).try_balance(pool) {
+            Ok(Ok(bal)) => bal,
+            _ => return None,
+        };
+        Some((token_a, token_b, reserve_a, reserve_b))
     }
 }
 
@@ -907,6 +1021,7 @@ mod tests {
         rm.initialize(&gov, &factory);
         assert_eq!(rm.get_governance(), gov);
         assert_eq!(rm.get_factory(), factory);
+        assert_eq!(rm.get_admin(), Some(gov.clone()));
     }
 
     #[test]
@@ -1681,5 +1796,312 @@ mod tests {
             Err(Ok(ReserveManagerError::WrongAdmin))
         );
         assert_eq!(rm.get_admin(), Some(s.governance));
+    }
+
+    // ── Issue #1042: single governance/admin role, CL-aware checks ──────────
+
+    /// Regression: after a governance handover the rotated-out address must
+    /// not retain an Admin key it can use to seize governance back.
+    #[test]
+    fn test_takeover_regression_rotated_out_governance_cannot_propose_admin() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let g2 = Address::generate(&s.env);
+        let x = Address::generate(&s.env);
+
+        rm.propose_governance(&s.governance, &g2);
+        rm.accept_governance(&g2);
+        assert_eq!(rm.get_governance(), g2.clone());
+
+        // Rotated-out governance is no longer authorized on either entrypoint.
+        assert_eq!(
+            rm.try_propose_admin(&s.governance, &x),
+            Err(Ok(ReserveManagerError::Unauthorized))
+        );
+        assert_eq!(
+            rm.try_propose_governance(&s.governance, &x),
+            Err(Ok(ReserveManagerError::Unauthorized))
+        );
+
+        // The new governance can still rotate.
+        rm.propose_admin(&g2, &x);
+        assert_eq!(rm.get_pending_admin(), Some(x.clone()));
+    }
+
+    /// Handover through propose_admin/accept_admin keeps both views in sync.
+    #[test]
+    fn test_handover_via_admin_path_keeps_roles_in_sync() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let new_gov = Address::generate(&s.env);
+
+        rm.propose_admin(&s.governance, &new_gov);
+        rm.accept_admin(&new_gov);
+
+        assert_eq!(rm.get_governance(), new_gov.clone());
+        assert_eq!(rm.get_admin(), Some(new_gov.clone()));
+        assert_eq!(rm.get_pending_governance(), None);
+        assert_eq!(rm.get_pending_admin(), None);
+    }
+
+    /// Handover through propose_governance/accept_governance keeps both views
+    /// in sync — get_admin() must not be left pointing at the old address.
+    #[test]
+    fn test_handover_via_governance_path_keeps_roles_in_sync() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let new_gov = Address::generate(&s.env);
+
+        rm.propose_governance(&s.governance, &new_gov);
+        rm.accept_governance(&new_gov);
+
+        assert_eq!(rm.get_governance(), new_gov.clone());
+        assert_eq!(rm.get_admin(), Some(new_gov));
+        assert_eq!(rm.get_pending_governance(), None);
+        assert_eq!(rm.get_pending_admin(), None);
+    }
+
+    /// Both entrypoints share one pending-nominee key; either handover path
+    /// clears it.
+    #[test]
+    fn test_pending_nominee_cleared_after_either_handover_path() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+
+        // Governance path.
+        let g2 = Address::generate(&s.env);
+        rm.propose_governance(&s.governance, &g2);
+        assert_eq!(rm.get_pending_governance(), Some(g2.clone()));
+        assert_eq!(rm.get_pending_admin(), Some(g2.clone()));
+        rm.accept_governance(&g2);
+        assert_eq!(rm.get_pending_governance(), None);
+        assert_eq!(rm.get_pending_admin(), None);
+
+        // Admin path (g2 is now in charge).
+        let x = Address::generate(&s.env);
+        rm.propose_admin(&g2, &x);
+        assert_eq!(rm.get_pending_governance(), Some(x.clone()));
+        assert_eq!(rm.get_pending_admin(), Some(x.clone()));
+        rm.accept_admin(&x);
+        assert_eq!(rm.get_pending_governance(), None);
+        assert_eq!(rm.get_pending_admin(), None);
+    }
+
+    /// Pause gates both admin handover entrypoints, matching the governance path.
+    #[test]
+    fn test_pause_blocks_admin_handover_entry_points() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let new_admin = Address::generate(&s.env);
+
+        rm.pause();
+        assert_eq!(
+            rm.try_propose_admin(&s.governance, &new_admin),
+            Err(Ok(ReserveManagerError::Paused))
+        );
+        assert_eq!(rm.get_pending_admin(), None);
+
+        // Propose while unpaused, then pause before accept.
+        rm.unpause();
+        rm.propose_admin(&s.governance, &new_admin);
+        rm.pause();
+        assert_eq!(
+            rm.try_accept_admin(&new_admin),
+            Err(Ok(ReserveManagerError::Paused))
+        );
+        assert_eq!(rm.get_pending_admin(), Some(new_admin.clone()));
+        assert_eq!(rm.get_governance(), s.governance.clone());
+    }
+
+    /// check_reserves_detailed on an AMM pool agrees with check_reserves.
+    #[test]
+    fn test_check_reserves_detailed_amm_healthy_matches_check_reserves() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        rm.set_min_reserve(&s.ta, &s.tb, &500_000_i128, &500_000_i128);
+
+        let report = rm.check_reserves_detailed(&s.pool);
+        assert_eq!(report.healthy, rm.check_reserves(&s.pool));
+        assert!(report.healthy);
+        assert_eq!(report.reserve_a, 1_000_000);
+        assert_eq!(report.reserve_b, 1_000_000);
+        assert_eq!(report.min_a, 500_000);
+        assert_eq!(report.min_b, 500_000);
+        assert_eq!(report.shortfall_a, 0);
+        assert_eq!(report.shortfall_b, 0);
+    }
+
+    /// check_reserves_detailed on an unregistered CL pool must not trap and
+    /// must agree with check_reserves.
+    #[test]
+    fn test_check_reserves_detailed_cl_pool_does_not_trap() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let cl = deploy_cl_pool(&s, 1_000_000);
+
+        rm.set_min_reserve(&s.ta, &s.tb, &500_000_i128, &500_000_i128);
+        let report = rm.check_reserves_detailed(&cl);
+        assert_eq!(report.healthy, rm.check_reserves(&cl));
+        assert!(report.healthy);
+        assert_eq!(report.reserve_a, 1_000_000);
+        assert_eq!(report.reserve_b, 1_000_000);
+
+        rm.set_min_reserve(&s.ta, &s.tb, &2_000_000_i128, &2_000_000_i128);
+        let report = rm.check_reserves_detailed(&cl);
+        assert_eq!(report.healthy, rm.check_reserves(&cl));
+        assert!(!report.healthy);
+        assert_eq!(report.shortfall_a, 1_000_000);
+        assert_eq!(report.shortfall_b, 1_000_000);
+    }
+
+    /// check_reserves_detailed on a CL pool with a recorded PoolKind.
+    #[test]
+    fn test_check_reserves_detailed_cl_pool_with_recorded_kind() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let cl = deploy_cl_pool(&s, 1_000_000);
+
+        rm.set_pool_kind(&cl, &PoolKind::ConcentratedLiquidity);
+        rm.set_min_reserve(&s.ta, &s.tb, &500_000_i128, &500_000_i128);
+
+        let report = rm.check_reserves_detailed(&cl);
+        assert_eq!(report.healthy, rm.check_reserves(&cl));
+        assert!(report.healthy);
+        assert_eq!(report.pool, cl);
+        assert_eq!(report.reserve_a, 1_000_000);
+        assert_eq!(report.reserve_b, 1_000_000);
+        assert_eq!(report.token_a, s.ta);
+        assert_eq!(report.token_b, s.tb);
+    }
+
+    /// Mixed batch: AMM + healthy CL + unhealthy CL. Numbers are correct for
+    /// every pool; res_warn lists only the unhealthy one.
+    #[test]
+    fn test_check_reserves_batch_mixed_amm_and_cl() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let cl_ok = deploy_cl_pool(&s, 1_000_000);
+        let cl_bad = deploy_cl_pool(&s, 100_000);
+
+        rm.set_min_reserve(&s.ta, &s.tb, &500_000_i128, &500_000_i128);
+
+        let pools = soroban_sdk::vec![&s.env, s.pool.clone(), cl_ok.clone(), cl_bad.clone()];
+        let reports = rm.check_reserves_batch(&pools);
+        assert_eq!(reports.len(), 3);
+
+        assert!(reports.get(0).unwrap().healthy);
+        assert_eq!(reports.get(0).unwrap().reserve_a, 1_000_000);
+
+        assert!(reports.get(1).unwrap().healthy);
+        assert_eq!(reports.get(1).unwrap().reserve_a, 1_000_000);
+
+        assert!(!reports.get(2).unwrap().healthy);
+        assert_eq!(reports.get(2).unwrap().reserve_a, 100_000);
+        assert_eq!(reports.get(2).unwrap().shortfall_a, 400_000);
+        assert_eq!(reports.get(2).unwrap().shortfall_b, 400_000);
+
+        // res_warn only for the unhealthy CL pool — healthy CL is not unreadable.
+        let (version, (unhealthy,)): (u32, (soroban_sdk::Vec<Address>,)) =
+            last_versioned_event(&s, "res_warn");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(unhealthy, soroban_sdk::vec![&s.env, cl_bad]);
+    }
+
+    /// set_pool_kind writes to persistent storage; a legacy instance entry is
+    /// migrated to persistent on first touch.
+    #[test]
+    fn test_pool_kind_stored_in_persistent_and_migrates_from_instance() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let cl = deploy_cl_pool(&s, 1_000_000);
+
+        // Fresh set_pool_kind writes to persistent storage, not instance.
+        rm.set_pool_kind(&s.pool, &PoolKind::Amm);
+        let amm_key = DataKey::PoolKind(s.pool.clone());
+        s.env.as_contract(&s.rm_addr, || {
+            assert!(s.env.storage().persistent().has(&amm_key));
+            assert!(!s.env.storage().instance().has(&amm_key));
+        });
+        assert_eq!(rm.get_pool_kind(&s.pool), Some(PoolKind::Amm));
+
+        // A legacy instance-storage entry is migrated to persistent on first touch.
+        let cl_key = DataKey::PoolKind(cl.clone());
+        s.env.as_contract(&s.rm_addr, || {
+            s.env
+                .storage()
+                .instance()
+                .set(&cl_key, &PoolKind::ConcentratedLiquidity);
+            assert!(!s.env.storage().persistent().has(&cl_key));
+        });
+        assert_eq!(rm.get_pool_kind(&cl), Some(PoolKind::ConcentratedLiquidity));
+        s.env.as_contract(&s.rm_addr, || {
+            assert!(s.env.storage().persistent().has(&cl_key));
+        });
+
+        // The migrated kind is usable for CL-aware checks.
+        rm.set_min_reserve(&s.ta, &s.tb, &500_000_i128, &500_000_i128);
+        let report = rm.check_reserves_detailed(&cl);
+        assert!(report.healthy);
+        assert_eq!(report.reserve_a, 1_000_000);
+    }
+
+    /// initialize must require governance auth.
+    #[test]
+    fn test_initialize_does_not_require_governance_auth() {
+        // governance is typically a contract address (a DAO/voting contract)
+        // with no __check_auth, so initialize must not demand its signature
+        // — only the one-time AlreadyInitialized guard protects it. Calling
+        // this with no mock_all_auths at all pins that regression: if
+        // initialize ever required any address's auth again, this would
+        // fail with no mocked auths in scope.
+        let env = Env::default();
+        let gov = Address::generate(&env);
+        let factory = Address::generate(&env);
+        let rm_addr = env.register_contract(None, ReserveManager);
+        let rm = ReserveManagerClient::new(&env, &rm_addr);
+
+        assert!(rm.try_initialize(&gov, &factory).is_ok());
+    }
+
+    /// res_warn payload: version-stamped, lists only unhealthy pools, and
+    /// healthy CL pools never trigger the event.
+    #[test]
+    fn test_res_warn_payload_only_lists_unhealthy_pools() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        let cl_ok = deploy_cl_pool(&s, 1_000_000);
+        let cl_bad = deploy_cl_pool(&s, 100_000);
+
+        rm.set_min_reserve(&s.ta, &s.tb, &500_000_i128, &500_000_i128);
+
+        // Healthy AMM + healthy CL: no res_warn at all.
+        let before = s.env.events().all().len();
+        let pools = soroban_sdk::vec![&s.env, s.pool.clone(), cl_ok.clone()];
+        let reports = rm.check_reserves_batch(&pools);
+        assert!(reports.get(0).unwrap().healthy);
+        assert!(reports.get(1).unwrap().healthy);
+        assert_eq!(s.env.events().all().len(), before);
+
+        // Unhealthy CL alone: res_warn carries exactly that pool.
+        let pools = soroban_sdk::vec![&s.env, cl_bad.clone()];
+        let reports = rm.check_reserves_batch(&pools);
+        assert!(!reports.get(0).unwrap().healthy);
+
+        let (version, (unhealthy,)): (u32, (soroban_sdk::Vec<Address>,)) =
+            last_versioned_event(&s, "res_warn");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(unhealthy, soroban_sdk::vec![&s.env, cl_bad.clone()]);
+
+        // The unhealthy report carries real numbers, not the unreadable placeholder.
+        let report = reports.get(0).unwrap();
+        assert_eq!(report.pool, cl_bad);
+        assert_ne!(report.token_a, cl_bad);
+        assert_ne!(report.token_b, cl_bad);
+        assert_eq!(report.reserve_a, 100_000);
+        assert_eq!(report.reserve_b, 100_000);
+        assert_eq!(report.min_a, 500_000);
+        assert_eq!(report.min_b, 500_000);
+        assert_eq!(report.shortfall_a, 400_000);
+        assert_eq!(report.shortfall_b, 400_000);
     }
 }
