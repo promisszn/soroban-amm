@@ -24,6 +24,12 @@ use soroban_sdk::{
 
 const DEFAULT_MAX_ORDERS: u32 = 50;
 const MAX_ORDERS_CEILING: u32 = 200;
+/// Ceiling on the admin-managed venue allowlist (issue #700): `VenueList` is
+/// read and rewritten in full on every `add_venue`/`remove_venue` call, so an
+/// unbounded list would eventually make those calls exceed the ledger
+/// footprint/resource limits. `remove_venue` a stale entry to add another
+/// past this cap.
+const MAX_VENUES: u32 = 200;
 /// Ceiling on how far in the future a trader-supplied `deadline` may be
 /// (issue #700): otherwise a trader could pin their escrow open indefinitely
 /// with a far-future deadline, since only the trader's own `cancel_order` (or
@@ -32,6 +38,12 @@ const MAX_ORDER_LIFETIME_SECS: u64 = 7 * 24 * 60 * 60;
 
 const MIN_TTL: u32 = 172_800;
 const BUMP_TO: u32 = 518_400;
+
+/// Persistent-storage TTL for orders, claimables and the venue registry.
+/// Must outlive `MAX_ORDER_LIFETIME_SECS` plus a claim window, so a trader
+/// can always `claim_refund` a stranded refund long after the order expired.
+const PERSISTENT_MIN_TTL: u32 = 172_800;
+const PERSISTENT_BUMP_TO: u32 = 3_110_400;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -70,6 +82,9 @@ pub enum AuctionError {
     /// `claim_refund` called for an order with no claimable balance on
     /// record (issue #700).
     NothingToClaim = 18,
+    /// `add_venue` would push the persistent venue registry past
+    /// `MAX_VENUES` (issue #700).
+    TooManyVenues = 19,
 }
 
 // ── Storage types ─────────────────────────────────────────────────────────────
@@ -151,6 +166,14 @@ fn max_orders(env: &Env) -> u32 {
 
 fn extend_ttl(env: &Env) {
     env.storage().instance().extend_ttl(MIN_TTL, BUMP_TO);
+}
+
+/// Bump the TTL of a persistent entry so it outlives the order lifetime plus
+/// a claim window. Called on every write and every read of `Order`/`Claimable`.
+fn bump_persistent(env: &Env, key: &DataKey) {
+    env.storage()
+        .persistent()
+        .extend_ttl(key, PERSISTENT_MIN_TTL, PERSISTENT_BUMP_TO);
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -360,7 +383,8 @@ impl BatchAuction {
             alt_pool,
         };
 
-        env.storage().instance().set(&DataKey::Order(id), &order);
+        env.storage().persistent().set(&DataKey::Order(id), &order);
+        bump_persistent(&env, &DataKey::Order(id));
 
         pending.push_back(id);
         env.storage()
@@ -388,7 +412,7 @@ impl BatchAuction {
 
         let order: Order = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Order(order_id))
             .ok_or(AuctionError::OrderNotFound)?;
 
@@ -403,7 +427,7 @@ impl BatchAuction {
             &order.amount_in,
         );
 
-        env.storage().instance().remove(&DataKey::Order(order_id));
+        env.storage().persistent().remove(&DataKey::Order(order_id));
 
         let pending: Vec<u64> = env
             .storage()
@@ -494,7 +518,7 @@ impl BatchAuction {
             let order_id = pending.get(i).unwrap();
             let order: Order = env
                 .storage()
-                .instance()
+                .persistent()
                 .get(&DataKey::Order(order_id))
                 .unwrap();
 
@@ -516,7 +540,7 @@ impl BatchAuction {
                     (Symbol::new(&env, "order_expired"), order.trader.clone()),
                     (order_id,)
                 );
-                env.storage().instance().remove(&DataKey::Order(order_id));
+                env.storage().persistent().remove(&DataKey::Order(order_id));
                 continue;
             }
 
@@ -540,7 +564,7 @@ impl BatchAuction {
                     ),
                     (order_id,)
                 );
-                env.storage().instance().remove(&DataKey::Order(order_id));
+                env.storage().persistent().remove(&DataKey::Order(order_id));
                 continue;
             }
 
@@ -600,7 +624,7 @@ impl BatchAuction {
                     );
                 }
             }
-            env.storage().instance().remove(&DataKey::Order(order_id));
+            env.storage().persistent().remove(&DataKey::Order(order_id));
         }
 
         let mut remaining = Vec::<u64>::new(&env);
@@ -637,10 +661,11 @@ impl BatchAuction {
             .and_then(|r| r.ok())
             .is_some();
         if !ok {
-            env.storage().instance().set(
+            env.storage().persistent().set(
                 &DataKey::Claimable(order_id),
                 &(trader.clone(), token.clone(), amount),
             );
+            bump_persistent(env, &DataKey::Claimable(order_id));
             emit_versioned_event!(
                 env,
                 (Symbol::new(env, "order_refund_failed"), trader.clone()),
@@ -658,7 +683,7 @@ impl BatchAuction {
     pub fn expire_order(env: Env, order_id: u64) -> Result<(), AuctionError> {
         let order: Order = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Order(order_id))
             .ok_or(AuctionError::OrderNotFound)?;
         let now = env.ledger().timestamp();
@@ -672,7 +697,7 @@ impl BatchAuction {
             &order.token_in,
             order.amount_in,
         );
-        env.storage().instance().remove(&DataKey::Order(order_id));
+        env.storage().persistent().remove(&DataKey::Order(order_id));
         let pending: Vec<u64> = env
             .storage()
             .instance()
@@ -708,7 +733,7 @@ impl BatchAuction {
         for oid in pending.iter() {
             if let Some(order) = env
                 .storage()
-                .instance()
+                .persistent()
                 .get::<_, Order>(&DataKey::Order(oid))
             {
                 if now > order.deadline {
@@ -726,14 +751,14 @@ impl BatchAuction {
         trader.require_auth();
         let (owner, token, amount): (Address, Address, i128) = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Claimable(order_id))
             .ok_or(AuctionError::NothingToClaim)?;
         if owner != trader {
             return Err(AuctionError::Unauthorized);
         }
         env.storage()
-            .instance()
+            .persistent()
             .remove(&DataKey::Claimable(order_id));
         SepTokenClient::new(&env, &token).transfer(
             &env.current_contract_address(),
@@ -757,7 +782,7 @@ impl BatchAuction {
     pub fn quote_order(env: Env, order_id: u64) -> Result<(i128, Address, PoolType), AuctionError> {
         let order: Order = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Order(order_id))
             .ok_or(AuctionError::OrderNotFound)?;
         Ok(Self::best_venue(&env, &order))
@@ -1023,7 +1048,7 @@ impl BatchAuction {
         let mut orders = Vec::<Order>::new(&env);
         for i in 0..pending.len() {
             let id = pending.get(i).unwrap();
-            if let Some(order) = env.storage().instance().get(&DataKey::Order(id)) {
+            if let Some(order) = env.storage().persistent().get(&DataKey::Order(id)) {
                 orders.push_back(order);
             }
         }
@@ -1123,6 +1148,9 @@ impl BatchAuction {
                 .instance()
                 .get(&DataKey::VenueList)
                 .unwrap_or_else(|| Vec::new(&env));
+            if list.len() >= MAX_VENUES {
+                return Err(AuctionError::TooManyVenues);
+            }
             list.push_back(pool.clone());
             env.storage().instance().set(&DataKey::VenueList, &list);
         }
@@ -1246,6 +1274,17 @@ impl BatchAuction {
             .instance()
             .get(&DataKey::PendingAdmin)
             .unwrap_or(None)
+    }
+
+    /// Return the stranded `(trader, token, amount)` claimable for `order_id`,
+    /// or `None` if there is nothing to claim (issue #700).
+    pub fn get_claimable(env: Env, order_id: u64) -> Option<(Address, Address, i128)> {
+        let key = DataKey::Claimable(order_id);
+        let value: Option<(Address, Address, i128)> = env.storage().persistent().get(&key);
+        if value.is_some() {
+            bump_persistent(&env, &key);
+        }
+        value
     }
 }
 
@@ -2047,7 +2086,7 @@ mod tests {
         };
         env.as_contract(&auction_addr, || {
             env.storage()
-                .instance()
+                .persistent()
                 .set(&DataKey::Order(order.id), &order);
         });
 
@@ -2266,9 +2305,11 @@ mod tests {
         // address so that the payout try_transfer will trap.
         let fake_token_out = Address::generate(&env);
         env.as_contract(&auction_addr, || {
-            let mut bad_order: Order = env.storage().instance().get(&DataKey::Order(0)).unwrap();
+            let mut bad_order: Order = env.storage().persistent().get(&DataKey::Order(0)).unwrap();
             bad_order.token_out = fake_token_out.clone();
-            env.storage().instance().set(&DataKey::Order(0), &bad_order);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Order(0), &bad_order);
         });
 
         env.ledger().set_timestamp(1031);
@@ -2287,7 +2328,7 @@ mod tests {
         // than lost outright.
         let claimable: (Address, Address, i128) = env.as_contract(&auction_addr, || {
             env.storage()
-                .instance()
+                .persistent()
                 .get(&DataKey::Claimable(0))
                 .unwrap()
         });
@@ -2326,9 +2367,9 @@ mod tests {
         // refund try_transfer traps.
         let fake_token_in = Address::generate(&env);
         env.as_contract(&auction_addr, || {
-            let mut order: Order = env.storage().instance().get(&DataKey::Order(0)).unwrap();
+            let mut order: Order = env.storage().persistent().get(&DataKey::Order(0)).unwrap();
             order.token_in = fake_token_in.clone();
-            env.storage().instance().set(&DataKey::Order(0), &order);
+            env.storage().persistent().set(&DataKey::Order(0), &order);
         });
 
         // Advance past the batch window AND the deadline.
@@ -2344,7 +2385,7 @@ mod tests {
         // than lost outright.
         let claimable: (Address, Address, i128) = env.as_contract(&auction_addr, || {
             env.storage()
-                .instance()
+                .persistent()
                 .get(&DataKey::Claimable(0))
                 .unwrap()
         });
@@ -2655,6 +2696,43 @@ mod tests {
     }
 
     #[test]
+    fn test_add_venue_rejects_past_max_venues_and_recovers_after_remove() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+        // Filling the allowlist to MAX_VENUES makes 200 contract calls in one
+        // test, which exceeds the default test-env CPU budget well before
+        // hitting any real resource limit.
+        env.budget().reset_unlimited();
+
+        let admin = Address::generate(&env);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+
+        let mut pools: std::vec::Vec<Address> = std::vec::Vec::new();
+        for _ in 0..MAX_VENUES {
+            let pool = Address::generate(&env);
+            client.add_venue(&admin, &pool, &PoolType::Amm);
+            pools.push(pool);
+        }
+        assert_eq!(client.list_venues(&0_u32, &MAX_VENUES).len(), MAX_VENUES);
+
+        let one_too_many = Address::generate(&env);
+        let err = client
+            .try_add_venue(&admin, &one_too_many, &PoolType::Amm)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, AuctionError::TooManyVenues);
+
+        // Freeing a slot lets a new venue in again.
+        client.remove_venue(&admin, pools.first().unwrap());
+        client.add_venue(&admin, &one_too_many, &PoolType::Amm);
+        assert!(client.is_venue_allowed(&one_too_many));
+    }
+
+    #[test]
     fn test_set_factory_is_admin_gated_and_attests_cl_venue_without_allowlist() {
         let env = Env::default();
         env.budget().reset_unlimited();
@@ -2859,7 +2937,7 @@ mod tests {
         // isolates claim_refund's own payout/authorization/clearing logic.
         StellarAssetClient::new(&env, &ta).mint(&auction_addr, &5_000_i128);
         env.as_contract(&auction_addr, || {
-            env.storage().instance().set(
+            env.storage().persistent().set(
                 &DataKey::Claimable(42_u64),
                 &(trader.clone(), ta.clone(), 5_000_i128),
             );

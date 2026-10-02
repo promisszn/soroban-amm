@@ -121,6 +121,7 @@ Defined in [contracts/batch_auction/src/lib.rs](../contracts/batch_auction/src/l
 | 16 | `DeadlineTooFar` | `deadline` is further in the future than `MAX_ORDER_LIFETIME_SECS` (7 days). | Submit with a nearer deadline. |
 | 17 | `OrderNotExpired` | `expire_order` called on an order whose deadline has not passed yet. | Wait until the order's deadline, or use `cancel_order` instead. |
 | 18 | `NothingToClaim` | `claim_refund` called for an order with no claimable balance on record. | No action — nothing was stranded for this order. |
+| 19 | `TooManyVenues` | `add_venue` would push the persistent venue registry past `MAX_VENUES`. | Remove a stale venue with `remove_venue` before adding another. |
 
 ---
 
