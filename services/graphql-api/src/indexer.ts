@@ -8,20 +8,29 @@
 
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
+// Kept a superset of store/interface.ts's PoolEventType/PoolEvent (rather
+// than importing those directly) so this module's own narrower PoolEvent —
+// which only requires id/poolId/type/timestamp/payload, not the store's
+// ledger/txHash/eventIndex — keeps working as the minimal shape indexEvent
+// actually needs. A RpcIngester-sourced PoolEvent (the store's richer type)
+// is still assignable here; TypeScript's structural typing allows an object
+// with extra fields to satisfy a type that requires fewer of them.
 export type PoolEventType =
   | "swap"
   | "add_liquidity"
   | "remove_liquidity"
   | "campaign_created"
   | "reward_distributed"
-  | "fot_detected";
+  | "fot_detected"
+  | "price_upd"
+  | "tick_crossed";
 
 export interface PoolEvent {
   id: string;
   poolId: string;
   type: PoolEventType;
   timestamp: number;
-  payload: Record<string, string | number>;
+  payload: Record<string, unknown>;
 }
 
 export interface PoolStats {

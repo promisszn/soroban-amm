@@ -1,38 +1,25 @@
 import test from "node:test";
 import assert from "node:assert";
-import { RpcIngester } from "./ingest/rpc.js";
-import { xdr, scValToNative } from "@stellar/stellar-sdk";
+import { RpcIngester } from "./rpc.js";
+import { xdr, nativeToScVal } from "@stellar/stellar-sdk";
+import type { PoolEvent } from "../store/interface.js";
 
 // Helper to encode sample XDR fixtures for tests
 function encodeFixture(topicSymbol: string, schemaVersion: number, payload: unknown, traderOrProvider?: string): { topic: string[]; value: string } {
-  const topics: string[] = [];
-  const symVal = xdr.scValToNative(xdr.ScVal.scvSymbol(topicSymbol)) ? xdr.ScVal.scvSymbol(topicSymbol) : xdr.ScVal.scvSymbol(topicSymbol);
-  topics.push(symVal.toXDR("base64"));
+  const topics: string[] = [nativeToScVal(topicSymbol, { type: "symbol" }).toXDR("base64")];
   if (traderOrProvider) {
     // arbitrary address scVal for topic[1] or similar
-    const addr = xdr.ScVal.scvAddress(xdr.ScAddress.scAddressTypeAccountId(xdr.PublicKey.fromAccountId("GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")));
-    topics.push(addr.toXDR("base64"));
+    topics.push(nativeToScVal(traderOrProvider, { type: "address" }).toXDR("base64"));
   } else {
     // schema version in topic[1] or data tuple
-    const sv = xdr.ScVal.scvU32(schemaVersion);
-    topics.push(sv.toXDR("base64"));
+    topics.push(nativeToScVal(schemaVersion, { type: "u32" }).toXDR("base64"));
   }
 
   // Versioned envelope data: (schemaVersion, payload)
-  const versionScVal = xdr.ScVal.scvU32(schemaVersion);
-  let payloadScVal: xdr.ScVal;
-  if (Array.isArray(payload)) {
-    const vec = payload.map((item) => {
-      if (typeof item === "number") return xdr.ScVal.scvI64(xdr.UnsignedHyper.fromString(String(item)));
-      if (typeof item === "string") return xdr.ScVal.scvString(item);
-      return xdr.ScVal.scvVoid();
-    });
-    payloadScVal = xdr.ScVal.scvVec(vec);
-  } else {
-    payloadScVal = xdr.ScVal.scvVoid();
-  }
-
-  const envelope = xdr.ScVal.scvVec([versionScVal, payloadScVal]);
+  const envelope = xdr.ScVal.scvVec([
+    nativeToScVal(schemaVersion, { type: "u32" }),
+    nativeToScVal(payload),
+  ]);
   return {
     topic: topics,
     value: envelope.toXDR("base64"),
@@ -98,7 +85,7 @@ test("2. A real swap event fixture (AMM) decodes to a PoolEvent of type swap wit
   let decodedEvent: any = null;
   const ingester = new RpcIngester(
     { rpcUrl: "https://rpc.test", contractIds: ["C_POOL"] },
-    async (ev) => { decodedEvent = ev; },
+    async (ev: PoolEvent) => { decodedEvent = ev; },
     async () => {},
   );
 
@@ -251,7 +238,7 @@ test("5. Two contracts polled in one cycle each advance their own cursor", async
 });
 
 test("6. Replaying the same page twice produces no duplicate store entries (idempotent MemoryStore)", async () => {
-  const { MemoryStore } = await import("./store/memory.js");
+  const { MemoryStore } = await import("../store/memory.js");
   const store = new MemoryStore();
 
   const event = {
@@ -295,7 +282,7 @@ test("7. Retention check detects ledger outside window", async () => {
     const ingester = new RpcIngester(
       { rpcUrl: "https://rpc.test", contractIds: ["POOL_1"], startLedger: 1000 },
       async () => {},
-      async (err) => { errorCaught = err; },
+      async (err: Error) => { errorCaught = err; },
     );
 
     await (ingester as any)._poll();

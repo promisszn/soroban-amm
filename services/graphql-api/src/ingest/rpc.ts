@@ -10,7 +10,9 @@
  * - Calls onEvent / indexer for each successfully decoded event
  */
 
-import fetch from "node-fetch";
+// Node >=22 (see package.json engines) ships a native global `fetch`, so no
+// node-fetch import — tests rely on being able to stub the ambient
+// `globalThis.fetch`, which a module-scoped import would bypass entirely.
 import { xdr, scValToNative } from "@stellar/stellar-sdk";
 import type { PoolEvent, PoolEventType, AnalyticsStore } from "../store/interface.js";
 
@@ -26,7 +28,18 @@ export interface RpcIngesterOptions {
   pollIntervalMs?: number;
   /** Starting ledger (default 0 = start from latestLedger - retention or oldest available) */
   startLedger?: number;
+  /**
+   * Swap fee, in basis points, per pool contract ID. A swap event carries no
+   * fee field (see contracts/amm-sdk/src/events.rs's SwapEvent), so the fee
+   * actually charged can't be recovered from the event stream alone — it
+   * must come from how the pool was configured. Pools not listed here fall
+   * back to DEFAULT_FEE_BPS, which is very likely wrong for that pool.
+   */
+  poolFeeBps?: Record<string, number>;
 }
+
+/** Fallback swap fee, in basis points, for a pool not in `poolFeeBps`. */
+const DEFAULT_FEE_BPS = 30;
 
 /**
  * Response shape from Soroban RPC getEvents.
@@ -84,6 +97,11 @@ export class RpcIngester {
   // Per-contract cursors and ledger tracking
   private contractCursors = new Map<string, string>(); // contractId -> pagingToken
   private contractLedgers = new Map<string, number>(); // contractId -> currentLedger
+  // contractIds whose persisted cursor we've already tried to restore. Keyed
+  // separately from contractLedgers (which is pre-populated for every
+  // configured contract in the constructor) so restoration runs exactly once
+  // per contract regardless of startLedger.
+  private restoredContracts = new Set<string>();
 
   constructor(
     opts: RpcIngesterOptions,
@@ -94,6 +112,7 @@ export class RpcIngester {
     this.opts = {
       pollIntervalMs: 5000,
       startLedger: 0,
+      poolFeeBps: {},
       ...opts,
     };
     for (const contractId of this.opts.contractIds) {
@@ -152,20 +171,41 @@ export class RpcIngester {
   }
 
   private async _poll(): Promise<void> {
-    // If store is provided and we haven't loaded cursors yet, load them
-    if (this.store && this.contractCursors.size === 0) {
-      const cursor = await this.store.getCursor();
-      if (cursor) {
-        // If store has cursor, we can initialize contract ledgers or cursors if desired.
+    for (const contractId of this.opts.contractIds) {
+      // Isolate one contract's failure from the rest: otherwise a single
+      // misbehaving contract (a bad getEvents response, a transient RPC
+      // error) would stop every other configured contract from being
+      // polled for the rest of this cycle.
+      try {
+        await this._pollContract(contractId);
+      } catch (err) {
+        await this.onError(err instanceof Error ? err : new Error(String(err)));
       }
     }
+  }
 
-    for (const contractId of this.opts.contractIds) {
-      await this._pollContract(contractId);
+  /**
+   * On a contract's very first poll after this ingester starts, resume from
+   * its persisted cursor instead of `startLedger`. There's no persisted
+   * getEvents pagination token to restore (IngestionCursor doesn't carry
+   * one — it's an idempotency marker, not an RPC cursor), so resumption
+   * works by setting `contractLedgers` to the last successfully ingested
+   * ledger and letting the normal startLedger path in `_pollContract` take
+   * it from there.
+   */
+  private async _restoreCursorOnce(contractId: string): Promise<void> {
+    if (!this.store || this.restoredContracts.has(contractId)) {
+      return;
+    }
+    this.restoredContracts.add(contractId);
+    const persisted = await this.store.getCursor(contractId);
+    if (persisted) {
+      this.contractLedgers.set(contractId, persisted.ledger);
     }
   }
 
   private async _pollContract(contractId: string): Promise<void> {
+    await this._restoreCursorOnce(contractId);
     let currentLedger = this.contractLedgers.get(contractId) ?? this.opts.startLedger;
     const cursor = this.contractCursors.get(contractId);
 
@@ -254,6 +294,7 @@ export class RpcIngester {
           await this.onEvent(event);
           if (this.store) {
             await this.store.setCursor({
+              contractId,
               ledger: raw.ledger,
               txHash: event.txHash,
               eventIndex: event.eventIndex,
@@ -271,30 +312,38 @@ export class RpcIngester {
   }
 
   private async _getLatestLedgerInfo(): Promise<{ latestLedger: number; oldestLedger?: number }> {
-    try {
-      const res = await fetch(this.opts.rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          jsonrpc: "2.0",
-          id: `latestLedger-${Date.now()}`,
-          method: "getLatestLedger",
-          params: {},
-        }),
-      });
-      if (res.ok) {
-        const body = (await res.json()) as any;
-        if (body.result) {
-          return {
-            latestLedger: body.result.sequence ?? body.result.latestLedger ?? 1,
-            oldestLedger: body.result.oldestLedger,
-          };
-        }
-      }
-    } catch {
-      // fallback
+    // Deliberately no catch-and-default here: a hardcoded fallback ledger
+    // would make the caller start polling from a bogus, network-independent
+    // ledger with no visible failure — silently missing every real event, or
+    // repeatedly tripping the retention-window check. Any failure here must
+    // propagate to the caller's error handling instead.
+    const res = await fetch(this.opts.rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: `latestLedger-${Date.now()}`,
+        method: "getLatestLedger",
+        params: {},
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(
+        `RPC error: HTTP ${res.status} from ${this.opts.rpcUrl} (getLatestLedger)`,
+      );
     }
-    return { latestLedger: 100000 };
+    const body = (await res.json()) as {
+      result?: { sequence?: number; latestLedger?: number; oldestLedger?: number };
+      error?: { code: number; message: string };
+    };
+    if (body.error) {
+      throw new Error(`RPC error ${body.error.code}: ${body.error.message} (getLatestLedger)`);
+    }
+    const latestLedger = body.result?.sequence ?? body.result?.latestLedger;
+    if (!latestLedger) {
+      throw new Error("RPC getLatestLedger returned no sequence");
+    }
+    return { latestLedger, oldestLedger: body.result?.oldestLedger };
   }
 
   private _decodeEvent(raw: SorobanRpcEvent, contractId: string): PoolEvent | null {
@@ -345,17 +394,11 @@ export class RpcIngester {
         return null;
       }
 
-      // Map rawPayload to PoolEvent payload fields based on contract emit_versioned_event! call sites:
-      // 1. swap: emit_versioned_event!("swap", (token_in, amt_in, token_out, amt_out, referrer), ...)
-      //    Wait, from contracts/amm-sdk/src/events.rs and lib.rs:
-      //    swap topics: `("swap", trader)` -> topics[1] is trader (or topics[0] = "swap", topics[1] = trader)
-      //    Wait! Let's check how topics are structured.
-      //    events.rs table:
-      //    - swap: Topics: `("swap", trader)`, Data: `(1, (token_in, amt_in, token_out, amt_out, referrer))`
-      //    - add_liquidity: Topics: `("add_liquidity", provider)`, Data: `(1, (amount_a, amount_b, shares))`
-      //    - remove_liquidity (`rm_liq` / `rm_liq_1s`): Topics: `("rm_liq",)` or `("rm_liq_1s",)`, Data: `(1, (provider, shares, amount_a, amount_b))` or similar.
-      //    Let's map robustly.
-      const payload = this._mapPayload(eventName, topics, rawPayload);
+      // Maps rawPayload onto PoolEvent fields per contracts/amm-sdk/src/events.rs:
+      // - swap: topics `("swap", trader)`, data `(1, (token_in, amount_in, token_out, amount_out, referrer))`
+      // - add_liquidity: topics `("add_liquidity", provider)`, data `(1, (amount_a, amount_b, shares_minted))`
+      // - remove_liquidity (`rm_liq`/`rm_liq_1s`): topics `("rm_liq",)`, data `(1, (provider, shares_burned, amount_a, amount_b))`
+      const payload = this._mapPayload(eventName, topics, rawPayload, contractId);
 
       const [txHashPart, indexStr] = (raw.pagingToken || "").split("-");
       const eventIndex = Number(indexStr ?? "0");
@@ -378,7 +421,12 @@ export class RpcIngester {
     }
   }
 
-  private _mapPayload(eventName: string, topics: unknown[], rawPayload: unknown): Record<string, unknown> {
+  private _mapPayload(
+    eventName: string,
+    topics: unknown[],
+    rawPayload: unknown,
+    contractId: string,
+  ): Record<string, unknown> {
     const payload: Record<string, unknown> = {};
 
     // Helper to convert Stellar Address / scValNative representations to string if needed
@@ -405,7 +453,8 @@ export class RpcIngester {
         payload["amountOut"] = Number(rawPayload[3] ?? 0);
         payload["referrer"] = rawPayload[4] !== null && rawPayload[4] !== undefined ? asStr(rawPayload[4]) : null;
         payload["price"] = Number(rawPayload[3] ?? 0) > 0 && Number(rawPayload[1] ?? 0) > 0 ? Number(rawPayload[3]) / Number(rawPayload[1]) : 0;
-        payload["fee"] = Math.round(Number(rawPayload[1] ?? 0) * 0.003); // default 30 bps fee estimation if needed or 0
+        const feeBps = this.opts.poolFeeBps[contractId] ?? DEFAULT_FEE_BPS;
+        payload["fee"] = Math.round((Number(rawPayload[1] ?? 0) * feeBps) / 10_000);
       }
     } else if (eventName === "add_liquidity") {
       // topics[1] is provider

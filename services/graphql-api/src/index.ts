@@ -2,13 +2,15 @@ import { ApolloServer } from "@apollo/server";
 import { startStandaloneServer } from "@apollo/server/standalone";
 import { typeDefs } from "./schema.js";
 import { resolvers } from "./resolvers.js";
-import { PoolIndexer } from "./indexer.js";
+import { defaultIndexer } from "./indexer.js";
 import { MemoryStore } from "./store/memory.js";
 import { RpcIngester } from "./ingest/rpc.js";
 
 export async function startServer(port = 4000) {
   const store = new MemoryStore();
-  const indexer = new PoolIndexer();
+  // The resolvers read from this same singleton (see resolvers.ts) — a
+  // fresh PoolIndexer here would make ingestion a no-op for every query.
+  const indexer = defaultIndexer;
 
   const rpcUrl = process.env.SOROBAN_RPC_URL;
   const contractIdsEnv = process.env.CONTRACT_IDS;
