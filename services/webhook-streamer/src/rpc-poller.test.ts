@@ -49,6 +49,16 @@ function versionedEnvelope(
   ]).toXDR("base64");
 }
 
+/** Base64 XDR of an ScVec([u32 version, vec payload]) event envelope — the
+ * shape a tuple-valued event body takes, as opposed to `versionedEnvelope`'s
+ * map-valued one. */
+function versionedTuple(version: number, items: unknown[]): string {
+  return xdr.ScVal.scvVec([
+    nativeToScVal(version, { type: "u32" }),
+    xdr.ScVal.scvVec(items.map((item) => nativeToScVal(item))),
+  ]).toXDR("base64");
+}
+
 function silentLogger(): Logger {
   return { info: () => {}, warn: () => {}, error: () => {} };
 }
@@ -213,6 +223,50 @@ test("decodeEvent tolerates events missing contractId, timestamp and value", () 
   assert.equal(decoded.schemaVersion, 0);
   assert.deepEqual(decoded.payload, {});
   assert.equal(decoded.txHash, undefined);
+});
+
+test("decodeTopicName translates an abbreviated on-chain topic to its documented eventType", () => {
+  // contracts/amm emits the raw topic `rm_liq`/`rm_liq_1s`, but the service's
+  // README documents the subscribable eventType as `remove_liquidity` /
+  // `remove_liquidity_one_sided` — without this alias, a webhook filtered on
+  // the documented name could never match.
+  assert.equal(decodeTopicName(symbolTopic("rm_liq")), "remove_liquidity");
+  assert.equal(
+    decodeTopicName(symbolTopic("rm_liq_1s")),
+    "remove_liquidity_one_sided"
+  );
+});
+
+test("decodeEvent names a tuple-shaped payload's fields instead of flattening it to an array", () => {
+  // contracts/amm's `remove_liquidity` emits `(provider, shares, out_a, out_b)`
+  // as a plain tuple (contracts/amm-sdk/src/events.rs). Consumers rely on
+  // named fields like the README's own example payload, so this must not
+  // collapse to `{ value: [...] }`.
+  const decoded = decodeEvent(
+    rpcEvent({
+      topic: [symbolTopic("rm_liq")],
+      value: versionedTuple(1, ["GPROVIDER", 100, 11, 12]),
+    })
+  );
+  assert.ok(decoded);
+  assert.equal(decoded.eventType, "remove_liquidity");
+  assert.deepEqual(decoded.payload, {
+    provider: "GPROVIDER",
+    shares_burned: "100",
+    amount_a: "11",
+    amount_b: "12",
+  });
+});
+
+test("decodeEvent falls back to the generic array shape when a tuple's arity doesn't match its schema", () => {
+  const decoded = decodeEvent(
+    rpcEvent({
+      topic: [symbolTopic("rm_liq")],
+      value: versionedTuple(1, ["GPROVIDER", 100]),
+    })
+  );
+  assert.ok(decoded);
+  assert.deepEqual(decoded.payload, { value: ["GPROVIDER", "100"] });
 });
 
 // ── request shape and cursors ──────────────────────────────────────────────

@@ -27,6 +27,7 @@ npm run build && npm start
 | `SOROBAN_RPC_URL` | `https://soroban-testnet.stellar.org`      | Stellar RPC base URL                     |
 | `HORIZON_URL`     | _(deprecated)_                             | Legacy alias for `SOROBAN_RPC_URL`; accepted for one release with a startup deprecation warning. `SOROBAN_RPC_URL` takes precedence. |
 | `CONTRACT_IDS`    | _(empty)_                                  | Comma-separated contract IDs to watch    |
+| `START_LEDGER`    | `1`                                        | Ledger to start `getEvents` from on a contract's first poll (before it has a cursor). A live RPC endpoint only retains a recent window of ledgers, so the default of `1` will be rejected outside local/sandbox testing — set this to a recent ledger before pointing the service at testnet/mainnet. |
 | `POLL_INTERVAL_MS`| `5000`                                     | Polling interval in milliseconds         |
 | `PORT`            | `3001`                                     | Management API HTTP port                 |
 | `WEBHOOK_ALLOW_PRIVATE_TARGETS` | `false`                       | Set to `true` to allow registering webhook URLs that point at loopback/link-local/private-range addresses. Only for local development against a same-host test receiver — leave unset in production, since it disables SSRF protection on `POST /webhooks`. |

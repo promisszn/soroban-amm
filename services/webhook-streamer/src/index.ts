@@ -27,6 +27,8 @@ import { CircuitBreaker } from "./circuit-breaker.js";
 import { RpcPoller } from "./rpc-poller.js";
 import type { PoolEvent } from "./types.js";
 
+const DEFAULT_SOROBAN_RPC_URL = "https://soroban-testnet.stellar.org";
+
 const PORT = Number(process.env["PORT"] ?? 3001);
 const SOROBAN_RPC_URL = process.env["SOROBAN_RPC_URL"];
 const HORIZON_URL = process.env["HORIZON_URL"];
@@ -38,13 +40,12 @@ if (!SOROBAN_RPC_URL && HORIZON_URL) {
   );
 }
 
-const RPC_URL = SOROBAN_RPC_URL ?? HORIZON_URL;
+const RPC_URL = SOROBAN_RPC_URL ?? HORIZON_URL ?? DEFAULT_SOROBAN_RPC_URL;
 
-if (!RPC_URL) {
-  console.error(
-    "[webhook-streamer] SOROBAN_RPC_URL is required (HORIZON_URL is a deprecated alias).",
+if (!SOROBAN_RPC_URL && !HORIZON_URL) {
+  console.warn(
+    `[webhook-streamer] SOROBAN_RPC_URL is not set; defaulting to ${DEFAULT_SOROBAN_RPC_URL}.`,
   );
-  process.exit(1);
 }
 
 const CONTRACT_IDS = (process.env["CONTRACT_IDS"] ?? "")
