@@ -25,7 +25,7 @@ export class MemoryStore implements AnalyticsStore {
   private priceHistory: PricePoint[] = [];
   private alertConfigs = new Map<string, AlertConfig>();
   private firedAlerts: HealthAlert[] = [];
-  private cursor: IngestionCursor | null = null;
+  private cursors = new Map<string, IngestionCursor>();
 
   // Track (ledger, txHash, eventIndex) for idempotency
   private eventKeys = new Set<string>();
@@ -127,12 +127,12 @@ export class MemoryStore implements AnalyticsStore {
     return all.slice(-limit).reverse();
   }
 
-  async getCursor(): Promise<IngestionCursor | null> {
-    return this.cursor;
+  async getCursor(contractId: string): Promise<IngestionCursor | null> {
+    return this.cursors.get(contractId) ?? null;
   }
 
   async setCursor(cursor: IngestionCursor): Promise<void> {
-    this.cursor = cursor;
+    this.cursors.set(cursor.contractId, cursor);
   }
 
   async close(): Promise<void> {

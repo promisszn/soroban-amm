@@ -71,6 +71,13 @@ export interface AlertConfig {
 /** Ingestion cursor tracking progress through RPC events. */
 export interface IngestionCursor {
   /**
+   * Contract this cursor tracks progress for. A single ingester polls
+   * multiple contracts, each paginating independently, so one cursor per
+   * contract is required — otherwise each contract's progress would
+   * overwrite the others'.
+   */
+  contractId: string;
+  /**
    * Last ledger sequence number successfully ingested.
    * Used to resume from where we left off.
    */
@@ -182,13 +189,14 @@ export interface AnalyticsStore {
   // ─── Ingestion cursor ────────────────────────────────────────────────────
 
   /**
-   * Get the current ingestion cursor (progress through RPC events).
-   * Returns null if never ingested.
+   * Get the current ingestion cursor for a contract (progress through RPC
+   * events). Returns null if that contract has never been ingested.
    */
-  getCursor(): Promise<IngestionCursor | null>;
+  getCursor(contractId: string): Promise<IngestionCursor | null>;
 
   /**
-   * Update the ingestion cursor (called after successfully processing events).
+   * Update a contract's ingestion cursor (called after successfully
+   * processing its events).
    */
   setCursor(cursor: IngestionCursor): Promise<void>;
 
