@@ -30,6 +30,9 @@ mod memory_leak_detection_test;
 #[cfg(test)]
 mod governance_locker_test;
 
+#[cfg(test)]
+mod pol_vesting_governance_test;
+
 #[cfg(all(test, feature = "legacy-integration-matrix"))]
 mod tests {
     use soroban_sdk::{

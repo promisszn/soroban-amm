@@ -26,6 +26,7 @@ governance       = { path = "../governance",       features = ["testutils"] }
 concentrated_liquidity = { path = "../concentrated_liquidity", features = ["testutils"] }
 staking          = { path = "../staking",          features = ["testutils"] }
 cl_position_nft  = { path = "../cl_position_nft",  features = ["testutils"] }
+pol_vesting      = { path = "../pol_vesting",      features = ["testutils"] }
 
 [dev-dependencies]
 twap_consumer    = { path = "../twap_consumer",    features = ["testutils"] }
