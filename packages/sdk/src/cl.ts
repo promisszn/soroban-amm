@@ -247,14 +247,30 @@ export class ConcentratedLiquidityClient {
   }
 
   /**
-   * Returns oracle tick cumulative values for an array of historical timestamps.
-   * Returns one `i64` per requested timestamp.
+   * Returns the tick cumulative `secondsAgo` seconds in the past.
+   *
+   * Mirrors `ConcentratedLiquidity::observe` —
+   * contracts/concentrated_liquidity/src/lib.rs:3294
+   * `(seconds_ago: u64) -> i64`. The contract takes a single timestamp, not a
+   * list, and returns a single cumulative value. Use {@link observeBatch} to
+   * sample several points; each point is one RPC call.
    */
-  async observe(timestamps: bigint[]): Promise<bigint[]> {
-    const tsVec = nativeToScVal(timestamps.map((t) => nativeToScVal(t, { type: "u64" })));
-    const raw = await this.simulate("observe", tsVec);
-    const native = scValToNative(raw) as unknown[];
-    return (native ?? []).map((v) => BigInt(String(v)));
+  async observe(secondsAgo: bigint): Promise<bigint> {
+    const raw = await this.simulate("observe", u64(secondsAgo));
+    return BigInt(String(scValToNative(raw)));
+  }
+
+  /**
+   * Sample {@link observe} at several `secondsAgo` points, in order.
+   *
+   * Client-side convenience, not a contract entrypoint: the contract only
+   * exposes the single-point `observe`, so this loops and costs one RPC call per
+   * point.
+   */
+  async observeBatch(secondsAgos: bigint[]): Promise<bigint[]> {
+    const out: bigint[] = [];
+    for (const secondsAgo of secondsAgos) out.push(await this.observe(secondsAgo));
+    return out;
   }
 
   /** Returns whether the pool is paused. */
@@ -269,13 +285,15 @@ export class ConcentratedLiquidityClient {
    * Parameters for `mint_position`.
    *
    * Mirrors `ConcentratedLiquidity::mint_position` —
-   * contracts/concentrated_liquidity/src/lib.rs:407
+   * contracts/concentrated_liquidity/src/lib.rs:706
    * `(provider: Address, lower_tick: i32, upper_tick: i32,
-   *   amount_a_desired: i128, amount_b_desired: i128, min_a: i128, min_b: i128)`
+   *   amount_a_desired: i128, amount_b_desired: i128, min_a: i128,
+   *   min_b: i128, deadline: u64)`
    *
-   * Note there is no `deadline` argument: `mint_position` has no deadline
-   * guard. `minA`/`minB` are independent per-token slippage floors, not a
-   * single combined minimum-liquidity bound.
+   * The trailing `deadline` is a Unix timestamp (seconds); the contract rejects
+   * a call whose ledger time has passed it with `DeadlineExpired`. `minA`/`minB`
+   * are independent per-token slippage floors, not a single combined
+   * minimum-liquidity bound.
    */
   mintPositionParams(
     provider: string,
@@ -284,7 +302,8 @@ export class ConcentratedLiquidityClient {
     amountADesired: bigint,
     amountBDesired: bigint,
     minA: bigint,
-    minB: bigint
+    minB: bigint,
+    deadline: bigint
   ): xdr.ScVal[] {
     return [
       addr(provider),
@@ -294,6 +313,7 @@ export class ConcentratedLiquidityClient {
       i128(amountBDesired),
       i128(minA),
       i128(minB),
+      u64(deadline),
     ];
   }
 
@@ -301,7 +321,7 @@ export class ConcentratedLiquidityClient {
    * Parameters for `modify_position`.
    *
    * Mirrors `ConcentratedLiquidity::modify_position` —
-   * contracts/concentrated_liquidity/src/lib.rs:540
+   * contracts/concentrated_liquidity/src/lib.rs:889
    * `(provider: Address, lower_tick: i32, upper_tick: i32,
    *   liquidity_delta: i128, min_a: i128, min_b: i128, deadline: u64)`
    *
@@ -323,7 +343,7 @@ export class ConcentratedLiquidityClient {
    * Parameters for `burn_position`.
    *
    * Mirrors `ConcentratedLiquidity::burn_position` —
-   * contracts/concentrated_liquidity/src/lib.rs:1118
+   * contracts/concentrated_liquidity/src/lib.rs:1567
    * `(provider: Address, lower_tick: i32, upper_tick: i32, liquidity: i128)`
    *
    * `liquidity` specifies how much of the position to burn and must be
@@ -344,7 +364,7 @@ export class ConcentratedLiquidityClient {
    * Parameters for `collect_fees`.
    *
    * Mirrors `ConcentratedLiquidity::collect_fees` —
-   * contracts/concentrated_liquidity/src/lib.rs:1229
+   * contracts/concentrated_liquidity/src/lib.rs:1627
    * `(provider: Address, lower_tick: i32, upper_tick: i32)`
    *
    * Returns `(fee_a, fee_b)`.
@@ -357,7 +377,7 @@ export class ConcentratedLiquidityClient {
    * Parameters for `swap`.
    *
    * Mirrors `ConcentratedLiquidity::swap` —
-   * contracts/concentrated_liquidity/src/lib.rs:1437
+   * contracts/concentrated_liquidity/src/lib.rs:2146
    * `(sender: Address, zero_for_one: bool, amount_in: i128,
    *   sqrt_price_limit_x96: u128, min_amount_out: i128, deadline: u64)`
    *
