@@ -99,6 +99,18 @@ function isValidMetric(metric: string): metric is AlertMetric {
   return (VALID_ALERT_METRICS as readonly string[]).includes(metric);
 }
 
+/** Stringifies a payload field without risking a plain object's default
+ * `[object Object]` stringification — payload values are `unknown` since
+ * they come straight off the wire. */
+function toStr(val: unknown): string {
+  if (val === null || val === undefined) return "";
+  if (typeof val === "string") return val;
+  if (typeof val === "number" || typeof val === "bigint" || typeof val === "boolean") {
+    return val.toString();
+  }
+  return (val as { toString(): string }).toString();
+}
+
 export interface AlertConfig {
   poolId: string;
   metric: AlertMetric;
@@ -124,8 +136,8 @@ export class PoolIndexer {
 
     const stats = this.stats.get(event.poolId) ?? {
       poolId: event.poolId,
-      tokenA: String(event.payload["tokenA"] ?? ""),
-      tokenB: String(event.payload["tokenB"] ?? ""),
+      tokenA: toStr(event.payload["tokenA"] ?? ""),
+      tokenB: toStr(event.payload["tokenB"] ?? ""),
       tvl: 0,
       volume24h: 0,
       fees24h: 0,

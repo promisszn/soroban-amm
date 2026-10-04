@@ -30,7 +30,7 @@ export async function startServer(port = 4000) {
           startLedger,
         },
         async (event) => {
-          store.appendEvent(event);
+          await store.appendEvent(event);
           indexer.indexEvent(event);
         },
         async (err) => {

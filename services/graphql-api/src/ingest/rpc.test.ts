@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert";
-import { RpcIngester } from "./rpc.js";
+import { RpcIngester, type SorobanRpcEvent } from "./rpc.js";
 import { xdr, nativeToScVal } from "@stellar/stellar-sdk";
 import type { PoolEvent } from "../store/interface.js";
 
@@ -26,12 +26,40 @@ function encodeFixture(topicSymbol: string, schemaVersion: number, payload: unkn
   };
 }
 
+/** Shape of the JSON-RPC request body RpcIngester sends. */
+interface RpcRequestBody {
+  jsonrpc: string;
+  id: string;
+  method: string;
+  params: Record<string, unknown>;
+}
+
+/** The private surface these tests exercise directly. */
+interface RpcIngesterInternals {
+  _poll(): Promise<void>;
+  _decodeEvent(raw: SorobanRpcEvent, contractId: string): PoolEvent | null;
+  contractCursors: Map<string, string>;
+}
+
+function internals(ingester: RpcIngester): RpcIngesterInternals {
+  return ingester as unknown as RpcIngesterInternals;
+}
+
+/** A `fetch`-shaped stub for monkey-patching `global.fetch` in these tests. */
+function stubFetch(
+  handler: (body: RpcRequestBody) => { ok: boolean; json: () => Promise<unknown> },
+): typeof fetch {
+  return (async (_url, init) => {
+    const body = JSON.parse(init?.body as string) as RpcRequestBody;
+    return handler(body);
+  }) as typeof fetch;
+}
+
 test("1. With START_LEDGER unset, the first getEvents request contains a positive startLedger", async () => {
-  let capturedBody: any = null;
+  let capturedBody: RpcRequestBody | null = null;
   const originalFetch = global.fetch;
 
-  (global as any).fetch = async (url: string, init: any) => {
-    const body = JSON.parse(init.body);
+  global.fetch = stubFetch((body) => {
     capturedBody = body;
     if (body.method === "getLatestLedger") {
       return {
@@ -47,7 +75,7 @@ test("1. With START_LEDGER unset, the first getEvents request contains a positiv
         result: { events: [], latestLedger: 12345 },
       }),
     };
-  };
+  });
 
   try {
     const ingester = new RpcIngester(
@@ -57,11 +85,13 @@ test("1. With START_LEDGER unset, the first getEvents request contains a positiv
     );
 
     // Trigger poll manually by starting and stopping quickly or calling private method
-    await (ingester as any)._poll();
+    await internals(ingester)._poll();
 
     assert.ok(capturedBody, "Fetch should have been called");
-    assert.strictEqual(capturedBody.method, "getEvents");
-    assert.ok(capturedBody.params.startLedger > 0, `startLedger should be positive, got ${capturedBody.params.startLedger}`);
+    const body = capturedBody as RpcRequestBody;
+    assert.strictEqual(body.method, "getEvents");
+    const startLedger = body.params["startLedger"];
+    assert.ok(typeof startLedger === "number" && startLedger > 0, `startLedger should be positive, got ${String(startLedger)}`);
   } finally {
     global.fetch = originalFetch;
   }
@@ -69,7 +99,7 @@ test("1. With START_LEDGER unset, the first getEvents request contains a positiv
 
 test("2. A real swap event fixture (AMM) decodes to a PoolEvent of type swap with correct amounts and schema version", async () => {
   const fixture = encodeFixture("swap", 1, ["GC_IN", 1000, "GC_OUT", 950, null], "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF");
-  const rawEvent = {
+  const rawEvent: SorobanRpcEvent = {
     type: "contract",
     ledger: 100,
     ledgerClosedAt: new Date().toISOString(),
@@ -82,24 +112,23 @@ test("2. A real swap event fixture (AMM) decodes to a PoolEvent of type swap wit
     txHash: "tx-abc",
   };
 
-  let decodedEvent: any = null;
   const ingester = new RpcIngester(
     { rpcUrl: "https://rpc.test", contractIds: ["C_POOL"] },
-    async (ev: PoolEvent) => { decodedEvent = ev; },
+    async () => {},
     async () => {},
   );
 
-  const result = (ingester as any)._decodeEvent(rawEvent, "C_POOL");
+  const result = internals(ingester)._decodeEvent(rawEvent, "C_POOL");
   assert.notStrictEqual(result, null);
-  assert.strictEqual(result.type, "swap");
-  assert.strictEqual(result.payload.amountIn, 1000);
-  assert.strictEqual(result.payload.amountOut, 950);
-  assert.strictEqual(result.txHash, "tx-abc");
+  assert.strictEqual(result!.type, "swap");
+  assert.strictEqual(result!.payload["amountIn"], 1000);
+  assert.strictEqual(result!.payload["amountOut"], 950);
+  assert.strictEqual(result!.txHash, "tx-abc");
 });
 
 test("3. Fixtures for add_liquidity and remove_liquidity decode correctly", async () => {
   const addFixture = encodeFixture("add_liquidity", 1, [5000, 5000, 1000], "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF");
-  const rawAdd = {
+  const rawAdd: SorobanRpcEvent = {
     type: "contract",
     ledger: 101,
     ledgerClosedAt: new Date().toISOString(),
@@ -117,14 +146,14 @@ test("3. Fixtures for add_liquidity and remove_liquidity decode correctly", asyn
     async () => {},
   );
 
-  const decodedAdd = (ingester as any)._decodeEvent(rawAdd, "C_POOL");
+  const decodedAdd = internals(ingester)._decodeEvent(rawAdd, "C_POOL");
   assert.notStrictEqual(decodedAdd, null);
-  assert.strictEqual(decodedAdd.type, "add_liquidity");
-  assert.strictEqual(decodedAdd.payload.amountA, 5000);
-  assert.strictEqual(decodedAdd.payload.amountB, 5000);
+  assert.strictEqual(decodedAdd!.type, "add_liquidity");
+  assert.strictEqual(decodedAdd!.payload["amountA"], 5000);
+  assert.strictEqual(decodedAdd!.payload["amountB"], 5000);
 
   const rmFixture = encodeFixture("remove_liquidity", 1, ["G_PROV", 500, 2500, 2500]);
-  const rawRm = {
+  const rawRm: SorobanRpcEvent = {
     type: "contract",
     ledger: 102,
     ledgerClosedAt: new Date().toISOString(),
@@ -136,15 +165,15 @@ test("3. Fixtures for add_liquidity and remove_liquidity decode correctly", asyn
     inSuccessfulContractInvocation: true,
   };
 
-  const decodedRm = (ingester as any)._decodeEvent(rawRm, "C_POOL");
+  const decodedRm = internals(ingester)._decodeEvent(rawRm, "C_POOL");
   assert.notStrictEqual(decodedRm, null);
-  assert.strictEqual(decodedRm.type, "remove_liquidity");
-  assert.strictEqual(decodedRm.payload.amountA, 2500);
+  assert.strictEqual(decodedRm!.type, "remove_liquidity");
+  assert.strictEqual(decodedRm!.payload["amountA"], 2500);
 });
 
 test("4. An event whose data version is higher than supported is rejected. Version equal to supported is accepted", async () => {
   const newerFixture = encodeFixture("swap", 2, [100, 200]);
-  const rawNewer = {
+  const rawNewer: SorobanRpcEvent = {
     type: "contract",
     ledger: 103,
     ledgerClosedAt: new Date().toISOString(),
@@ -162,11 +191,11 @@ test("4. An event whose data version is higher than supported is rejected. Versi
     async () => {},
   );
 
-  const resNewer = (ingester as any)._decodeEvent(rawNewer, "C_POOL");
+  const resNewer = internals(ingester)._decodeEvent(rawNewer, "C_POOL");
   assert.strictEqual(resNewer, null, "Newer schema version should be rejected");
 
   const validFixture = encodeFixture("swap", 1, [100, 200]);
-  const rawValid = {
+  const rawValid: SorobanRpcEvent = {
     type: "contract",
     ledger: 104,
     ledgerClosedAt: new Date().toISOString(),
@@ -178,21 +207,19 @@ test("4. An event whose data version is higher than supported is rejected. Versi
     inSuccessfulContractInvocation: true,
   };
 
-  const resValid = (ingester as any)._decodeEvent(rawValid, "C_POOL");
+  const resValid = internals(ingester)._decodeEvent(rawValid, "C_POOL");
   assert.notStrictEqual(resValid, null, "Supported schema version should be accepted");
 });
 
 test("5. Two contracts polled in one cycle each advance their own cursor", async () => {
-  const requests: any[] = [];
   const originalFetch = global.fetch;
 
-  (global as any).fetch = async (url: string, init: any) => {
-    const body = JSON.parse(init.body);
-    requests.push(body);
-    const contractId = body.params.filters[0].contractIds[0];
-    const cursor = body.params.pagination.cursor;
+  global.fetch = stubFetch((body) => {
+    const params = body.params as { filters: Array<{ contractIds: string[] }>; pagination: { cursor?: string } };
+    const contractId = params.filters[0].contractIds[0];
+    const cursor = params.pagination.cursor;
 
-    let events: any[] = [];
+    let events: SorobanRpcEvent[] = [];
     if (!cursor) {
       const fixture = encodeFixture("swap", 1, ["A", 10, "B", 10]);
       events = [
@@ -217,7 +244,7 @@ test("5. Two contracts polled in one cycle each advance their own cursor", async
         result: { events, latestLedger: 250 },
       }),
     };
-  };
+  });
 
   try {
     const ingester = new RpcIngester(
@@ -226,10 +253,10 @@ test("5. Two contracts polled in one cycle each advance their own cursor", async
       async () => {},
     );
 
-    await (ingester as any)._poll();
-    await (ingester as any)._poll(); // second poll should send respective cursors
+    await internals(ingester)._poll();
+    await internals(ingester)._poll(); // second poll should send respective cursors
 
-    const cursors = (ingester as any).contractCursors;
+    const cursors = internals(ingester).contractCursors;
     assert.strictEqual(cursors.get("POOL_1"), "POOL_1-token-1");
     assert.strictEqual(cursors.get("POOL_2"), "POOL_2-token-1");
   } finally {
@@ -241,10 +268,10 @@ test("6. Replaying the same page twice produces no duplicate store entries (idem
   const { MemoryStore } = await import("../store/memory.js");
   const store = new MemoryStore();
 
-  const event = {
+  const event: PoolEvent = {
     id: "evt-dup",
     poolId: "POOL_1",
-    type: "swap" as const,
+    type: "swap",
     timestamp: 123456,
     ledger: 100,
     txHash: "tx-1",
@@ -263,20 +290,18 @@ test("7. Retention check detects ledger outside window", async () => {
   let errorCaught: Error | null = null;
   const originalFetch = global.fetch;
 
-  (global as any).fetch = async () => {
-    return {
-      ok: true,
-      json: async () => ({
-        jsonrpc: "2.0",
-        id: "1",
-        result: {
-          events: [],
-          latestLedger: 50000,
-          oldestLedger: 40000,
-        },
-      }),
-    };
-  };
+  global.fetch = stubFetch(() => ({
+    ok: true,
+    json: async () => ({
+      jsonrpc: "2.0",
+      id: "1",
+      result: {
+        events: [],
+        latestLedger: 50000,
+        oldestLedger: 40000,
+      },
+    }),
+  }));
 
   try {
     const ingester = new RpcIngester(
@@ -285,7 +310,7 @@ test("7. Retention check detects ledger outside window", async () => {
       async (err: Error) => { errorCaught = err; },
     );
 
-    await (ingester as any)._poll();
+    await internals(ingester)._poll();
     assert.notStrictEqual(errorCaught, null);
     assert.ok(errorCaught!.message.includes("retention window"));
   } finally {
@@ -300,7 +325,7 @@ test("8. Malformed event topics or XDR gracefully handled", async () => {
     async () => {},
   );
 
-  const rawBad = {
+  const rawBad: SorobanRpcEvent = {
     type: "contract",
     ledger: 100,
     ledgerClosedAt: new Date().toISOString(),
@@ -312,6 +337,6 @@ test("8. Malformed event topics or XDR gracefully handled", async () => {
     inSuccessfulContractInvocation: true,
   };
 
-  const res = (ingester as any)._decodeEvent(rawBad, "POOL_1");
+  const res = internals(ingester)._decodeEvent(rawBad, "POOL_1");
   assert.strictEqual(res, null);
 });

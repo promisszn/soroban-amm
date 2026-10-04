@@ -42,9 +42,10 @@ export interface RpcIngesterOptions {
 const DEFAULT_FEE_BPS = 30;
 
 /**
- * Response shape from Soroban RPC getEvents.
+ * Response shape from Soroban RPC getEvents. Exported for tests building
+ * fixtures against this shape.
  */
-interface SorobanRpcEvent {
+export interface SorobanRpcEvent {
   type: string;
   ledger: number;
   ledgerClosedAt: string;
@@ -54,6 +55,8 @@ interface SorobanRpcEvent {
   topic: string[];
   value: string;
   inSuccessfulContractInvocation: boolean;
+  /** Not present on every RPC version; falls back to pagingToken/id when absent. */
+  txHash?: string;
 }
 
 interface GetEventsResponse {
@@ -89,6 +92,19 @@ const TOPIC_MAP: Record<string, PoolEventType> = {
  * Current event schema version that this ingester understands.
  */
 const CURRENT_EVENT_SCHEMA_VERSION = 1;
+
+/** Converts an scValToNative result (string, number, bigint, Address-like
+ * object, ...) to a string without risking a plain-object's default
+ * `[object Object]` stringification. */
+function asStr(val: unknown): string {
+  if (val === null || val === undefined) return "";
+  if (typeof val === "string") return val;
+  if (typeof val === "number" || typeof val === "bigint" || typeof val === "boolean") {
+    return val.toString();
+  }
+  // Address and similar SDK-decoded objects expose a meaningful toString().
+  return (val as { toString(): string }).toString();
+}
 
 export class RpcIngester {
   private running = false;
@@ -350,7 +366,7 @@ export class RpcIngester {
     try {
       // Topic[0] is event name, Topic[1] is schema version (or part of versioned envelope)
       // Let's decode topics using xdr.ScVal.fromXDR(..., "base64") and scValToNative
-      const topics = (raw.topic || []).map((t) => {
+      const topics = (raw.topic || []).map((t): unknown => {
         try {
           const scVal = xdr.ScVal.fromXDR(t, "base64");
           return scValToNative(scVal);
@@ -359,7 +375,7 @@ export class RpcIngester {
         }
       });
 
-      const eventName = String(topics[0] ?? "");
+      const eventName = asStr(topics[0] ?? "");
       const eventType = TOPIC_MAP[eventName];
       if (!eventType) {
         return null;
@@ -373,14 +389,14 @@ export class RpcIngester {
       if (raw.value) {
         try {
           const valScVal = xdr.ScVal.fromXDR(raw.value, "base64");
-          const nativeVal = scValToNative(valScVal);
+          const nativeVal: unknown = scValToNative(valScVal);
           if (Array.isArray(nativeVal) && nativeVal.length >= 2) {
             schemaVersion = Number(nativeVal[0]);
             rawPayload = nativeVal[1];
           } else {
             rawPayload = nativeVal;
           }
-        } catch (e) {
+        } catch {
           // fallback if not a tuple
         }
       }
@@ -403,7 +419,7 @@ export class RpcIngester {
       const [txHashPart, indexStr] = (raw.pagingToken || "").split("-");
       const eventIndex = Number(indexStr ?? "0");
       // Use real transaction hash from RPC response if available, else txHashPart or raw.id
-      const txHash = (raw as any).txHash ?? txHashPart ?? raw.id;
+      const txHash = raw.txHash ?? txHashPart ?? raw.id;
 
       return {
         id: raw.id,
@@ -428,15 +444,6 @@ export class RpcIngester {
     contractId: string,
   ): Record<string, unknown> {
     const payload: Record<string, unknown> = {};
-
-    // Helper to convert Stellar Address / scValNative representations to string if needed
-    const asStr = (val: unknown): string => {
-      if (val === null || val === undefined) return "";
-      if (typeof val === "object" && "toString" in val && typeof (val as any).toString === "function") {
-        return (val as any).toString();
-      }
-      return String(val);
-    };
 
     if (eventName === "swap") {
       // topics[1] is trader (Address)
