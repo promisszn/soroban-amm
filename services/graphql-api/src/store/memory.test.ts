@@ -79,12 +79,13 @@ describe("MemoryStore event queries", () => {
 describe("MemoryStore ingestion cursor", () => {
   it("starts with no cursor", async () => {
     const store = new MemoryStore();
-    assert.equal(await store.getCursor(), null);
+    assert.equal(await store.getCursor("C1"), null);
   });
 
   it("returns the cursor that was last persisted", async () => {
     const store = new MemoryStore();
     const cursor = {
+      contractId: "C1",
       ledger: 1000,
       txHash: "tx-1",
       eventIndex: 0,
@@ -93,6 +94,17 @@ describe("MemoryStore ingestion cursor", () => {
     await store.setCursor(cursor);
     await store.setCursor({ ...cursor, ledger: 1001 });
 
-    assert.deepEqual(await store.getCursor(), { ...cursor, ledger: 1001 });
+    assert.deepEqual(await store.getCursor("C1"), { ...cursor, ledger: 1001 });
+  });
+
+  it("tracks each contract's cursor independently", async () => {
+    const store = new MemoryStore();
+    const base = { ledger: 1000, txHash: "tx-1", eventIndex: 0, updatedAt: 1 };
+    await store.setCursor({ ...base, contractId: "C1", ledger: 1000 });
+    await store.setCursor({ ...base, contractId: "C2", ledger: 2000 });
+
+    assert.equal((await store.getCursor("C1"))?.ledger, 1000);
+    assert.equal((await store.getCursor("C2"))?.ledger, 2000);
+    assert.equal(await store.getCursor("C3"), null);
   });
 });

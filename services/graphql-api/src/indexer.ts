@@ -8,20 +8,29 @@
 
 const RETENTION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 
+// Kept a superset of store/interface.ts's PoolEventType/PoolEvent (rather
+// than importing those directly) so this module's own narrower PoolEvent —
+// which only requires id/poolId/type/timestamp/payload, not the store's
+// ledger/txHash/eventIndex — keeps working as the minimal shape indexEvent
+// actually needs. A RpcIngester-sourced PoolEvent (the store's richer type)
+// is still assignable here; TypeScript's structural typing allows an object
+// with extra fields to satisfy a type that requires fewer of them.
 export type PoolEventType =
   | "swap"
   | "add_liquidity"
   | "remove_liquidity"
   | "campaign_created"
   | "reward_distributed"
-  | "fot_detected";
+  | "fot_detected"
+  | "price_upd"
+  | "tick_crossed";
 
 export interface PoolEvent {
   id: string;
   poolId: string;
   type: PoolEventType;
   timestamp: number;
-  payload: Record<string, string | number>;
+  payload: Record<string, unknown>;
 }
 
 export interface PoolStats {
@@ -90,6 +99,18 @@ function isValidMetric(metric: string): metric is AlertMetric {
   return (VALID_ALERT_METRICS as readonly string[]).includes(metric);
 }
 
+/** Stringifies a payload field without risking a plain object's default
+ * `[object Object]` stringification — payload values are `unknown` since
+ * they come straight off the wire. */
+function toStr(val: unknown): string {
+  if (val === null || val === undefined) return "";
+  if (typeof val === "string") return val;
+  if (typeof val === "number" || typeof val === "bigint" || typeof val === "boolean") {
+    return val.toString();
+  }
+  return (val as { toString(): string }).toString();
+}
+
 export interface AlertConfig {
   poolId: string;
   metric: AlertMetric;
@@ -115,8 +136,8 @@ export class PoolIndexer {
 
     const stats = this.stats.get(event.poolId) ?? {
       poolId: event.poolId,
-      tokenA: String(event.payload["tokenA"] ?? ""),
-      tokenB: String(event.payload["tokenB"] ?? ""),
+      tokenA: toStr(event.payload["tokenA"] ?? ""),
+      tokenB: toStr(event.payload["tokenB"] ?? ""),
       tvl: 0,
       volume24h: 0,
       fees24h: 0,
