@@ -617,8 +617,8 @@ impl ReserveManager {
     ///
     /// The kind is written to **persistent** storage with a TTL bump. A legacy
     /// instance-storage entry (written before kinds moved to persistent) is
-    /// still honoured — see [`Self::pool_kind_of`] — and is migrated to
-    /// persistent storage on first touch.
+    /// still honoured — see the private `pool_kind_of` helper — and is
+    /// migrated to persistent storage on first touch.
     pub fn set_pool_kind(
         env: Env,
         pool: Address,
@@ -667,7 +667,7 @@ impl ReserveManager {
     ///
     /// The read of each pool is fault-isolated and pool-kind aware: each pool
     /// is resolved through the same recorded-kind → V2-probe → balance-fallback
-    /// path as [`Self::check_reserves`]. A pool that fails **both** the V2
+    /// path as [`ReserveManager::check_reserves`]. A pool that fails **both** the V2
     /// probe and the balance fallback is reported with `healthy: false` and
     /// zeroed amounts instead of aborting the whole batch. Healthy CL pools
     /// are reported as healthy — they are not treated as unreadable just
