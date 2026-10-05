@@ -39,12 +39,20 @@ export interface SwapParams {
   deadline: bigint;
 }
 
-/** Result of a swap simulation. */
+/**
+ * Result of a swap simulation, decoded from the contract's `SwapSimulation`
+ * struct (`contracts/amm/src/lib.rs`). `priceImpactBps` is surfaced as a number
+ * because it is a small basis-point figure; every other field stays a bigint.
+ */
 export interface SwapSimulation {
   amountIn: bigint;
   amountOut: bigint;
   priceImpactBps: number;
   feeAmount: bigint;
+  /** `amount_out / amount_in`, scaled by 1_000_000. */
+  effectivePrice: bigint;
+  /** `reserve_out / reserve_in`, scaled by 1_000_000. */
+  spotPrice: bigint;
 }
 
 /** Input for adding liquidity. */

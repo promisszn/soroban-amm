@@ -49,7 +49,11 @@ describe("SIMULATION_SOURCE_ACCOUNT", () => {
 
 describe("read-only clients never fetch a dummy source account", () => {
   const clients: Array<[string, () => { server: unknown }, (c: never) => Promise<unknown>]> = [
-    ["AmmPool", () => new AmmPool(config) as never, (c: never) => (c as AmmPool).getName()],
+    [
+      "AmmPool",
+      () => new AmmPool(config) as never,
+      (c: never) => (c as AmmPool).sharesOf(SIMULATION_SOURCE_ACCOUNT),
+    ],
     ["TokenClient", () => new TokenClient(config) as never, (c: never) => (c as TokenClient).decimals()],
     ["FactoryClient", () => new FactoryClient(config) as never, (c: never) => (c as FactoryClient).poolCount()],
     ["GovernanceClient", () => new GovernanceClient(config) as never, (c: never) => (c as GovernanceClient).proposalCount()],

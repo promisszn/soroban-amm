@@ -26,6 +26,18 @@ function i128(value: bigint): xdr.ScVal {
   return nativeToScVal(value, { type: "i128" });
 }
 
+/**
+ * Encode `Option<BytesN<32>>` the way the contract expects: `None` is `scvVoid`
+ * and `Some` is `scvVec([scvBytes(32)])`, matching `soroban_sdk`'s `Option`
+ * conversion.
+ */
+function governanceHash(value?: string): xdr.ScVal {
+  if (value === undefined) return xdr.ScVal.scvVoid();
+  return xdr.ScVal.scvVec([
+    nativeToScVal(Buffer.from(value, "hex"), { type: "bytes" }),
+  ]);
+}
+
 // ── Types ──────────────────────────────────────────────────────────────────────
 
 /** Result of `create_pool` — the pool address and optional governance address. */
@@ -93,30 +105,67 @@ export class FactoryClient {
     return native !== null && native !== undefined ? toText(native) : null;
   }
 
-  /** Returns the pool count (monotonic counter used to derive deployment salts). */
+  /** Returns the number of AMM pools deployed by this factory. */
   async poolCount(): Promise<bigint> {
-    const raw = await this.simulate("pool_count");
+    // The exported entrypoint is `get_pool_count`; the contract's `pool_count`
+    // is a private helper and is not callable over RPC.
+    const raw = await this.simulate("get_pool_count");
     return BigInt(String(scValToNative(raw)));
   }
 
   // ── Write-method parameter types ───────────────────────────────────────────
 
   /**
-   * Parameters for `create_pool(token_a, token_b, fee_bps, governance_wasm_hash)`.
+   * Parameters for `create_pool`.
    *
-   * `governanceWasmHash` should be a 32-byte hex string, or omit the field to
-   * deploy a pool without governance.
+   * Mirrors `Factory::create_pool` — contracts/factory/src/lib.rs:253
+   * `(caller: Address, token_a: Address, token_b: Address, fee_tier: i128,
+   *   governance_wasm_hash: Option<BytesN<32>>)`
+   *
+   * The contract calls `caller.require_auth()`, so `caller` must be passed
+   * explicitly. `feeTier` is the 0–3 standard tier index, not basis points; for
+   * a custom fee use {@link createPoolWithFeeBpsParams}. `governanceWasmHash` is
+   * a 32-byte hex string, or omit it to deploy a pool without governance.
    */
   createPoolParams(
+    caller: string,
+    tokenA: string,
+    tokenB: string,
+    feeTier: bigint,
+    governanceWasmHash?: string
+  ): xdr.ScVal[] {
+    return [
+      addr(caller),
+      addr(tokenA),
+      addr(tokenB),
+      i128(feeTier),
+      governanceHash(governanceWasmHash),
+    ];
+  }
+
+  /**
+   * Parameters for `create_pool_with_fee_bps`.
+   *
+   * Mirrors `Factory::create_pool_with_fee_bps` — contracts/factory/src/lib.rs:277
+   * `(caller: Address, token_a: Address, token_b: Address, fee_bps: i128,
+   *   governance_wasm_hash: Option<BytesN<32>>)`
+   *
+   * Identical to {@link createPoolParams} except `feeBps` is a custom fee in
+   * basis points (0–10_000) rather than a standard tier index.
+   */
+  createPoolWithFeeBpsParams(
+    caller: string,
     tokenA: string,
     tokenB: string,
     feeBps: bigint,
     governanceWasmHash?: string
   ): xdr.ScVal[] {
-    const govHash =
-      governanceWasmHash !== undefined
-        ? nativeToScVal(Buffer.from(governanceWasmHash, "hex"), { type: "bytes" })
-        : xdr.ScVal.scvVoid();
-    return [addr(tokenA), addr(tokenB), i128(feeBps), govHash];
+    return [
+      addr(caller),
+      addr(tokenA),
+      addr(tokenB),
+      i128(feeBps),
+      governanceHash(governanceWasmHash),
+    ];
   }
 }

@@ -30,9 +30,9 @@ const pool = new AmmPool({
 const info = await pool.getInfo();
 console.log(info.reserveA, info.reserveB, info.feeBps);
 
-// Simulate a swap off-chain
+// Simulate a swap via the pool's own `simulate_swap` entrypoint
 const quote = await pool.simulateSwap(info.tokenA, 1_000_000n);
-console.log(`Yout: ${quote.amountOut}, price impact: ${quote.priceImpactBps} bps`);
+console.log(`Out: ${quote.amountOut}, price impact: ${quote.priceImpactBps} bps`);
 
 // On-chain quote
 const out = await pool.getAmountOut(info.tokenA, 1_000_000n);
@@ -241,12 +241,32 @@ try {
 `tryGetProposal` returns `null` for an unknown id instead of throwing; every
 other failure still propagates.
 
+## Contract ABI conformance
+
+`npm run generate:abi` regenerates `src/__fixtures__/contract-abi.json` from the
+contract Rust sources; `npm run check:abi` fails when the checked-in fixture is
+stale. `abi.test.ts` is driven by that fixture: every `*Params` builder must
+match its entrypoint's arity, order and XDR types, and every method name a client
+sends must exist in the fixture.
+
+The fixture is generated from the Rust source rather than `docs/abi.json`, which
+is produced from built WASM and currently lags the source (see `governance.ts`).
+
+Write builders follow the deployed signatures: `mintPositionParams` takes the
+trailing `deadline`, `approveParams` takes `liveUntilLedger`, and
+`createPoolParams` takes `caller` first plus a `feeTier` — use
+`createPoolWithFeeBpsParams` for a custom fee in basis points. Returning reads
+name real entrypoints: `getFlashLoanFeeBps` reads `get_info().flash_loan_fee_bps`,
+`poolCount` calls `get_pool_count`, and `observe(secondsAgo)` mirrors the
+single-argument contract function (`observeBatch` samples several points
+client-side).
+
 ## Exported types
 
 | Type | Description |
 ~|---|---|
 | `PoolInfo` | Full pool state from `get_info` |
-| `SwapSimulation` | Result of `simulateSwap` (off-chain) |
+| `SwapSimulation` | Result of `simulateSwap` (decoded from the contract's `simulate_swap`) |
 | `SwapParams` | Parameters for a swap transaction |
 | `AddLiquidityParams` | Parameters for adding liquidity |
 | `RemoveLiquidityParams` | Parameters for removing liquidity |

@@ -25,6 +25,10 @@ function i128(value: bigint): xdr.ScVal {
   return nativeToScVal(value, { type: "i128" });
 }
 
+function u32(value: number): xdr.ScVal {
+  return nativeToScVal(value, { type: "u32" });
+}
+
 // ── TokenClient ───────────────────────────────────────────────────────────────
 
 export class TokenClient {
@@ -96,7 +100,7 @@ export class TokenClient {
   /**
    * Parameters for `transfer`.
    *
-   * Mirrors `LpToken::transfer` — contracts/token/src/lib.rs:128
+   * Mirrors `LpToken::transfer` — contracts/token/src/lib.rs:289
    * `(from: Address, to: Address, amount: i128)`
    */
   transferParams(from: string, to: string, amount: bigint): xdr.ScVal[] {
@@ -106,7 +110,7 @@ export class TokenClient {
   /**
    * Parameters for `transfer_from`.
    *
-   * Mirrors `LpToken::transfer_from` — contracts/token/src/lib.rs:138
+   * Mirrors `LpToken::transfer_from` — contracts/token/src/lib.rs:303
    * `(spender: Address, from: Address, to: Address, amount: i128)`
    */
   transferFromParams(spender: string, from: string, to: string, amount: bigint): xdr.ScVal[] {
@@ -116,21 +120,28 @@ export class TokenClient {
   /**
    * Parameters for `approve`.
    *
-   * Mirrors `LpToken::approve` — contracts/token/src/lib.rs:156
-   * `(from: Address, spender: Address, amount: i128)`
+   * Mirrors `LpToken::approve` — contracts/token/src/lib.rs:334
+   * `(from: Address, spender: Address, amount: i128, live_until_ledger: u32)`
    *
-   * This contract stores allowances without an expiry ledger, so — unlike the
-   * SEP-41 reference interface — it takes no `live_until_ledger` argument.
-   * Passing a 4th argument would be rejected for arity mismatch.
+   * `liveUntilLedger` is the ledger sequence through which the allowance is
+   * valid. The contract requires it to be >= the current ledger sequence
+   * whenever `amount > 0`, rejecting the call with `InvalidExpiry` otherwise.
+   * This is the SEP-41 `live_until_ledger` argument a previous version of this
+   * builder omitted. Setting `amount` to `0` revokes the allowance.
    */
-  approveParams(from: string, spender: string, amount: bigint): xdr.ScVal[] {
-    return [addr(from), addr(spender), i128(amount)];
+  approveParams(
+    from: string,
+    spender: string,
+    amount: bigint,
+    liveUntilLedger: number
+  ): xdr.ScVal[] {
+    return [addr(from), addr(spender), i128(amount), u32(liveUntilLedger)];
   }
 
   /**
    * Parameters for `mint` — admin only.
    *
-   * Mirrors `LpToken::mint` — contracts/token/src/lib.rs:164
+   * Mirrors `LpToken::mint` — contracts/token/src/lib.rs:360
    * `(to: Address, amount: i128)`
    */
   mintParams(to: string, amount: bigint): xdr.ScVal[] {
@@ -140,7 +151,7 @@ export class TokenClient {
   /**
    * Parameters for `burn` — admin only.
    *
-   * Mirrors `LpToken::burn` — contracts/token/src/lib.rs:179
+   * Mirrors `LpToken::burn` — contracts/token/src/lib.rs:384
    * `(from: Address, amount: i128)`
    */
   burnParams(from: string, amount: bigint): xdr.ScVal[] {

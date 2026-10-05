@@ -45,6 +45,7 @@ export default defineConfig(
           // Config and test files that sit outside a workspace's tsconfig
           // "include" are still type-checked, against default options.
           allowDefaultProject: [
+            "packages/sdk/scripts/*.mjs",
             "packages/ui-components/vitest.config.ts",
             "packages/ts-advanced-client/test/*.js",
           ],
@@ -106,7 +107,7 @@ export default defineConfig(
   // type-aware set (floating/misused promises, await-thenable, ...) still
   // applies.
   {
-    files: ["**/*.js"],
+    files: ["**/*.js", "**/*.mjs"],
     rules: {
       "@typescript-eslint/no-unsafe-argument": "off",
       "@typescript-eslint/no-unsafe-assignment": "off",

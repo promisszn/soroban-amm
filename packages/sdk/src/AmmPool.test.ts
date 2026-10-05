@@ -9,8 +9,9 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { Networks, nativeToScVal, xdr } from "@stellar/stellar-sdk";
 
-import { AmmContractError, decodeError } from "./AmmPool.js";
+import { AmmPool, AmmContractError, decodeError } from "./AmmPool.js";
 import { AmmErrors, AmmErrorNames } from "./types.js";
 
 describe("decodeError", () => {
@@ -150,4 +151,120 @@ describe("AmmErrors", () => {
     expect(Object.keys(fromRust).length).toBeGreaterThan(0);
     expect(AmmErrorNames).toEqual(fromRust);
   });
+});
+
+// ── simulateSwap decodes the contract's SwapSimulation ────────────────────────
+
+const SWAP_TOKEN_A = "CAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQC526";
+const SWAP_TOKEN_B = "CABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAFNSZ";
+
+const poolConfig = {
+  rpcUrl: "https://rpc.example.invalid",
+  networkPassphrase: Networks.TESTNET,
+  contractId: "CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOAOPIFY6YQGAXE",
+};
+
+interface SimCall {
+  method: string;
+  args: xdr.ScVal[];
+}
+
+/** An `AmmPool` whose RPC server is replaced by a responder, plus its calls. */
+function mockPool(responder: (call: SimCall) => xdr.ScVal): { client: AmmPool; calls: SimCall[] } {
+  const client = new AmmPool(poolConfig);
+  const server = (client as unknown as { server: Record<string, unknown> }).server;
+  const calls: SimCall[] = [];
+  server.simulateTransaction = async (tx: { operations: Array<{ func: xdr.HostFunction }> }) => {
+    const invoke = tx.operations[0].func.invokeContract();
+    const call: SimCall = { method: String(invoke.functionName()), args: invoke.args() };
+    calls.push(call);
+    return { result: { retval: responder(call) } };
+  };
+  return { client, calls };
+}
+
+interface ContractQuote {
+  amountOut: bigint;
+  feeAmount: bigint;
+  priceImpactBps: bigint;
+  effectivePrice: bigint;
+  spotPrice: bigint;
+}
+
+/** The exact `SwapSimulation` math of `contracts/amm/src/lib.rs::simulate_swap`. */
+function contractQuote(
+  reserveIn: bigint,
+  reserveOut: bigint,
+  amountIn: bigint,
+  feeBps: bigint
+): ContractQuote {
+  const amountInWithFee = amountIn * (10_000n - feeBps);
+  const amountOut = (amountInWithFee * reserveOut) / (reserveIn * 10_000n + amountInWithFee);
+  const feeAmount = (amountIn * feeBps) / 10_000n;
+  const spotPrice = (reserveOut * 1_000_000n) / reserveIn;
+  const effectivePrice = (amountOut * 1_000_000n) / amountIn;
+  const priceImpactBps =
+    amountOut === 0n ? 0n : ((spotPrice - effectivePrice) * 10_000n) / spotPrice;
+  return { amountOut, feeAmount, priceImpactBps, effectivePrice, spotPrice };
+}
+
+/** Encode a `SwapSimulation` struct the way `scValToNative` expects to decode it. */
+function swapSimulationScVal(quote: ContractQuote): xdr.ScVal {
+  const fields: Array<[string, bigint]> = [
+    ["amount_out", quote.amountOut],
+    ["fee_amount", quote.feeAmount],
+    ["price_impact_bps", quote.priceImpactBps],
+    ["effective_price", quote.effectivePrice],
+    ["spot_price", quote.spotPrice],
+  ];
+  return xdr.ScVal.scvMap(
+    fields.map(
+      ([key, value]) =>
+        new xdr.ScMapEntry({
+          key: xdr.ScVal.scvSymbol(key),
+          val: nativeToScVal(value, { type: "i128" }),
+        })
+    )
+  );
+}
+
+describe("AmmPool.simulateSwap", () => {
+  it("calls simulate_swap with (token_in, amount_in) and decodes every field", async () => {
+    const expected = contractQuote(1_000_000n, 4_000_000n, 1_000n, 30n);
+    const { client, calls } = mockPool(() => swapSimulationScVal(expected));
+
+    const quote = await client.simulateSwap(SWAP_TOKEN_A, 1_000n);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].method).toBe("simulate_swap");
+    expect(calls[0].args.map((a) => a.switch().name)).toEqual(["scvAddress", "scvI128"]);
+    expect(quote).toEqual({
+      amountIn: 1_000n,
+      amountOut: expected.amountOut,
+      feeAmount: expected.feeAmount,
+      priceImpactBps: Number(expected.priceImpactBps),
+      effectivePrice: expected.effectivePrice,
+      spotPrice: expected.spotPrice,
+    });
+  });
+
+  const directions: Array<[string, string, bigint, bigint]> = [
+    ["A in, B out", SWAP_TOKEN_A, 1_000_000n, 4_000_000n],
+    ["B in, A out", SWAP_TOKEN_B, 4_000_000n, 1_000_000n],
+  ];
+
+  it.each(directions)(
+    "reports a small non-negative impact for %s on a 1M/4M pool",
+    async (_label, tokenIn, reserveIn, reserveOut) => {
+      const expected = contractQuote(reserveIn, reserveOut, 1_000n, 30n);
+      const { client } = mockPool(() => swapSimulationScVal(expected));
+
+      const quote = await client.simulateSwap(tokenIn, 1_000n);
+
+      expect(quote.priceImpactBps).toBeGreaterThanOrEqual(0);
+      // The old inverted-units math reported -9,372 and +150,640 bps here.
+      expect(quote.priceImpactBps).toBeLessThan(100);
+      expect(quote.amountOut).toBe(expected.amountOut);
+    }
+  );
 });
