@@ -110,7 +110,7 @@ describe("PoolIndexer with second-resolution timestamps", () => {
     idx.indexEvent(swap("b", at(-60), 1));
     idx.indexEvent(swap("c", at(-1), 1.1));
     const [stats] = idx.getPoolStats("pool-t");
-    assert.ok(stats!.priceDeviationBps > 0 && stats!.priceDeviationBps < 1000);
+    assert.ok(stats.priceDeviationBps > 0 && stats.priceDeviationBps < 1000);
   });
 });
 
@@ -144,7 +144,7 @@ describe("retention with an injected clock", () => {
     const idx = new PoolIndexer(() => now);
     idx.setAlertConfig({ poolId: "pool-t", metric: "volume24h", thresholdValue: 1 });
     idx.indexEvent(swap("a", NOW)); // fires an alert stamped NOW
-    assert.equal(idx.getPoolHealth("pool-t")!.alertsFired[0]!.firedAt, NOW);
+    assert.equal(idx.getPoolHealth("pool-t")!.alertsFired[0].firedAt, NOW);
 
     now = at(RETENTION_SECONDS + 10);
     idx.indexEvent(swap("b", now));
@@ -160,7 +160,7 @@ describe("retention with an injected clock", () => {
     const idx = new PoolIndexer(() => NOW);
     idx.setAlertConfig({ poolId: "pool-t", metric: "volume24h", thresholdValue: 1 });
     idx.indexEvent(swap("a", NOW));
-    assert.equal(idx.getPoolHealth("pool-t")!.alertsFired[0]!.firedAt, NOW);
+    assert.equal(idx.getPoolHealth("pool-t")!.alertsFired[0].firedAt, NOW);
   });
 });
 
@@ -209,7 +209,7 @@ describe("RpcIngester events through the GraphQL API", () => {
         value: fixture.value,
         inSuccessfulContractInvocation: true,
         txHash: `tx-${i}`,
-      } as SorobanRpcEvent,
+      },
       POOL,
     );
     assert.ok(event, "fixture should decode");
@@ -244,7 +244,7 @@ describe("RpcIngester events through the GraphQL API", () => {
       data.priceHistory.map((p) => p.timestamp),
       [second, third],
     );
-    assert.ok(Math.abs(data.priceHistory[0]!.price - 0.95) < 1e-9);
+    assert.ok(Math.abs(data.priceHistory[0].price - 0.95) < 1e-9);
   });
 
   it("twal returns the price", async () => {
@@ -258,8 +258,8 @@ describe("RpcIngester events through the GraphQL API", () => {
     const data = await query<{ poolStats: { swapCount: number; volume24h: number }[] }>(
       `{ poolStats(poolId: "${POOL}") { swapCount volume24h } }`,
     );
-    assert.equal(data.poolStats[0]!.swapCount, 5);
-    assert.equal(data.poolStats[0]!.volume24h, 5000);
+    assert.equal(data.poolStats[0].swapCount, 5);
+    assert.equal(data.poolStats[0].volume24h, 5000);
   });
 
   it("alert firedAt is in seconds", async () => {
