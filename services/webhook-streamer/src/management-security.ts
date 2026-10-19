@@ -60,7 +60,7 @@ export function isAuthorized(req: IncomingMessage, config: AuthConfig): boolean 
   if (typeof header !== "string") return false;
   const match = /^Bearer +(\S+)$/i.exec(header);
   if (!match) return false;
-  return safeEqual(match[1]!, config.token);
+  return safeEqual(match[1], config.token);
 }
 
 // ── Bounded body reading ────────────────────────────────────────────────────

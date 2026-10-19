@@ -439,8 +439,8 @@ function exitOf(env: Record<string, string>): Promise<{ code: number | null; out
       stdio: ["ignore", "pipe", "pipe"],
     });
     let output = "";
-    child.stdout?.on("data", (c: Buffer) => (output += c));
-    child.stderr?.on("data", (c: Buffer) => (output += c));
+    child.stdout?.on("data", (c: Buffer) => (output += c.toString()));
+    child.stderr?.on("data", (c: Buffer) => (output += c.toString()));
     child.once("exit", (code) => resolve({ code, output }));
   });
 }
@@ -523,7 +523,11 @@ describe("management API over HTTP", () => {
     assert.equal(anonymous.status, 200);
     assert.deepEqual(JSON.parse(anonymous.text), { status: "ok" });
 
-    const authed = JSON.parse((await call(service, "GET", "/health", { token: TOKEN })).text);
+    const authed = JSON.parse((await call(service, "GET", "/health", { token: TOKEN })).text) as {
+      status: string;
+      webhooks: unknown;
+      poller: unknown;
+    };
     assert.equal(authed.status, "ok");
     assert.equal(typeof authed.webhooks, "number");
     assert.ok(authed.poller);
@@ -535,7 +539,7 @@ describe("management API over HTTP", () => {
       body: JSON.stringify({ url: "http://127.0.0.1:9/hook", secret: SECRET, contractId: "C1" }),
     });
     assert.equal(created.status, 201);
-    assert.equal(JSON.parse(created.text).hasSecret, true);
+    assert.equal((JSON.parse(created.text) as { hasSecret: boolean }).hasSecret, true);
 
     const outputs = [created.text];
     for (const path of ["/webhooks", "/dead-letters", "/metrics", "/health"]) {
@@ -546,8 +550,12 @@ describe("management API over HTTP", () => {
     outputs.push(service.output());
     for (const text of outputs) assert.equal(text.includes(SECRET), false);
 
-    const listed = JSON.parse((await call(service, "GET", "/webhooks", { token: TOKEN })).text);
-    const mine = listed.find((sub: { contractId?: string }) => sub.contractId === "C1");
+    const listed = JSON.parse((await call(service, "GET", "/webhooks", { token: TOKEN })).text) as {
+      contractId?: string;
+      hasSecret: boolean;
+    }[];
+    const mine = listed.find((sub) => sub.contractId === "C1");
+    assert.ok(mine);
     assert.equal(mine.hasSecret, true);
     assert.equal("secret" in mine, false);
   });
@@ -557,7 +565,7 @@ describe("management API over HTTP", () => {
 
     const json = await bad("{nope");
     assert.equal(json.status, 400);
-    assert.equal(JSON.parse(json.text).error, "invalid JSON");
+    assert.equal((JSON.parse(json.text) as { error: string }).error, "invalid JSON");
 
     const contract = await bad('{"url":"http://127.0.0.1:9/h","contractId":7}');
     assert.equal(contract.status, 400);
@@ -565,18 +573,18 @@ describe("management API over HTTP", () => {
 
     const empty = await bad('{"url":""}');
     assert.equal(empty.status, 400);
-    assert.equal(JSON.parse(empty.text).field, "url");
+    assert.equal((JSON.parse(empty.text) as { field: string }).field, "url");
 
     const secret = await bad(JSON.stringify({ url: "http://127.0.0.1:9/h", secret: "x".repeat(300) }));
     assert.equal(secret.status, 400);
-    assert.equal(JSON.parse(secret.text).field, "secret");
+    assert.equal((JSON.parse(secret.text) as { field: string }).field, "secret");
   });
 
   it("rejects an oversized body with 413", async () => {
     const huge = JSON.stringify({ url: "http://127.0.0.1:9/h", secret: "x".repeat(10_000) });
     const response = await call(service, "POST", "/webhooks", { token: TOKEN, body: huge });
     assert.equal(response.status, 413);
-    assert.match(JSON.parse(response.text).error, /exceeds 2048 bytes/);
+    assert.match((JSON.parse(response.text) as { error: string }).error, /exceeds 2048 bytes/);
   });
 
   it("checks the token before reading an oversized body", async () => {
