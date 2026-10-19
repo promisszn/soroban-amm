@@ -16,10 +16,15 @@
  *   CONTRACT_IDS     – comma-separated list of contract IDs to watch
  *   POLL_INTERVAL_MS – polling interval in ms (default: 5000)
  *   PORT             – HTTP port (default: 3001)
+ *   DATA_DIR         – directory for durable state (subscriptions, dead letters,
+ *                      poller cursors). Unset = in-memory, lost on restart.
+ *   SHUTDOWN_TIMEOUT_MS – how long SIGTERM/SIGINT waits for in-flight
+ *                      deliveries before exiting (default: 10000)
  */
 
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
-import { defaultRegistry } from "./registry.js";
+import { WebhookRegistry } from "./registry.js";
+import { FileStateStore, MemoryStateStore, StateFileError, type StateStore } from "./storage.js";
 import { InvalidWebhookUrlError } from "./url-validation.js";
 import { WebhookDispatcher } from "./dispatcher.js";
 import { DeadLetterQueue } from "./dead-letter.js";
@@ -59,10 +64,32 @@ const DEAD_LETTER_MAX = Number(process.env["DEAD_LETTER_MAX"] ?? 1_000);
 const CIRCUIT_THRESHOLD = Number(process.env["CIRCUIT_FAILURE_THRESHOLD"] ?? 5);
 const CIRCUIT_COOLDOWN_MS = Number(process.env["CIRCUIT_COOLDOWN_MS"] ?? 30_000);
 
+const DATA_DIR = process.env["DATA_DIR"];
+const SHUTDOWN_TIMEOUT_MS = Number(process.env["SHUTDOWN_TIMEOUT_MS"] ?? 10_000);
+
+let store: StateStore;
+try {
+  store = DATA_DIR ? new FileStateStore(DATA_DIR) : new MemoryStateStore();
+} catch (err) {
+  if (err instanceof StateFileError) {
+    console.error(`[webhook-streamer] ${err.message}`);
+    process.exit(1);
+  }
+  throw err;
+}
+if (!DATA_DIR) {
+  console.warn(
+    "[webhook-streamer] DATA_DIR is not set: subscriptions, dead letters and poller cursors " +
+      "are kept in memory and lost on restart. Set DATA_DIR to a persistent directory.",
+  );
+}
+
+const defaultRegistry = new WebhookRegistry(store);
+
 const dispatcher = new WebhookDispatcher(defaultRegistry, {
   timeoutMs: DELIVERY_TIMEOUT_MS,
   concurrency: DELIVERY_CONCURRENCY,
-  deadLetterQueue: new DeadLetterQueue(DEAD_LETTER_MAX),
+  deadLetterQueue: new DeadLetterQueue(DEAD_LETTER_MAX, store),
   circuitBreaker: new CircuitBreaker({
     failureThreshold: CIRCUIT_THRESHOLD,
     cooldownMs: CIRCUIT_COOLDOWN_MS,
@@ -75,7 +102,7 @@ let poller: RpcPoller | undefined;
 
 if (CONTRACT_IDS.length > 0) {
   poller = new RpcPoller(
-    { rpcUrl: RPC_URL, contractIds: CONTRACT_IDS, pollIntervalMs: POLL_INTERVAL_MS },
+    { rpcUrl: RPC_URL, contractIds: CONTRACT_IDS, pollIntervalMs: POLL_INTERVAL_MS, store },
     async (event: PoolEvent) => {
       const results = await dispatcher.dispatch(event);
       const failed = results.filter((r) => !r.success);
@@ -237,5 +264,47 @@ const server = createServer((req, res) => {
 server.listen(PORT, () => {
   console.log(`[webhook-streamer] management API listening on port ${PORT}`);
 });
+
+// ── Graceful shutdown ───────────────────────────────────────────────────────
+
+let shuttingDown = false;
+
+/**
+ * Stops polling, lets in-flight deliveries finish (up to SHUTDOWN_TIMEOUT_MS),
+ * flushes state and exits 0. Work that doesn't finish keeps its old cursor, so
+ * it is redelivered on the next start instead of lost.
+ */
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) {
+    console.warn(`[webhook-streamer] ${signal} again: exiting now`);
+    process.exit(1);
+  }
+  shuttingDown = true;
+  console.log(`[webhook-streamer] ${signal} received, draining (up to ${SHUTDOWN_TIMEOUT_MS} ms)`);
+
+  const deadline = Date.now() + SHUTDOWN_TIMEOUT_MS;
+  server.close();
+  // Idle keep-alive connections would otherwise hold close() open.
+  server.closeIdleConnections();
+
+  const pollerDrained = poller ? await poller.stopAndDrain(SHUTDOWN_TIMEOUT_MS) : true;
+  const deliveriesDrained = await dispatcher.drain(Math.max(0, deadline - Date.now()));
+  store.flush();
+
+  if (!pollerDrained || !deliveriesDrained) {
+    console.warn(
+      `[webhook-streamer] shutdown timed out with ${dispatcher.inFlight} delivery(ies) in flight; ` +
+        "they will be redelivered after restart",
+    );
+  }
+  console.log("[webhook-streamer] shutdown complete");
+  process.exit(0);
+}
+
+for (const signal of ["SIGTERM", "SIGINT"] as const) {
+  process.on(signal, () => {
+    void shutdown(signal);
+  });
+}
 
 export { server, dispatcher, defaultRegistry, poller };

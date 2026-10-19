@@ -157,6 +157,7 @@ export class WebhookDispatcher {
   private readonly maxDelayMs: number;
   private readonly sleep: (ms: number) => Promise<void>;
   private readonly random: () => number;
+  private readonly pending = new Set<Promise<unknown>>();
 
   readonly deadLetters: DeadLetterQueue;
   readonly circuitBreaker: CircuitBreaker;
@@ -192,7 +193,48 @@ export class WebhookDispatcher {
    * Every subscriber gets a result regardless of how any other behaves, and
    * the fan-out never opens more than `concurrency` sockets at once.
    */
-  async dispatch(event: PoolEvent): Promise<DeliveryResult[]> {
+  dispatch(event: PoolEvent): Promise<DeliveryResult[]> {
+    return this._track(this._fanOut(event));
+  }
+
+  /** Deliveries (fan-outs and replays) currently in flight. */
+  get inFlight(): number {
+    return this.pending.size;
+  }
+
+  /**
+   * Resolves true once nothing is in flight, or false after `timeoutMs`. Used
+   * at shutdown so a SIGTERM doesn't cut a request off mid-send.
+   */
+  async drain(timeoutMs: number): Promise<boolean> {
+    if (this.pending.size === 0) return true;
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<false>((resolve) => {
+      timer = setTimeout(() => resolve(false), timeoutMs);
+    });
+    const idle = (async () => {
+      while (this.pending.size > 0) {
+        await Promise.allSettled([...this.pending]);
+      }
+      return true as const;
+    })();
+    try {
+      return await Promise.race([idle, timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  private _track<T>(op: Promise<T>): Promise<T> {
+    this.pending.add(op);
+    const done = () => {
+      this.pending.delete(op);
+    };
+    op.then(done, done);
+    return op;
+  }
+
+  private async _fanOut(event: PoolEvent): Promise<DeliveryResult[]> {
     const subs = this.registry.matching(event.contractId, event.eventType);
     const settled = await _mapWithConcurrency(subs, this.concurrency, (sub) =>
       this._deliver(sub, event),
@@ -218,7 +260,11 @@ export class WebhookDispatcher {
    * Re-attempt a previously dead-lettered delivery. The entry is removed only
    * once it succeeds, so a failed replay stays available to try again.
    */
-  async replay(deadLetterId: string): Promise<DeliveryResult | undefined> {
+  replay(deadLetterId: string): Promise<DeliveryResult | undefined> {
+    return this._track(this._replay(deadLetterId));
+  }
+
+  private async _replay(deadLetterId: string): Promise<DeliveryResult | undefined> {
     const entry = this.deadLetters.get(deadLetterId);
     if (!entry) return undefined;
 
@@ -276,6 +322,8 @@ export class WebhookDispatcher {
 
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
+      // Stable across retries, restarts and replays: receivers deduplicate on it.
+      "X-Webhook-Id": event.id,
     };
     if (sub.secret) {
       headers["X-Webhook-Secret"] = sub.secret;
