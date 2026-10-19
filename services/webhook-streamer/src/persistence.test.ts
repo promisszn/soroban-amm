@@ -544,7 +544,14 @@ function startService(env: Record<string, string>) {
     (port) =>
       new Promise<{ port: number; output: () => string; exited: Promise<number | null>; signal: (s: NodeJS.Signals) => void }>((resolve, reject) => {
         const child = spawn(process.execPath, [INDEX_JS], {
-          env: { PATH: process.env["PATH"] ?? "", WEBHOOK_ALLOW_PRIVATE_TARGETS: "true", ...env, PORT: String(port) },
+          env: {
+            PATH: process.env["PATH"] ?? "",
+            WEBHOOK_ALLOW_PRIVATE_TARGETS: "true",
+            // These tests are about durability, not auth.
+            MANAGEMENT_API_INSECURE: "true",
+            ...env,
+            PORT: String(port),
+          },
           stdio: ["ignore", "pipe", "pipe"],
         });
         let output = "";
