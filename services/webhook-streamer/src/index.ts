@@ -14,6 +14,9 @@
  *   SOROBAN_RPC_URL  – Soroban RPC base URL (required; must answer getHealth)
  *   HORIZON_URL      – deprecated alias for SOROBAN_RPC_URL (removed next release)
  *   CONTRACT_IDS     – comma-separated list of contract IDs to watch
+ *   CONTRACT_KINDS   – comma-separated <contractId>:<kind> pairs (kind = a
+ *                      directory under contracts/, e.g. amm); event fields are
+ *                      named only for contracts listed here
  *   POLL_INTERVAL_MS – polling interval in ms (default: 5000)
  *   PORT             – HTTP port (default: 3001)
  */
@@ -25,6 +28,7 @@ import { WebhookDispatcher } from "./dispatcher.js";
 import { DeadLetterQueue } from "./dead-letter.js";
 import { CircuitBreaker } from "./circuit-breaker.js";
 import { RpcPoller } from "./rpc-poller.js";
+import { parseContractKinds } from "./event-schemas.js";
 import type { PoolEvent } from "./types.js";
 
 const DEFAULT_SOROBAN_RPC_URL = "https://soroban-testnet.stellar.org";
@@ -52,6 +56,13 @@ const CONTRACT_IDS = (process.env["CONTRACT_IDS"] ?? "")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
+let CONTRACT_KINDS: Record<string, string>;
+try {
+  CONTRACT_KINDS = parseContractKinds(process.env["CONTRACT_KINDS"]);
+} catch (err) {
+  console.error(`[webhook-streamer] ${err instanceof Error ? err.message : String(err)}`);
+  process.exit(1);
+}
 const POLL_INTERVAL_MS = Number(process.env["POLL_INTERVAL_MS"] ?? 5_000);
 const DELIVERY_TIMEOUT_MS = Number(process.env["DELIVERY_TIMEOUT_MS"] ?? 10_000);
 const DELIVERY_CONCURRENCY = Number(process.env["DELIVERY_CONCURRENCY"] ?? 10);
@@ -74,8 +85,21 @@ const dispatcher = new WebhookDispatcher(defaultRegistry, {
 let poller: RpcPoller | undefined;
 
 if (CONTRACT_IDS.length > 0) {
+  const unknownKind = CONTRACT_IDS.filter((id) => !CONTRACT_KINDS[id]);
+  if (unknownKind.length > 0) {
+    console.warn(
+      `[poller] no CONTRACT_KINDS entry for ${unknownKind.join(", ")}: their event payloads ` +
+        "keep the generic { value: [...] } shape because the same event name means " +
+        "different things in different contracts.",
+    );
+  }
   poller = new RpcPoller(
-    { rpcUrl: RPC_URL, contractIds: CONTRACT_IDS, pollIntervalMs: POLL_INTERVAL_MS },
+    {
+      rpcUrl: RPC_URL,
+      contractIds: CONTRACT_IDS,
+      pollIntervalMs: POLL_INTERVAL_MS,
+      contractKinds: CONTRACT_KINDS,
+    },
     async (event: PoolEvent) => {
       const results = await dispatcher.dispatch(event);
       const failed = results.filter((r) => !r.success);
