@@ -383,7 +383,7 @@ function nameFields(
 ): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   if (scalar) {
-    out[fields[0]!] = normalise(body);
+    out[fields[0]] = normalise(body);
     return out;
   }
   const items = body as unknown[];

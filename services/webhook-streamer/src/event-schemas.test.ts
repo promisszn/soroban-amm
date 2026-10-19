@@ -163,7 +163,7 @@ test("random tuples never receive field names unless kind, event, version and ar
 
   for (let i = 0; i < 400; i++) {
     const kind = kinds[rand(kinds.length)];
-    const name = names[rand(names.length)]!;
+    const name = names[rand(names.length)];
     const version = 1 + rand(2);
     const items = Array.from({ length: rand(8) }, () => samples[rand(samples.length)]);
 
@@ -221,11 +221,11 @@ test("an abbreviated topic is looked up by its on-chain name and reported by its
 
 for (const kind of KNOWN_CONTRACT_KINDS) {
   test(`${kind}: its events decode to the schema's field names`, () => {
-    const events = (schemaFile as { kinds: Record<string, { events: Record<string, { version: number; fields: string[]; shape: string; versioned?: boolean }[]> }> }).kinds[kind]!.events;
+    const events = (schemaFile as { kinds: Record<string, { events: Record<string, { version: number; fields: string[]; shape: string; versioned?: boolean }[]> }> }).kinds[kind].events;
     const names = Object.keys(events);
     assert.ok(names.length > 0, `${kind} has no events`);
     for (const name of names) {
-      for (const variant of events[name]!) {
+      for (const variant of events[name]) {
         const items = variant.fields.map((_, i) => 100 + i);
         let value: string;
         if (variant.versioned === false) {
@@ -298,7 +298,7 @@ test("the poller names fields using the kind configured for each contract", asyn
     logger: silent,
     fetchFn: (async (_url: unknown, init?: { body?: string }) => {
       const body = JSON.parse(init?.body ?? "{}") as { params: { filters: { contractIds: string[] }[] } };
-      const id = body.params.filters[0]!.contractIds[0]!;
+      const id = body.params.filters[0].contractIds[0];
       return {
         ok: true,
         status: 200,

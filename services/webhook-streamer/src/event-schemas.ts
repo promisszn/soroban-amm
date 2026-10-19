@@ -41,8 +41,8 @@ export function isKnownContractKind(kind: string): boolean {
 
 function variantsFor(kind: string | undefined, event: string): EventVariant[] {
   if (kind === undefined || !isKnownContractKind(kind)) return [];
-  const events = SCHEMAS.kinds[kind]!.events;
-  return Object.hasOwn(events, event) ? events[event]! : [];
+  const events = SCHEMAS.kinds[kind].events;
+  return Object.hasOwn(events, event) ? events[event] : [];
 }
 
 /**
