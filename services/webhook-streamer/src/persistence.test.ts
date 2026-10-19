@@ -156,7 +156,7 @@ describe("FileStateStore", () => {
     a.saveDeadLetters({ entries: [], nextId: 5 });
 
     const b = new FileStateStore(dir);
-    assert.equal(b.loadSubscriptions().subscriptions[0]!.secret, "s");
+    assert.equal(b.loadSubscriptions().subscriptions[0].secret, "s");
     assert.equal(b.loadSubscriptions().nextId, 8);
     assert.deepEqual(b.loadCursors(), { C1: { cursor: "abc", ledger: 42 } });
     assert.equal(b.loadDeadLetters().nextId, 5);
@@ -167,7 +167,8 @@ describe("FileStateStore", () => {
     const store = new FileStateStore(dir);
     for (let i = 0; i < 5; i++) store.saveCursor("C1", { cursor: `c${i}` });
     assert.deepEqual(readdirSync(dir), [STATE_FILE_NAME]);
-    assert.equal(JSON.parse(readFileSync(join(dir, STATE_FILE_NAME), "utf8")).cursors.C1.cursor, "c4");
+    const file = JSON.parse(readFileSync(join(dir, STATE_FILE_NAME), "utf8")) as { cursors: Record<string, CursorState> };
+    assert.equal(file.cursors["C1"]?.cursor, "c4");
   });
 
   it("creates the state file readable by its owner only, since it holds secrets", () => {
@@ -201,7 +202,7 @@ describe("registry and dead letters over a store", () => {
 
     const second = new WebhookRegistry(new FileStateStore(dir));
     assert.deepEqual(second.list().map((s) => s.url), ["https://example.com/a"]);
-    assert.equal(second.list()[0]!.secret, "s3");
+    assert.equal(second.list()[0].secret, "s3");
     const c = second.register("https://example.com/c");
     assert.notEqual(c.id, a.id);
     assert.notEqual(c.id, b.id);
@@ -343,7 +344,7 @@ describe("cursors", () => {
       for (const id of [token(100), token(101)]) {
         assert.ok(receiver.ids.filter((x) => x === id).length >= 2, `${id} was redelivered (at-least-once)`);
       }
-      assert.equal(new FileStateStore(dir).loadCursors()["CPOOL"]!.cursor, token(101));
+      assert.equal(new FileStateStore(dir).loadCursors()["CPOOL"].cursor, token(101));
     } finally {
       await receiver.close();
     }
@@ -409,7 +410,7 @@ describe("RPC retention window", () => {
     const { gaps } = poller.health();
     assert.equal(gaps.length, 1);
     assert.deepEqual(
-      { contractId: gaps[0]!.contractId, reason: gaps[0]!.reason, fromLedger: gaps[0]!.fromLedger, toLedger: gaps[0]!.toLedger, resumedAt: gaps[0]!.resumedAt },
+      { contractId: gaps[0].contractId, reason: gaps[0].reason, fromLedger: gaps[0].fromLedger, toLedger: gaps[0].toLedger, resumedAt: gaps[0].resumedAt },
       { contractId: "CPOOL", reason: "start", fromLedger: 1, toLedger: 399, resumedAt: 400 },
     );
     assert.ok(warnings.some((w) => /gap contract=CPOOL .*ledgers=1-399/.test(w)));
@@ -424,12 +425,12 @@ describe("RPC retention window", () => {
     const events = await poller.poll();
     assert.equal(events.length, 1);
     const [gap] = poller.health().gaps;
-    assert.deepEqual([gap!.reason, gap!.fromLedger, gap!.toLedger], ["cursor", 151, 249]);
+    assert.deepEqual([gap.reason, gap.fromLedger, gap.toLedger], ["cursor", 151, 249]);
     const requests = rpc.calls.filter((c) => c.method === "getEvents");
-    assert.equal(requests[0]!.params["cursor"], token(150, 3));
-    assert.equal(requests[1]!.params["startLedger"], 250);
-    assert.ok(!("cursor" in requests[1]!.params));
-    assert.equal(store.loadCursors()["CPOOL"]!.cursor, token(300), "the new position is saved");
+    assert.equal(requests[0].params["cursor"], token(150, 3));
+    assert.equal(requests[1].params["startLedger"], 250);
+    assert.ok(!("cursor" in requests[1].params));
+    assert.equal(store.loadCursors()["CPOOL"].cursor, token(300), "the new position is saved");
   });
 
   it("falls back to getHealth when the error does not carry the range", async () => {
@@ -437,7 +438,7 @@ describe("RPC retention window", () => {
     const poller = new RpcPoller({ rpcUrl: "https://rpc.example", contractIds: ["CPOOL"], fetchFn: rpc.fetchFn, logger: silent });
     assert.equal((await poller.poll()).length, 1);
     assert.ok(rpc.calls.some((c) => c.method === "getHealth"));
-    assert.equal(poller.health().gaps[0]!.resumedAt, 400);
+    assert.equal(poller.health().gaps[0].resumedAt, 400);
   });
 
   it("does not skip ahead when START_LEDGER is newer than the chain", async () => {
@@ -500,7 +501,7 @@ describe("dispatcher.drain", () => {
       await until(() => dispatcher.inFlight === 1);
       assert.equal(await dispatcher.drain(2000), true);
       assert.equal(dispatcher.inFlight, 0);
-      assert.equal((await pending)[0]!.success, true);
+      assert.equal((await pending)[0].success, true);
     } finally {
       await receiver.close();
     }

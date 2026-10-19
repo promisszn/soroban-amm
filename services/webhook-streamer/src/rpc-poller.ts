@@ -53,7 +53,7 @@ const INVALID_PARAMS = -32602;
 export function ledgerFromPagingToken(token: string): number | undefined {
   const match = /^(\d{1,19})-\d+$/.exec(token);
   if (!match) return undefined;
-  const ledger = Number(BigInt(match[1]!) >> 32n);
+  const ledger = Number(BigInt(match[1]) >> 32n);
   return ledger > 0 ? ledger : undefined;
 }
 
