@@ -560,6 +560,9 @@ Defined in [contracts/twap_consumer/src/lib.rs](../contracts/twap_consumer/src/l
 | 12 | `InvalidRetentionPolicy` | `max_age_seconds` is shorter than the minimum supported TWAP window (`LONGEST_TWAP_WINDOW`). | Set `max_age_seconds` to at least `LONGEST_TWAP_WINDOW` or 0 (disabled). |
 | 13 | `Unauthorized` | Non-keeper/admin address attempted an administrative action. | Submit the transaction authenticated by the configured keeper/admin. |
 | 14 | `CrossContractCallFailed` | A call into a pool's oracle failed: the pool does not implement the interface its tracked type implies (`get_price_cumulative` for `Amm`, `get_tick_cumulative` for `Cl`), the address is not a contract, or the callee panicked. Returned by the snapshot and TWAP reads, including `get_twap_all`, instead of a host trap (#964). | Check the pool address and type with `get_tracked_pools_typed`. A legacy entry that is really a CL pool is re-typed by calling `save_cl_snapshot` for it. |
+| 15 | `TooManyTrackedPools` | `add_tracked_pool`, or implicit registration inside `save_snapshot`/`save_cl_snapshot`, would grow the tracked set past `MAX_TRACKED_POOLS` (100). | Call `remove_tracked_pool` on a stale pool first, or track fewer pools. |
+| 16 | `NotTracked` | `remove_tracked_pool` was called with a pool that is not currently tracked. | Check `is_tracked` before removing. |
+| 17 | `TooManyPools` | `get_twap_batch` was called with more pools than `MAX_TRACKED_POOLS`. | Split the request into smaller batches. |
 
 ---
 
@@ -569,6 +572,12 @@ When `stellar-sdk-rs` (or the Soroban RPC) returns a failed invocation, the
 result contains an XDR `ScError` with kind `Contract` and a `code` field. Map
 the code to the table above using the contract address to identify which enum
 applies.
+
+`get_twap_all_safe` and `get_twap_batch` never return an `Err` for a single bad
+pool — they return a `TwapEntry` with `ok: false` and `error_code` set to one
+of the codes above instead, so a single dead pool cannot take down a batch
+read. `get_twap_all` is kept on the ABI for existing callers and still
+surfaces the first such code as a typed `Err`.
 
 ```rust
 // Pseudocode — adapt to your stellar-sdk-rs version
