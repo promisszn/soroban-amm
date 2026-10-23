@@ -4967,8 +4967,7 @@ mod tests {
                     break;
                 }
                 let trimmed = line.trim();
-                if trimmed.starts_with("//! | `") {
-                    let rest = &trimmed["//! | `".len()..];
+                if let Some(rest) = trimmed.strip_prefix("//! | `") {
                     if let Some(end_idx) = rest.find('`') {
                         let fn_name = &rest[..end_idx];
                         table_functions.insert(String::from(fn_name));
@@ -4990,8 +4989,7 @@ mod tests {
                     break;
                 }
                 let trimmed = line.trim();
-                if trimmed.starts_with("pub fn ") {
-                    let rest = &trimmed["pub fn ".len()..];
+                if let Some(rest) = trimmed.strip_prefix("pub fn ") {
                     if let Some(paren_idx) = rest.find('(') {
                         let fn_name = rest[..paren_idx].trim();
                         contract_functions.insert(String::from(fn_name));
