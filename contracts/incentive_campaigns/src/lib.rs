@@ -61,7 +61,7 @@
 //! # Pause policy
 //!
 //! Governance can pause contract activity with `pause` (and resume with `unpause`).
-//! While paused, `create_campaign`, `set_campaign_rate` and `claim_rewards` are
+//! While paused, `create_campaign`, `create_campaign_with_grace`, `set_campaign_rate` and `claim_rewards` are
 //! blocked with `IncentiveError::Paused`. All views, `stake`, `unstake`, and
 //! `recover_leftover_funds` (after campaign ends) remain functional.
 //! Accrual is unaffected by a pause: rewards accrue strictly by ledger time, so
@@ -75,6 +75,9 @@
 //! | `get_governance` | allowed | View. |
 //! | `get_pending_governance` | allowed | View. |
 //! | `create_campaign` | blocked (`Paused`) | Creates a new campaign and takes funding. |
+//! | `create_campaign_with_grace` | blocked (`Paused`) | Same as `create_campaign` with an explicit claim grace. |
+//! | `get_claim_grace` | allowed | View. |
+//! | `migrate_indexes` | allowed | Permissionless storage migration; moves no funds. |
 //! | `set_campaign_rate` | blocked (`Paused`) | Modifies campaign reward rate. |
 //! | `recover_leftover_funds` | allowed | Post-campaign leftover recovery. |
 //! | `stake` | allowed | LP position management. |
@@ -186,6 +189,8 @@ pub enum IncentiveError {
     ClaimGraceActive = 26,
     /// `migrate_indexes` was given a `kind` other than 0, 1 or 2.
     InvalidIndexKind = 27,
+    /// Operation is paused by governance.
+    Paused = 28,
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +260,8 @@ pub enum DataKey {
     CreatorCount(Address),
     /// Indexed layout, per (creator, n): the n-th campaign id.
     CreatorItem(Address, u32),
+    /// Contract pause status. Instance storage; absent reads back as unpaused.
+    Paused,
 }
 
 // ---------------------------------------------------------------------------
@@ -749,6 +756,8 @@ impl IncentiveCampaigns {
         funding_amount: i128,
         claim_grace_secs: u64,
     ) -> Result<u64, IncentiveError> {
+        // `create_campaign` delegates here, so this one guard covers both.
+        Self::ensure_not_paused(&env)?;
         extend_instance_ttl(&env);
         caller.require_auth();
         Self::require_governance(&env, &caller)?;
@@ -5146,7 +5155,9 @@ mod tests {
             &gov, &pool, &lp, &reward, &10_000, &15_000, &100, &1_000_000,
         );
         set_time(&env, 10_000);
-        client.stake(&provider, &id2, &500_000);
+        // The provider still has 500_000 staked in campaign 1, so stake what is
+        // left; as the only staker in each campaign it earns the full rate either way.
+        client.stake(&provider, &id2, &400_000);
         set_time(&env, 13_000); // 3_000s elapsed, exactly matching t=1_000 to t=4_000 in id1
         let payout2 = client.claim_rewards(&provider, &id2);
 
@@ -5165,7 +5176,8 @@ mod tests {
 
         let id = client.create_campaign(&gov, &pool, &lp, &reward, &1_000, &2_000, &100, &500_000);
 
-        set_time(&env, 3_000); // Campaign ended
+        // Past end_time + the 7-day default claim grace, so recovery is open.
+        set_time(&env, 700_000);
         client.pause(&gov);
 
         let recovered = client.recover_leftover_funds(&gov, &id, &treasury);
@@ -5280,7 +5292,7 @@ mod tests {
 
         let id =
             client.create_campaign(&gov, &pool, &lp, &reward, &1_000, &5_000, &100, &1_000_000);
-        client.stake(&provider, &id, &300_000);
+        client.stake(&provider, &id, &500_000);
         set_time(&env, 2_000);
         let claimed = client.claim_rewards(&provider, &id);
         assert_eq!(claimed, 100_000);
@@ -5288,7 +5300,9 @@ mod tests {
 
         client.pause(&gov);
 
-        // Upload same WASM and upgrade
+        // Upload same WASM and upgrade. Once upgraded the contract runs as real
+        // WASM, which the default test budget cannot cover.
+        env.budget().reset_unlimited();
         let wasm_hash = env.deployer().upload_contract_wasm(WASM);
         client.upgrade(&gov, &wasm_hash);
 
@@ -5303,8 +5317,8 @@ mod tests {
         assert_eq!(client.version(), CONTRACT_VERSION);
         let camp = client.get_campaign(&id);
         assert_eq!(camp.total_distributed, 100_000);
-        assert_eq!(client.get_stake(&id, &provider), 300_000);
-        assert_eq!(client.get_total_staked(&id), 300_000);
+        assert_eq!(client.get_stake(&id, &provider), 500_000);
+        assert_eq!(client.get_total_staked(&id), 500_000);
         assert_eq!(client.get_distribution_count(&id), 1);
         let rec = client.get_distribution_record(&1);
         assert_eq!(rec.amount, 100_000);
