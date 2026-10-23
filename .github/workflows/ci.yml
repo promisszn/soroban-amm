@@ -18,6 +18,7 @@ jobs:
                   bash scripts/check_repo_hygiene.sh tracked
                   bash scripts/check_repo_hygiene.test.sh
                   bash scripts/check_staking_deploy.test.sh
+                  bash scripts/check_twap_consumer_deploy.test.sh
             # Channel, components and targets all come from
             # rust-toolchain.toml, so CI cannot drift onto a newer stable than
             # contributors are running; `rustup show` installs what it asks
@@ -95,10 +96,18 @@ jobs:
               run: make check-docs
             - name: Check storage keys do not depend on the ledger clock
               run: make check-storage-keys
+            # BRANCH_PROTECTION.md must list the checks this workflow reports.
+            - name: Check branch protection doc matches the CI jobs
+              run: make check-branch-protection
+            - name: Test the branch protection checker
+              run: node --test scripts/check_branch_protection_doc.test.mjs
             # Every deployable workspace contract must have a scripts/deploy/
             # module that scripts/deploy.sh actually runs (issue #959).
             - name: Check deploy scripts cover every contract
               run: make check-deploy-scripts
+            # Every *_test.rs under a contract src/ must be a mod, or cargo never runs it.
+            - name: Check test modules are compiled
+              run: make check-test-modules
 
             - name: Security audit
               uses: rustsec/audit-check@v2
@@ -206,6 +215,9 @@ jobs:
               run: node --test scripts/check_event_schemas.test.mjs
 
     npm-packages:
+        # Explicit so the reported context is "npm-packages (<dir>)" and does not
+        # include the test command (see .github/BRANCH_PROTECTION.md).
+        name: npm-packages (${{ matrix.dir }})
         runs-on: ubuntu-latest
         permissions:
             contents: read

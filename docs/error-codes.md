@@ -69,16 +69,14 @@ Defined in [contracts/amm/src/lib.rs](../contracts/amm/src/lib.rs) as `AmmError`
 | 20 | `ProposalExpired` | Emergency withdrawal multisig proposal exceeded its validity window (`now > proposal.expires_at`). | Submit a new emergency withdrawal proposal. |
 | 21 | `NotInitialized` | A function that reads pool configuration (tokens, LP token, admin, fee settings) was called before `initialize`. Covers admin setters, liquidity, swaps, quotes, and the `get_info` / `get_fee_info` / `shares_of` views. | Call `initialize` first. |
 | 22 | `PoolDrained` | The pool has entered the terminal `Drained` state after an `emergency_withdraw` or `exec_multisig_emergency_wd` (#1095). All liquidity, swap, flash-loan, fee-withdrawal, unpause, recovery, and repeat emergency-withdrawal entrypoints are permanently disabled so pre-existing LP tokens cannot drain subsequent deposits. | Deploy a new pool contract; a drained pool is permanently retired. |
-| 23 | `QuorumNotMet` | `exec_multisig_emergency_wd` was called while the number of collected signer approvals was below `MultisigQuorum` (#1095). | Collect additional signer approvals via `approve_emergency_withdraw` until `approvals.len() >= quorum`. |
-| 24 | `NoPendingProposal` | `exec_multisig_emergency_wd` was called when no multisig emergency withdrawal proposal has been created (#1095). | Have a multisig signer call `propose_emergency_withdraw` first. |
-| 25 | `QuorumNotReached` | `exec_multisig_emergency_wd` was called while the number of collected signer approvals was below `MultisigQuorum`. Distinct from `QuorumNotMet` so signers and tooling can tell a too-early execution apart from a governance quorum failure. | Collect additional signer approvals via `approve_emergency_withdraw` until `approvals.len() >= quorum`. |
-| 26 | `NoPendingProposal` | `exec_multisig_emergency_wd` was called when no multisig emergency withdrawal proposal has been created. Distinct from `NoPendingAdmin` so tooling can tell a missing proposal apart from a missing admin nomination. | Have a multisig signer call `propose_emergency_withdraw` first. |
-| 27 | `InvalidQuorum` | `set_multisig` was called with `quorum > signers.len()`, or with a quorum that cannot be satisfied by the supplied signer set. | Pass `quorum` in `1..=signers.len()`, or `0` only through the multisig flow to disable the guard. |
-| 28 | `EmergencyNotAnnounced` | `emergency_withdraw` was called without a prior `announce_emergency_withdraw`, or after `cancel_emergency_withdraw` cleared the announcement. | Call `announce_emergency_withdraw(to)` first and wait for `EMERGENCY_DELAY_SECS`. |
-| 29 | `EmergencyDelayNotElapsed` | `emergency_withdraw` or `exec_multisig_emergency_wd` was called before `EMERGENCY_DELAY_SECS` elapsed since the announcement (or since quorum was reached for the multisig path). | Wait for the configured delay after announcing (single-admin) or after collecting quorum (multisig). |
-| 30 | `EmergencyNotPaused` | `emergency_withdraw` was called while the pool is not paused. The emergency path requires the pool to be paused first. | Call `pause()` before `emergency_withdraw`. |
-| 31 | `InvalidEmergencyRecipient` | `to` was the pool contract itself or the LP token contract on `emergency_withdraw`, `announce_emergency_withdraw`, or `exec_multisig_emergency_wd`. | Pass a recipient address that is neither `env.current_contract_address()` nor the LP token. |
-| 32 | `MultisigGuardActive` | `set_multisig` attempted to change or disable the multisig guard while `MultisigQuorum > 0` without going through the multisig propose/approve/execute flow. | Propose the change through the multisig (same quorum) or wait out the timelock. |
+| 23 | `QuorumNotMet` | Legacy governance-style quorum failure. No longer returned by the emergency path; see `QuorumNotReached` (#1095). | — |
+| 24 | `NoPendingProposal` | No emergency withdrawal announcement or multisig proposal exists to act on: `emergency_withdraw` without a prior `announce_emergency_withdraw` (or after `cancel_emergency_withdraw` or a completed drain), `cancel_emergency_withdraw` with nothing announced, or a multisig exec/approve with an unknown proposal id. | Call `announce_emergency_withdraw(admin, to)` first, or have a signer call `propose_emergency_withdraw` and use the returned id. |
+| 25 | `QuorumNotReached` | `exec_multisig_emergency_wd` or `exec_multisig_set_multisig` was called while the collected approvals were below `MultisigQuorum`. Distinct from `QuorumNotMet`, so tooling can tell a too-early execution from a governance quorum failure. | Collect more signer approvals with `approve_multisig_proposal` until `approvals.len() >= quorum`. |
+| 26 | `InvalidQuorum` | `set_multisig` / `propose_set_multisig` was given `quorum > signers.len()`, or a signer set containing duplicates. | Pass `quorum` in `0..=signers.len()` with unique signers. |
+| 27 | `EmergencyDelayNotElapsed` | `emergency_withdraw` ran before `EmergencyDelaySecs` had passed since the announcement, or `exec_multisig_emergency_wd` ran before the delay had passed since quorum was reached. | Wait for the delay (24 h by default, at most 7 days). |
+| 28 | `InvalidRecipient` | The emergency recipient is the pool itself or its LP token, or `emergency_withdraw` was called for a recipient other than the announced one. | Pass a recipient that is neither the pool nor the LP token, and the one that was announced. |
+| 29 | `MultisigGuardActive` | `set_multisig` was called while a multisig guard is active (`MultisigQuorum > 0`). An active guard can only be changed through the multisig. | Use `propose_set_multisig` / `approve_multisig_proposal` / `exec_multisig_set_multisig`. |
+| 30 | `InvalidEmergencyDelay` | `initialize_with_emergency_delay` was given a delay above 7 days. | Pass a delay of at most `604800` seconds. |
 
 ---
 
@@ -112,14 +110,25 @@ Defined in [contracts/amm-sdk/src/types.rs](../contracts/amm-sdk/src/types.rs) a
 | 22 | `PoolDrained` | Pool entered terminal `Drained` state after emergency withdrawal (#1095). | Deploy a new pool; drained pools are permanently retired. |
 | 23 | `QuorumNotMet` | Multisig emergency withdrawal approvals are below `MultisigQuorum` (#1095). | Collect enough signer approvals before executing. |
 | 24 | `NoPendingProposal` | `exec_multisig_emergency_wd` called with no active multisig proposal (#1095). | Call `propose_emergency_withdraw` first. |
-| 25 | `QuorumNotReached` | Multisig emergency withdrawal approvals are below `MultisigQuorum`. | Collect enough signer approvals before executing. |
-| 26 | `NoPendingProposal` | `exec_multisig_emergency_wd` called with no active multisig proposal. | Call `propose_emergency_withdraw` first. |
-| 27 | `InvalidQuorum` | `set_multisig` quorum exceeds the signer count. | Pass `quorum` in `1..=signers.len()`. |
-| 28 | `EmergencyNotAnnounced` | `emergency_withdraw` called without a prior announcement. | Call `announce_emergency_withdraw(to)` first. |
-| 29 | `EmergencyDelayNotElapsed` | Emergency withdrawal called before `EMERGENCY_DELAY_SECS` elapsed. | Wait for the configured delay. |
-| 30 | `EmergencyNotPaused` | `emergency_withdraw` called while the pool is not paused. | Call `pause()` first. |
-| 31 | `InvalidEmergencyRecipient` | Recipient is the pool or the LP token. | Pass a different recipient. |
-| 32 | `MultisigGuardActive` | `set_multisig` tried to change the guard without the multisig flow. | Propose through the multisig. |
+
+---
+
+## SdkTokenError (`contracts/amm-sdk`)
+
+Defined in [contracts/amm-sdk/src/types.rs](../contracts/amm-sdk/src/types.rs) as `SdkTokenError`. It mirrors the token contract's `TokenError` for SDK consumers; the codes are identical to the Token section above.
+
+| Code | Symbol | Cause | Remedy |
+|------|--------|-------|--------|
+| 1 | `AlreadyInitialized` | The token contract was initialized twice. | Initialize once upon deployment. |
+| 2 | `NotInitialized` | A function was called before `initialize` (the admin is unset). | Initialize the token first. |
+| 3 | `InvalidAmount` | An amount was zero or negative where a positive value is required, or negative where a non-negative value is required. | Pass a valid amount. |
+| 4 | `InsufficientBalance` | A transfer, burn, or lock exceeded the account's unlocked balance. | Operate on no more than the available unlocked balance. |
+| 5 | `InsufficientAllowance` | `transfer_from` exceeded the spender's approved allowance. | Approve a sufficient allowance before transferring. |
+| 6 | `InvalidExpiry` | `approve` was given a `live_until_ledger` before the current ledger for a non-zero amount. | Pass a `live_until_ledger` at or after the current ledger. |
+| 7 | `Unauthorized` | `propose_admin` was called by a non-admin, or `accept_admin` by a non-nominee. | Call from the correct admin or nominated pending-admin address. |
+| 8 | `InsufficientLocked` | An unlock exceeded the locker's entry for the holder, or the holder's total locked balance. | Unlock no more than the locker locked for the holder. |
+| 9 | `MigrationOverflow` | A legacy-lock migration would allocate more than the holder's recorded total locked balance. | Migrate an amount within the total locked balance. |
+| 10 | `BalanceUnavailable` | `balance_at` was queried for a ledger whose covering checkpoint has been evicted. | Query a ledger within the retained checkpoint window. |
 
 ---
 
@@ -148,6 +157,9 @@ Defined in [contracts/batch_auction/src/lib.rs](../contracts/batch_auction/src/l
 | 17 | `OrderNotExpired` | `expire_order` called on an order whose deadline has not passed yet. | Wait until the order's deadline, or use `cancel_order` instead. |
 | 18 | `NothingToClaim` | `claim_refund` called for an order with no claimable balance on record. | No action — nothing was stranded for this order. |
 | 19 | `TooManyVenues` | `add_venue` would push the persistent venue registry past `MAX_VENUES`. | Remove a stale venue with `remove_venue` before adding another. |
+| 20 | `NotInitialized` | An admin function, `get_admin` or `accept_admin` was called before `initialize`. | Call `initialize` first. |
+| 21 | `InvalidBatchWindow` | `initialize` or `set_batch_window` was given a window outside the configured bounds (default 5 s to 1 day), for example `0` or `u64::MAX`. | Pass a window within `get_window_bounds()`. |
+| 22 | `InvalidWindowBounds` | `set_window_bounds` was given `min == 0`, `min > max`, a `max` above 30 days, or bounds that exclude the current window. | Pass `0 < min <= max <= 30 days` with the current window inside them. |
 
 ---
 
@@ -279,6 +291,9 @@ Defined in [contracts/factory/src/lib.rs](../contracts/factory/src/lib.rs) as `F
 | 10 | `NoPendingAdmin` | `accept_admin` was called when no admin transfer is in progress. | Call `propose_admin` first to nominate a successor. |
 | 11 | `WrongAdmin` | `accept_admin` was called by an address that does not match the pending nominee. | Have the correct address (the one passed to `propose_admin`) call `accept_admin`. |
 | 12 | `NotInitialized` | A function that reads factory configuration (admin, AMM/LP WASM hashes) was called before `initialize`. Covers pool creation (`create_pool`, `create_pool_with_fee_bps`, `create_cl_pool`) and every admin entrypoint. Code 2 is `InvalidFeeBps`, so this code is appended. | Call `initialize` first. |
+| 13 | `FeeOutOfRange` | A requested AMM fee lies outside the admin-configured `[min_fee_bps, max_fee_bps]` window (see `set_fee_bps_window`). Distinct from `InvalidFeeBps`, which reports a value that is invalid outright. | Request a fee inside the configured window, or have the admin widen it with `set_fee_bps_window`. |
+| 14 | `PoolNotFound` | The pool is not an AMM pool registered by this factory, or is not currently active in the pair registry. | Pass a pool created by this factory; check it with `get_pool`. |
+| 15 | `PoolAlreadyDeprecated` | `deprecate_pool` was called on a pool that is already deprecated. | No action needed; the pool is already deprecated. |
 
 ---
 
@@ -352,6 +367,8 @@ Defined in [contracts/governance/src/lib.rs](../contracts/governance/src/lib.rs)
 | 33 | `NoPendingAdmin` | `accept_admin` called without a prior `propose_admin`. | Call `propose_admin` first to nominate a successor. |
 | 34 | `PartialFactoryUpdate` | `UpdateFactoryGlobalFee` proposal window (`offset`/`limit`) does not cover all factory pools. | Submit proposal covering all registered factory pools. |
 | 35 | `NotInitialized` | A function that reads governance configuration (admin, AMM pool, LP token, voting period, timelock, quorum, proposer stake, proposal counter) was called before `initialize`. Covers the admin setters, `propose_admin`, `propose`, `get_params`, and any proposal path that reaches that configuration. Code 2 is `InvalidVotingPeriod`, so this code is appended. | Call `initialize` first. |
+| 36 | `InvalidProposalParams` | Proposal parameters failed validation at `propose` time, for example a `CreatePolVesting` schedule with a non-positive total or out-of-order ledgers, a pause/unpause/oracle target or `EmergencyWithdraw` recipient equal to the governance contract, or a `TransferAdmin` target that is already the admin. | Fix the proposal parameters and submit a new proposal. |
+| 37 | `DelegationDepthExceeded` | A delegation would make a chain longer than `MAX_DELEGATION_DEPTH`, or a stored chain was found to exceed it during aggregation. Rejected at write time so voting power is never silently dropped from a tally. | Delegate to an account that is not itself at the end of a long chain, or have the chain shortened first. |
 
 ---
 
@@ -385,6 +402,10 @@ Defined in [contracts/incentive_campaigns/src/lib.rs](../contracts/incentive_cam
 | 22 | `InsufficientStake` | `unstake` asked for more than the caller has staked in the campaign. | Unstake at most `get_stake(campaign_id, provider)`. |
 | 23 | `CampaignEnded` | `stake` was called at or after the campaign's `end_time`. | Stake before the campaign ends; `unstake` and `claim_rewards` stay available. |
 | 24 | `LegacyCampaign` | `stake` was called on a campaign created before the stake-based model. | Legacy campaigns keep paying from the live LP balance; stake only into campaigns created after the upgrade. See [incentive-campaigns.md](incentive-campaigns.md). |
+| 25 | `InvalidClaimGrace` | `create_campaign_with_grace` was given a `claim_grace_secs` outside `[3_600, 7_776_000]` (1 hour to 90 days). | Pass a grace period inside the bounds; `create_campaign` uses the 7-day default. |
+| 26 | `ClaimGraceActive` | `recover_leftover_funds` was called at or before `end_time + claim_grace_secs`, while providers may still claim. | Wait until the ledger time is strictly past `end_time + get_claim_grace(id)`. |
+| 27 | `InvalidIndexKind` | `migrate_indexes` was given a `kind` other than 0 (by campaign), 1 (by provider) or 2 (by creator). | Pass 0, 1 or 2. |
+| 28 | `Paused` | Governance has paused the contract, and `create_campaign`, `set_campaign_rate` or `claim_rewards` was called. Views, `stake`, `unstake` and `recover_leftover_funds` keep working. | Wait for governance to call `unpause`; check `is_paused`. |
 
 
 
@@ -500,6 +521,23 @@ Defined in [contracts/token/src/lib.rs](../contracts/token/src/lib.rs) as `Token
 
 ---
 
+## OracleAdapters (`contracts/oracle_adapters`)
+
+Defined in [contracts/oracle_adapters/src/lib.rs](../contracts/oracle_adapters/src/lib.rs) as `AdapterError`.
+
+| Code | Symbol | Cause | Remedy |
+|------|--------|-------|--------|
+| 1 | `AlreadyInitialized` | `initialize` was called on an adapter that is already set up. | Initialize the adapter only once after deployment. |
+| 2 | `NotInitialized` | A function that reads adapter configuration was called before `initialize`. | Call `initialize` first. |
+| 3 | `InvalidConfiguration` | `initialize` was given `window_seconds == 0` or `max_age_seconds == 0`, or a concentrated-liquidity adapter was given an empty `fee_tiers` list. | Pass a non-zero window and max age, and at least one fee tier for a CL adapter. |
+| 4 | `PoolNotFound` | The factory has no pool for the requested token pair (or fee tier), so no price can be read. | Create the pool through the factory, or request a pair and fee tier that exist. |
+| 5 | `NoSnapshot` | The TWAP consumer has no snapshot for the pool, so no TWAP can be computed. | Wait for the keeper to save a snapshot. |
+| 6 | `StaleSnapshot` | The newest snapshot is older than the configured `max_age_seconds`. | Wait for a fresh snapshot from the keeper. |
+| 7 | `InvalidPrice` | The computed TWAP price is zero or negative. | Check that the pool reserves and cumulative prices are positive. |
+| 8 | `ArithmeticOverflow` | A price conversion or scaling step overflowed. | Use a smaller amount or a pool with less extreme reserves. |
+
+---
+
 ## V2ToV3Migration (`contracts/v2_to_v3_migration`)
 
 Defined in [contracts/v2_to_v3_migration/src/lib.rs](../contracts/v2_to_v3_migration/src/lib.rs) as `MigrationError`.
@@ -560,9 +598,13 @@ Defined in [contracts/twap_consumer/src/lib.rs](../contracts/twap_consumer/src/l
 | 12 | `InvalidRetentionPolicy` | `max_age_seconds` is shorter than the minimum supported TWAP window (`LONGEST_TWAP_WINDOW`). | Set `max_age_seconds` to at least `LONGEST_TWAP_WINDOW` or 0 (disabled). |
 | 13 | `Unauthorized` | Non-keeper/admin address attempted an administrative action. | Submit the transaction authenticated by the configured keeper/admin. |
 | 14 | `CrossContractCallFailed` | A call into a pool's oracle failed: the pool does not implement the interface its tracked type implies (`get_price_cumulative` for `Amm`, `get_tick_cumulative` for `Cl`), the address is not a contract, or the callee panicked. Returned by the snapshot and TWAP reads, including `get_twap_all`, instead of a host trap (#964). | Check the pool address and type with `get_tracked_pools_typed`. A legacy entry that is really a CL pool is re-typed by calling `save_cl_snapshot` for it. |
-| 15 | `TooManyTrackedPools` | `add_tracked_pool`, or implicit registration inside `save_snapshot`/`save_cl_snapshot`, would grow the tracked set past `MAX_TRACKED_POOLS` (100). | Call `remove_tracked_pool` on a stale pool first, or track fewer pools. |
-| 16 | `NotTracked` | `remove_tracked_pool` was called with a pool that is not currently tracked. | Check `is_tracked` before removing. |
-| 17 | `TooManyPools` | `get_twap_batch` was called with more pools than `MAX_TRACKED_POOLS`. | Split the request into smaller batches. |
+| 15 | `SnapshotRateLimited` | A snapshot was saved for a pool less than `MinSnapshotInterval` seconds (300 by default) after its previous snapshot. | Wait until the minimum snapshot interval has elapsed before saving another snapshot. |
+| 16 | `PoolNotRegistered` | The pool is not registered with the factory (no factory is configured, or the factory has no token pair for it), so a snapshot was refused. | Register the pool through the factory, or pass a pool the factory created. |
+| 17 | `TooManyTrackedPools` | `add_tracked_pool`, or the implicit registration inside `save_snapshot` / `save_cl_snapshot`, would grow the tracked set past `MAX_TRACKED_POOLS` (100). Storage is left unchanged. | `remove_tracked_pool` a stale pool first, or snapshot only pools you need. |
+| 18 | `NotTracked` | `remove_tracked_pool` was called with a pool that is not currently tracked. | Check `is_tracked` before removing. |
+| 19 | `TooManyPools` | `get_twap_batch` was called with more pools than `MAX_TRACKED_POOLS`. | Split the request into smaller batches. |
+| 20 | `NoPendingKeeper` | `accept_keeper` was called while no `propose_keeper` nomination is pending. | Have the current keeper call `propose_keeper` first. |
+| 21 | `WrongPendingKeeper` | `accept_keeper` was called with an address other than the pending keeper. | Sign and call `accept_keeper` as the nominated address. |
 
 ---
 
@@ -574,7 +616,7 @@ the code to the table above using the contract address to identify which enum
 applies.
 
 `get_twap_all_safe` and `get_twap_batch` never return an `Err` for a single bad
-pool — they return a `TwapEntry` with `ok: false` and `error_code` set to one
+pool — they return a `TwapSafeEntry` with `ok: false` and `error_code` set to one
 of the codes above instead, so a single dead pool cannot take down a batch
 read. `get_twap_all` is kept on the ABI for existing callers and still
 surfaces the first such code as a typed `Err`.

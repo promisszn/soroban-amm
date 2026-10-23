@@ -59,6 +59,19 @@ pub trait LpTokenInterface {
 /// Lifetime of a multisig emergency-withdraw proposal before it expires.
 const MULTISIG_PROPOSAL_TTL_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
 
+/// Default delay between announcing an emergency withdrawal (or reaching
+/// multisig quorum for one) and being allowed to execute it.
+const DEFAULT_EMERGENCY_DELAY_SECS: u64 = 24 * 60 * 60; // 24 hours
+
+/// Upper bound for the configurable emergency delay.
+const MAX_EMERGENCY_DELAY_SECS: u64 = 7 * 24 * 60 * 60; // 7 days
+
+/// Persistent-storage TTL bounds (in ledgers) for multisig proposals. A proposal
+/// can stay live for `MULTISIG_PROPOSAL_TTL_SECS` plus the emergency delay, so
+/// the bump comfortably exceeds both.
+const PROPOSAL_TTL_THRESHOLD: u32 = 200_000;
+const PROPOSAL_TTL_EXTEND_TO: u32 = 400_000;
+
 // ── Typed errors ─────────────────────────────────────────────────────────────
 
 #[contracterror]
@@ -106,8 +119,26 @@ pub enum AmmError {
     PoolDrained = 22,
     /// Multisig emergency withdrawal proposal has insufficient approvals to meet quorum.
     QuorumNotMet = 23,
-    /// No emergency withdrawal proposal exists to execute.
+    /// No emergency withdrawal announcement or multisig proposal exists to act on.
     NoPendingProposal = 24,
+    /// `exec_multisig_emergency_wd` was called while the collected approvals
+    /// are below `MultisigQuorum`. Distinct from `QuorumNotMet`, which is the
+    /// governance vote quorum error, so tooling can tell the two apart.
+    QuorumNotReached = 25,
+    /// `set_multisig` / `propose_set_multisig` was given a quorum greater than
+    /// the signer count, or a signer set containing duplicates.
+    InvalidQuorum = 26,
+    /// The emergency delay has not elapsed since the announcement (single
+    /// admin path) or since quorum was reached (multisig path).
+    EmergencyDelayNotElapsed = 27,
+    /// The emergency recipient is the pool itself or its LP token, or does not
+    /// match the announced recipient.
+    InvalidRecipient = 28,
+    /// `set_multisig` was called while a multisig guard is active. An active
+    /// guard can only be changed through `propose_set_multisig`.
+    MultisigGuardActive = 29,
+    /// The configured emergency delay exceeds `MAX_EMERGENCY_DELAY_SECS` (7 days).
+    InvalidEmergencyDelay = 30,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -151,13 +182,20 @@ pub enum DataKey {
     MultisigSigners,
     /// Required quorum (k in k-of-n).
     MultisigQuorum,
-    /// Pending emergency-withdraw proposal: (recipient, `Vec<Address>` approvals).
-    MultisigProposalRecipient,
-    MultisigProposalApprovals,
-    /// Expiration timestamp for the pending multisig proposal.
-    MultisigProposalExpiresAt,
-    /// Whether the pending multisig proposal has already been executed.
-    MultisigProposalExecuted,
+    /// Monotonic counter of multisig proposals; the last id handed out.
+    MultisigProposalCount,
+    /// Multisig proposal by id (persistent storage).
+    MultisigProposalById(u64),
+    /// Bumped whenever the signer set or quorum changes, so proposals created
+    /// under an older configuration can no longer be approved or executed.
+    MultisigEpoch,
+
+    // Emergency withdrawal hardening (audit M-04).
+    /// Seconds that must pass between an announcement (or multisig quorum) and
+    /// the withdrawal itself.
+    EmergencyDelaySecs,
+    /// The pending single-admin announcement: `EmergencyAnnouncement`.
+    EmergencyAnnouncement,
 
     // Issue #294: minimum liquidity lock — LP tokens permanently locked on first deposit.
     /// Whether the minimum liquidity has already been locked (set on first deposit).
@@ -223,12 +261,37 @@ pub struct MultisigConfig {
     pub quorum: u32,
 }
 
-/// Issue #293: pending emergency-withdraw proposal.
+/// What a multisig proposal does once executed.
+#[contracttype]
+#[derive(Debug, Clone, PartialEq)]
+pub enum MultisigAction {
+    /// Drain the pool to the given recipient.
+    EmergencyWithdraw(Address),
+    /// Replace the signer set and quorum. A quorum of 0 disables the guard.
+    SetMultisig(soroban_sdk::Vec<Address>, u32),
+}
+
+/// Issue #293: pending multisig proposal, addressed by id.
 #[contracttype]
 #[derive(Debug, Clone, PartialEq)]
 pub struct MultisigProposal {
-    pub recipient: Address,
+    pub action: MultisigAction,
     pub approvals: soroban_sdk::Vec<Address>,
+    /// Timestamp after which the proposal can no longer be approved/executed.
+    pub expires_at: u64,
+    /// Timestamp at which approvals first reached the quorum; 0 until then.
+    pub quorum_reached_at: u64,
+    /// Signer-set epoch the proposal was created under.
+    pub epoch: u32,
+    pub executed: bool,
+}
+
+/// A pending single-admin emergency withdrawal announcement.
+#[contracttype]
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmergencyAnnouncement {
+    pub to: Address,
+    pub announced_at: u64,
 }
 
 #[contractclient(name = "FlashLoanReceiverClient")]
@@ -337,7 +400,7 @@ impl AmmPool {
     /// `admin` is stored as the contract administrator and is the only address
     /// permitted to call `set_protocol_fee` after deployment.
     /// `fee_recipient` receives accrued protocol fees via `withdraw_protocol_fees`.
-    /// `protocol_fee_bps` must be ≤ `fee_bps`; set to 0 to disable protocol fees.
+    /// `protocol_fee_bps` must be strictly below `fee_bps` (or both 0); set to 0 to disable protocol fees.
     /// # Panics
     /// - If the pool has already been initialized.
     /// - If `token_a == token_b`.
@@ -366,6 +429,43 @@ impl AmmPool {
         )
     }
 
+    /// Initialize the pool with a custom emergency-withdrawal delay.
+    ///
+    /// Behaves like `initialize`, and additionally sets the number of seconds
+    /// that must pass between `announce_emergency_withdraw` (or multisig
+    /// quorum) and the withdrawal itself. `emergency_delay_secs` may not exceed
+    /// 7 days; `initialize` uses the 24 hour default.
+    #[allow(clippy::too_many_arguments)]
+    pub fn initialize_with_emergency_delay(
+        env: Env,
+        admin: Address,
+        token_a: Address,
+        token_b: Address,
+        lp_token: Address,
+        fee_bps: i128,
+        fee_recipient: Address,
+        protocol_fee_bps: i128,
+        emergency_delay_secs: u64,
+    ) -> Result<(), AmmError> {
+        if emergency_delay_secs > MAX_EMERGENCY_DELAY_SECS {
+            return Err(AmmError::InvalidEmergencyDelay);
+        }
+        Self::initialize(
+            env.clone(),
+            admin,
+            token_a,
+            token_b,
+            lp_token,
+            fee_bps,
+            fee_recipient,
+            protocol_fee_bps,
+        )?;
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyDelaySecs, &emergency_delay_secs);
+        Ok(())
+    }
+
     /// Initialize the pool with a distinct flash-loan fee.
     #[allow(clippy::too_many_arguments)]
     pub fn initialize_with_flash_loan_fee(
@@ -386,11 +486,10 @@ impl AmmPool {
         if token_a == token_b {
             return Err(AmmError::InvalidToken);
         }
-        Self::validate_fee_bps(fee_bps)?;
+        // #1107: one shared check for the swap fee and the protocol cut, so
+        // `initialize`, `update_fee` and `set_protocol_fee` cannot drift apart.
+        Self::validate_fee_pair(fee_bps, protocol_fee_bps)?;
         Self::validate_flash_loan_fee_bps(flash_loan_fee_bps)?;
-        if !(0..=fee_bps).contains(&protocol_fee_bps) {
-            return Err(AmmError::InvalidFeeBps);
-        }
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::TokenA, &token_a);
@@ -435,6 +534,15 @@ impl AmmPool {
             &DataKey::MultisigSigners,
             &soroban_sdk::Vec::<Address>::new(&env),
         );
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigEpoch, &0_u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigProposalCount, &0_u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyDelaySecs, &DEFAULT_EMERGENCY_DELAY_SECS);
         // Issue #294: minimum liquidity not yet locked.
         env.storage()
             .instance()
@@ -560,80 +668,126 @@ impl AmmPool {
             .unwrap_or(false)
     }
 
-    /// Emergency withdraw of all pool reserves to a designated address.
-    /// Admin-only, callable via a timed governance proposal.
-    pub fn emergency_withdraw(env: Env, to: Address) -> Result<(), AmmError> {
+    /// Announce an emergency withdrawal of all pool reserves to `to`.
+    ///
+    /// Admin-only. Starts the emergency delay clock; `emergency_withdraw` only
+    /// succeeds for the same recipient once `EmergencyDelaySecs` have passed and
+    /// while the pool is paused. Announcing again replaces the previous
+    /// announcement and restarts the delay. `to` may not be the pool itself or
+    /// its LP token.
+    pub fn announce_emergency_withdraw(
+        env: Env,
+        admin: Address,
+        to: Address,
+    ) -> Result<(), AmmError> {
         Self::extend_ttl(&env);
-        // Acquire the reentrancy lock before any external transfer below.
-        let _guard = ReentrancyGuard::acquire(&env)?;
-        let admin: Address = Self::read_admin(&env)?;
-        admin.require_auth();
-
+        Self::require_admin(&env, &admin)?;
         if Self::is_drained(env.clone()) {
             return Err(AmmError::PoolDrained);
         }
+        Self::validate_emergency_recipient(&env, &to)?;
+        let announced_at = env.ledger().timestamp();
+        env.storage().instance().set(
+            &DataKey::EmergencyAnnouncement,
+            &EmergencyAnnouncement {
+                to: to.clone(),
+                announced_at,
+            },
+        );
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "emergency_announce"),),
+            (admin, to, announced_at, Self::emergency_delay(&env))
+        );
+        Ok(())
+    }
+
+    /// Cancel a pending emergency withdrawal announcement. Admin-only.
+    pub fn cancel_emergency_withdraw(env: Env, admin: Address) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
+        Self::require_admin(&env, &admin)?;
+        let announcement: EmergencyAnnouncement = env
+            .storage()
+            .instance()
+            .get(&DataKey::EmergencyAnnouncement)
+            .ok_or(AmmError::NoPendingProposal)?;
+        env.storage()
+            .instance()
+            .remove(&DataKey::EmergencyAnnouncement);
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "emergency_cancel"),),
+            (admin, announcement.to)
+        );
+        Ok(())
+    }
+
+    /// Return the pending single-admin emergency announcement, if any.
+    pub fn get_emergency_announcement(env: Env) -> Option<EmergencyAnnouncement> {
+        env.storage()
+            .instance()
+            .get(&DataKey::EmergencyAnnouncement)
+    }
+
+    /// Return the configured emergency delay in seconds.
+    pub fn get_emergency_delay(env: Env) -> u64 {
+        Self::emergency_delay(&env)
+    }
+
+    /// Emergency withdraw of all pool reserves and accrued protocol fees to a
+    /// designated address.
+    ///
+    /// Admin-only, and only on the single-admin path: it is rejected while a
+    /// multisig guard is active. The pool must be paused, `to` must match a
+    /// prior `announce_emergency_withdraw`, and `EmergencyDelaySecs` must have
+    /// elapsed since that announcement. A governance `EmergencyWithdraw`
+    /// proposal executes through this same call, so it is subject to the same
+    /// rules.
+    pub fn emergency_withdraw(env: Env, admin: Address, to: Address) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
+        // Acquire the reentrancy lock before any external transfer below.
+        let _guard = ReentrancyGuard::acquire(&env)?;
+        Self::require_admin(&env, &admin)?;
 
         // If a k-of-n multisig guard is configured, the single-admin path must
         // not be allowed to drain reserves. Callers must use the multisig flow
         // (propose_emergency_withdraw / exec_multisig_emergency_wd) instead.
-        let quorum: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultisigQuorum)
-            .unwrap_or(0);
-        if quorum > 0 {
+        if Self::multisig_quorum(&env) > 0 {
             return Err(AmmError::Unauthorized);
         }
 
-        // Record audit information
-        let ts: u64 = env.ledger().timestamp();
+        let announcement: EmergencyAnnouncement = env
+            .storage()
+            .instance()
+            .get(&DataKey::EmergencyAnnouncement)
+            .ok_or(AmmError::NoPendingProposal)?;
+        if announcement.to != to {
+            return Err(AmmError::InvalidRecipient);
+        }
+        if Self::is_drained(env.clone()) {
+            return Err(AmmError::PoolDrained);
+        }
+        if !Self::is_paused(env.clone()) {
+            return Err(AmmError::Paused);
+        }
+        Self::validate_emergency_recipient(&env, &to)?;
+        let ready_at = announcement
+            .announced_at
+            .saturating_add(Self::emergency_delay(&env));
+        if env.ledger().timestamp() < ready_at {
+            return Err(AmmError::EmergencyDelayNotElapsed);
+        }
         env.storage()
             .instance()
-            .set(&DataKey::EmergencyWithdrawTimestamp, &ts);
-        env.storage()
-            .instance()
-            .set(&DataKey::EmergencyWithdrawRecipient, &to);
+            .remove(&DataKey::EmergencyAnnouncement);
 
-        // Get token addresses, reserves, and accrued protocol fees
-        let token_a: Address = Self::read_token_a(&env)?;
-        let token_b: Address = Self::read_token_b(&env)?;
-        let reserve_a = Self::get_reserve_a(env.clone());
-        let reserve_b = Self::get_reserve_b(env.clone());
-        let (accrued_a, accrued_b) = Self::get_accrued_fees(env.clone());
-        let drain_a = reserve_a.saturating_add(accrued_a);
-        let drain_b = reserve_b.saturating_add(accrued_b);
-
-        // Transfer reserves and accrued protocol fees to recipient
-        if drain_a > 0 {
-            SepTokenClient::new(&env, &token_a).transfer(
-                &env.current_contract_address(),
-                &to,
-                &drain_a,
-            );
-        }
-        if drain_b > 0 {
-            SepTokenClient::new(&env, &token_b).transfer(
-                &env.current_contract_address(),
-                &to,
-                &drain_b,
-            );
-        }
-
-        // Zero out reserves and accrued protocol fees. The pool enters a terminal
-        // Drained state (#1095) so existing LP tokens cannot drain subsequent deposits.
-        // TotalShares and MinLiquidityLocked are left intact to record historical LP shares.
-        env.storage().instance().set(&DataKey::ReserveA, &0_i128);
-        env.storage().instance().set(&DataKey::ReserveB, &0_i128);
-        env.storage().instance().set(&DataKey::AccruedFeeA, &0_i128);
-        env.storage().instance().set(&DataKey::AccruedFeeB, &0_i128);
-        env.storage().instance().set(&DataKey::Drained, &true);
-        env.storage().instance().set(&DataKey::Paused, &true);
+        let (drain_a, drain_b) = Self::drain_to(&env, &to)?;
 
         // Emit event for audit trail
         soroban_amm_sdk::emit_versioned_event!(
             env,
-            (Symbol::new(&env, "emergency_withdraw"), admin.clone()),
-            (to, drain_a, drain_b)
+            (Symbol::new(&env, "emergency_wd"),),
+            (admin, to, drain_a, drain_b)
         );
 
         Ok(())
@@ -937,7 +1091,8 @@ impl AmmPool {
     /// Update the protocol fee configuration. Admin-only.
     ///
     /// Set `protocol_fee_bps` to 0 to disable protocol fee collection.
-    /// `protocol_fee_bps` must be ≤ the pool's `fee_bps`.
+    /// `protocol_fee_bps` must be strictly below the pool's `fee_bps` (or both
+    /// must be 0); see `validate_fee_pair`.
     pub fn set_protocol_fee(
         env: Env,
         admin: Address,
@@ -952,15 +1107,8 @@ impl AmmPool {
         admin.require_auth();
         let fee_bps: i128 = Self::read_fee_bps(&env)?;
         // Fix M-02: protocol_fee_bps must be *strictly* less than fee_bps so LPs
-        // always retain a portion of swap income. Allowing protocol_fee_bps == fee_bps
-        // would route 100% of swap fees to the protocol, leaving LPs with nothing.
-        // Special case: both zero is valid (fees entirely disabled).
-        if protocol_fee_bps < 0
-            || (fee_bps > 0 && protocol_fee_bps >= fee_bps)
-            || (fee_bps == 0 && protocol_fee_bps != 0)
-        {
-            return Err(AmmError::InvalidFeeBps);
-        }
+        // always retain a portion of swap income (see `validate_fee_pair`).
+        Self::validate_fee_pair(fee_bps, protocol_fee_bps)?;
         env.storage()
             .instance()
             .set(&DataKey::FeeRecipient, &recipient);
@@ -1027,11 +1175,14 @@ impl AmmPool {
 
     // ── Issue #293: k-of-n multisig emergency guard ───────────────────────────
 
-    /// Configure the k-of-n multisig guard for emergency operations.
+    /// Install the initial k-of-n multisig guard for emergency operations.
     ///
-    /// Once set, `emergency_withdraw` requires `quorum` approvals from `signers`
-    /// before funds can be moved. Admin-only.
-    /// Set `quorum` to 0 to disable the multisig guard (single-admin mode).
+    /// Admin-only, and only while no guard is active (`quorum == 0`). Once a
+    /// guard exists, the admin it constrains can no longer change or disable it
+    /// alone: use `propose_set_multisig` / `approve_multisig_proposal` /
+    /// `exec_multisig_set_multisig` instead. `quorum` must be in
+    /// `0..=signers.len()` and `signers` must be unique; a quorum of 0 stores an
+    /// empty signer set (single-admin mode).
     pub fn set_multisig(
         env: Env,
         admin: Address,
@@ -1039,35 +1190,11 @@ impl AmmPool {
         quorum: u32,
     ) -> Result<(), AmmError> {
         Self::extend_ttl(&env);
-        let stored_admin: Address = Self::read_admin(&env)?;
-        if admin != stored_admin {
-            return Err(AmmError::Unauthorized);
+        Self::require_admin(&env, &admin)?;
+        if Self::multisig_quorum(&env) > 0 {
+            return Err(AmmError::MultisigGuardActive);
         }
-        admin.require_auth();
-        if quorum > 0 && (quorum as usize) > signers.len() as usize {
-            return Err(AmmError::InvalidFeeBps);
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::MultisigSigners, &signers);
-        env.storage()
-            .instance()
-            .set(&DataKey::MultisigQuorum, &quorum);
-        // Clear any pending proposal when config changes.
-        env.storage().instance().set(
-            &DataKey::MultisigProposalRecipient,
-            &Option::<Address>::None,
-        );
-        env.storage().instance().set(
-            &DataKey::MultisigProposalApprovals,
-            &soroban_sdk::Vec::<Address>::new(&env),
-        );
-        env.storage()
-            .instance()
-            .set(&DataKey::MultisigProposalExpiresAt, &0u64);
-        env.storage()
-            .instance()
-            .set(&DataKey::MultisigProposalExecuted, &false);
+        Self::apply_multisig_config(&env, signers, quorum)?;
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "multisig_set"), admin),
@@ -1079,224 +1206,170 @@ impl AmmPool {
     /// Return the current multisig configuration.
     pub fn get_multisig_config(env: Env) -> MultisigConfig {
         MultisigConfig {
-            signers: env
-                .storage()
-                .instance()
-                .get(&DataKey::MultisigSigners)
-                .unwrap_or_else(|| soroban_sdk::Vec::new(&env)),
-            quorum: env
-                .storage()
-                .instance()
-                .get(&DataKey::MultisigQuorum)
-                .unwrap_or(0),
+            signers: Self::multisig_signers(&env),
+            quorum: Self::multisig_quorum(&env),
         }
     }
 
-    /// Propose an emergency withdrawal (multisig mode).
+    /// Return the current multisig signers and quorum.
+    pub fn get_multisig(env: Env) -> (soroban_sdk::Vec<Address>, u32) {
+        (Self::multisig_signers(&env), Self::multisig_quorum(&env))
+    }
+
+    /// Propose an emergency withdrawal to `recipient` (multisig mode).
     ///
-    /// Any configured signer may call this to initiate or co-sign a proposal.
-    /// Once `quorum` approvals are collected the proposal can be executed via
-    /// `exec_multisig_emergency_wd`.
+    /// Any configured signer may call this; the proposer's approval is recorded
+    /// automatically. Other signers add theirs with `approve_multisig_proposal`.
+    /// Once the quorum is reached and `EmergencyDelaySecs` have passed the
+    /// proposal can be executed via `exec_multisig_emergency_wd`. Returns the
+    /// proposal id.
     pub fn propose_emergency_withdraw(
         env: Env,
         signer: Address,
         recipient: Address,
-    ) -> Result<(), AmmError> {
+    ) -> Result<u64, AmmError> {
         Self::extend_ttl(&env);
         signer.require_auth();
-        let quorum: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultisigQuorum)
-            .unwrap_or(0);
-        if quorum == 0 {
-            return Err(AmmError::Unauthorized); // use emergency_withdraw directly
-        }
-        let signers: soroban_sdk::Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultisigSigners)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-        if !signers.contains(&signer) {
-            return Err(AmmError::Unauthorized);
-        }
-        // Reset approvals if recipient changed.
-        let current_recipient: Option<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultisigProposalRecipient)
-            .unwrap_or(None);
-        let mut approvals: soroban_sdk::Vec<Address> =
-            if current_recipient.as_ref() == Some(&recipient) {
-                env.storage()
-                    .instance()
-                    .get(&DataKey::MultisigProposalApprovals)
-                    .unwrap_or_else(|| soroban_sdk::Vec::new(&env))
-            } else {
-                soroban_sdk::Vec::new(&env)
-            };
-        // Only record a new approval — and only refresh the expiry window — when
-        // this signer has not already approved the same recipient.
-        //
-        // A brand-new proposal (first proposal, or a recipient change which resets
-        // the approval set above) always starts from an empty approval set, so the
-        // proposer is a *new* approval and is granted a fresh TTL window.
-        //
-        // Crucially, re-calling with an already-approved signer must NOT extend
-        // `MultisigProposalExpiresAt`. Otherwise a single signer could keep a stuck
-        // proposal (e.g. 1 of 3 required approvals) alive forever by periodically
-        // re-proposing with their own address and the same recipient, defeating the
-        // `ProposalExpired` freshness/security check on stale multisig proposals.
-        // Since each signer can only add a new approval once (approvals never
-        // contain duplicates and are only cleared on execution or a recipient
-        // change), the expiry can no longer be refreshed indefinitely.
-        let added_approval = !approvals.contains(&signer);
-        if added_approval {
-            approvals.push_back(signer.clone());
-        }
-        env.storage().instance().set(
-            &DataKey::MultisigProposalRecipient,
-            &Some(recipient.clone()),
+        Self::require_signer(&env, &signer)?;
+        Self::validate_emergency_recipient(&env, &recipient)?;
+        let id = Self::create_multisig_proposal(
+            &env,
+            &signer,
+            MultisigAction::EmergencyWithdraw(recipient.clone()),
         );
-        env.storage()
-            .instance()
-            .set(&DataKey::MultisigProposalApprovals, &approvals);
-        if added_approval {
-            env.storage().instance().set(
-                &DataKey::MultisigProposalExpiresAt,
-                &(env.ledger().timestamp() + MULTISIG_PROPOSAL_TTL_SECS),
-            );
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::MultisigProposalExecuted, &false);
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "ms_proposed"), signer),
-            (recipient, approvals.len())
+            (id, recipient)
+        );
+        Ok(id)
+    }
+
+    /// Propose replacing the multisig signer set and quorum. A quorum of 0
+    /// disables the guard. This is the only way to change an active guard.
+    /// Returns the proposal id.
+    pub fn propose_set_multisig(
+        env: Env,
+        signer: Address,
+        new_signers: soroban_sdk::Vec<Address>,
+        new_quorum: u32,
+    ) -> Result<u64, AmmError> {
+        Self::extend_ttl(&env);
+        signer.require_auth();
+        Self::require_signer(&env, &signer)?;
+        Self::validate_multisig_config(&new_signers, new_quorum)?;
+        let id = Self::create_multisig_proposal(
+            &env,
+            &signer,
+            MultisigAction::SetMultisig(new_signers, new_quorum),
+        );
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "ms_set_proposed"), signer),
+            (id, new_quorum)
+        );
+        Ok(id)
+    }
+
+    /// Add `signer`'s approval to multisig proposal `proposal_id`.
+    ///
+    /// Re-approving is a no-op. When the approvals first reach the quorum the
+    /// emergency delay clock starts and the proposal's lifetime is extended once
+    /// to cover it.
+    pub fn approve_multisig_proposal(
+        env: Env,
+        signer: Address,
+        proposal_id: u64,
+    ) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
+        signer.require_auth();
+        Self::require_signer(&env, &signer)?;
+        let mut proposal = Self::load_live_proposal(&env, proposal_id)?;
+        if !proposal.approvals.contains(&signer) {
+            proposal.approvals.push_back(signer.clone());
+            Self::mark_quorum_if_reached(&env, &mut proposal);
+            Self::store_proposal(&env, proposal_id, &proposal);
+        }
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "ms_approved"), signer),
+            (proposal_id, proposal.approvals.len())
         );
         Ok(())
     }
 
-    /// Return the current pending multisig proposal, if any.
-    pub fn get_multisig_proposal(env: Env) -> Option<MultisigProposal> {
-        let recipient: Option<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultisigProposalRecipient)
-            .unwrap_or(None);
-        recipient.map(|r| MultisigProposal {
-            recipient: r,
-            approvals: env
-                .storage()
-                .instance()
-                .get(&DataKey::MultisigProposalApprovals)
-                .unwrap_or_else(|| soroban_sdk::Vec::new(&env)),
-        })
+    /// Return a multisig proposal by id, if it exists.
+    pub fn get_multisig_proposal(env: Env, proposal_id: u64) -> Option<MultisigProposal> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MultisigProposalById(proposal_id))
     }
 
-    /// Execute the pending multisig emergency withdrawal once quorum is reached.
+    /// Execute multisig emergency-withdraw proposal `proposal_id`.
     ///
-    /// Any signer may call this after enough approvals have been collected.
-    pub fn exec_multisig_emergency_wd(env: Env, signer: Address) -> Result<(), AmmError> {
+    /// Any signer may call this once the quorum is reached, the emergency delay
+    /// has passed since it was reached, and the pool is paused. Sweeps reserves
+    /// and accrued protocol fees to the proposal's recipient.
+    pub fn exec_multisig_emergency_wd(
+        env: Env,
+        signer: Address,
+        proposal_id: u64,
+    ) -> Result<(), AmmError> {
         Self::extend_ttl(&env);
+        let _guard = ReentrancyGuard::acquire(&env)?;
         signer.require_auth();
-        let quorum: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultisigQuorum)
-            .unwrap_or(0);
-        if quorum == 0 {
-            return Err(AmmError::Unauthorized);
-        }
-        let signers: soroban_sdk::Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultisigSigners)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-        if !signers.contains(&signer) {
-            return Err(AmmError::Unauthorized);
-        }
-        let executed: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultisigProposalExecuted)
-            .unwrap_or(false);
-        if executed {
-            return Err(AmmError::AlreadyExecuted);
-        }
+        Self::require_signer(&env, &signer)?;
+        let mut proposal = Self::load_live_proposal(&env, proposal_id)?;
+        let MultisigAction::EmergencyWithdraw(to) = proposal.action.clone() else {
+            return Err(AmmError::NoPendingProposal);
+        };
         if Self::is_drained(env.clone()) {
             return Err(AmmError::PoolDrained);
         }
-        let recipient: Option<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultisigProposalRecipient)
-            .unwrap_or(None);
-        let to = recipient.ok_or(AmmError::NoPendingProposal)?;
-        let expires_at: u64 = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultisigProposalExpiresAt)
-            .unwrap_or(0);
-        if env.ledger().timestamp() > expires_at {
-            return Err(AmmError::ProposalExpired);
+        Self::require_quorum_and_delay(&env, &proposal)?;
+        if !Self::is_paused(env.clone()) {
+            return Err(AmmError::Paused);
         }
-        let approvals: soroban_sdk::Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::MultisigProposalApprovals)
-            .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-        if approvals.len() < quorum {
-            return Err(AmmError::QuorumNotMet);
-        }
-        let token_a: Address = Self::read_token_a(&env)?;
-        let token_b: Address = Self::read_token_b(&env)?;
-        let reserve_a = Self::get_reserve_a(env.clone());
-        let reserve_b = Self::get_reserve_b(env.clone());
-        let (accrued_a, accrued_b) = Self::get_accrued_fees(env.clone());
-        let drain_a = reserve_a.saturating_add(accrued_a);
-        let drain_b = reserve_b.saturating_add(accrued_b);
-        if drain_a > 0 {
-            SepTokenClient::new(&env, &token_a).transfer(
-                &env.current_contract_address(),
-                &to,
-                &drain_a,
-            );
-        }
-        if drain_b > 0 {
-            SepTokenClient::new(&env, &token_b).transfer(
-                &env.current_contract_address(),
-                &to,
-                &drain_b,
-            );
-        }
-        env.storage().instance().set(&DataKey::ReserveA, &0_i128);
-        env.storage().instance().set(&DataKey::ReserveB, &0_i128);
-        env.storage().instance().set(&DataKey::AccruedFeeA, &0_i128);
-        env.storage().instance().set(&DataKey::AccruedFeeB, &0_i128);
-        env.storage().instance().set(&DataKey::Drained, &true);
-        env.storage().instance().set(&DataKey::Paused, &true);
-        // Mark executed so re-execution returns AlreadyExecuted.
-        env.storage()
-            .instance()
-            .set(&DataKey::MultisigProposalExecuted, &true);
-        // Clear proposal details.
-        env.storage().instance().set(
-            &DataKey::MultisigProposalRecipient,
-            &Option::<Address>::None,
-        );
-        env.storage().instance().set(
-            &DataKey::MultisigProposalApprovals,
-            &soroban_sdk::Vec::<Address>::new(&env),
-        );
-        env.storage()
-            .instance()
-            .set(&DataKey::MultisigProposalExpiresAt, &0u64);
+        Self::validate_emergency_recipient(&env, &to)?;
+
+        proposal.executed = true;
+        Self::store_proposal(&env, proposal_id, &proposal);
+
+        let (drain_a, drain_b) = Self::drain_to(&env, &to)?;
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "ms_ew"), signer),
             (to, drain_a, drain_b)
+        );
+        Ok(())
+    }
+
+    /// Execute multisig proposal `proposal_id` that replaces the signer set and
+    /// quorum. Requires the current quorum of approvals; no delay applies.
+    pub fn exec_multisig_set_multisig(
+        env: Env,
+        signer: Address,
+        proposal_id: u64,
+    ) -> Result<(), AmmError> {
+        Self::extend_ttl(&env);
+        signer.require_auth();
+        Self::require_signer(&env, &signer)?;
+        let mut proposal = Self::load_live_proposal(&env, proposal_id)?;
+        let MultisigAction::SetMultisig(new_signers, new_quorum) = proposal.action.clone() else {
+            return Err(AmmError::NoPendingProposal);
+        };
+        if (proposal.approvals.len()) < Self::multisig_quorum(&env) {
+            return Err(AmmError::QuorumNotReached);
+        }
+
+        proposal.executed = true;
+        Self::store_proposal(&env, proposal_id, &proposal);
+
+        Self::apply_multisig_config(&env, new_signers, new_quorum)?;
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "multisig_set"), signer),
+            (new_quorum,)
         );
         Ok(())
     }
@@ -1353,12 +1426,261 @@ impl AmmPool {
         Ok(())
     }
 
+    /// The pool's fee invariant (#1107), shared by `initialize*`, `update_fee`
+    /// and `set_protocol_fee`:
+    ///
+    /// - the swap fee passes `validate_fee_bps`, and
+    /// - `0 <= protocol_fee_bps < fee_bps`, or both are 0.
+    ///
+    /// `protocol_fee_bps == fee_bps` would send every swap fee to the protocol
+    /// and leave LPs with nothing (AUDIT M-02 / M-03), and a non-zero protocol
+    /// fee on a zero swap fee has nothing to take a cut of.
+    fn validate_fee_pair(fee_bps: i128, protocol_fee_bps: i128) -> Result<(), AmmError> {
+        Self::validate_fee_bps(fee_bps)?;
+        let ok = if fee_bps == 0 {
+            protocol_fee_bps == 0
+        } else {
+            (0..fee_bps).contains(&protocol_fee_bps)
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(AmmError::InvalidFeeBps)
+        }
+    }
+
     /// Flash loan fee validation: [0, 10_000] bps.
     fn validate_flash_loan_fee_bps(fee_bps: i128) -> Result<(), AmmError> {
         if !(0..=10_000).contains(&fee_bps) {
             return Err(AmmError::InvalidFeeBps);
         }
         Ok(())
+    }
+
+    fn require_signer(env: &Env, signer: &Address) -> Result<(), AmmError> {
+        if Self::multisig_quorum(env) == 0 || !Self::multisig_signers(env).contains(signer) {
+            return Err(AmmError::Unauthorized);
+        }
+        Ok(())
+    }
+
+    fn validate_multisig_config(
+        signers: &soroban_sdk::Vec<Address>,
+        quorum: u32,
+    ) -> Result<(), AmmError> {
+        if quorum > signers.len() {
+            return Err(AmmError::InvalidQuorum);
+        }
+        // A duplicate would make the signer count overstate how many distinct
+        // approvals are possible and could leave the quorum unreachable.
+        for i in 0..signers.len() {
+            for j in (i + 1)..signers.len() {
+                if signers.get(i) == signers.get(j) {
+                    return Err(AmmError::InvalidQuorum);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Store a validated signer set and quorum, invalidating every proposal made
+    /// under the previous configuration.
+    fn apply_multisig_config(
+        env: &Env,
+        signers: soroban_sdk::Vec<Address>,
+        quorum: u32,
+    ) -> Result<(), AmmError> {
+        Self::validate_multisig_config(&signers, quorum)?;
+        let signers = if quorum == 0 {
+            soroban_sdk::Vec::new(env)
+        } else {
+            signers
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigSigners, &signers);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigQuorum, &quorum);
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigEpoch, &(Self::multisig_epoch(env) + 1));
+        Ok(())
+    }
+
+    fn create_multisig_proposal(env: &Env, proposer: &Address, action: MultisigAction) -> u64 {
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::MultisigProposalCount)
+            .unwrap_or(0)
+            + 1;
+        env.storage()
+            .instance()
+            .set(&DataKey::MultisigProposalCount, &id);
+        let mut approvals = soroban_sdk::Vec::new(env);
+        approvals.push_back(proposer.clone());
+        let mut proposal = MultisigProposal {
+            action,
+            approvals,
+            expires_at: env
+                .ledger()
+                .timestamp()
+                .saturating_add(MULTISIG_PROPOSAL_TTL_SECS),
+            quorum_reached_at: 0,
+            epoch: Self::multisig_epoch(env),
+            executed: false,
+        };
+        Self::mark_quorum_if_reached(env, &mut proposal);
+        Self::store_proposal(env, id, &proposal);
+        id
+    }
+
+    /// Start the emergency delay clock the first time approvals reach the
+    /// quorum, extending the proposal's lifetime once so the delay cannot make
+    /// it expire before it can be executed.
+    fn mark_quorum_if_reached(env: &Env, proposal: &mut MultisigProposal) {
+        if proposal.quorum_reached_at == 0 && proposal.approvals.len() >= Self::multisig_quorum(env)
+        {
+            let now = env.ledger().timestamp();
+            proposal.quorum_reached_at = now;
+            proposal.expires_at = proposal.expires_at.max(
+                now.saturating_add(MULTISIG_PROPOSAL_TTL_SECS)
+                    .saturating_add(Self::emergency_delay(env)),
+            );
+        }
+    }
+
+    fn store_proposal(env: &Env, id: u64, proposal: &MultisigProposal) {
+        let key = DataKey::MultisigProposalById(id);
+        env.storage().persistent().set(&key, proposal);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, PROPOSAL_TTL_THRESHOLD, PROPOSAL_TTL_EXTEND_TO);
+    }
+
+    /// Load a proposal that can still be approved or executed.
+    fn load_live_proposal(env: &Env, id: u64) -> Result<MultisigProposal, AmmError> {
+        let proposal: MultisigProposal = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigProposalById(id))
+            .ok_or(AmmError::NoPendingProposal)?;
+        if proposal.executed {
+            return Err(AmmError::AlreadyExecuted);
+        }
+        if proposal.epoch != Self::multisig_epoch(env)
+            || env.ledger().timestamp() > proposal.expires_at
+        {
+            return Err(AmmError::ProposalExpired);
+        }
+        Ok(proposal)
+    }
+
+    fn require_quorum_and_delay(env: &Env, proposal: &MultisigProposal) -> Result<(), AmmError> {
+        if proposal.approvals.len() < Self::multisig_quorum(env) {
+            return Err(AmmError::QuorumNotReached);
+        }
+        let ready_at = proposal
+            .quorum_reached_at
+            .saturating_add(Self::emergency_delay(env));
+        if env.ledger().timestamp() < ready_at {
+            return Err(AmmError::EmergencyDelayNotElapsed);
+        }
+        Ok(())
+    }
+
+    fn require_admin(env: &Env, admin: &Address) -> Result<(), AmmError> {
+        let stored_admin: Address = Self::read_admin(env)?;
+        if *admin != stored_admin {
+            return Err(AmmError::Unauthorized);
+        }
+        admin.require_auth();
+        Ok(())
+    }
+
+    fn multisig_quorum(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MultisigQuorum)
+            .unwrap_or(0)
+    }
+
+    fn multisig_signers(env: &Env) -> soroban_sdk::Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::MultisigSigners)
+            .unwrap_or_else(|| soroban_sdk::Vec::new(env))
+    }
+
+    fn multisig_epoch(env: &Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::MultisigEpoch)
+            .unwrap_or(0)
+    }
+
+    fn emergency_delay(env: &Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::EmergencyDelaySecs)
+            .unwrap_or(DEFAULT_EMERGENCY_DELAY_SECS)
+    }
+
+    /// The pool and its LP token can never be an emergency recipient: funds
+    /// sent there would be unrecoverable or would corrupt share accounting.
+    fn validate_emergency_recipient(env: &Env, to: &Address) -> Result<(), AmmError> {
+        if *to == env.current_contract_address() || *to == Self::read_lp_token(env)? {
+            return Err(AmmError::InvalidRecipient);
+        }
+        Ok(())
+    }
+
+    /// Transfer all reserves and accrued protocol fees to `to` and put the pool
+    /// in its terminal drained state. Returns the amounts moved.
+    fn drain_to(env: &Env, to: &Address) -> Result<(i128, i128), AmmError> {
+        // Record audit information
+        let ts: u64 = env.ledger().timestamp();
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyWithdrawTimestamp, &ts);
+        env.storage()
+            .instance()
+            .set(&DataKey::EmergencyWithdrawRecipient, to);
+
+        let token_a: Address = Self::read_token_a(env)?;
+        let token_b: Address = Self::read_token_b(env)?;
+        let reserve_a = Self::get_reserve_a(env.clone());
+        let reserve_b = Self::get_reserve_b(env.clone());
+        let (accrued_a, accrued_b) = Self::get_accrued_fees(env.clone());
+        let drain_a = reserve_a.saturating_add(accrued_a);
+        let drain_b = reserve_b.saturating_add(accrued_b);
+
+        if drain_a > 0 {
+            SepTokenClient::new(env, &token_a).transfer(
+                &env.current_contract_address(),
+                to,
+                &drain_a,
+            );
+        }
+        if drain_b > 0 {
+            SepTokenClient::new(env, &token_b).transfer(
+                &env.current_contract_address(),
+                to,
+                &drain_b,
+            );
+        }
+
+        // Zero out reserves and accrued protocol fees. The pool enters a terminal
+        // Drained state (#1095) so existing LP tokens cannot drain subsequent deposits.
+        // TotalShares and MinLiquidityLocked are left intact to record historical LP shares.
+        env.storage().instance().set(&DataKey::ReserveA, &0_i128);
+        env.storage().instance().set(&DataKey::ReserveB, &0_i128);
+        env.storage().instance().set(&DataKey::AccruedFeeA, &0_i128);
+        env.storage().instance().set(&DataKey::AccruedFeeB, &0_i128);
+        env.storage().instance().set(&DataKey::Drained, &true);
+        env.storage().instance().set(&DataKey::Paused, &true);
+        Ok((drain_a, drain_b))
     }
 
     fn extend_ttl(env: &Env) {
@@ -1409,23 +1731,26 @@ impl AmmPool {
     /// - `admin` - must match the stored admin address.
     /// - `new_fee_bps` - new swap fee in basis points; must be in [0, 10_000).
     ///
+    /// # Errors
+    /// - `InvalidFeeBps` if `new_fee_bps` is outside [0, 10_000).
+    /// - `InvalidFeeBps` if the new fee and the current `protocol_fee_bps` would
+    ///   break the invariant (`protocol_fee_bps < fee_bps`, or both 0). The
+    ///   call is rejected as a whole: the protocol fee is never silently
+    ///   clamped, so lowering the fee below the protocol cut means lowering
+    ///   `set_protocol_fee` first.
+    ///
     /// # Panics
     /// - If `admin` auth fails.
-    /// - If `new_fee_bps` is outside [0, 10_000).
-    /// - If `new_fee_bps` is less than the current `protocol_fee_bps`.
     pub fn update_fee(env: Env, new_fee_bps: i128) -> Result<(), AmmError> {
         Self::extend_ttl(&env);
         let admin: Address = Self::read_admin(&env)?;
         admin.require_auth();
-        Self::validate_fee_bps(new_fee_bps)?;
         let protocol_fee_bps: i128 = env
             .storage()
             .instance()
             .get(&DataKey::ProtocolFeeBps)
             .unwrap_or(0);
-        if new_fee_bps < protocol_fee_bps {
-            return Err(AmmError::InvalidFeeBps);
-        }
+        Self::validate_fee_pair(new_fee_bps, protocol_fee_bps)?;
         env.storage().instance().set(&DataKey::FeeBps, &new_fee_bps);
         soroban_amm_sdk::emit_versioned_event!(
             env,
