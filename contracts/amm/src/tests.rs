@@ -2,9 +2,9 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
+    testutils::{Address as _, Events, Ledger},
     token::{StellarAssetClient, TokenClient as StellarTokenClient},
-    Env, IntoVal,
+    Env,
 };
 use token::LpToken;
 
@@ -4778,7 +4778,7 @@ fn setup_pool_with_emergency_delay(fee_bps: i128, delay_secs: u64) -> TestSetup 
     }
 }
 
-fn seed_pool(ts: &TestSetup) -> i128 {
+pub(crate) fn seed_pool(ts: &TestSetup) -> i128 {
     let amm = AmmPoolClient::new(&ts.env, &ts.amm_addr);
     let ta_sac = StellarAssetClient::new(&ts.env, &ts.ta_addr);
     let tb_sac = StellarAssetClient::new(&ts.env, &ts.tb_addr);
@@ -5629,102 +5629,3 @@ fn test_fot_token_two_percent_deduction_mints_from_actual_and_locks() {
     let lp = token::LpTokenClient::new(&env, &lp_addr);
     assert_eq!(lp.balance(&amm_addr), 1_000);
 }
-
-/// Verifies no-auth, stranger-auth, and correct-signer-auth behavior for one
-/// valid invocation. The function name is included in every failure.
-fn assert_requires_auth<T>(
-    env: &Env,
-    contract_id: &Address,
-    signer_expected: &Address,
-    stranger: &Address,
-    function_name: &str,
-    args: soroban_sdk::Val,
-    invoke: impl Fn() -> Result<Result<T, AmmError>, soroban_sdk::InvokeError>,
-) {
-    env.set_auths(&[]);
-    assert!(matches!(invoke(), Err(Err(_))), "{function_name}: no authorization did not produce a host auth error");
-
-    env.mock_auths(&[MockAuth {
-        address: stranger,
-        invoke: &MockAuthInvoke {
-            contract: contract_id,
-            fn_name: function_name,
-            args: args.clone(),
-            sub_invokes: &[],
-        },
-    }]);
-    assert!(matches!(invoke(), Err(Err(_))), "{function_name}: stranger authorization did not produce a host auth error");
-
-    env.mock_auths(&[MockAuth {
-        address: signer_expected,
-        invoke: &MockAuthInvoke {
-            contract: contract_id,
-            fn_name: function_name,
-            args,
-            sub_invokes: &[],
-        },
-    }]);
-    assert!(matches!(invoke(), Ok(Ok(_))), "{function_name}: correct signer authorization failed");
-}
-
-#[test]
-fn test_accept_admin_requires_auth() {
-    let ts=setup_pool(30); let env=&ts.env; let amm=AmmPoolClient::new(env,&ts.amm_addr);
-    let nominee=Address::generate(env); let stranger=Address::generate(env);
-    env.mock_all_auths(); amm.propose_admin(&ts.admin,&nominee);
-    env.mock_all_auths(); assert_eq!(amm.try_accept_admin(&stranger),Err(Ok(AmmError::WrongAdmin)),"accept_admin: stranger address must be rejected");
-    env.mock_all_auths();
-    assert_requires_auth(env,&ts.amm_addr,&nominee,&stranger,"accept_admin",(nominee.clone(),).into_val(env),||amm.try_accept_admin(&nominee));
-}
-
-#[test]
-fn test_emergency_withdraw_requires_auth() {
-    let ts=setup_pool(30); let env=&ts.env; let amm=AmmPoolClient::new(env,&ts.amm_addr);
-    seed_pool(&ts); let recipient=Address::generate(env); let stranger=Address::generate(env);
-    env.mock_all_auths(); amm.pause(); amm.announce_emergency_withdraw(&ts.admin,&recipient);
-    env.ledger().set_timestamp(env.ledger().timestamp()+86_400);
-    assert_requires_auth(env,&ts.amm_addr,&ts.admin,&stranger,"emergency_withdraw",(ts.admin.clone(),recipient.clone()).into_val(env),||amm.try_emergency_withdraw(&ts.admin,&recipient));
-    env.mock_all_auths(); assert_eq!(amm.try_emergency_withdraw(&stranger,&recipient),Err(Ok(AmmError::Unauthorized)),"emergency_withdraw: stranger admin must be rejected");
-}
-
-#[test]
-fn test_force_unlock_requires_auth() { let ts=setup_pool(30); let env=&ts.env; let amm=AmmPoolClient::new(env,&ts.amm_addr); let stranger=Address::generate(env); let callers=soroban_sdk::Vec::<Address>::new(env); assert_requires_auth(env,&ts.amm_addr,&ts.admin,&stranger,"force_unlock",(callers.clone(),).into_val(env),||amm.try_force_unlock(&callers)); }
-
-#[test]
-fn test_pause_requires_auth() { let ts=setup_pool(30); let env=&ts.env; let amm=AmmPoolClient::new(env,&ts.amm_addr); let stranger=Address::generate(env); assert_requires_auth(env,&ts.amm_addr,&ts.admin,&stranger,"pause",().into_val(env),||amm.try_pause()); }
-
-#[test]
-fn test_propose_admin_requires_auth() { let ts=setup_pool(30); let env=&ts.env; let amm=AmmPoolClient::new(env,&ts.amm_addr); let nominee=Address::generate(env); let stranger=Address::generate(env); assert_requires_auth(env,&ts.amm_addr,&ts.admin,&stranger,"propose_admin",(ts.admin.clone(),nominee.clone()).into_val(env),||amm.try_propose_admin(&ts.admin,&nominee)); env.mock_all_auths(); assert_eq!(amm.try_propose_admin(&stranger,&nominee),Err(Ok(AmmError::Unauthorized)),"propose_admin: stranger admin must be rejected"); }
-
-#[test]
-fn test_set_circuit_breaker_config_requires_auth() { let ts=setup_pool(30); let env=&ts.env; let amm=AmmPoolClient::new(env,&ts.amm_addr); let stranger=Address::generate(env); assert_requires_auth(env,&ts.amm_addr,&ts.admin,&stranger,"set_circuit_breaker_config",(5_000_i128,300_u64).into_val(env),||amm.try_set_circuit_breaker_config(&5_000,&300)); }
-
-#[test]
-fn test_set_lp_locker_requires_auth() { let ts=setup_pool(30); let env=&ts.env; let amm=AmmPoolClient::new(env,&ts.amm_addr); let locker=Address::generate(env); let stranger=Address::generate(env); assert_requires_auth(env,&ts.amm_addr,&ts.admin,&stranger,"set_lp_locker",(locker.clone(),).into_val(env),||amm.try_set_lp_locker(&locker)); }
-
-#[test]
-fn test_set_lp_rebate_requires_auth() { let ts=setup_pool(30); let env=&ts.env; let amm=AmmPoolClient::new(env,&ts.amm_addr); let stranger=Address::generate(env); assert_requires_auth(env,&ts.amm_addr,&ts.admin,&stranger,"set_lp_rebate",(ts.admin.clone(),1_000_i128).into_val(env),||amm.try_set_lp_rebate(&ts.admin,&1_000)); env.mock_all_auths(); assert_eq!(amm.try_set_lp_rebate(&stranger,&1_000),Err(Ok(AmmError::Unauthorized)),"set_lp_rebate: stranger admin must be rejected"); }
-
-#[test]
-fn test_set_max_oracle_deviation_bps_requires_auth() { let ts=setup_pool(30); let env=&ts.env; let amm=AmmPoolClient::new(env,&ts.amm_addr); let stranger=Address::generate(env); assert_requires_auth(env,&ts.amm_addr,&ts.admin,&stranger,"set_max_oracle_deviation_bps",(ts.admin.clone(),500_i128).into_val(env),||amm.try_set_max_oracle_deviation_bps(&ts.admin,&500)); env.mock_all_auths(); assert_eq!(amm.try_set_max_oracle_deviation_bps(&stranger,&500),Err(Ok(AmmError::Unauthorized)),"set_max_oracle_deviation_bps: stranger admin must be rejected"); }
-
-#[test]
-fn test_set_multisig_requires_auth() { let ts=setup_pool(30); let env=&ts.env; let amm=AmmPoolClient::new(env,&ts.amm_addr); let empty=soroban_sdk::Vec::<Address>::new(env); let stranger=Address::generate(env); assert_requires_auth(env,&ts.amm_addr,&ts.admin,&stranger,"set_multisig",(ts.admin.clone(),empty.clone(),0_u32).into_val(env),||amm.try_set_multisig(&ts.admin,&empty,&0)); env.mock_all_auths(); assert_eq!(amm.try_set_multisig(&stranger,&empty,&0),Err(Ok(AmmError::Unauthorized)),"set_multisig: stranger admin must be rejected"); }
-
-#[test]
-fn test_set_oracle_requires_auth() { let ts=setup_pool(30); let env=&ts.env; let amm=AmmPoolClient::new(env,&ts.amm_addr); let stranger=Address::generate(env); assert_requires_auth(env,&ts.amm_addr,&ts.admin,&stranger,"set_oracle",(ts.admin.clone(),Option::<Address>::None).into_val(env),||amm.try_set_oracle(&ts.admin,&None)); env.mock_all_auths(); assert_eq!(amm.try_set_oracle(&stranger,&None),Err(Ok(AmmError::Unauthorized)),"set_oracle: stranger admin must be rejected"); }
-
-#[test]
-fn test_set_protocol_fee_requires_auth() { let ts=setup_pool(30); let env=&ts.env; let amm=AmmPoolClient::new(env,&ts.amm_addr); let recipient=Address::generate(env); let stranger=Address::generate(env); assert_requires_auth(env,&ts.amm_addr,&ts.admin,&stranger,"set_protocol_fee",(ts.admin.clone(),recipient.clone(),10_i128).into_val(env),||amm.try_set_protocol_fee(&ts.admin,&recipient,&10)); env.mock_all_auths(); assert_eq!(amm.try_set_protocol_fee(&stranger,&recipient,&10),Err(Ok(AmmError::Unauthorized)),"set_protocol_fee: stranger admin must be rejected"); }
-
-#[test]
-fn test_unpause_requires_auth() { let ts=setup_pool(30); let env=&ts.env; let amm=AmmPoolClient::new(env,&ts.amm_addr); let stranger=Address::generate(env); env.mock_all_auths(); amm.pause(); assert_requires_auth(env,&ts.amm_addr,&ts.admin,&stranger,"unpause",().into_val(env),||amm.try_unpause()); }
-
-#[test]
-fn test_update_fee_requires_auth() { let ts=setup_pool(30); let env=&ts.env; let amm=AmmPoolClient::new(env,&ts.amm_addr); let stranger=Address::generate(env); assert_requires_auth(env,&ts.amm_addr,&ts.admin,&stranger,"update_fee",(20_i128,).into_val(env),||amm.try_update_fee(&20)); }
-
-#[test]
-fn test_update_flash_loan_fee_requires_auth() { let ts=setup_pool(30); let env=&ts.env; let amm=AmmPoolClient::new(env,&ts.amm_addr); let stranger=Address::generate(env); assert_requires_auth(env,&ts.amm_addr,&ts.admin,&stranger,"update_flash_loan_fee",(9_i128,).into_val(env),||amm.try_update_flash_loan_fee(&9)); }
-
-#[test]
-fn test_upgrade_requires_auth() { let ts=setup_pool(30); let env=&ts.env; let amm=AmmPoolClient::new(env,&ts.amm_addr); let stranger=Address::generate(env); let wasm_hash=env.deployer().upload_contract_wasm(crate::WASM); assert_requires_auth(env,&ts.amm_addr,&ts.admin,&stranger,"upgrade",(wasm_hash.clone(),).into_val(env),||amm.try_upgrade(&wasm_hash)); }
