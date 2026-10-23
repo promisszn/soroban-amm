@@ -1013,7 +1013,7 @@ impl TwapConsumer {
     /// `TwapEntry`).
     ///
     /// Returns the first error encountered, like `twal_consumer::get_twal_all`,
-    /// so one bad pool fails the whole call. Prefer [`Self::get_twap_all_safe`],
+    /// so one bad pool fails the whole call. Prefer `get_twap_all_safe`,
     /// which reports a result or an error per pool and never aborts. A pool
     /// that does not implement the interface its type implies yields
     /// `CrossContractCallFailed` rather than a host trap (#964).
@@ -1041,7 +1041,7 @@ impl TwapConsumer {
         Ok(results)
     }
 
-    /// Fault-isolated version of [`Self::get_twap_all`]: exactly one
+    /// Fault-isolated version of `get_twap_all`: exactly one
     /// [`TwapSafeEntry`] per tracked pool. A pool with too little history, a
     /// zero elapsed time, a non-contract address or a panicking oracle yields
     /// `ok: false` with its `TwapError` code in that slot and does not affect
