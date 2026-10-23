@@ -2586,10 +2586,7 @@ mod tests {
         let admin = Address::generate(&env);
         let stranger = Address::generate(&env);
         let auction_addr = env.register_contract(None, BatchAuction);
-        let args = Vec::from_array(
-            &env,
-            [admin.clone().into_val(&env), 30_u64.into_val(&env)],
-        );
+        let args = Vec::from_array(&env, [admin.clone().into_val(&env), 30_u64.into_val(&env)]);
 
         assert_requires_auth(
             &env,
@@ -2672,7 +2669,10 @@ mod tests {
 
         let args = Vec::from_array(
             &env,
-            [admin.clone().into_val(&env), factory_addr.clone().into_val(&env)],
+            [
+                admin.clone().into_val(&env),
+                factory_addr.clone().into_val(&env),
+            ],
         );
         assert_requires_auth(
             &env,
@@ -2745,7 +2745,10 @@ mod tests {
         client.initialize(&admin, &30_u64);
         client.add_venue(&admin, &pool, &PoolType::Amm);
 
-        let args = Vec::from_array(&env, [admin.clone().into_val(&env), pool.clone().into_val(&env)]);
+        let args = Vec::from_array(
+            &env,
+            [admin.clone().into_val(&env), pool.clone().into_val(&env)],
+        );
         assert_requires_auth(
             &env,
             &auction_addr,
