@@ -9,9 +9,10 @@
 //!
 //! # Pausing policy
 //! When paused (via `pause` or circuit breaker trip), swaps, deposits
-//! (`add_liquidity`, `add_liquidity_fot`), and `flash_loan` are blocked.
-//! Liquidity withdrawals (`remove_liquidity` and `remove_liquidity_one_sided`)
-//! remain open so LP funds are never trapped.
+//! (`add_liquidity`, `add_liquidity_fot`), `flash_loan` and
+//! `remove_liquidity_one_sided` (which swaps against the reserves) are
+//! blocked. `remove_liquidity` stays open: it pays out pro rata with no price
+//! impact, so LP funds are never trapped.
 
 #![no_std]
 
@@ -2190,6 +2191,7 @@ impl AmmPool {
     /// - If `provider` owns fewer shares than `shares`.
     /// - If `token_out` is not one of the two pool tokens.
     /// - If the computed output would be less than `min_out`.
+    /// - If the pool is paused (use `remove_liquidity` to exit pro rata).
     #[allow(clippy::too_many_arguments)]
     pub fn remove_liquidity_one_sided(
         env: Env,
@@ -2206,7 +2208,12 @@ impl AmmPool {
         if deadline < env.ledger().timestamp() {
             return Err(AmmError::DeadlineExceeded);
         }
-        // No pause guard -- LPs must always be able to exit.
+        // Unlike `remove_liquidity`, this entrypoint swaps against the pool's own
+        // reserves, so the pause (and a circuit breaker trip) must stop it. An LP
+        // can still exit pro rata through `remove_liquidity`.
+        if Self::is_paused(env.clone()) {
+            return Err(AmmError::Paused);
+        }
         // Acquire the reentrancy lock for the duration of this call; a
         // reentrant call arriving via a token/receiver callback is rejected
         // here with `Reentrant`, and the lock is released automatically
