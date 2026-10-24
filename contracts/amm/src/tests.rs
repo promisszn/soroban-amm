@@ -5679,6 +5679,23 @@ fn test_remove_liquidity_while_paused_pays_out_pro_rata() {
 }
 
 #[test]
+fn test_exits_allowed_when_paused_view_matches_behaviour() {
+    let (ts, provider, shares) = paused_policy_pool();
+    let amm = AmmPoolClient::new(&ts.env, &ts.amm_addr);
+
+    // The view is a policy flag, so it holds before and after a pause...
+    assert!(amm.exits_allowed_when_paused());
+    amm.pause();
+    assert!(amm.is_paused());
+    assert!(amm.exits_allowed_when_paused());
+
+    // ...and it is backed by the entrypoint it advertises.
+    assert!(amm
+        .try_remove_liquidity(&provider, &(shares / 2), &0, &0, &u64::MAX)
+        .is_ok());
+}
+
+#[test]
 fn test_remove_liquidity_one_sided_blocked_while_paused() {
     let (ts, provider, shares) = paused_policy_pool();
     let amm = AmmPoolClient::new(&ts.env, &ts.amm_addr);

@@ -660,6 +660,19 @@ impl AmmPool {
         Ok(())
     }
 
+    /// Whether LPs can still redeem through `remove_liquidity` while the pool
+    /// is paused. Always `true`: the pro-rata exit has no pause guard, so
+    /// integrators, routers and UIs can use this to confirm that funds are
+    /// never trapped by a pause or circuit breaker trip.
+    ///
+    /// Only `remove_liquidity` is covered. `remove_liquidity_one_sided` swaps
+    /// against the reserves and is blocked while paused, and a pool drained by
+    /// an emergency withdrawal rejects every exit (see `is_drained`).
+    pub fn exits_allowed_when_paused(env: Env) -> bool {
+        Self::extend_ttl(&env);
+        true
+    }
+
     pub fn is_paused(env: Env) -> bool {
         env.storage()
             .instance()
