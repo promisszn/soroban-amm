@@ -1998,6 +1998,9 @@ impl Factory {
 //   cargo test -p factory
 
 #[cfg(test)]
+mod guard_tests;
+
+#[cfg(test)]
 mod tests {
     extern crate std;
     use super::*;
