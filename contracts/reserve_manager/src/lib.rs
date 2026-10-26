@@ -937,6 +937,9 @@ impl ReserveManager {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod auth_tests;
+
+#[cfg(test)]
 mod tests {
     use amm::AmmPool;
     use soroban_sdk::{
