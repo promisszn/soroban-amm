@@ -3679,6 +3679,9 @@ pub(crate) mod tests;
 #[cfg(test)]
 mod auth_tests;
 
+#[cfg(test)]
+mod guard_tests;
+
 // ── Property-based tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
