@@ -1212,6 +1212,9 @@ mod mock_cl_pool {
 use mock_cl_pool::{MockClPool, MockClPoolClient};
 
 #[cfg(test)]
+mod auth_tests;
+
+#[cfg(test)]
 mod tests {
     extern crate std;
     use super::*;
