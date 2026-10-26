@@ -3008,3 +3008,6 @@ mod tests_issue_1112;
 
 #[cfg(test)]
 mod auth_tests;
+
+#[cfg(test)]
+mod guard_tests;
