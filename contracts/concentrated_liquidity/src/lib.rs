@@ -11095,6 +11095,8 @@ mod test_range_order_fill_status {
 }
 
 #[cfg(test)]
+mod auth_tests;
+#[cfg(test)]
 mod tests_issue_1100;
 #[cfg(test)]
 mod tests_issue_1102;
