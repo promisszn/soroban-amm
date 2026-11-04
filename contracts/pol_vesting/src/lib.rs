@@ -947,6 +947,9 @@ impl PolVestingContract {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod auth_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sdk::{
