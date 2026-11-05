@@ -58,7 +58,7 @@ jobs:
             # fast, and does not need this job's compiler to match the CLI's
             # locked dependency tree the way `cargo install` would.
             - name: Install Stellar CLI
-              uses: stellar/stellar-cli@v27.1.0
+              uses: stellar/stellar-cli@v30.0.1
             - name: Setup Node for documentation checks
               uses: actions/setup-node@v7
               with:
