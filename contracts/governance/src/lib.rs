@@ -2069,6 +2069,9 @@ impl Governance {
 mod auth_tests;
 
 #[cfg(test)]
+mod lifecycle_tests;
+
+#[cfg(test)]
 mod tests {
     extern crate std;
     use super::*;
