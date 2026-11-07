@@ -2328,6 +2328,9 @@ impl Staking {
 mod cap_tests;
 
 #[cfg(test)]
+mod guard_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sdk::{
