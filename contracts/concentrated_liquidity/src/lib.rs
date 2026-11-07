@@ -11102,6 +11102,9 @@ mod tests_issue_1102;
 mod tests_issue_1103;
 
 #[cfg(test)]
+mod guard_tests;
+
+#[cfg(test)]
 mod test_issue_1099_tick_sqrt_price_precision {
     extern crate std;
     use super::*;
