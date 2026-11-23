@@ -39,6 +39,12 @@
 > with `--target wasm32v1-none` and warns if stale `wasm32-unknown-unknown`
 > artifacts are present.
 
+> **bash 4+ is required.** macOS ships `/bin/bash` 3.2, which does not support
+> associative arrays. `scripts/deploy/common.sh` checks the version at startup
+> and exits immediately with a clear error and install instructions if bash 3.2
+> is detected. Install bash 4+ via Homebrew (`brew install bash`) and invoke
+> the script with the full path: `/opt/homebrew/bin/bash scripts/deploy.sh`.
+
 The pinned Stellar CLI version (25.1.0) is the version used in CI and in the
 `Dockerfile` (`rust:1.93.0-slim` base). Newer CLI versions may change `stellar
 contract upload` / `invoke` flag names — pin to avoid silent breakage.
@@ -101,13 +107,16 @@ exist (testnet only).
 cargo build --release --target wasm32v1-none
 # Or via Make:
 make build
-# To shrink binaries 20–40% for upload limits:
+# Optimize artifacts (20–40% smaller) — REQUIRED for concentrated_liquidity
+# and factory, both of which exceed the 131 072-byte network cap unoptimized:
 make optimize
 ```
 
-The deploy script also builds automatically if any expected
-`target/wasm32v1-none/release/*.wasm` file is missing, but pre-building lets
-you verify the build succeeds before touching the network.
+The deploy script also builds automatically if any expected artifact is
+missing. **Run `make optimize` before deploying** — `scripts/deploy.sh` now
+prefers the optimized artifacts under `optimized-artifacts/` when they exist,
+and enforces the 131 072-byte network cap before each upload (failing early
+with a clear message instead of surfacing `TxSorobanInvalid` from the RPC).
 
 Expected artifacts (18 deployable crates):
 
@@ -119,6 +128,7 @@ concentrated_liquidity.wasm
 governance.wasm
 staking.wasm
 twap_consumer.wasm
+oracle_adapters.wasm
 twal_consumer.wasm
 oracle_aggregator.wasm
 router.wasm
@@ -158,8 +168,9 @@ governance ──► staking (needs LP token + reward token) ──────�
        ├──► pol_vesting (needs governance + treasury)             │
        └──► reserve_manager (needs governance + factory)          │
                                                                 │
-factory ──► router, batch_router, dex_aggregator (needs factory)  │
+factory ──► router, dex_aggregator (needs factory)                │
 admin ──► batch_auction (needs admin + window)                    │
+            └──► batch_router (fronts the auction; needs factory) │
 pools ──► v2_to_v3_migration (needs both V2 and V3 pool)          │
 ```
 
@@ -173,16 +184,17 @@ pools ──► v2_to_v3_migration (needs both V2 and V3 pool)          │
 | 4 | **Pools via Factory** (`create_pool`, `create_cl_pool`) | Factory + Token A/B | Factory deploys LP token (admin = pool) and AMM pool in one tx, enforces pair uniqueness, registers in `Pool(token_a,token_b) → pool`. CL pool needs `initial_tick` and `tick_spacing` derived from fee tier. Pools are **never** deployed directly — the factory path guarantees `Pool → LpToken` linkage and indexing for `dex_aggregator`. |
 | 5 | **Governance** | AMM pool + LP token | LP-weighted voting: `balance_at` snapshots need the LP token's checkpoint history. Governance becomes the LP token's `locker` so `vote` can lock shares during the voting window. Factory wiring: if pools were created with a `governance_wasm_hash`, factory already deployed governance; otherwise deploy here. |
 | 6 | **Oracle Aggregator** | Admin only | Standalone median-price aggregator over fresh, agreeing sources. No pool dependency for deployment, but pools can later `set_oracle` to wire it. Deploy early so pools can be configured with it immediately after. |
-| 7 | **TWAP Consumer / TWAL Consumer** | Keeper (admin) + pools (optional) | Read `get_price_cumulative` / `get_liquidity_cumulative` from pools and store snapshots. Initialized with a `keeper` address authorized to call `save_snapshot`. No pool required at init — keeper can start snapshotting after. |
+| 7 | **TWAP Consumer / TWAL Consumer** | Keeper (admin) + pools | Read `get_price_cumulative` / `get_liquidity_cumulative` from pools and store snapshots. Initialized with a `keeper` address authorized to call `save_snapshot`. No pool required at init, but they run after the pools so `deploy.sh` can register the AMM and CL pools with the TWAL consumer (`add_tracked_pool`) straight away. |
 | 8 | **Staking** | LP token + Reward token + admin | Users stake LP tokens for reward-token emissions. Boost-lock config (`min_boost=1x`, `max_boost=2.5x`, `min_lock=7d`, `max_lock=4y`) is set at init. Needs LP token address to transfer stakes. |
 | 9 | **Incentive Campaigns** | Governance | Governance creates time-based campaigns with `reward_rate * duration <= funding`. Needs governance address so only governance can call `create_campaign`. |
 | 10 | **POL Vesting** | Governance + Treasury | Linear vesting of POL LP tokens between `cliff_ledger` and `end_ledger`. Governance creates/revokes, treasury receives revoked tokens. |
 | 11 | **Reserve Manager** | Governance + Factory | Off-chain gate `check_reserves(pool)` — reads `get_info()` and compares to `min_reserve` per pair. No AMM hook (see issue #518); bots/dashboards call it before migration. |
-| 12 | **Router / Batch Router** | Factory | Multi-hop `swap_exact_in` across pools discovered via `factory.get_pool`. Atomic batch of swaps/liquidity ops. |
+| 12 | **Router** | Factory | Multi-hop `swap_exact_in` across pools discovered via `factory.get_pool`. |
 | 13 | **DEX Aggregator** | Factory + Admin + CL pools | Cross-venue best-execution router over AMM + CL pools. Initialized with `MaxHops=4`, `MAX_CL_POOLS=50`, `CL_FEE_TIERS=[30,100,500]`. CL pools must be `register_cl_pool`ed before they participate in routing. |
 | 14 | **Batch Auction** | Admin + `batch_window_secs` | Collects orders for `batch_window_secs` then `settle_batch` atomically. Needs no pool at init — validates `pool_matches_pair` at `submit_order`. |
-| 15 | **CL Position NFT** | CL pool | ERC-721 receipt for CL positions. Only `cl_pool` may `mint`/`burn`. After deploy, `cl_pool.set_position_nft(nft)` wires it so positions automatically mint an NFT. |
-| 16 | **V2 → V3 Migration** | V2 pool + V3 pool + admin | Burns V2 LP shares and mints a CL position in one tx. Verifies `token_a/token_b` match or reverts `TokenMismatch`. |
+| 15 | **Batch Router** | Factory (+ Batch Auction) | Atomic batch of swaps/liquidity ops resolved through the factory. Deployed right after the auction it fronts, so a deployment never ends up with an auction and no router. |
+| 16 | **CL Position NFT** | CL pool | ERC-721 receipt for CL positions. Only `cl_pool` may `mint`/`burn`. After deploy, `cl_pool.set_position_nft(nft)` wires it so positions automatically mint an NFT. |
+| 17 | **V2 → V3 Migration** | V2 pool + V3 pool + admin | Burns V2 LP shares and mints a CL position in one tx. Verifies `token_a/token_b` match or reverts `TokenMismatch`. |
 
 Within `scripts/deploy.sh` these steps are executed by `deploy_tokens`, `deploy_factory`,
 `deploy_pools`, `deploy_governance`, etc., each respecting `--only`/`--skip`.
@@ -330,6 +342,10 @@ Needs `MIN_VALID_SOURCES=2` fresh, agreeing sources to return non-zero confidenc
 | `keeper` | `ADMIN_ADDRESS` | Authorized to `save_snapshot(pool)` / `save_cl_snapshot`. Run a cron (e.g. every 60s) calling `save_snapshot`. |
 | `SNAPSHOT_TTL_LEDGERS` | `120960` (~7 days at 5s/ledger) | Snapshots evicted after TTL — keeper must snapshot frequently enough that `get_twap_price(pool, window)` can always find `now_ts - window`. |
 
+When `ADMIN_ADDRESS` is the deploying account, `deploy.sh` also registers the
+deployed AMM pool (`Amm`) and CL pool (`Cl`) with the TWAL consumer. With a
+separate keeper it prints the `add_tracked_pool` commands for the keeper to run.
+
 TWAP is `(cum_a_now - cum_a_then) / window` scaled by `1_000_000`. CL path uses `get_tick_cumulative`. TWAL differences `active_liquidity * elapsed`.
 
 ### 3.12 Router / Batch Router / DEX Aggregator / Batch Auction
@@ -342,7 +358,7 @@ TWAP is `(cum_a_now - cum_a_then) / window` scaled by `1_000_000`. CL path uses 
 |  | `factory` | `FACTORY_CONTRACT_ID` |  |
 |  | `max_hops` | `4` (default) | 4-hop paths are exhaustive enough without excessive gas. |
 | **Batch Auction** | `admin` | `ADMIN_ADDRESS` |  |
-|  | `batch_window_secs` | `60` | Orders collected for 60s, then `settle_batch` executes atomically. Lower = more latency-sensitive, higher = more orders per batch but slower fills. Max orders default `50`, ceiling `200`. |
+|  | `batch_window_secs` | `60` | Orders collected for 60s, then `settle_batch` executes atomically. Lower = more latency-sensitive, higher = more orders per batch but slower fills. Max orders default `50`, ceiling `200`. The window must lie within the contract's bounds (default 5 s to 1 day, admin-settable up to 30 days with `set_window_bounds`); `initialize` and `set_batch_window` reject anything else with `InvalidBatchWindow`. |
 
 ### 3.13 CL Position NFT (`cl_position_nft`)
 
@@ -360,11 +376,26 @@ TWAP is `(cum_a_now - cum_a_then) / window` scaled by `1_000_000`. CL path uses 
 | `v2_pool` | `AMM_POOL_CONTRACT_ID` |
 | `v3_pool` | `CL_POOL_CONTRACT_ID` |
 
-Verifies `token_a/token_b` match or reverts `TokenMismatch`. Sentinel ticks `i32::MIN`/`MAX` map to `current_tick ± width` for single-sided migration.
+Verifies `token_a/token_b` match in either order or reverts `TokenMismatch`. The
+migration mints the CL position directly for the LP and maps token amounts into
+the V3 pool's order. Sentinel ticks `i32::MIN`/`MAX` derive bounds from
+`current_tick ± width`, round outward to `tick_spacing`, and clamp to the usable
+CL tick range. Explicit ticks must already be aligned. Configure the two deposit
+minimums in V3 token order; the result reports actual deposits, LP-held
+leftovers, final ticks, and the optional position NFT token ID.
 
 ---
 
 ## 4. Post-Deployment Verification
+
+> **Initialization window:** `token::initialize` performs no authorization
+> check — it only checks that the contract is not already initialized. Between
+> the deploy transaction and the initialize transaction there is a window in
+> which a third party could call `initialize` first and set themselves as admin.
+> `scripts/deploy/token.sh` closes this window by calling `initialize` in the
+> immediately following transaction and then asserting the admin with
+> `verify_token`, which now fails fatally on a mismatch. Factory-deployed pools
+> are not affected (factory deploys and initializes in one invocation).
 
 A deployment that "succeeded" (zero exit code) but left a contract
 uninitialized costs the most to debug later. Run these checks manually or rely
@@ -377,7 +408,7 @@ After each `initialize`, the script reads state and asserts:
 
 | Contract | Verification call | Asserts |
 |----------|-------------------|---------|
-| Token A/B/Reward | `name`, `total_supply`, `admin` | `admin == $SOURCE_PUBLIC_KEY`, `name` readable |
+| Token A/B/Reward | `admin` | `admin == $SOURCE_PUBLIC_KEY`; mismatch is **fatal** — indicates a front-run |
 | Factory | `get_pool_count`, `get_pools` | Hashes registered, count readable; `creation_paused == false` (unless paused) |
 | AMM Pool (via factory) | `get_info` | `token_a/b == expected`, `fee_bps == 30`, `total_shares == 0`, `admin == gov or factory_admin` |
 | LP Token | `admin` | `admin == AMM_POOL_CONTRACT_ID` |
@@ -386,16 +417,24 @@ After each `initialize`, the script reads state and asserts:
 | LP locker | `locker` on LP token | `locker == GOVERNANCE_CONTRACT_ID` |
 | Staking | `get_pool_info` | `lp_token == LP_TOKEN`, `reward_token == REWARD_TOKEN` |
 | Oracle Aggregator | `get_sources` / `get_admin` | `admin == ADMIN_ADDRESS` |
-| TWAP/TWAL Consumer | `get_keeper` | `keeper == ADMIN_ADDRESS` |
-| Router/Batch Router | `get_factory` (if exposed) | `factory == FACTORY_CONTRACT_ID` |
+| TWAP Consumer | `get_keeper` | `keeper == ADMIN_ADDRESS` |
+| TWAL Consumer | `get_keeper`, `is_tracked` | `keeper == ADMIN_ADDRESS`; each registered pool reports tracked |
+| Router | `get_factory` (if exposed) | `factory == FACTORY_CONTRACT_ID` |
+| Batch Router | `simulate_batch([])` | Returns `[]`. There is no factory getter; the call loads the stored factory, so it only succeeds once `initialize` has run |
 | DEX Aggregator | `get_factory` / `get_admin` | matches |
 | Batch Auction | `get_admin` / `get_batch_window` | matches |
 | CL Position NFT | `get_admin` / `next_token_id` | `admin == ADMIN_ADDRESS` |
 | POL Vesting | `get_governance` | `governance == GOVERNANCE_CONTRACT_ID` |
 | Reserve Manager | `get_governance` | `governance == GOVERNANCE_CONTRACT_ID` |
 
-On failure the script prints `[deploy][warn]` but does not abort — review the
-log for warnings and re-run with `--force` after fixing the cause.
+For most contracts, failure prints `[deploy][warn]` but does not abort — review
+the log and re-run with `--force` after fixing the cause. **Token admin
+verification is an exception**: a mismatch is treated as a fatal error and
+aborts the deploy, because it indicates the contract was front-run between
+deploy and initialize. See §1 for notes on the initialization window.
+The Batch Router and TWAL Consumer steps are also strict: a failed
+`initialize` or read-back aborts the run without recording the step as done,
+so a re-run retries it.
 
 ### 4.2 Manual verification (operator checklist)
 
@@ -416,6 +455,7 @@ stellar contract invoke --id $AMM_POOL_CONTRACT_ID -- get_info
 #        fee_bps == 30, protocol_fee_bps == 0, admin is governance or ADMIN_ADDRESS
 
 # 3. LP token admin is the pool
+# contract: token
 stellar contract invoke --id $LP_TOKEN_CONTRACT_ID -- admin
 # Must equal $AMM_POOL_CONTRACT_ID
 
@@ -431,9 +471,11 @@ stellar contract invoke --id $LP_TOKEN_CONTRACT_ID -- locker
 # Must equal $GOVERNANCE_CONTRACT_ID
 
 # 7. Oracle aggregator admin
+# contract: oracle_aggregator
 stellar contract invoke --id $ORACLE_AGGREGATOR_CONTRACT_ID -- get_admin
 
 # 8. TWAP consumer keeper
+# contract: twap_consumer
 stellar contract invoke --id $TWAP_CONSUMER_CONTRACT_ID -- get_keeper
 
 # 9. Staking pool info
@@ -458,9 +500,31 @@ bash scripts/e2e.sh
 # Exits non-zero on any failed assertion; prints [PASS]/[FAIL] summary
 ```
 
+The flows live in `scripts/e2e/`. The shared flows (`v2`, `factory`, `cl`,
+`governance`, `staking`) run against the addresses `deploy.sh` persists. The
+self-contained flows (`token`, `router`, `dex_aggregator`,
+`oracle_aggregator`, `cl_position_nft`, `pol_vesting`, `twap_consumer`)
+deploy their own instances and can be run one at a time without a full
+deployment, e.g. `bash scripts/e2e/router.sh`. Select flows with
+`--only`/`--skip` (see `bash scripts/e2e/run.sh --help`); the self-contained
+flows fund extra signers through friendbot, so they target testnet.
+
 Run this against the same `NETWORK` and `SOURCE_ACCOUNT` after a deployment
 to confirm the core path is healthy. For a production deployment, consider a
 testnet run before targeting mainnet.
+
+To tell a network or funding problem apart from a real failure before
+spending a deployment on it, run the preflight first:
+
+```sh
+SOURCE_ACCOUNT=<identity> bash scripts/e2e/preflight.sh
+# Exits 75 on an infrastructure problem: unhealthy RPC, friendbot rate limit,
+# or a missing/underfunded account (re-created via friendbot after a reset)
+```
+
+CI runs the same preflight and suite nightly, on relevant pushes to `main` and
+on each release (`.github/workflows/smoke-test.yml`); see
+`.github/BRANCH_PROTECTION.md` for how its failures are reported.
 
 ---
 
@@ -470,6 +534,13 @@ Contracts are upgradeable via `upgrade(new_wasm_hash)` (or factory's
 `update_wasm_hashes` for future pools). Instance storage is preserved; only
 bytecode is replaced. **Storage layout is immutable** — changing `DataKey`
 variants or types without a migration bricks the contract.
+
+Two signatures exist:
+
+| Contract | Entrypoint | Authorized by |
+|---|---|---|
+| `amm`, `factory`, `token` | `upgrade(new_wasm_hash)` | stored `admin` (`require_auth`) |
+| `governance`, `concentrated_liquidity`, `oracle_aggregator`, `staking` | `upgrade(admin, new_wasm_hash)` | `admin` must equal the stored admin **and** `require_auth` — see §5.5 |
 
 ### 5.1 Prerequisites
 
@@ -493,6 +564,7 @@ stellar contract upload --wasm target/wasm32v1-none/release/amm.wasm --network $
 # -> NEW_HASH=abc123...
 
 # 2. Upgrade the live contract (admin auth required)
+# contract: amm
 stellar contract invoke --id $AMM_POOL_CONTRACT_ID --network $NETWORK --source $ADMIN_ADDRESS -- upgrade --new_wasm_hash $NEW_HASH
 
 # 3. Verify upgrade took — read back liveness and a known getter
@@ -508,6 +580,7 @@ For the **factory**, the upgrade path is:
 
 ```sh
 # Upgrade factory bytecode itself
+# contract: factory
 stellar contract invoke --id $FACTORY_CONTRACT_ID -- upgrade --new_wasm_hash $NEW_HASH
 # Update future-pool WASM hashes (existing pools unaffected):
 stellar contract invoke --id $FACTORY_CONTRACT_ID -- update_wasm_hashes --amm_wasm_hash $NEW_AMM_HASH --token_wasm_hash $NEW_TOKEN_HASH
@@ -520,6 +593,7 @@ hash. Keep the previous hash in `.soroban-amm.deploy.env` history or in git
 tags:
 
 ```sh
+# contract: factory
 stellar contract invoke --id $FACTORY_CONTRACT_ID -- upgrade --new_wasm_hash $PREVIOUS_HASH
 ```
 
@@ -539,6 +613,98 @@ with the old hash. Test upgrades on testnet first and keep a multisig
   `get_params`, `get_pool_count`) and confirm it still returns the expected
   state. Query the RPC for the `upgraded` event topic to audit the hash change.
 
+### 5.5 Governance, concentrated liquidity, oracle aggregator and staking
+
+These four contracts expose `upgrade(admin, new_wasm_hash)`, following the same
+explicit-`admin` convention as their other admin entrypoints (`pause`,
+`propose_admin`, `set_protocol_fee`, ...):
+
+1. The stored admin is read from instance storage (`DataKey::Admin`). An
+   uninitialized contract returns its `NotInitialized` error.
+2. The `admin` argument must equal the stored admin, otherwise the call fails
+   with the contract's typed error (below). The contract is not modified.
+3. `admin.require_auth()` — the admin key (or multisig account) must sign.
+4. `env.deployer().update_current_contract_wasm(new_wasm_hash)` swaps the
+   bytecode in place, and an `upgraded` event carrying the new hash is emitted.
+
+| Contract | Admin set by | Wrong `admin` error |
+|---|---|---|
+| `governance` | `initialize(admin, ...)`; rotate with `propose_admin`/`accept_admin` | `GovernanceError::Unauthorized` (25) |
+| `concentrated_liquidity` | `initialize(admin, ...)` (the factory admin for factory-created pools) | `ClError::Unauthorized` (12) |
+| `oracle_aggregator` | `initialize(admin, ...)` | `OracleError::NotAdmin` (3) |
+| `staking` | `initialize(..., admin)` | `StakingError::Unauthorized` (3) |
+
+Authority is the single stored admin address of each contract. **Upgrades are
+not voted on**: there is no governance `ProposalKind` for WASM upgrades, and
+the `governance` contract's own upgrade is signed by its admin, not by LP
+holders. For multi-party control, set the admin to a multisig account and
+rotate it with `propose_admin`/`accept_admin` (§7).
+
+`upgrade` never re-runs `initialize` and writes no storage, so admin,
+configuration, proposals and votes, pool/tick/position state, oracle sources,
+and stakes/locks/reward accounting all carry over unchanged. The new WASM must
+read the same `DataKey` layout; any layout change needs its own migration.
+
+```sh
+source .soroban-amm.deploy.env
+
+# Upload the new WASM (repeat per contract)
+stellar contract upload --wasm target/wasm32v1-none/release/governance.wasm --network $NETWORK --source $SOURCE_ACCOUNT
+# -> NEW_HASH=...
+
+# Upgrade — the admin is passed explicitly and must sign
+stellar contract invoke --id $GOVERNANCE_CONTRACT_ID --network $NETWORK --source $ADMIN_ADDRESS -- upgrade --admin $ADMIN_ADDRESS --new_wasm_hash $NEW_HASH
+stellar contract invoke --id $CL_POOL_CONTRACT_ID --network $NETWORK --source $ADMIN_ADDRESS -- upgrade --admin $ADMIN_ADDRESS --new_wasm_hash $NEW_HASH
+stellar contract invoke --id $ORACLE_AGGREGATOR_CONTRACT_ID --network $NETWORK --source $ADMIN_ADDRESS -- upgrade --admin $ADMIN_ADDRESS --new_wasm_hash $NEW_HASH
+stellar contract invoke --id $STAKING_CONTRACT_ID --network $NETWORK --source $ADMIN_ADDRESS -- upgrade --admin $ADMIN_ADDRESS --new_wasm_hash $NEW_HASH
+```
+
+Verify each upgrade by snapshotting state **before** the upgrade and comparing
+it **after**:
+
+| Contract | Read before and after |
+|---|---|
+| `governance` | `get_params`, `get_proposal_count`, `get_proposal --proposal_id <open id>` |
+| `concentrated_liquidity` | `get_pool_state`, `get_tokens`, `fee_bps`, `get_position` for a known LP |
+| `oracle_aggregator` | `get_admin`, `list_sources`, `get_max_staleness`, `get_max_deviation_bps` |
+| `staking` | `get_pool_info`, `get_staker_info` / `pending_rewards` for a known staker |
+
+Then confirm the `upgraded` event with `NEW_HASH` on the RPC, and roll back per
+§5.3 if anything differs (pass `--admin` as above). The in-process test
+`contracts/integration-tests/src/core_contract_upgrade_test.rs` checks this for
+all four contracts: it swaps each one onto a different WASM, shows the new code
+is running at the same address against the old storage, restores the original,
+checks that all prior state matches and still works, and checks the typed
+rejection of a non-admin caller.
+
+### 5.6 Storage migrations and layout updates
+
+#### 5.6.1 Token paged checkpoints (Issue #1074)
+- **Problem addressed:** Previously, token balance changes rewrote an account's entire checkpoint vector in one persistent entry (`DataKey::Checkpoints(Address)`). This created two failures:
+  1. Simulation/apply write byte count mismatch when an account had already transacted in the simulation ledger (overwrite branch vs append branch), triggering `ResourceLimitExceeded`.
+  2. Write sizes grew linearly with history ($O(N)$), causing active pools to hit the network's `tx_max_write_bytes` (132 KB) around 880 checkpoints.
+- **New storage layout:** Checkpoints are stored in fixed-size pages of 32 entries (`DataKey::CheckpointPage(Address, page)`), coordinated by `DataKey::CheckpointTracker(Address)`.
+- **Properties:**
+  - Storage writes touch only the current page and the tracker, ensuring $O(1)$ write byte count bounded by $\approx 2.3\text{ KB}$ regardless of history length.
+  - No same-ledger coalescing: always append, ensuring write footprint and bytes are strictly identical between simulation and apply ledgers.
+- **Upgrade and migration:**
+  - For deployed tokens upgrading to the new WASM, `balance_at` falls back seamlessly to the legacy `DataKey::Checkpoints(Address)` entry for accounts not yet migrated.
+  - On an account's first write (transfer, mint, or burn) post-upgrade, the contract automatically migrates legacy checkpoints into paged storage and removes the legacy entry. At the 1024 checkpoint cap, migration writes $\approx 74\text{ KB}$, well within the 132 KB transaction write limit.
+
+#### 5.6.2 Concentrated liquidity fee growth scale (Issue #1098)
+- **Problem addressed:** Concentrated liquidity previously tracked `fee_growth_global` and position fee growth using a fixed-point scale of $10^6$ (`1_000_000`). For realistic pool liquidities ($L \sim 10^{11} - 10^{15}$), any swap whose fee was smaller than $L / 10^6$ credited 0 growth, permanently locking fee dust.
+- **New scale:** Switched to wide fixed-point scale $2^{64}$ (Q64, `FEE_GROWTH_SCALE = 1_i128 << 64`). Fee growth math uses 256-bit wide arithmetic (`mul_div`, `mul_wide`) to prevent overflow.
+- **Parity:** Simulator (`packages/amm-simulator`) and contract use identical Q64 arithmetic and pass zero-tolerance parity tests.
+- **Migration decision:** Pre-launch breaking change. Concentrated liquidity pools are redeployed with the new scale; existing pre-launch testnet pools should be re-created.
+
+#### 5.6.3 POL vesting revocation semantics (Issue #1073)
+- **Problem addressed:** `revoke_vesting` previously executed token transfers directly to both the treasury and the beneficiary. When invoked immediately after a `release` in the same ledger, simulation observed 0 unreleased vested tokens for the beneficiary (skipping the beneficiary transfer in the footprint), but applying in a later ledger attempted a positive transfer and trapped.
+- **Resolution:**
+  - `revoke_vesting` only ever transfers unvested tokens (`total - vested`) to the treasury. It never transfers directly to the beneficiary.
+  - The schedule is frozen at the revocation ledger (`schedule.total = vested; schedule.revoked = true;`).
+  - The beneficiary claims any vested-but-unreleased remainder via the standard `release` entrypoint.
+  - Only treasury tokens are deducted from `Committed(lp_token)` on revoke; the beneficiary remainder remains committed until released.
+
 ---
 
 ## 6. Emergency Procedures
@@ -546,14 +712,16 @@ with the old hash. Test upgrades on testnet first and keep a multisig
 ### 6.1 Pausing a pool
 
 ```sh
-# Anyone with admin auth can pause — halts swaps, add/remove liquidity, flash loans
-stellar contract invoke --id $AMM_POOL_CONTRACT_ID -- pause --admin $ADMIN_ADDRESS
+# Pausing stops swaps, deposits, flash loans and one-sided exits; remove_liquidity stays open.
+# The stored admin authorizes the call; pause takes no contract arguments.
+stellar contract invoke --id $AMM_POOL_CONTRACT_ID --network $NETWORK --source $ADMIN_KEY -- pause
 # Check:
 stellar contract invoke --id $AMM_POOL_CONTRACT_ID -- is_paused
 # -> true
 
 # Resume:
-stellar contract invoke --id $AMM_POOL_CONTRACT_ID -- unpause --admin $ADMIN_ADDRESS
+# contract: amm
+stellar contract invoke --id $AMM_POOL_CONTRACT_ID --network $NETWORK --source $ADMIN_KEY -- unpause
 ```
 
 The CL pool has the same `pause`/`unpause` interface. Factory pools can be
@@ -586,7 +754,8 @@ stellar contract invoke --id $AMM_POOL_CONTRACT_ID -- try_circuit_breaker_recove
 # -> true if cooldown elapsed and pool was tripped; reverts otherwise
 
 # Admin can also unpause directly without waiting (governance review path):
-stellar contract invoke --id $AMM_POOL_CONTRACT_ID -- unpause --admin $ADMIN_ADDRESS
+# contract: amm
+stellar contract invoke --id $AMM_POOL_CONTRACT_ID --network $NETWORK --source $ADMIN_KEY -- unpause
 
 # Tune threshold/cooldown (admin-only):
 stellar contract invoke --id $AMM_POOL_CONTRACT_ID -- set_circuit_breaker_config --threshold_bps 3000 --cooldown_secs 1800
@@ -602,18 +771,19 @@ single-admin `emergency_withdraw` path is **disabled** — funds can only be
 moved via the multisig flow:
 
 ```sh
-# 1. A signer proposes the recipient
+# 1. A signer proposes the recipient; the call returns the proposal id
 stellar contract invoke --id $AMM_POOL_CONTRACT_ID -- propose_emergency_withdraw --signer $SIGNER_A --recipient $SAFE_ADDRESS
+# -> PROPOSAL_ID
 
-# 2. Other signers approve the same recipient (each calls the same function — approvals accumulate)
-stellar contract invoke --id $AMM_POOL_CONTRACT_ID -- propose_emergency_withdraw --signer $SIGNER_B --recipient $SAFE_ADDRESS
+# 2. Other signers approve that proposal by id (the proposer's approval counts already)
+stellar contract invoke --id $AMM_POOL_CONTRACT_ID -- approve_multisig_proposal --signer $SIGNER_B --proposal_id $PROPOSAL_ID
 # ... until approvals >= quorum
 
 # 3. Any signer executes once quorum is reached and before expiry (7 days)
-stellar contract invoke --id $AMM_POOL_CONTRACT_ID -- exec_multisig_emergency_wd --signer $SIGNER_A
+stellar contract invoke --id $AMM_POOL_CONTRACT_ID -- exec_multisig_emergency_wd --signer $SIGNER_A --proposal_id $PROPOSAL_ID
 
 # 4. Verify
-stellar contract invoke --id $AMM_POOL_CONTRACT_ID -- get_multisig_proposal
+stellar contract invoke --id $AMM_POOL_CONTRACT_ID -- get_multisig_proposal --proposal_id $PROPOSAL_ID
 # Reserves are zeroed; TotalShares reset; MinLiquidityLocked cleared so deposits can resume
 ```
 
@@ -645,21 +815,28 @@ manipulated fees while the root cause is investigated.
 ## 7. Admin Key Management
 
 Every contract uses a **two-step `propose_admin` / `accept_admin`** rotation —
-there is no single-transaction admin steal. The pattern is identical across
-`token`, `amm`, `factory`, `oracle_aggregator`, `batch_auction`, etc.
+there is no single-transaction admin steal. The `propose_admin` argument is
+named `admin` on factory, staking, concentrated-liquidity, and reserve-manager
+contracts, and `current_admin` on AMM and governance contracts.
 
 ### 7.1 Rotation procedure
 
 ```sh
-# 1. Current admin nominates the new admin
-stellar contract invoke --id $CONTRACT_ID -- propose_admin --current_admin $OLD --new_admin $NEW
+# 1. Current admin nominates the new admin (AMM/governance pools)
+# contract: amm
+stellar contract invoke --id $CONTRACT_ID --source $OLD_KEY -- propose_admin --current_admin $OLD --new_admin $NEW
+
+# Factory, staking, concentrated-liquidity, and reserve-manager contracts use `admin` instead
+# contract: factory
+stellar contract invoke --id $CONTRACT_ID --source $OLD_KEY -- propose_admin --admin $OLD --new_admin $NEW
 
 # 2. New admin must accept from its own key (require_auth on $NEW)
-stellar contract invoke --id $CONTRACT_ID -- accept_admin --new_admin $NEW \
-  --source $NEW_KEY
+# contract: amm
+stellar contract invoke --id $CONTRACT_ID --source $NEW_KEY -- accept_admin --new_admin $NEW
 
-# Verify:
-stellar contract invoke --id $CONTRACT_ID -- admin   # or get_admin / get_info
+# Verify (the getter is `admin` on token and cl_position_nft, `get_admin` on most others, `get_info` on the AMM):
+# contract: token
+stellar contract invoke --id $CONTRACT_ID -- admin
 ```
 
 If step 2 is not completed, the nomination sits as `PendingAdmin` and the old
@@ -684,8 +861,10 @@ for ((offset = 0; offset < count; offset += page)); do
     -- get_pools --offset "$offset" --limit "$page" | grep -Eo 'C[A-Z0-9]{55}')
   for pool in $pools; do
     echo "Rotating $pool"
-    stellar contract invoke --id $pool -- propose_admin --current_admin $OLD --new_admin $NEW --source $OLD
-    stellar contract invoke --id $pool -- accept_admin --new_admin $NEW --source $NEW
+    # contract: amm
+    stellar contract invoke --id $pool --source $OLD_KEY -- propose_admin --current_admin $OLD --new_admin $NEW
+    # contract: amm
+    stellar contract invoke --id $pool --source $NEW_KEY -- accept_admin --new_admin $NEW
   done
 done
 ```
@@ -843,6 +1022,12 @@ scripts/deploy.sh --skip governance,staking,incentive_campaigns
 NETWORK=mainnet SOURCE_ACCOUNT=mainnet-deployer scripts/deploy.sh --force
 ```
 
+Every deployable contract in the workspace has a module in `scripts/deploy/`
+and a step in `ALL_CONTRACTS` (`scripts/deploy/common.sh`), which is also the
+list `deploy.sh` loads its modules from. `scripts/check_deploy_scripts.sh`
+(`make check-deploy-scripts`, run in CI) fails when a contract crate has no
+module, is missing from `ALL_CONTRACTS`, or is never called from `main()`.
+
 ### Env file contract
 
 All state is persisted to `.soroban-amm.deploy.env` (overridable via
@@ -916,7 +1101,7 @@ are also untouched.
 | twal_consumer | `initialize(keeper)` | `contracts/twal_consumer/src/lib.rs` |
 | oracle_aggregator | `initialize(admin, max_staleness_seconds)` | `contracts/oracle_aggregator/src/lib.rs` |
 | router | `initialize(factory)` | `contracts/router/src/lib.rs` |
-| batch_router | `initialize(factory)` | `contracts/batch_router/src/lib.rs` |
+| batch_router | `initialize(admin, factory)` | `contracts/batch_router/src/lib.rs` |
 | dex_aggregator | `initialize(admin, factory)` | `contracts/dex_aggregator/src/lib.rs` |
 | batch_auction | `initialize(admin, batch_window_secs)` | `contracts/batch_auction/src/lib.rs` |
 | cl_position_nft | `initialize(admin, cl_pool)` | `contracts/cl_position_nft/src/lib.rs` |

@@ -24,14 +24,37 @@ use soroban_sdk::{
 
 const DEFAULT_MAX_ORDERS: u32 = 50;
 const MAX_ORDERS_CEILING: u32 = 200;
+/// Ceiling on the admin-managed venue allowlist (issue #700): `VenueList` is
+/// read and rewritten in full on every `add_venue`/`remove_venue` call, so an
+/// unbounded list would eventually make those calls exceed the ledger
+/// footprint/resource limits. `remove_venue` a stale entry to add another
+/// past this cap.
+const MAX_VENUES: u32 = 200;
 /// Ceiling on how far in the future a trader-supplied `deadline` may be
 /// (issue #700): otherwise a trader could pin their escrow open indefinitely
 /// with a far-future deadline, since only the trader's own `cancel_order` (or
 /// this ceiling) can release it before then.
 const MAX_ORDER_LIFETIME_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// Default lower bound for the batch window (issue #1119): a window shorter
+/// than this is effectively no batching, so a sandwich fits between two
+/// settlements. The admin can move the bounds with `set_window_bounds`.
+pub const MIN_BATCH_WINDOW_SECS: u64 = 5;
+/// Default upper bound for the batch window (issue #1119): one day. A larger
+/// window stalls settlement for as long as it is configured.
+pub const MAX_BATCH_WINDOW_SECS: u64 = 24 * 60 * 60;
+/// Hard ceiling for the *upper* bound the admin may configure (issue #1119),
+/// so `opened_at + window` can never get near `u64::MAX` whatever is set.
+pub const WINDOW_BOUNDS_CEILING_SECS: u64 = 30 * 24 * 60 * 60;
+
 const MIN_TTL: u32 = 172_800;
 const BUMP_TO: u32 = 518_400;
+
+/// Persistent-storage TTL for orders, claimables and the venue registry.
+/// Must outlive `MAX_ORDER_LIFETIME_SECS` plus a claim window, so a trader
+/// can always `claim_refund` a stranded refund long after the order expired.
+const PERSISTENT_MIN_TTL: u32 = 172_800;
+const PERSISTENT_BUMP_TO: u32 = 3_110_400;
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
@@ -70,6 +93,19 @@ pub enum AuctionError {
     /// `claim_refund` called for an order with no claimable balance on
     /// record (issue #700).
     NothingToClaim = 18,
+    /// `add_venue` would push the persistent venue registry past
+    /// `MAX_VENUES` (issue #700).
+    TooManyVenues = 19,
+    /// An admin entrypoint, `get_admin` or `accept_admin` was called before
+    /// `initialize` (issue #1119).
+    NotInitialized = 20,
+    /// `batch_window_secs` is outside the configured `[min, max]` window
+    /// bounds (issue #1119).
+    InvalidBatchWindow = 21,
+    /// `set_window_bounds` was given `min == 0`, `min > max`, a `max` above
+    /// `WINDOW_BOUNDS_CEILING_SECS`, or bounds that exclude the current window
+    /// (issue #1119).
+    InvalidWindowBounds = 22,
 }
 
 // ── Storage types ─────────────────────────────────────────────────────────────
@@ -140,6 +176,9 @@ pub enum DataKey {
     /// that failed during `settle_batch`/`expire_order`, claimable later via
     /// `claim_refund` (issue #700).
     Claimable(u64),
+    /// Admin-settable `(min, max)` bounds for the batch window (issue #1119).
+    /// Absent means `(MIN_BATCH_WINDOW_SECS, MAX_BATCH_WINDOW_SECS)`.
+    WindowBounds,
 }
 
 fn max_orders(env: &Env) -> u32 {
@@ -153,6 +192,40 @@ fn extend_ttl(env: &Env) {
     env.storage().instance().extend_ttl(MIN_TTL, BUMP_TO);
 }
 
+/// The one place the admin is read (issue #1119): an uninitialized contract
+/// returns `NotInitialized` instead of trapping on an `unwrap`.
+fn read_admin(env: &Env) -> Result<Address, AuctionError> {
+    env.storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(AuctionError::NotInitialized)
+}
+
+/// The configured `(min, max)` batch-window bounds, or the defaults.
+fn window_bounds(env: &Env) -> (u64, u64) {
+    env.storage()
+        .instance()
+        .get(&DataKey::WindowBounds)
+        .unwrap_or((MIN_BATCH_WINDOW_SECS, MAX_BATCH_WINDOW_SECS))
+}
+
+/// Reject a batch window outside the configured bounds (issue #1119).
+fn validate_window(env: &Env, batch_window_secs: u64) -> Result<(), AuctionError> {
+    let (min, max) = window_bounds(env);
+    if batch_window_secs < min || batch_window_secs > max {
+        return Err(AuctionError::InvalidBatchWindow);
+    }
+    Ok(())
+}
+
+/// Bump the TTL of a persistent entry so it outlives the order lifetime plus
+/// a claim window. Called on every write and every read of `Order`/`Claimable`.
+fn bump_persistent(env: &Env, key: &DataKey) {
+    env.storage()
+        .persistent()
+        .extend_ttl(key, PERSISTENT_MIN_TTL, PERSISTENT_BUMP_TO);
+}
+
 // ── Contract ──────────────────────────────────────────────────────────────────
 
 #[contract]
@@ -163,7 +236,9 @@ impl BatchAuction {
     /// Initialize the auction contract.
     ///
     /// - `batch_window_secs` — how long (in ledger seconds) a batch window stays
-    ///   open before it can be settled.
+    ///   open before it can be settled. Must lie within the window bounds
+    ///   (`MIN_BATCH_WINDOW_SECS`..=`MAX_BATCH_WINDOW_SECS` until the admin
+    ///   changes them), otherwise `InvalidBatchWindow`.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -173,6 +248,7 @@ impl BatchAuction {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(AuctionError::AlreadyInitialized);
         }
+        validate_window(&env, batch_window_secs)?;
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage()
@@ -360,7 +436,8 @@ impl BatchAuction {
             alt_pool,
         };
 
-        env.storage().instance().set(&DataKey::Order(id), &order);
+        env.storage().persistent().set(&DataKey::Order(id), &order);
+        bump_persistent(&env, &DataKey::Order(id));
 
         pending.push_back(id);
         env.storage()
@@ -388,7 +465,7 @@ impl BatchAuction {
 
         let order: Order = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Order(order_id))
             .ok_or(AuctionError::OrderNotFound)?;
 
@@ -403,7 +480,7 @@ impl BatchAuction {
             &order.amount_in,
         );
 
-        env.storage().instance().remove(&DataKey::Order(order_id));
+        env.storage().persistent().remove(&DataKey::Order(order_id));
 
         let pending: Vec<u64> = env
             .storage()
@@ -468,7 +545,8 @@ impl BatchAuction {
             .get(&DataKey::BatchWindowSecs)
             .unwrap_or(60);
         let now = env.ledger().timestamp();
-        if now < opened_at + window_secs {
+        // Checked: a window loaded from legacy storage can be arbitrarily large.
+        if now < opened_at.saturating_add(window_secs) {
             return Err(AuctionError::BatchWindowOpen);
         }
 
@@ -494,7 +572,7 @@ impl BatchAuction {
             let order_id = pending.get(i).unwrap();
             let order: Order = env
                 .storage()
-                .instance()
+                .persistent()
                 .get(&DataKey::Order(order_id))
                 .unwrap();
 
@@ -516,7 +594,7 @@ impl BatchAuction {
                     (Symbol::new(&env, "order_expired"), order.trader.clone()),
                     (order_id,)
                 );
-                env.storage().instance().remove(&DataKey::Order(order_id));
+                env.storage().persistent().remove(&DataKey::Order(order_id));
                 continue;
             }
 
@@ -540,7 +618,7 @@ impl BatchAuction {
                     ),
                     (order_id,)
                 );
-                env.storage().instance().remove(&DataKey::Order(order_id));
+                env.storage().persistent().remove(&DataKey::Order(order_id));
                 continue;
             }
 
@@ -600,7 +678,7 @@ impl BatchAuction {
                     );
                 }
             }
-            env.storage().instance().remove(&DataKey::Order(order_id));
+            env.storage().persistent().remove(&DataKey::Order(order_id));
         }
 
         let mut remaining = Vec::<u64>::new(&env);
@@ -637,10 +715,11 @@ impl BatchAuction {
             .and_then(|r| r.ok())
             .is_some();
         if !ok {
-            env.storage().instance().set(
+            env.storage().persistent().set(
                 &DataKey::Claimable(order_id),
                 &(trader.clone(), token.clone(), amount),
             );
+            bump_persistent(env, &DataKey::Claimable(order_id));
             emit_versioned_event!(
                 env,
                 (Symbol::new(env, "order_refund_failed"), trader.clone()),
@@ -656,9 +735,10 @@ impl BatchAuction {
     /// behalf. Idempotent: once refunded, the order no longer exists, so a
     /// second call returns `OrderNotFound` rather than double-refunding.
     pub fn expire_order(env: Env, order_id: u64) -> Result<(), AuctionError> {
+        extend_ttl(&env);
         let order: Order = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Order(order_id))
             .ok_or(AuctionError::OrderNotFound)?;
         let now = env.ledger().timestamp();
@@ -672,7 +752,7 @@ impl BatchAuction {
             &order.token_in,
             order.amount_in,
         );
-        env.storage().instance().remove(&DataKey::Order(order_id));
+        env.storage().persistent().remove(&DataKey::Order(order_id));
         let pending: Vec<u64> = env
             .storage()
             .instance()
@@ -698,6 +778,7 @@ impl BatchAuction {
     /// Return the IDs of pending orders whose deadline has already passed,
     /// for keepers to drive `expire_order` (issue #700).
     pub fn get_expired_orders(env: Env) -> Vec<u64> {
+        extend_ttl(&env);
         let now = env.ledger().timestamp();
         let pending: Vec<u64> = env
             .storage()
@@ -708,7 +789,7 @@ impl BatchAuction {
         for oid in pending.iter() {
             if let Some(order) = env
                 .storage()
-                .instance()
+                .persistent()
                 .get::<_, Order>(&DataKey::Order(oid))
             {
                 if now > order.deadline {
@@ -723,17 +804,18 @@ impl BatchAuction {
     /// `settle_batch`/`expire_order` (issue #700). `trader` must be the same
     /// address the claimable amount was recorded for.
     pub fn claim_refund(env: Env, trader: Address, order_id: u64) -> Result<i128, AuctionError> {
+        extend_ttl(&env);
         trader.require_auth();
         let (owner, token, amount): (Address, Address, i128) = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Claimable(order_id))
             .ok_or(AuctionError::NothingToClaim)?;
         if owner != trader {
             return Err(AuctionError::Unauthorized);
         }
         env.storage()
-            .instance()
+            .persistent()
             .remove(&DataKey::Claimable(order_id));
         SepTokenClient::new(&env, &token).transfer(
             &env.current_contract_address(),
@@ -755,9 +837,10 @@ impl BatchAuction {
     /// quote walks the same pool math used at execution, so the chosen venue
     /// matches `settle_batch`'s routing for an unchanged pool state.
     pub fn quote_order(env: Env, order_id: u64) -> Result<(i128, Address, PoolType), AuctionError> {
+        extend_ttl(&env);
         let order: Order = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::Order(order_id))
             .ok_or(AuctionError::OrderNotFound)?;
         Ok(Self::best_venue(&env, &order))
@@ -1015,6 +1098,7 @@ impl BatchAuction {
 
     /// Return all pending orders in the current batch window.
     pub fn get_pending_orders(env: Env) -> Vec<Order> {
+        extend_ttl(&env);
         let pending: Vec<u64> = env
             .storage()
             .instance()
@@ -1023,7 +1107,7 @@ impl BatchAuction {
         let mut orders = Vec::<Order>::new(&env);
         for i in 0..pending.len() {
             let id = pending.get(i).unwrap();
-            if let Some(order) = env.storage().instance().get(&DataKey::Order(id)) {
+            if let Some(order) = env.storage().persistent().get(&DataKey::Order(id)) {
                 orders.push_back(order);
             }
         }
@@ -1035,6 +1119,7 @@ impl BatchAuction {
     /// The tuple is `(pending_count, max_orders, batch_opened_at,
     /// batch_window_secs)`.
     pub fn get_batch_info(env: Env) -> (u32, u32, u64, u64) {
+        extend_ttl(&env);
         let pending: Vec<u64> = env
             .storage()
             .instance()
@@ -1055,10 +1140,17 @@ impl BatchAuction {
     }
 
     /// Update the batch window duration. Admin-only.
+    ///
+    /// The window must lie within the configured bounds (default
+    /// `MIN_BATCH_WINDOW_SECS`..=`MAX_BATCH_WINDOW_SECS`, see
+    /// `set_window_bounds`); `0` and `u64::MAX` are rejected with
+    /// `InvalidBatchWindow`, so a mis-set window can neither disable batching
+    /// nor freeze settlement (issue #1119).
     pub fn set_batch_window(env: Env, batch_window_secs: u64) -> Result<(), AuctionError> {
         extend_ttl(&env);
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin: Address = read_admin(&env)?;
         admin.require_auth();
+        validate_window(&env, batch_window_secs)?;
         env.storage()
             .instance()
             .set(&DataKey::BatchWindowSecs, &batch_window_secs);
@@ -1070,6 +1162,52 @@ impl BatchAuction {
         Ok(())
     }
 
+    /// Set the `[min_secs, max_secs]` bounds enforced on the batch window.
+    /// Admin-only (issue #1119).
+    ///
+    /// Requires `0 < min_secs <= max_secs <= WINDOW_BOUNDS_CEILING_SECS` and
+    /// that the current window still lies inside the new bounds; otherwise
+    /// `InvalidWindowBounds`.
+    pub fn set_window_bounds(
+        env: Env,
+        admin: Address,
+        min_secs: u64,
+        max_secs: u64,
+    ) -> Result<(), AuctionError> {
+        extend_ttl(&env);
+        let stored_admin = read_admin(&env)?;
+        if stored_admin != admin {
+            return Err(AuctionError::Unauthorized);
+        }
+        admin.require_auth();
+        if min_secs == 0 || min_secs > max_secs || max_secs > WINDOW_BOUNDS_CEILING_SECS {
+            return Err(AuctionError::InvalidWindowBounds);
+        }
+        let current: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BatchWindowSecs)
+            .unwrap_or(min_secs);
+        if current < min_secs || current > max_secs {
+            return Err(AuctionError::InvalidWindowBounds);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::WindowBounds, &(min_secs, max_secs));
+        emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "window_bounds_updated"),),
+            (min_secs, max_secs)
+        );
+        Ok(())
+    }
+
+    /// The `(min_secs, max_secs)` bounds currently enforced on the batch window.
+    pub fn get_window_bounds(env: Env) -> (u64, u64) {
+        extend_ttl(&env);
+        window_bounds(&env)
+    }
+
     /// Update the maximum number of orders accepted into a batch. Admin-only.
     ///
     /// `n` must be between 1 and `MAX_ORDERS_CEILING`, inclusive. The ceiling
@@ -1077,7 +1215,7 @@ impl BatchAuction {
     /// changed under production load.
     pub fn set_max_orders(env: Env, admin: Address, n: u32) -> Result<(), AuctionError> {
         extend_ttl(&env);
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored_admin: Address = read_admin(&env)?;
         if stored_admin != admin {
             return Err(AuctionError::Unauthorized);
         }
@@ -1094,7 +1232,8 @@ impl BatchAuction {
     /// Configure the factory that attests to protocol-deployed pools
     /// (issue #700). Admin-only; may be updated to rotate the factory.
     pub fn set_factory(env: Env, admin: Address, factory: Address) -> Result<(), AuctionError> {
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        extend_ttl(&env);
+        let stored_admin: Address = read_admin(&env)?;
         if stored_admin != admin {
             return Err(AuctionError::Unauthorized);
         }
@@ -1112,7 +1251,8 @@ impl BatchAuction {
         pool: Address,
         pool_type: PoolType,
     ) -> Result<(), AuctionError> {
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        extend_ttl(&env);
+        let stored_admin: Address = read_admin(&env)?;
         if stored_admin != admin {
             return Err(AuctionError::Unauthorized);
         }
@@ -1123,6 +1263,9 @@ impl BatchAuction {
                 .instance()
                 .get(&DataKey::VenueList)
                 .unwrap_or_else(|| Vec::new(&env));
+            if list.len() >= MAX_VENUES {
+                return Err(AuctionError::TooManyVenues);
+            }
             list.push_back(pool.clone());
             env.storage().instance().set(&DataKey::VenueList, &list);
         }
@@ -1137,7 +1280,8 @@ impl BatchAuction {
     /// after an order was submitted against it causes that order to be
     /// refunded at settlement rather than executed (see `settle_batch`).
     pub fn remove_venue(env: Env, admin: Address, pool: Address) -> Result<(), AuctionError> {
-        let stored_admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        extend_ttl(&env);
+        let stored_admin: Address = read_admin(&env)?;
         if stored_admin != admin {
             return Err(AuctionError::Unauthorized);
         }
@@ -1163,26 +1307,34 @@ impl BatchAuction {
 
     /// Return whether `pool` is on the admin allowlist.
     pub fn is_venue_allowed(env: Env, pool: Address) -> bool {
+        extend_ttl(&env);
         env.storage().instance().has(&DataKey::Venue(pool))
     }
 
     /// Return admin-allowlisted venues, `(pool, pool_type)`, paginated.
+    ///
+    /// Defensive (issue #1119): the offset and limit may be anything, including
+    /// `u32::MAX`; the page is clamped to the list, and an index entry without a
+    /// `Venue(pool)` record is skipped rather than trapping.
     pub fn list_venues(env: Env, offset: u32, limit: u32) -> Vec<(Address, PoolType)> {
+        extend_ttl(&env);
         let list: Vec<Address> = env
             .storage()
             .instance()
             .get(&DataKey::VenueList)
             .unwrap_or_else(|| Vec::new(&env));
         let mut out = Vec::new(&env);
-        let end = (offset as u64 + limit as u64).min(list.len() as u64) as u32;
-        for i in offset..end {
-            let pool = list.get(i).unwrap();
-            let pool_type: PoolType = env
-                .storage()
-                .instance()
-                .get(&DataKey::Venue(pool.clone()))
-                .unwrap();
-            out.push_back((pool, pool_type));
+        let end = offset.saturating_add(limit).min(list.len());
+        let mut i = offset;
+        while i < end {
+            if let Some(pool) = list.get(i) {
+                let pool_type: Option<PoolType> =
+                    env.storage().instance().get(&DataKey::Venue(pool.clone()));
+                if let Some(pool_type) = pool_type {
+                    out.push_back((pool, pool_type));
+                }
+            }
+            i += 1;
         }
         out
     }
@@ -1198,7 +1350,7 @@ impl BatchAuction {
         new_admin: Address,
     ) -> Result<(), AuctionError> {
         extend_ttl(&env);
-        let stored: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let stored: Address = read_admin(&env)?;
         if current_admin != stored {
             return Err(AuctionError::Unauthorized);
         }
@@ -1217,6 +1369,7 @@ impl BatchAuction {
     /// Accept the pending admin nomination. Caller becomes the new admin.
     pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), AuctionError> {
         extend_ttl(&env);
+        read_admin(&env)?;
         let pending: Option<Address> = env
             .storage()
             .instance()
@@ -1235,17 +1388,31 @@ impl BatchAuction {
         Ok(())
     }
 
-    /// Return the active admin address.
-    pub fn get_admin(env: Env) -> Address {
-        env.storage().instance().get(&DataKey::Admin).unwrap()
+    /// Return the active admin address, or `NotInitialized` before `initialize`.
+    pub fn get_admin(env: Env) -> Result<Address, AuctionError> {
+        extend_ttl(&env);
+        read_admin(&env)
     }
 
     /// Return the pending admin nominee, or `None` if no transfer is in progress.
     pub fn get_pending_admin(env: Env) -> Option<Address> {
+        extend_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::PendingAdmin)
             .unwrap_or(None)
+    }
+
+    /// Return the stranded `(trader, token, amount)` claimable for `order_id`,
+    /// or `None` if there is nothing to claim (issue #700).
+    pub fn get_claimable(env: Env, order_id: u64) -> Option<(Address, Address, i128)> {
+        extend_ttl(&env);
+        let key = DataKey::Claimable(order_id);
+        let value: Option<(Address, Address, i128)> = env.storage().persistent().get(&key);
+        if value.is_some() {
+            bump_persistent(&env, &key);
+        }
+        value
     }
 }
 
@@ -1260,9 +1427,10 @@ mod tests {
     use factory::{Factory, FactoryClient};
     use pool_interfaces::{AmmError, PoolInfo};
     use soroban_sdk::{
-        testutils::{Address as _, Events, Ledger},
+        testutils::{Address as _, Events, Ledger, MockAuth, MockAuthInvoke},
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
-        Env, String, TryFromVal,
+        xdr::{ScErrorCode, ScErrorType},
+        Env, IntoVal, String, Symbol, TryFromVal, Val, Vec,
     };
     use token::{LpToken, LpTokenClient};
 
@@ -1328,6 +1496,63 @@ mod tests {
     /// previously used `u64::MAX` before the ceiling existed (issue #700).
     fn far_future_deadline(env: &Env) -> u64 {
         env.ledger().timestamp() + MAX_ORDER_LIFETIME_SECS - 1
+    }
+
+    fn auth_invalid_action() -> soroban_sdk::Error {
+        soroban_sdk::Error::from_type_and_code(ScErrorType::Context, ScErrorCode::InvalidAction)
+    }
+
+    fn assert_requires_auth(
+        env: &Env,
+        contract_id: &Address,
+        signer_expected: &Address,
+        stranger: &Address,
+        fn_name: &str,
+        args: Vec<Val>,
+        success: impl FnOnce(),
+    ) {
+        env.set_auths(&[]);
+        let no_auth = env.try_invoke_contract::<(), soroban_sdk::Error>(
+            contract_id,
+            &Symbol::new(env, fn_name),
+            args.clone(),
+        );
+        assert_eq!(
+            no_auth,
+            Err(Ok(auth_invalid_action())),
+            "{fn_name}: missing auth should fail with Auth/InvalidAction"
+        );
+
+        env.mock_auths(&[MockAuth {
+            address: stranger,
+            invoke: &MockAuthInvoke {
+                contract: contract_id,
+                fn_name,
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }]);
+        let wrong_signer = env.try_invoke_contract::<(), soroban_sdk::Error>(
+            contract_id,
+            &Symbol::new(env, fn_name),
+            args.clone(),
+        );
+        assert_eq!(
+            wrong_signer,
+            Err(Ok(auth_invalid_action())),
+            "{fn_name}: stranger signature should fail with Auth/InvalidAction"
+        );
+
+        env.mock_auths(&[MockAuth {
+            address: signer_expected,
+            invoke: &MockAuthInvoke {
+                contract: contract_id,
+                fn_name,
+                args: args.clone(),
+                sub_invokes: &[],
+            },
+        }]);
+        success();
     }
 
     /// Deploy a concentrated-liquidity pool over `(token_a, token_b)`, seed a
@@ -2047,7 +2272,7 @@ mod tests {
         };
         env.as_contract(&auction_addr, || {
             env.storage()
-                .instance()
+                .persistent()
                 .set(&DataKey::Order(order.id), &order);
         });
 
@@ -2266,9 +2491,11 @@ mod tests {
         // address so that the payout try_transfer will trap.
         let fake_token_out = Address::generate(&env);
         env.as_contract(&auction_addr, || {
-            let mut bad_order: Order = env.storage().instance().get(&DataKey::Order(0)).unwrap();
+            let mut bad_order: Order = env.storage().persistent().get(&DataKey::Order(0)).unwrap();
             bad_order.token_out = fake_token_out.clone();
-            env.storage().instance().set(&DataKey::Order(0), &bad_order);
+            env.storage()
+                .persistent()
+                .set(&DataKey::Order(0), &bad_order);
         });
 
         env.ledger().set_timestamp(1031);
@@ -2287,7 +2514,7 @@ mod tests {
         // than lost outright.
         let claimable: (Address, Address, i128) = env.as_contract(&auction_addr, || {
             env.storage()
-                .instance()
+                .persistent()
                 .get(&DataKey::Claimable(0))
                 .unwrap()
         });
@@ -2326,9 +2553,9 @@ mod tests {
         // refund try_transfer traps.
         let fake_token_in = Address::generate(&env);
         env.as_contract(&auction_addr, || {
-            let mut order: Order = env.storage().instance().get(&DataKey::Order(0)).unwrap();
+            let mut order: Order = env.storage().persistent().get(&DataKey::Order(0)).unwrap();
             order.token_in = fake_token_in.clone();
-            env.storage().instance().set(&DataKey::Order(0), &order);
+            env.storage().persistent().set(&DataKey::Order(0), &order);
         });
 
         // Advance past the batch window AND the deadline.
@@ -2344,11 +2571,263 @@ mod tests {
         // than lost outright.
         let claimable: (Address, Address, i128) = env.as_contract(&auction_addr, || {
             env.storage()
-                .instance()
+                .persistent()
                 .get(&DataKey::Claimable(0))
                 .unwrap()
         });
         assert_eq!(claimable, (trader, fake_token_in, 10_000_i128));
+    }
+
+    // ── Admin authorization regression tests ────────────────────────────────────
+
+    #[test]
+    fn test_initialize_requires_admin_signature() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let args = Vec::from_array(&env, [admin.clone().into_val(&env), 30_u64.into_val(&env)]);
+
+        assert_requires_auth(
+            &env,
+            &auction_addr,
+            &admin,
+            &stranger,
+            "initialize",
+            args,
+            || {
+                BatchAuctionClient::new(&env, &auction_addr).initialize(&admin, &30_u64);
+            },
+        );
+    }
+
+    #[test]
+    fn test_set_batch_window_requires_admin_signature() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        env.mock_all_auths();
+        client.initialize(&admin, &30_u64);
+
+        let args = Vec::from_array(&env, [60_u64.into_val(&env)]);
+        assert_requires_auth(
+            &env,
+            &auction_addr,
+            &admin,
+            &stranger,
+            "set_batch_window",
+            args,
+            || {
+                client.set_batch_window(&60_u64);
+            },
+        );
+    }
+
+    #[test]
+    fn test_set_max_orders_requires_admin_signature() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        env.mock_all_auths();
+        client.initialize(&admin, &30_u64);
+
+        let args = Vec::from_array(&env, [admin.clone().into_val(&env), 10_u32.into_val(&env)]);
+        assert_requires_auth(
+            &env,
+            &auction_addr,
+            &admin,
+            &stranger,
+            "set_max_orders",
+            args,
+            || {
+                client.set_max_orders(&admin, &10_u32);
+            },
+        );
+
+        let err = client
+            .try_set_max_orders(&stranger, &10_u32)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, AuctionError::Unauthorized);
+    }
+
+    #[test]
+    fn test_set_factory_requires_admin_signature() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let factory_addr = env.register_contract(None, Factory);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        env.mock_all_auths();
+        client.initialize(&admin, &30_u64);
+
+        let args = Vec::from_array(
+            &env,
+            [
+                admin.clone().into_val(&env),
+                factory_addr.clone().into_val(&env),
+            ],
+        );
+        assert_requires_auth(
+            &env,
+            &auction_addr,
+            &admin,
+            &stranger,
+            "set_factory",
+            args,
+            || {
+                client.set_factory(&admin, &factory_addr);
+            },
+        );
+
+        let err = client
+            .try_set_factory(&stranger, &factory_addr)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, AuctionError::Unauthorized);
+    }
+
+    #[test]
+    fn test_add_venue_requires_admin_signature() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let pool = Address::generate(&env);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        env.mock_all_auths();
+        client.initialize(&admin, &30_u64);
+
+        let args = Vec::from_array(
+            &env,
+            [
+                admin.clone().into_val(&env),
+                pool.clone().into_val(&env),
+                PoolType::Amm.into_val(&env),
+            ],
+        );
+        assert_requires_auth(
+            &env,
+            &auction_addr,
+            &admin,
+            &stranger,
+            "add_venue",
+            args,
+            || {
+                client.add_venue(&admin, &pool, &PoolType::Amm);
+            },
+        );
+
+        let err = client
+            .try_add_venue(&stranger, &pool, &PoolType::Amm)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, AuctionError::Unauthorized);
+    }
+
+    #[test]
+    fn test_remove_venue_requires_admin_signature() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let pool = Address::generate(&env);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        env.mock_all_auths();
+        client.initialize(&admin, &30_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
+
+        let args = Vec::from_array(
+            &env,
+            [admin.clone().into_val(&env), pool.clone().into_val(&env)],
+        );
+        assert_requires_auth(
+            &env,
+            &auction_addr,
+            &admin,
+            &stranger,
+            "remove_venue",
+            args,
+            || {
+                client.remove_venue(&admin, &pool);
+            },
+        );
+
+        let err = client
+            .try_remove_venue(&stranger, &pool)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, AuctionError::Unauthorized);
+    }
+
+    #[test]
+    fn test_propose_admin_requires_admin_signature() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let nominee = Address::generate(&env);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        env.mock_all_auths();
+        client.initialize(&admin, &30_u64);
+
+        let args = Vec::from_array(
+            &env,
+            [admin.clone().into_val(&env), nominee.clone().into_val(&env)],
+        );
+        assert_requires_auth(
+            &env,
+            &auction_addr,
+            &admin,
+            &stranger,
+            "propose_admin",
+            args,
+            || {
+                client.propose_admin(&admin, &nominee);
+            },
+        );
+
+        let err = client
+            .try_propose_admin(&stranger, &nominee)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, AuctionError::Unauthorized);
+    }
+
+    #[test]
+    fn test_accept_admin_requires_admin_signature() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let nominee = Address::generate(&env);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        env.mock_all_auths();
+        client.initialize(&admin, &30_u64);
+        client.propose_admin(&admin, &nominee);
+
+        let args = Vec::from_array(&env, [nominee.clone().into_val(&env)]);
+        assert_requires_auth(
+            &env,
+            &auction_addr,
+            &nominee,
+            &stranger,
+            "accept_admin",
+            args,
+            || {
+                client.accept_admin(&nominee);
+            },
+        );
     }
 
     // ── Issue #553: two-step admin rotation ─────────────────────────────────────
@@ -2655,6 +3134,43 @@ mod tests {
     }
 
     #[test]
+    fn test_add_venue_rejects_past_max_venues_and_recovers_after_remove() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+        // Filling the allowlist to MAX_VENUES makes 200 contract calls in one
+        // test, which exceeds the default test-env CPU budget well before
+        // hitting any real resource limit.
+        env.budget().reset_unlimited();
+
+        let admin = Address::generate(&env);
+        let auction_addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &auction_addr);
+        client.initialize(&admin, &30_u64);
+
+        let mut pools: std::vec::Vec<Address> = std::vec::Vec::new();
+        for _ in 0..MAX_VENUES {
+            let pool = Address::generate(&env);
+            client.add_venue(&admin, &pool, &PoolType::Amm);
+            pools.push(pool);
+        }
+        assert_eq!(client.list_venues(&0_u32, &MAX_VENUES).len(), MAX_VENUES);
+
+        let one_too_many = Address::generate(&env);
+        let err = client
+            .try_add_venue(&admin, &one_too_many, &PoolType::Amm)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, AuctionError::TooManyVenues);
+
+        // Freeing a slot lets a new venue in again.
+        client.remove_venue(&admin, pools.first().unwrap());
+        client.add_venue(&admin, &one_too_many, &PoolType::Amm);
+        assert!(client.is_venue_allowed(&one_too_many));
+    }
+
+    #[test]
     fn test_set_factory_is_admin_gated_and_attests_cl_venue_without_allowlist() {
         let env = Env::default();
         env.budget().reset_unlimited();
@@ -2859,7 +3375,7 @@ mod tests {
         // isolates claim_refund's own payout/authorization/clearing logic.
         StellarAssetClient::new(&env, &ta).mint(&auction_addr, &5_000_i128);
         env.as_contract(&auction_addr, || {
-            env.storage().instance().set(
+            env.storage().persistent().set(
                 &DataKey::Claimable(42_u64),
                 &(trader.clone(), ta.clone(), 5_000_i128),
             );
@@ -3335,5 +3851,475 @@ mod tests {
             checked >= 7,
             "representative sequence should emit several auction events, saw {checked}"
         );
+    }
+
+    // ── #1119: window bounds, NotInitialized, TTL, list_venues ────────────────
+
+    fn init_client(env: &Env, window: u64) -> (BatchAuctionClient<'_>, Address, Address) {
+        let admin = Address::generate(env);
+        let addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(env, &addr);
+        client.initialize(&admin, &window);
+        (client, addr, admin)
+    }
+
+    #[test]
+    fn test_initialize_rejects_out_of_range_windows() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        for bad in [
+            0_u64,
+            MIN_BATCH_WINDOW_SECS - 1,
+            MAX_BATCH_WINDOW_SECS + 1,
+            u64::MAX,
+        ] {
+            let addr = env.register_contract(None, BatchAuction);
+            let client = BatchAuctionClient::new(&env, &addr);
+            assert_eq!(
+                client.try_initialize(&admin, &bad),
+                Err(Ok(AuctionError::InvalidBatchWindow)),
+                "window {bad} must be rejected"
+            );
+            // A rejected initialize leaves the contract uninitialized.
+            assert_eq!(
+                client.try_get_admin(),
+                Err(Ok(AuctionError::NotInitialized))
+            );
+        }
+        for good in [MIN_BATCH_WINDOW_SECS, 30, MAX_BATCH_WINDOW_SECS] {
+            let addr = env.register_contract(None, BatchAuction);
+            let client = BatchAuctionClient::new(&env, &addr);
+            client.initialize(&admin, &good);
+            assert_eq!(client.get_batch_info().3, good);
+        }
+    }
+
+    #[test]
+    fn test_set_batch_window_rejects_zero_and_u64_max() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, _) = init_client(&env, 30);
+
+        assert_eq!(
+            client.try_set_batch_window(&0_u64),
+            Err(Ok(AuctionError::InvalidBatchWindow))
+        );
+        assert_eq!(
+            client.try_set_batch_window(&u64::MAX),
+            Err(Ok(AuctionError::InvalidBatchWindow))
+        );
+        assert_eq!(
+            client.try_set_batch_window(&(MAX_BATCH_WINDOW_SECS + 1)),
+            Err(Ok(AuctionError::InvalidBatchWindow))
+        );
+        // The rejected calls changed nothing.
+        assert_eq!(client.get_batch_info().3, 30);
+    }
+
+    #[test]
+    fn test_set_batch_window_accepts_both_edges() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, _) = init_client(&env, 30);
+
+        client.set_batch_window(&MIN_BATCH_WINDOW_SECS);
+        assert_eq!(client.get_batch_info().3, MIN_BATCH_WINDOW_SECS);
+        client.set_batch_window(&MAX_BATCH_WINDOW_SECS);
+        assert_eq!(client.get_batch_info().3, MAX_BATCH_WINDOW_SECS);
+    }
+
+    #[test]
+    fn test_settle_batch_cannot_overflow_with_the_largest_legal_window() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+        let (client, addr, admin) = init_client(&env, 30);
+
+        // The largest window the admin can configure at all.
+        client.set_window_bounds(&admin, &MIN_BATCH_WINDOW_SECS, &WINDOW_BOUNDS_CEILING_SECS);
+        client.set_batch_window(&WINDOW_BOUNDS_CEILING_SECS);
+        assert_eq!(
+            client.try_settle_batch(),
+            Err(Ok(AuctionError::BatchWindowOpen))
+        );
+
+        // A window written by an older version can be anything; settlement
+        // must return an error, not trap on the addition.
+        env.as_contract(&addr, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::BatchWindowSecs, &u64::MAX);
+            env.storage()
+                .instance()
+                .set(&DataKey::BatchOpenedAt, &(u64::MAX - 1));
+        });
+        assert_eq!(
+            client.try_settle_batch(),
+            Err(Ok(AuctionError::BatchWindowOpen))
+        );
+    }
+
+    #[test]
+    fn test_admin_entrypoints_return_not_initialized_before_initialize() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &addr);
+        let someone = Address::generate(&env);
+        let pool = Address::generate(&env);
+        assert_eq!(
+            client.try_get_admin().err(),
+            Some(Ok(AuctionError::NotInitialized))
+        );
+        let not_init = AuctionError::NotInitialized;
+        assert_eq!(
+            client.try_set_batch_window(&30_u64).err(),
+            Some(Ok(not_init))
+        );
+        assert_eq!(
+            client.try_set_max_orders(&someone, &10_u32).err(),
+            Some(Ok(not_init))
+        );
+        assert_eq!(
+            client.try_set_factory(&someone, &pool).err(),
+            Some(Ok(not_init))
+        );
+        assert_eq!(
+            client.try_add_venue(&someone, &pool, &PoolType::Amm).err(),
+            Some(Ok(not_init))
+        );
+        assert_eq!(
+            client.try_remove_venue(&someone, &pool).err(),
+            Some(Ok(not_init))
+        );
+        assert_eq!(
+            client.try_propose_admin(&someone, &pool).err(),
+            Some(Ok(not_init))
+        );
+        assert_eq!(client.try_accept_admin(&someone).err(), Some(Ok(not_init)));
+        assert_eq!(
+            client
+                .try_set_window_bounds(&someone, &5_u64, &60_u64)
+                .err(),
+            Some(Ok(not_init))
+        );
+        // Plain reads still work on an empty contract.
+        assert_eq!(client.get_pending_admin(), None);
+        assert_eq!(client.list_venues(&0, &10).len(), 0);
+    }
+
+    #[test]
+    fn test_set_window_bounds_validation_and_effect() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, admin) = init_client(&env, 30);
+        let stranger = Address::generate(&env);
+
+        assert_eq!(
+            client.get_window_bounds(),
+            (MIN_BATCH_WINDOW_SECS, MAX_BATCH_WINDOW_SECS)
+        );
+        assert_eq!(
+            client.try_set_window_bounds(&stranger, &5_u64, &60_u64),
+            Err(Ok(AuctionError::Unauthorized))
+        );
+        for (min, max) in [
+            (0_u64, 60_u64),
+            (61, 60),
+            (5, WINDOW_BOUNDS_CEILING_SECS + 1),
+            (31, 60), // excludes the current window of 30
+            (5, 29),  // excludes the current window of 30
+        ] {
+            assert_eq!(
+                client.try_set_window_bounds(&admin, &min, &max),
+                Err(Ok(AuctionError::InvalidWindowBounds)),
+                "bounds ({min}, {max})"
+            );
+        }
+
+        client.set_window_bounds(&admin, &10_u64, &120_u64);
+        assert_eq!(client.get_window_bounds(), (10, 120));
+        assert_eq!(
+            client.try_set_batch_window(&9_u64),
+            Err(Ok(AuctionError::InvalidBatchWindow))
+        );
+        assert_eq!(
+            client.try_set_batch_window(&121_u64),
+            Err(Ok(AuctionError::InvalidBatchWindow))
+        );
+        client.set_batch_window(&120_u64);
+    }
+
+    #[test]
+    fn test_window_bounds_update_emits_versioned_event() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, admin) = init_client(&env, 30);
+
+        client.set_window_bounds(&admin, &10_u64, &120_u64);
+
+        let events = env.events().all();
+        let event = events
+            .iter()
+            .rfind(|event| {
+                event.1.get(0).map(|t| {
+                    Symbol::try_from_val(&env, &t) == Ok(Symbol::new(&env, "window_bounds_updated"))
+                }) == Some(true)
+            })
+            .expect("window_bounds_updated event must be emitted");
+        let (version, (min, max)): (u32, (u64, u64)) =
+            <(u32, (u64, u64))>::try_from_val(&env, &event.2)
+                .expect("decodes as (u32, (u64, u64))");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!((min, max), (10, 120));
+    }
+
+    #[test]
+    fn test_list_venues_with_out_of_range_offset_and_limit() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, _, admin) = init_client(&env, 30);
+        let mut pools = std::vec::Vec::new();
+        for _ in 0..3 {
+            let pool = Address::generate(&env);
+            client.add_venue(&admin, &pool, &PoolType::Amm);
+            pools.push(pool);
+        }
+
+        assert_eq!(client.list_venues(&0, &u32::MAX).len(), 3);
+        assert_eq!(client.list_venues(&1, &u32::MAX).len(), 2);
+        assert_eq!(client.list_venues(&u32::MAX, &u32::MAX).len(), 0);
+        assert_eq!(client.list_venues(&u32::MAX, &1).len(), 0);
+        assert_eq!(client.list_venues(&3, &1).len(), 0);
+        assert_eq!(client.list_venues(&1, &0).len(), 0);
+        let page = client.list_venues(&1, &1);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page.get(0).unwrap().0, pools[1]);
+    }
+
+    #[test]
+    fn test_list_venues_skips_an_index_entry_without_a_record() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, addr, admin) = init_client(&env, 30);
+        let kept = Address::generate(&env);
+        let orphan = Address::generate(&env);
+        client.add_venue(&admin, &orphan, &PoolType::Amm);
+        client.add_venue(&admin, &kept, &PoolType::Cl);
+
+        // Break the invariant directly: the index still lists `orphan`.
+        env.as_contract(&addr, || {
+            env.storage()
+                .instance()
+                .remove(&DataKey::Venue(orphan.clone()));
+        });
+
+        let listed = client.list_venues(&0, &10);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed.get(0).unwrap(), (kept, PoolType::Cl));
+    }
+
+    #[test]
+    fn test_expire_order_with_failed_refund_is_claimable_by_the_trader_only_once() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().set_timestamp(1000);
+        let (ta, tb, pool, admin) = setup(&env);
+        let (client, addr, _) = {
+            let addr = env.register_contract(None, BatchAuction);
+            let client = BatchAuctionClient::new(&env, &addr);
+            client.initialize(&admin, &1_000_u64);
+            (client, addr, ())
+        };
+        client.add_venue(&admin, &pool, &PoolType::Amm);
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader, &10_000_i128);
+        let order_id =
+            client.submit_order(&trader, &pool, &ta, &tb, &5_000_i128, &0_i128, &1_010_u64);
+
+        // Make the refund transfer fail by pointing the order at a token that
+        // is not a contract.
+        let broken = Address::generate(&env);
+        env.as_contract(&addr, || {
+            let mut order: Order = env
+                .storage()
+                .persistent()
+                .get(&DataKey::Order(order_id))
+                .unwrap();
+            order.token_in = broken.clone();
+            env.storage()
+                .persistent()
+                .set(&DataKey::Order(order_id), &order);
+        });
+
+        env.ledger().set_timestamp(1_020);
+        client.expire_order(&order_id);
+        assert_eq!(
+            client.get_claimable(&order_id),
+            Some((trader.clone(), broken, 5_000_i128))
+        );
+        assert_eq!(client.get_pending_orders().len(), 0);
+
+        // The obstacle is resolved (here: the record is pointed at the real
+        // escrowed token) and the trader claims.
+        env.as_contract(&addr, || {
+            env.storage().persistent().set(
+                &DataKey::Claimable(order_id),
+                &(trader.clone(), ta.clone(), 5_000_i128),
+            );
+        });
+
+        // Another address cannot claim it.
+        let other = Address::generate(&env);
+        assert_eq!(
+            client.try_claim_refund(&other, &order_id),
+            Err(Ok(AuctionError::Unauthorized))
+        );
+        // The trader can, once.
+        let before = StellarTokenClient::new(&env, &ta).balance(&trader);
+        assert_eq!(client.claim_refund(&trader, &order_id), 5_000_i128);
+        assert_eq!(
+            StellarTokenClient::new(&env, &ta).balance(&trader),
+            before + 5_000
+        );
+        assert_eq!(
+            client.try_claim_refund(&trader, &order_id),
+            Err(Ok(AuctionError::NothingToClaim))
+        );
+    }
+
+    /// Everything the TTL test needs to call any entrypoint successfully.
+    struct TtlCtx {
+        admin: Address,
+        nominee: Address,
+        pool: Address,
+        trader: Address,
+        order_id: u64,
+        claim_id: u64,
+    }
+
+    fn instance_ttl(env: &Env, addr: &Address) -> u32 {
+        use soroban_sdk::testutils::storage::Instance as _;
+        env.as_contract(addr, || env.storage().instance().get_ttl())
+    }
+
+    /// Run `call` against a fresh contract whose instance TTL has lapsed below
+    /// `MIN_TTL`, and assert the call restores it to `BUMP_TO`.
+    fn assert_restores_ttl(name: &str, call: &dyn Fn(&Env, &BatchAuctionClient<'_>, &TtlCtx)) {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        // Entries start with a long TTL so the token, pool and order survive
+        // the ledger jump below while the auction's instance falls under MIN_TTL.
+        env.ledger().with_mut(|l| {
+            l.timestamp = 1_000;
+            l.min_persistent_entry_ttl = 700_000;
+            l.max_entry_ttl = 6_312_000;
+        });
+        let (ta, tb, pool, admin) = setup(&env);
+        let addr = env.register_contract(None, BatchAuction);
+        let client = BatchAuctionClient::new(&env, &addr);
+        client.initialize(&admin, &1_000_u64);
+        client.add_venue(&admin, &pool, &PoolType::Amm);
+
+        let trader = Address::generate(&env);
+        StellarAssetClient::new(&env, &ta).mint(&trader, &10_000_i128);
+        let order_id =
+            client.submit_order(&trader, &pool, &ta, &tb, &5_000_i128, &0_i128, &1_010_u64);
+        let claim_id = 77_u64;
+        StellarAssetClient::new(&env, &ta).mint(&addr, &1_000_i128);
+        env.as_contract(&addr, || {
+            env.storage().persistent().set(
+                &DataKey::Claimable(claim_id),
+                &(trader.clone(), ta.clone(), 1_000_i128),
+            );
+        });
+        let nominee = Address::generate(&env);
+        client.propose_admin(&admin, &nominee);
+        let ctx = TtlCtx {
+            admin,
+            nominee,
+            pool,
+            trader,
+            order_id,
+            claim_id,
+        };
+
+        env.ledger().with_mut(|l| l.sequence_number += 600_000);
+        assert!(
+            instance_ttl(&env, &addr) < MIN_TTL,
+            "{name}: the setup must lower the instance TTL below MIN_TTL"
+        );
+
+        call(&env, &client, &ctx);
+
+        let ttl = instance_ttl(&env, &addr);
+        assert!(
+            ttl >= BUMP_TO - 1,
+            "{name}: instance TTL {ttl} was not restored to {BUMP_TO}"
+        );
+    }
+
+    #[test]
+    fn test_every_public_entrypoint_restores_the_instance_ttl() {
+        assert_restores_ttl("get_admin", &|_, c, _| {
+            c.get_admin();
+        });
+        assert_restores_ttl("get_pending_admin", &|_, c, _| {
+            c.get_pending_admin();
+        });
+        assert_restores_ttl("get_batch_info", &|_, c, _| {
+            c.get_batch_info();
+        });
+        assert_restores_ttl("get_pending_orders", &|_, c, _| {
+            c.get_pending_orders();
+        });
+        assert_restores_ttl("get_expired_orders", &|_, c, _| {
+            c.get_expired_orders();
+        });
+        assert_restores_ttl("get_claimable", &|_, c, x| {
+            c.get_claimable(&x.claim_id);
+        });
+        assert_restores_ttl("get_window_bounds", &|_, c, _| {
+            c.get_window_bounds();
+        });
+        assert_restores_ttl("is_venue_allowed", &|_, c, x| {
+            c.is_venue_allowed(&x.pool);
+        });
+        assert_restores_ttl("list_venues", &|_, c, _| {
+            c.list_venues(&0, &10);
+        });
+        assert_restores_ttl("quote_order", &|_, c, x| {
+            c.quote_order(&x.order_id);
+        });
+        assert_restores_ttl("set_batch_window", &|_, c, _| c.set_batch_window(&60_u64));
+        assert_restores_ttl("set_window_bounds", &|_, c, x| {
+            c.set_window_bounds(&x.admin, &5_u64, &3_600_u64)
+        });
+        assert_restores_ttl("set_max_orders", &|_, c, x| {
+            c.set_max_orders(&x.admin, &10_u32)
+        });
+        assert_restores_ttl("set_factory", &|e, c, x| {
+            c.set_factory(&x.admin, &Address::generate(e));
+        });
+        assert_restores_ttl("add_venue", &|e, c, x| {
+            c.add_venue(&x.admin, &Address::generate(e), &PoolType::Amm)
+        });
+        assert_restores_ttl("remove_venue", &|_, c, x| c.remove_venue(&x.admin, &x.pool));
+        assert_restores_ttl("propose_admin", &|e, c, x| {
+            c.propose_admin(&x.admin, &Address::generate(e))
+        });
+        assert_restores_ttl("accept_admin", &|_, c, x| c.accept_admin(&x.nominee));
+        assert_restores_ttl("expire_order", &|e, c, x| {
+            e.ledger().set_timestamp(1_020);
+            c.expire_order(&x.order_id)
+        });
+        assert_restores_ttl("claim_refund", &|_, c, x| {
+            c.claim_refund(&x.trader, &x.claim_id);
+        });
+        assert_restores_ttl("cancel_order", &|_, c, x| {
+            c.cancel_order(&x.trader, &x.order_id)
+        });
     }
 }

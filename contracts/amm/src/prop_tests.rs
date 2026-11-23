@@ -197,10 +197,14 @@ fn test_emergency_withdraw() {
     assert_eq!(info_before.reserve_b, 1_000_000);
 
     let recipient = Address::generate(&env);
+    env.ledger().set_timestamp(5_000);
+    amm.pause();
+    amm.announce_emergency_withdraw(&admin, &recipient);
+    // Past the default 24 h emergency delay.
     let expected_ts = 99999_u64;
     env.ledger().set_timestamp(expected_ts);
 
-    amm.emergency_withdraw(&recipient);
+    amm.emergency_withdraw(&admin, &recipient);
 
     let info_after = amm.get_info();
     assert_eq!(info_after.reserve_a, 0);
@@ -261,37 +265,40 @@ fn test_emergency_withdraw_zeros_total_shares_and_allows_redeposit() {
 
     // Emergency drain.
     let recipient = Address::generate(&env);
-    amm.emergency_withdraw(&recipient);
+    amm.pause();
+    amm.announce_emergency_withdraw(&admin, &recipient);
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 86_400);
+    amm.emergency_withdraw(&admin, &recipient);
 
-    // After drain: reserves AND total_shares must all be 0.
+    // After drain: reserves are 0, total_shares is preserved, and pool is in terminal drained state (#1095).
     let info_after = amm.get_info();
     assert_eq!(info_after.reserve_a, 0, "reserve_a not zeroed");
     assert_eq!(info_after.reserve_b, 0, "reserve_b not zeroed");
     assert_eq!(
-        info_after.total_shares, 0,
-        "total_shares must be zeroed after emergency_withdraw (issue #569)"
+        info_after.total_shares, info.total_shares,
+        "total_shares must remain intact after emergency_withdraw (#1095)"
     );
+    assert!(amm.is_drained(), "pool must be marked drained");
 
-    // Re-deposit must not panic (was previously bricked by divide-by-zero).
+    // Re-deposit and redemption are blocked with PoolDrained so old LP tokens cannot drain new deposits.
     let new_provider = Address::generate(&env);
     ta_sac.mint(&new_provider, &2_000_000_i128);
     tb_sac.mint(&new_provider, &1_000_000_i128);
-    let shares = AddLiquidity::new(&amm, &new_provider, 2_000_000, 1_000_000).execute();
-    assert!(
-        shares > 0,
-        "re-deposit after emergency_withdraw must mint shares"
+    let res = amm.try_add_liquidity(
+        &new_provider,
+        &2_000_000_i128,
+        &1_000_000_i128,
+        &0_i128,
+        &u64::MAX,
     );
-
-    let info_final = amm.get_info();
-    assert!(info_final.reserve_a > 0);
-    assert!(info_final.reserve_b > 0);
-    assert!(info_final.total_shares > 0);
+    assert_eq!(res, Err(Ok(AmmError::PoolDrained)));
 }
 
-/// Regression test for issue #569 — multisig path.
+/// Regression test for issue #1095 — multisig path.
 ///
-/// `exec_multisig_emergency_wd` must also zero `TotalShares` so that
-/// add_liquidity can be called successfully after the multisig drain.
+/// `exec_multisig_emergency_wd` enters the terminal drained state, preserving
+/// `TotalShares` and rejecting post-drain deposits and redemptions with `PoolDrained`.
 #[test]
 fn test_multisig_emergency_wd_zeros_total_shares_and_allows_redeposit() {
     let (env, admin, amm_addr, lp_addr, _) = setup();
@@ -325,27 +332,34 @@ fn test_multisig_emergency_wd_zeros_total_shares_and_allows_redeposit() {
 
     // Propose + execute the multisig emergency withdrawal.
     let recipient = Address::generate(&env);
-    amm.propose_emergency_withdraw(&signer, &recipient);
-    amm.exec_multisig_emergency_wd(&signer);
+    let pid = amm.propose_emergency_withdraw(&signer, &recipient);
+    amm.pause();
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + 86_400);
+    amm.exec_multisig_emergency_wd(&signer, &pid);
 
-    // After drain: reserves AND total_shares must all be 0.
+    // After drain: reserves are 0, total_shares is preserved, and pool is drained (#1095).
     let info_after = amm.get_info();
     assert_eq!(info_after.reserve_a, 0, "reserve_a not zeroed");
     assert_eq!(info_after.reserve_b, 0, "reserve_b not zeroed");
     assert_eq!(
-        info_after.total_shares, 0,
-        "total_shares must be zeroed after exec_multisig_emergency_wd (issue #569)"
+        info_after.total_shares, info.total_shares,
+        "total_shares must remain intact after exec_multisig_emergency_wd (#1095)"
     );
+    assert!(amm.is_drained(), "pool must be marked drained");
 
-    // Re-deposit must not panic.
+    // Re-deposit is rejected with PoolDrained.
     let new_provider = Address::generate(&env);
     ta_sac.mint(&new_provider, &2_000_000_i128);
     tb_sac.mint(&new_provider, &1_000_000_i128);
-    let shares = AddLiquidity::new(&amm, &new_provider, 2_000_000, 1_000_000).execute();
-    assert!(
-        shares > 0,
-        "re-deposit after multisig emergency_wd must mint shares"
+    let res = amm.try_add_liquidity(
+        &new_provider,
+        &2_000_000_i128,
+        &1_000_000_i128,
+        &0_i128,
+        &u64::MAX,
     );
+    assert_eq!(res, Err(Ok(AmmError::PoolDrained)));
 }
 
 #[test]
@@ -354,8 +368,9 @@ fn test_emergency_withdraw_requires_admin_auth() {
     let env = Env::default();
     let amm_addr = env.register_contract(None, AmmPool);
     let amm = AmmPoolClient::new(&env, &amm_addr);
+    let admin = Address::generate(&env);
     let recipient = Address::generate(&env);
-    amm.emergency_withdraw(&recipient);
+    amm.emergency_withdraw(&admin, &recipient);
 }
 
 #[test]
@@ -481,8 +496,7 @@ fn test_swap_panics_when_paused() {
 }
 
 #[test]
-#[should_panic]
-fn test_remove_liquidity_panics_when_paused() {
+fn test_remove_liquidity_succeeds_when_paused() {
     let (env, admin, amm_addr, lp_addr, _) = setup();
     let (ta_client, ta_sac) = create_sac(&env, &admin);
     let (tb_client, tb_sac) = create_sac(&env, &admin);
@@ -503,7 +517,8 @@ fn test_remove_liquidity_panics_when_paused() {
     let shares = AddLiquidity::new(&amm, &provider, 1_000_000, 1_000_000).execute();
 
     amm.pause();
-    RemoveLiquidity::new(&amm, &provider, shares).execute();
+    let (out_a, out_b) = RemoveLiquidity::new(&amm, &provider, shares).execute();
+    assert!(out_a > 0 && out_b > 0);
 }
 
 #[test]
@@ -797,4 +812,169 @@ fn test_simulate_swap_price_impact_bps() {
         medium.price_impact_bps > tiny.price_impact_bps,
         "medium swap must have larger price impact than tiny"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #1097: swap_exact_out fee consistency & k monotonicity
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Acceptance criterion 4:
+/// For fees 0, 1, 30, 100, 5_000, 9_999 and amounts spanning 1, 1_000, 99% of reserve:
+/// swap_exact_out never charges less than the get_amount_out-consistent price
+/// (fee never negative for LPs: k does not decrease).
+#[test]
+fn test_swap_exact_out_never_undercharges_and_k_never_decreases() {
+    let fee_tiers = [0_i128, 1_i128, 30_i128, 100_i128, 5_000_i128, 9_999_i128];
+    let reserve: i128 = 1_000_000;
+    // Amounts spanning 1, 1_000, and 99% of reserve (990_000)
+    let test_amounts = [1_i128, 1_000_i128, (reserve * 99) / 100];
+
+    for &fee_bps in fee_tiers.iter() {
+        for &amount_out in test_amounts.iter() {
+            let ts = setup_pool(fee_bps);
+            let env = &ts.env;
+            let amm = AmmPoolClient::new(env, &ts.amm_addr);
+            let ta_sac = soroban_sdk::token::StellarAssetClient::new(env, &ts.ta_addr);
+            let tb_sac = soroban_sdk::token::StellarAssetClient::new(env, &ts.tb_addr);
+
+            let provider = Address::generate(env);
+            ta_sac.mint(&provider, &reserve);
+            tb_sac.mint(&provider, &reserve);
+            AddLiquidity::new(&amm, &provider, reserve, reserve).execute();
+
+            let initial_k = reserve * reserve;
+
+            // 1. Query required input via get_amount_in
+            let amount_in = amm.get_amount_in(&ts.tb_addr, &amount_out);
+            assert!(
+                amount_in >= 1,
+                "amount_in must be >= 1 (fee_bps={}, amount_out={})",
+                fee_bps,
+                amount_out
+            );
+
+            // 2. Consistent price check: if trader deposited amount_in, get_amount_out must yield >= amount_out
+            let consistent_out = amm.get_amount_out(&ts.ta_addr, &amount_in);
+            assert!(
+                consistent_out >= amount_out,
+                "swap_exact_out must never charge less than get_amount_out-consistent price: \
+                 got consistent_out={}, wanted amount_out={} for fee_bps={}",
+                consistent_out,
+                amount_out,
+                fee_bps
+            );
+
+            // 3. Execute swap_exact_out and verify k does not decrease
+            let trader = Address::generate(env);
+            ta_sac.mint(&trader, &amount_in);
+
+            let charged_in =
+                amm.swap_exact_out(&trader, &ts.tb_addr, &amount_out, &amount_in, &u64::MAX);
+            assert_eq!(charged_in, amount_in);
+
+            let info = amm.get_info();
+            let k_after = info.reserve_a * info.reserve_b;
+            assert!(
+                k_after >= initial_k,
+                "k must not decrease: initial_k={}, k_after={}, fee_bps={}, amount_out={}",
+                initial_k,
+                k_after,
+                fee_bps,
+                amount_out
+            );
+        }
+    }
+}
+
+proptest! {
+    /// Property: For any valid fee in [0, 9_999] and amount_out in [1, 99% of reserve],
+    /// required amount_in >= 1, consistent get_amount_out >= amount_out, and k_after >= k_before.
+    #[test]
+    fn prop_swap_exact_out_fee_and_k_invariants(
+        fee_bps in prop_oneof![
+            Just(0_i128),
+            Just(1_i128),
+            Just(30_i128),
+            Just(100_i128),
+            Just(5_000_i128),
+            Just(9_999_i128),
+            0_i128..10_000_i128,
+        ],
+        reserve_in in 100_000_i128..=10_000_000_i128,
+        reserve_out in 100_000_i128..=10_000_000_i128,
+        pct in 1_i128..=99_i128,
+    ) {
+        let amount_out = (reserve_out * pct) / 100;
+        if amount_out > 0 && amount_out < reserve_out {
+            let numerator = reserve_in * amount_out * 10_000;
+            let denominator = (reserve_out - amount_out) * (10_000 - fee_bps);
+            let amount_in = (numerator / denominator) + 1;
+            prop_assert!(amount_in >= 1);
+
+            let amount_in_with_fee = amount_in * (10_000 - fee_bps);
+            let consistent_out = amount_in_with_fee * reserve_out / (reserve_in * 10_000 + amount_in_with_fee);
+            prop_assert!(consistent_out >= amount_out);
+
+            let k_before = reserve_in * reserve_out;
+            let k_after = (reserve_in + amount_in) * (reserve_out - amount_out);
+            prop_assert!(k_after >= k_before);
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(20))]
+    #[test]
+    fn prop_test_reserves_balance_invariant_random_operations(
+        ops in prop::collection::vec((0u8..=3, 100_i128..=50_000_i128), 5..=15),
+    ) {
+        let ts = setup_pool(30);
+        let env = &ts.env;
+        let amm = AmmPoolClient::new(env, &ts.amm_addr);
+        let ta_sac = soroban_sdk::token::StellarAssetClient::new(env, &ts.ta_addr);
+        let tb_sac = soroban_sdk::token::StellarAssetClient::new(env, &ts.tb_addr);
+
+        amm.set_protocol_fee(&ts.admin, &ts.admin, &10_i128);
+        amm.set_lp_rebate(&ts.admin, &200_i128);
+
+        let seed_lp = Address::generate(env);
+        ta_sac.mint(&seed_lp, &10_000_000_i128);
+        tb_sac.mint(&seed_lp, &10_000_000_i128);
+        AddLiquidity::new(&amm, &seed_lp, 10_000_000, 10_000_000).execute();
+
+        let user = Address::generate(env);
+        ta_sac.mint(&user, &10_000_000_i128);
+        tb_sac.mint(&user, &10_000_000_i128);
+
+        for (action, amount) in ops {
+            match action {
+                0 => {
+                    // add_liquidity
+                    AddLiquidity::new(&amm, &user, amount, amount).execute();
+                }
+                1 => {
+                    // swap A for B
+                    Swap::new(&amm, &user, &ts.ta_addr, amount).execute();
+                }
+                2 => {
+                    // remove_liquidity_one_sided (token_a)
+                    let shares = amm.shares_of(&user);
+                    if shares > 10 {
+                        let to_burn = (shares / 4).max(1);
+                        let _ = amm.remove_liquidity_one_sided(&user, &to_burn, &ts.ta_addr, &0_i128, &u64::MAX);
+                    }
+                }
+                3 => {
+                    // remove_liquidity_one_sided (token_b)
+                    let shares = amm.shares_of(&user);
+                    if shares > 10 {
+                        let to_burn = (shares / 4).max(1);
+                        let _ = amm.remove_liquidity_one_sided(&user, &to_burn, &ts.tb_addr, &0_i128, &u64::MAX);
+                    }
+                }
+                _ => {}
+            }
+            assert_reserves_match_balances(&amm, env);
+        }
+    }
 }

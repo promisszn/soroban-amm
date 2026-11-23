@@ -65,9 +65,38 @@ def encode_string(value: str) -> Any:
     return scval.to_string(value)
 
 
+def encode_unit_variant(name: str) -> Any:
+    """Encode a unit enum variant (e.g. ``Vote::For``) as a Soroban ScVal.
+
+    Soroban encodes a ``#[contracttype]`` union variant as a vector whose first
+    element is the variant symbol, so a bare symbol is rejected by the host.
+    """
+    return scval.to_vec([scval.to_symbol(name)])
+
+
 def decode_scval(value: Any) -> Any:
     """Decode an ScVal through the SDK's native conversion helper."""
     return scval.to_native(value)
+
+
+def decode_enum_variant(value: Any) -> str:
+    """Decode a Soroban unit-enum ScVal to its variant name string.
+
+    ``scval.to_native`` decodes a unit enum variant (e.g. ``ProposalStatus::Active``)
+    as a one-element list ``['Active']``.  Dict-style variants (e.g. a tuple variant)
+    come back as ``{'VariantName': [...args]}``.  This helper normalises both shapes
+    to a plain string so callers can compare with ``== "Active"`` instead of
+    special-casing every possible shape.
+    """
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], str):
+        # Unit variant: ['Active']
+        return value[0]
+    if isinstance(value, dict) and len(value) == 1:
+        # Tuple/struct variant: {'Active': [...]} — return the key
+        return next(iter(value.keys()))
+    if isinstance(value, str):
+        return value
+    return str(value)
 
 
 def build_client(contract_id: str) -> ContractClient:

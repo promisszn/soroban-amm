@@ -1,7 +1,8 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, within } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { PositionManager } from "./PositionManager.js";
+import type { PositionFormValues } from "./PositionManager.js";
 
 async function setAmount(input: HTMLElement, value: string, user: ReturnType<typeof userEvent.setup>) {
   await user.tripleClick(input);
@@ -39,7 +40,7 @@ describe("PositionManager", () => {
 
   it("submits a valid position with the expected payload", async () => {
     const user = userEvent.setup();
-    const onSubmit = vi.fn();
+    const onSubmit = vi.fn<(values: PositionFormValues) => void>();
     render(<PositionManager {...baseProps} onSubmit={onSubmit} />);
     await setAmount(screen.getByLabelText("XLM deposit amount"), "100", user);
     await setAmount(screen.getByLabelText("USDC deposit amount"), "200", user);
@@ -54,7 +55,7 @@ describe("PositionManager", () => {
 
   it("rejects a negative amount and surfaces it to the user", async () => {
     const user = userEvent.setup();
-    const onSubmit = vi.fn();
+    const onSubmit = vi.fn<(values: PositionFormValues) => void>();
     // Seed a negative amountA through the position prop (number inputs strip a
     // leading minus, so this drives the internal state directly).
     render(
@@ -71,7 +72,7 @@ describe("PositionManager", () => {
 
   it("rejects a zero amount and surfaces it to the user", async () => {
     const user = userEvent.setup();
-    const onSubmit = vi.fn();
+    const onSubmit = vi.fn<(values: PositionFormValues) => void>();
     render(<PositionManager {...baseProps} onSubmit={onSubmit} />);
     await setAmount(screen.getByLabelText("XLM deposit amount"), "0", user);
     await setAmount(screen.getByLabelText("USDC deposit amount"), "50", user);
@@ -82,7 +83,7 @@ describe("PositionManager", () => {
 
   it("rejects a lower tick above the upper tick", async () => {
     const user = userEvent.setup();
-    const onSubmit = vi.fn();
+    const onSubmit = vi.fn<(values: PositionFormValues) => void>();
     // Seed a malformed range via the position prop so the UI state carries it.
     render(
       <PositionManager
@@ -99,9 +100,59 @@ describe("PositionManager", () => {
     ).toBe(true);
   });
 
+  it("rejects a negative lower bound and an Infinity amount with the lib messages", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn<(values: PositionFormValues) => void>();
+    // `lower = -5, upper = 10` and an `Infinity` amount both slipped through
+    // the shipped `!(amount > 0)` / `lower >= upper` checks; the lib validator
+    // rejects them explicitly.
+    render(
+      <PositionManager
+        {...baseProps}
+        onSubmit={onSubmit}
+        position={{
+          amountA: Infinity,
+          amountB: 100,
+          priceRange: { lower: -5, upper: 10 },
+        }}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Add Liquidity" }));
+    expect(onSubmit).not.toHaveBeenCalled();
+    const alerts = screen.getAllByRole("alert").map((a) => a.textContent ?? "");
+    expect(
+      alerts.some((m) => m.includes("Amount A must be a positive number (received Infinity).")),
+    ).toBe(true);
+    expect(
+      alerts.some((m) => m.includes("Lower price must be a positive number.")),
+    ).toBe(true);
+  });
+
+  it("reports only the invalid lower bound, not a range-order error", async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn<(values: PositionFormValues) => void>();
+    render(
+      <PositionManager
+        {...baseProps}
+        onSubmit={onSubmit}
+        position={{
+          amountA: 100,
+          amountB: 100,
+          priceRange: { lower: -5, upper: 10 },
+        }}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Add Liquidity" }));
+    expect(onSubmit).not.toHaveBeenCalled();
+    // Only the invalid lower bound is reported; the range order itself is fine.
+    const alerts = screen.getAllByRole("alert").map((a) => a.textContent ?? "");
+    expect(alerts).toContain("Lower price must be a positive number.");
+    expect(alerts.some((m) => m.includes("Lower price must be below the upper price"))).toBe(false);
+  });
+
   it("shows no error alert after a valid submit", async () => {
     const user = userEvent.setup();
-    const onSubmit = vi.fn();
+    const onSubmit = vi.fn<(values: PositionFormValues) => void>();
     render(<PositionManager {...baseProps} onSubmit={onSubmit} />);
     await setAmount(screen.getByLabelText("XLM deposit amount"), "100", user);
     await setAmount(screen.getByLabelText("USDC deposit amount"), "100", user);
@@ -139,5 +190,16 @@ describe("PositionManager", () => {
     render(<PositionManager {...baseProps} poolTvl={500} priceDeviationBps={600} />);
     const riskTab = screen.getByRole("tab", { name: /Risk/ });
     expect(riskTab.textContent).toContain("⚠");
+  });
+
+  it("shows the unknown risk state when the pool metrics are invalid", async () => {
+    const user = userEvent.setup();
+    // A non-finite TVL makes the shared assessor return "unknown"; the
+    // PositionManager must render that through RiskIndicator rather than a
+    // green "Low Risk" for data it could not read.
+    render(<PositionManager {...baseProps} poolTvl={NaN} />);
+    await user.click(screen.getByRole("tab", { name: /Risk/ }));
+    expect(screen.getByText("Risk Unknown")).toBeInTheDocument();
+    expect(screen.queryByText("Low Risk")).not.toBeInTheDocument();
   });
 });

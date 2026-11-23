@@ -1,11 +1,20 @@
 export const typeDefs = `#graphql
+  # Every timestamp in this API (event timestamp, price point timestamp,
+  # alert firedAt, and the priceHistory from/to arguments) is seconds since
+  # the Unix epoch, not milliseconds.
+
   type PoolStats {
     poolId: ID!
     tokenA: String!
     tokenB: String!
-    tvl: Float!
+    reserveA: Float!
+    reserveB: Float!
+    "USD TVL, or null until prices for both reserve assets are configured."
+    tvl: Float
     volume24h: Float!
     fees24h: Float!
+    feeBps: Int!
+    feeBpsSource: String!
     swapCount: Int!
     priceDeviationBps: Int!
   }
@@ -14,6 +23,7 @@ export const typeDefs = `#graphql
     id: ID!
     poolId: ID!
     type: String!
+    "Seconds since the Unix epoch (chain close time of the ledger)."
     timestamp: Float!
     payload: String!
   }
@@ -23,14 +33,18 @@ export const typeDefs = `#graphql
     poolId: ID!
     owner: String!
     shares: Float!
-    valueUsd: Float!
+    valueUsd: Float
+    lowerTick: Int
+    upperTick: Int
   }
 
   type PricePoint {
     poolId: ID!
+    "Seconds since the Unix epoch."
     timestamp: Float!
     price: Float!
     feeBps: Int!
+    feeBpsSource: String!
   }
 
   type PoolHealth {
@@ -49,6 +63,7 @@ export const typeDefs = `#graphql
     metric: String!
     threshold: Float!
     currentValue: Float!
+    "Seconds since the Unix epoch."
     firedAt: Float!
   }
 
@@ -69,6 +84,7 @@ export const typeDefs = `#graphql
     poolStats(poolId: ID): [PoolStats!]!
     poolEvents(poolId: ID, limit: Int = 100): [PoolEvent!]!
     positions(owner: String): [Position!]!
+    "from and to are inclusive bounds in seconds since the Unix epoch."
     priceHistory(poolId: ID!, from: Float, to: Float): [PricePoint!]!
     twal(poolId: ID!, windowSeconds: Int!): Float
     poolHealth(poolId: ID!): PoolHealth

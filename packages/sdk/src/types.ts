@@ -33,11 +33,11 @@ export interface PoolInfo {
   totalShares: bigint;
   feeBps: bigint;
   protocolFeeBps: bigint;
-  feeRecipient: string | null;
+  feeRecipient: string;
   flashLoanFeeBps: bigint;
-  admin: string | null;
+  admin: string;
+  lpRebateBps: bigint;
   isPaused: boolean;
-  name: string | null;
 }
 
 /** Input for a swap call. */
@@ -54,12 +54,20 @@ export interface SwapParams {
   deadline: bigint;
 }
 
-/** Result of a swap simulation. */
+/**
+ * Result of a swap simulation, decoded from the contract's `SwapSimulation`
+ * struct (`contracts/amm/src/lib.rs`). `priceImpactBps` is surfaced as a number
+ * because it is a small basis-point figure; every other field stays a bigint.
+ */
 export interface SwapSimulation {
   amountIn: bigint;
   amountOut: bigint;
   priceImpactBps: number;
   feeAmount: bigint;
+  /** `amount_out / amount_in`, scaled by 1_000_000. */
+  effectivePrice: bigint;
+  /** `reserve_out / reserve_in`, scaled by 1_000_000. */
+  spotPrice: bigint;
 }
 
 /** Input for adding liquidity. */
@@ -126,6 +134,15 @@ export const AmmErrors = {
   19: "multisig proposal already executed",
   20: "multisig proposal expired",
   21: "pool not initialized",
+  22: "pool drained by an emergency withdrawal",
+  23: "governance quorum not met",
+  24: "no pending emergency announcement or multisig proposal",
+  25: "multisig quorum not reached",
+  26: "invalid multisig quorum",
+  27: "emergency delay not elapsed",
+  28: "invalid emergency recipient",
+  29: "multisig guard is active",
+  30: "invalid emergency delay",
 } as const;
 
 /** Numeric discriminant of an `AmmError` variant. */
@@ -157,6 +174,15 @@ export const AmmErrorNames = {
   19: "AlreadyExecuted",
   20: "ProposalExpired",
   21: "NotInitialized",
+  22: "PoolDrained",
+  23: "QuorumNotMet",
+  24: "NoPendingProposal",
+  25: "QuorumNotReached",
+  26: "InvalidQuorum",
+  27: "EmergencyDelayNotElapsed",
+  28: "InvalidRecipient",
+  29: "MultisigGuardActive",
+  30: "InvalidEmergencyDelay",
 } as const;
 
 export type AmmErrorKey = (typeof AmmErrorNames)[AmmErrorCode];

@@ -18,9 +18,18 @@ from common import (
 # AMM spot price. See the "Use the TWAP Oracle" section of the README.
 PRICE_SCALE = 1_000_000
 
+# Exit code used when the TWAP read fails because no sufficiently old snapshot
+# exists yet.  This is an *expected* transient failure on the first run; callers
+# can distinguish it from unexpected errors by checking for this code.
+EXIT_NO_SNAPSHOT = 2
 
-def main() -> int:
-    argparse.ArgumentParser(description="Soroban AMM integration example").parse_args()
+
+def main(argv: list[str] | None = None) -> int:
+    # Explicit empty-by-default argv, not the implicit sys.argv[1:] default,
+    # so main() is safely callable as a plain function (e.g. from tests running
+    # under pytest) without this no-op parser choking on the caller's own CLI
+    # flags and exiting the whole process with SystemExit(2).
+    argparse.ArgumentParser(description="Soroban AMM integration example").parse_args(argv if argv is not None else [])
     rpc_url = os.getenv("STELLAR_RPC_URL", "https://soroban-testnet.stellar.org")
     network_passphrase = os.getenv(
         "STELLAR_NETWORK_PASSPHRASE",
@@ -60,6 +69,7 @@ def main() -> int:
             print("Snapshot saved.")
         except Exception as e:
             print(f"Failed to save snapshot: {e}")
+            client.server.close()
             return 1
     else:
         print("\n1. Skipping snapshot (SAVE_SNAPSHOT=false).")
@@ -75,7 +85,10 @@ def main() -> int:
             f"{window_seconds}s ago must exist first: {e}"
         )
         client.server.close()
-        return 0
+        # EXIT_NO_SNAPSHOT (2) signals that this is an *expected* first-run
+        # transient, not an unexpected failure.  Callers and CI can distinguish
+        # it from a real error (exit 1) by checking the exit code.
+        return EXIT_NO_SNAPSHOT
 
     # 3. Read both directions in a single call.
     print(f"\n3. Reading both TWAP directions over the last {window_seconds}s...")
@@ -85,6 +98,8 @@ def main() -> int:
         print(f"TWAP B->A: {twap_b_to_a}")
     except Exception as e:
         print(f"Failed to read both directions: {e}")
+        client.server.close()
+        return 1
 
     # 4. Optionally validate a real-time spot price against the TWAP.
     if spot_price:
@@ -104,6 +119,8 @@ def main() -> int:
                 print("Spot price is within the TWAP deviation threshold.")
         except Exception as e:
             print(f"Failed to validate price: {e}")
+            client.server.close()
+            return 1
     else:
         print("\n4. Skipping spot-price validation (SPOT_PRICE not set).")
 
@@ -114,6 +131,8 @@ def main() -> int:
         print(format_json(pools))
     except Exception as e:
         print(f"Failed to read tracked pools: {e}")
+        client.server.close()
+        return 1
 
     client.server.close()
     return 0
@@ -172,7 +191,7 @@ def get_tracked_pools(client: ContractClient) -> Any:
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        raise SystemExit(main(sys.argv[1:]))
     except Exception as exc:
         print(exc, file=sys.stderr)
         raise SystemExit(1) from exc

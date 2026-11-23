@@ -14,6 +14,9 @@ import {
 } from "@stellar/stellar-sdk";
 import type { NetworkConfig } from "./types.js";
 import { simulateRead } from "./internal/simulate.js";
+import { invoke } from "./internal/invoke.js";
+import type { InvocationResult, InvokeOptions, Signer } from "./internal/invoke.js";
+import { ContractDecodeError, requireBigInt, toBigInt } from "./internal/decode.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -103,6 +106,11 @@ export class ConcentratedLiquidityClient {
     return simulateRead(this.server, this.contract, this.networkPassphrase, method, args);
   }
 
+  private async execute<T>(method: string, args: xdr.ScVal[], signer: Signer, options?: InvokeOptions): Promise<InvocationResult<T>> {
+    return invoke<T>({ server: this.server, contract: this.contract, method, args,
+      source: await signer.publicKey(), signer, networkPassphrase: this.networkPassphrase, ...options });
+  }
+
   // ── Read-only methods ──────────────────────────────────────────────────────
 
   /** Returns the full pool state (sqrt price, current tick, active liquidity, tick spacing). */
@@ -110,10 +118,10 @@ export class ConcentratedLiquidityClient {
     const raw = await this.simulate("get_pool_state");
     const native = scValToNative(raw) as Record<string, unknown>;
     return {
-      sqrtPrice: BigInt(String(native.sqrt_price ?? 0)),
-      currentTick: Number(native.current_tick ?? 0),
-      activeLiquidity: BigInt(String(native.active_liquidity ?? 0)),
-      tickSpacing: Number(native.tick_spacing ?? 1),
+      sqrtPrice: requireBigInt(native, "sqrt_price", "PoolState"),
+      currentTick: Number(requireBigInt(native, "current_tick", "PoolState")),
+      activeLiquidity: requireBigInt(native, "active_liquidity", "PoolState"),
+      tickSpacing: Number(requireBigInt(native, "tick_spacing", "PoolState")),
     };
   }
 
@@ -126,7 +134,7 @@ export class ConcentratedLiquidityClient {
   /** Returns the current active liquidity across the current tick. */
   async activeLiquidity(): Promise<bigint> {
     const raw = await this.simulate("active_liquidity");
-    return BigInt(String(scValToNative(raw)));
+    return toBigInt(scValToNative(raw));
   }
 
   /**
@@ -138,8 +146,8 @@ export class ConcentratedLiquidityClient {
     const raw = await this.simulate("get_tick_cumulative");
     const native = scValToNative(raw) as [unknown, unknown];
     return {
-      tickCumulative: BigInt(String(native[0] ?? 0)),
-      lastTimestamp: BigInt(String(native[1] ?? 0)),
+      tickCumulative: toBigInt(native[0]),
+      lastTimestamp: toBigInt(native[1]),
     };
   }
 
@@ -147,15 +155,23 @@ export class ConcentratedLiquidityClient {
   async getPosition(owner: string, lowerTick: number, upperTick: number): Promise<Position> {
     const raw = await this.simulate("get_position", addr(owner), i32(lowerTick), i32(upperTick));
     const native = scValToNative(raw) as Record<string, unknown>;
-    const owed = native.tokens_owed as [unknown, unknown];
+    const posLower = Number(requireBigInt(native, "lower_tick", "Position"));
+    const posUpper = Number(requireBigInt(native, "upper_tick", "Position"));
+    const liquidity = requireBigInt(native, "liquidity", "Position");
+    const feeGrowthInsideA = requireBigInt(native, "fee_growth_inside_a", "Position");
+    const feeGrowthInsideB = requireBigInt(native, "fee_growth_inside_b", "Position");
+    const owed = native.tokens_owed;
+    if (!Array.isArray(owed) || owed.length !== 2) {
+      throw new ContractDecodeError("Position", "tokens_owed", Object.keys(native));
+    }
     return {
-      lowerTick: Number(native.lower_tick ?? lowerTick),
-      upperTick: Number(native.upper_tick ?? upperTick),
-      liquidity: BigInt(String(native.liquidity ?? 0)),
-      feeGrowthInsideA: BigInt(String(native.fee_growth_inside_a ?? 0)),
-      feeGrowthInsideB: BigInt(String(native.fee_growth_inside_b ?? 0)),
-      tokensOwedA: BigInt(String(owed?.[0] ?? 0)),
-      tokensOwedB: BigInt(String(owed?.[1] ?? 0)),
+      lowerTick: posLower,
+      upperTick: posUpper,
+      liquidity,
+      feeGrowthInsideA,
+      feeGrowthInsideB,
+      tokensOwedA: toBigInt(owed?.[0]),
+      tokensOwedB: toBigInt(owed?.[1]),
     };
   }
 
@@ -179,9 +195,9 @@ export class ConcentratedLiquidityClient {
     );
     const native = scValToNative(raw) as [unknown, unknown, unknown];
     return {
-      amountA: BigInt(String(native[0] ?? 0)),
-      amountB: BigInt(String(native[1] ?? 0)),
-      liquidity: BigInt(String(native[2] ?? 0)),
+      amountA: toBigInt(native[0]),
+      amountB: toBigInt(native[1]),
+      liquidity: toBigInt(native[2]),
     };
   }
 
@@ -204,19 +220,19 @@ export class ConcentratedLiquidityClient {
     );
     const native = scValToNative(raw) as Record<string, unknown>;
     return {
-      amountIn: BigInt(String(native.amount_in ?? 0)),
-      amountInAfterFee: BigInt(String(native.amount_in_after_fee ?? 0)),
-      amountOut: BigInt(String(native.amount_out ?? 0)),
-      feeAmount: BigInt(String(native.fee_amount ?? 0)),
-      spotPriceBefore: BigInt(String(native.spot_price_before ?? 0)),
-      effectivePrice: BigInt(String(native.effective_price ?? 0)),
-      priceImpactBps: BigInt(String(native.price_impact_bps ?? 0)),
-      sqrtPriceBefore: BigInt(String(native.sqrt_price_before ?? 0)),
-      sqrtPriceAfter: BigInt(String(native.sqrt_price_after ?? 0)),
-      tickBefore: Number(native.tick_before ?? 0),
-      tickAfter: Number(native.tick_after ?? 0),
-      activeLiquidityBefore: BigInt(String(native.active_liquidity_before ?? 0)),
-      activeLiquidityAfter: BigInt(String(native.active_liquidity_after ?? 0)),
+      amountIn: requireBigInt(native, "amount_in", "PriceImpactEstimate"),
+      amountInAfterFee: requireBigInt(native, "amount_in_after_fee", "PriceImpactEstimate"),
+      amountOut: requireBigInt(native, "amount_out", "PriceImpactEstimate"),
+      feeAmount: requireBigInt(native, "fee_amount", "PriceImpactEstimate"),
+      spotPriceBefore: requireBigInt(native, "spot_price_before", "PriceImpactEstimate"),
+      effectivePrice: requireBigInt(native, "effective_price", "PriceImpactEstimate"),
+      priceImpactBps: requireBigInt(native, "price_impact_bps", "PriceImpactEstimate"),
+      sqrtPriceBefore: requireBigInt(native, "sqrt_price_before", "PriceImpactEstimate"),
+      sqrtPriceAfter: requireBigInt(native, "sqrt_price_after", "PriceImpactEstimate"),
+      tickBefore: Number(requireBigInt(native, "tick_before", "PriceImpactEstimate")),
+      tickAfter: Number(requireBigInt(native, "tick_after", "PriceImpactEstimate")),
+      activeLiquidityBefore: requireBigInt(native, "active_liquidity_before", "PriceImpactEstimate"),
+      activeLiquidityAfter: requireBigInt(native, "active_liquidity_after", "PriceImpactEstimate"),
     };
   }
 
@@ -231,8 +247,8 @@ export class ConcentratedLiquidityClient {
     const raw = await this.simulate("fee_growth_inside", i32(lowerTick), i32(upperTick));
     const native = scValToNative(raw) as [unknown, unknown];
     return {
-      feeGrowthA: BigInt(String(native[0] ?? 0)),
-      feeGrowthB: BigInt(String(native[1] ?? 0)),
+      feeGrowthA: toBigInt(native[0]),
+      feeGrowthB: toBigInt(native[1]),
     };
   }
 
@@ -242,18 +258,34 @@ export class ConcentratedLiquidityClient {
    */
   async tickToPrice(tick: number): Promise<bigint> {
     const raw = await this.simulate("tick_to_price", i32(tick));
-    return BigInt(String(scValToNative(raw)));
+    return toBigInt(scValToNative(raw));
   }
 
   /**
-   * Returns oracle tick cumulative values for an array of historical timestamps.
-   * Returns one `i64` per requested timestamp.
+   * Returns the tick cumulative `secondsAgo` seconds in the past.
+   *
+   * Mirrors `ConcentratedLiquidity::observe` —
+   * contracts/concentrated_liquidity/src/lib.rs:3294
+   * `(seconds_ago: u64) -> i64`. The contract takes a single timestamp, not a
+   * list, and returns a single cumulative value. Use {@link observeBatch} to
+   * sample several points; each point is one RPC call.
    */
-  async observe(timestamps: bigint[]): Promise<bigint[]> {
-    const tsVec = nativeToScVal(timestamps.map((t) => nativeToScVal(t, { type: "u64" })));
-    const raw = await this.simulate("observe", tsVec);
-    const native = scValToNative(raw) as unknown[];
-    return (native ?? []).map((v) => BigInt(String(v)));
+  async observe(secondsAgo: bigint): Promise<bigint> {
+    const raw = await this.simulate("observe", u64(secondsAgo));
+    return toBigInt(scValToNative(raw));
+  }
+
+  /**
+   * Sample {@link observe} at several `secondsAgo` points, in order.
+   *
+   * Client-side convenience, not a contract entrypoint: the contract only
+   * exposes the single-point `observe`, so this loops and costs one RPC call per
+   * point.
+   */
+  async observeBatch(secondsAgos: bigint[]): Promise<bigint[]> {
+    const out: bigint[] = [];
+    for (const secondsAgo of secondsAgos) out.push(await this.observe(secondsAgo));
+    return out;
   }
 
   /** Returns whether the pool is paused. */
@@ -268,13 +300,15 @@ export class ConcentratedLiquidityClient {
    * Parameters for `mint_position`.
    *
    * Mirrors `ConcentratedLiquidity::mint_position` —
-   * contracts/concentrated_liquidity/src/lib.rs:407
+   * contracts/concentrated_liquidity/src/lib.rs:706
    * `(provider: Address, lower_tick: i32, upper_tick: i32,
-   *   amount_a_desired: i128, amount_b_desired: i128, min_a: i128, min_b: i128)`
+   *   amount_a_desired: i128, amount_b_desired: i128, min_a: i128,
+   *   min_b: i128, deadline: u64)`
    *
-   * Note there is no `deadline` argument: `mint_position` has no deadline
-   * guard. `minA`/`minB` are independent per-token slippage floors, not a
-   * single combined minimum-liquidity bound.
+   * The trailing `deadline` is a Unix timestamp (seconds); the contract rejects
+   * a call whose ledger time has passed it with `DeadlineExpired`. `minA`/`minB`
+   * are independent per-token slippage floors, not a single combined
+   * minimum-liquidity bound.
    */
   mintPositionParams(
     provider: string,
@@ -283,7 +317,8 @@ export class ConcentratedLiquidityClient {
     amountADesired: bigint,
     amountBDesired: bigint,
     minA: bigint,
-    minB: bigint
+    minB: bigint,
+    deadline: bigint
   ): xdr.ScVal[] {
     return [
       addr(provider),
@@ -293,6 +328,7 @@ export class ConcentratedLiquidityClient {
       i128(amountBDesired),
       i128(minA),
       i128(minB),
+      u64(deadline),
     ];
   }
 
@@ -300,7 +336,7 @@ export class ConcentratedLiquidityClient {
    * Parameters for `modify_position`.
    *
    * Mirrors `ConcentratedLiquidity::modify_position` —
-   * contracts/concentrated_liquidity/src/lib.rs:540
+   * contracts/concentrated_liquidity/src/lib.rs:889
    * `(provider: Address, lower_tick: i32, upper_tick: i32,
    *   liquidity_delta: i128, min_a: i128, min_b: i128, deadline: u64)`
    *
@@ -322,7 +358,7 @@ export class ConcentratedLiquidityClient {
    * Parameters for `burn_position`.
    *
    * Mirrors `ConcentratedLiquidity::burn_position` —
-   * contracts/concentrated_liquidity/src/lib.rs:1118
+   * contracts/concentrated_liquidity/src/lib.rs:1567
    * `(provider: Address, lower_tick: i32, upper_tick: i32, liquidity: i128)`
    *
    * `liquidity` specifies how much of the position to burn and must be
@@ -343,7 +379,7 @@ export class ConcentratedLiquidityClient {
    * Parameters for `collect_fees`.
    *
    * Mirrors `ConcentratedLiquidity::collect_fees` —
-   * contracts/concentrated_liquidity/src/lib.rs:1229
+   * contracts/concentrated_liquidity/src/lib.rs:1627
    * `(provider: Address, lower_tick: i32, upper_tick: i32)`
    *
    * Returns `(fee_a, fee_b)`.
@@ -356,7 +392,7 @@ export class ConcentratedLiquidityClient {
    * Parameters for `swap`.
    *
    * Mirrors `ConcentratedLiquidity::swap` —
-   * contracts/concentrated_liquidity/src/lib.rs:1437
+   * contracts/concentrated_liquidity/src/lib.rs:2146
    * `(sender: Address, zero_for_one: bool, amount_in: i128,
    *   sqrt_price_limit_x96: u128, min_amount_out: i128, deadline: u64)`
    *
@@ -381,5 +417,33 @@ export class ConcentratedLiquidityClient {
       i128(minAmountOut),
       u64(deadline),
     ];
+  }
+
+  swapExactOutParams(sender: string, zeroForOne: boolean, amountOut: bigint, sqrtPriceLimitX96: bigint, maxAmountIn: bigint, deadline: bigint): xdr.ScVal[] {
+    return [addr(sender), nativeToScVal(zeroForOne, { type: "bool" }), i128(amountOut), u128(sqrtPriceLimitX96), i128(maxAmountIn), u64(deadline)];
+  }
+
+  async mintPosition(provider: string, lowerTick: number, upperTick: number, amountADesired: bigint, amountBDesired: bigint, minA: bigint, minB: bigint, deadline: bigint, signer: Signer, options?: InvokeOptions): Promise<InvocationResult<PositionQuote>> {
+    return this.execute("mint_position", this.mintPositionParams(provider, lowerTick, upperTick, amountADesired, amountBDesired, minA, minB, deadline), signer, options);
+  }
+
+  async modifyPosition(provider: string, lowerTick: number, upperTick: number, liquidityDelta: bigint, minA: bigint, minB: bigint, deadline: bigint, signer: Signer, options?: InvokeOptions): Promise<InvocationResult<[bigint, bigint]>> {
+    return this.execute("modify_position", this.modifyPositionParams(provider, lowerTick, upperTick, liquidityDelta, minA, minB, deadline), signer, options);
+  }
+
+  async burnPosition(provider: string, lowerTick: number, upperTick: number, liquidity: bigint, signer: Signer, options?: InvokeOptions): Promise<InvocationResult<[bigint, bigint]>> {
+    return this.execute("burn_position", this.burnPositionParams(provider, lowerTick, upperTick, liquidity), signer, options);
+  }
+
+  async collectFees(provider: string, lowerTick: number, upperTick: number, signer: Signer, options?: InvokeOptions): Promise<InvocationResult<[bigint, bigint]>> {
+    return this.execute("collect_fees", this.collectFeesParams(provider, lowerTick, upperTick), signer, options);
+  }
+
+  async swap(sender: string, zeroForOne: boolean, amountIn: bigint, sqrtPriceLimitX96: bigint, minAmountOut: bigint, deadline: bigint, signer: Signer, options?: InvokeOptions): Promise<InvocationResult<bigint>> {
+    return this.execute("swap", this.swapParams(sender, zeroForOne, amountIn, sqrtPriceLimitX96, minAmountOut, deadline), signer, options);
+  }
+
+  async swapExactOut(sender: string, zeroForOne: boolean, amountOut: bigint, sqrtPriceLimitX96: bigint, maxAmountIn: bigint, deadline: bigint, signer: Signer, options?: InvokeOptions): Promise<InvocationResult<bigint>> {
+    return this.execute("swap_exact_out", this.swapExactOutParams(sender, zeroForOne, amountOut, sqrtPriceLimitX96, maxAmountIn, deadline), signer, options);
   }
 }

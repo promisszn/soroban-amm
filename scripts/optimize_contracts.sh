@@ -30,7 +30,7 @@ for wasm in "${artifacts[@]}"; do
   printf '[optimize] %s -> %s\n' "${wasm#$ROOT_DIR/}" "${output#$ROOT_DIR/}"
 
   if command -v stellar >/dev/null 2>&1; then
-    stellar contract optimize --wasm "$wasm" --output "$output"
+    stellar contract optimize --wasm "$wasm" --wasm-out "$output"
   elif command -v wasm-opt >/dev/null 2>&1; then
     wasm-opt -O3 --strip-dwarf -o "$output" "$wasm"
   else

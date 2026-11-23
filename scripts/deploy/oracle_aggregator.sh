@@ -42,7 +42,7 @@ deploy_oracle_aggregator() {
       CURRENT_STEP="initialize oracle_aggregator"
       log "initializing oracle_aggregator admin=$ADMIN_ADDRESS staleness=$DEFAULT_ORACLE_MAX_STALENESS_SECS"
       if ! invoke "$ORACLE_AGGREGATOR_CONTRACT_ID" initialize --admin "$ADMIN_ADDRESS" --max_staleness_seconds "$DEFAULT_ORACLE_MAX_STALENESS_SECS" >/dev/null 2>&1; then
-        if invoke_read "$ORACLE_AGGREGATOR_CONTRACT_ID" -- get_admin 2>&1 | grep -q "$ADMIN_ADDRESS" || invoke_read "$ORACLE_AGGREGATOR_CONTRACT_ID" -- get_sources >/dev/null 2>&1; then
+        if invoke_read "$ORACLE_AGGREGATOR_CONTRACT_ID" get_admin 2>/dev/null | grep -q "$ADMIN_ADDRESS" || invoke_read "$ORACLE_AGGREGATOR_CONTRACT_ID" get_sources >/dev/null 2>/dev/null; then
           log "oracle_aggregator already initialized"
         else
           warn "failed to initialize oracle_aggregator"
@@ -55,7 +55,7 @@ deploy_oracle_aggregator() {
   fi
 
   CURRENT_STEP="verify oracle_aggregator"
-  if invoke_read "$ORACLE_AGGREGATOR_CONTRACT_ID" -- get_sources >/dev/null 2>&1 || invoke_read "$ORACLE_AGGREGATOR_CONTRACT_ID" -- get_admin >/dev/null 2>&1; then
+  if invoke_read "$ORACLE_AGGREGATOR_CONTRACT_ID" get_sources >/dev/null 2>/dev/null || invoke_read "$ORACLE_AGGREGATOR_CONTRACT_ID" get_admin >/dev/null 2>/dev/null; then
     log "verified oracle_aggregator liveness"
   else
     warn "oracle_aggregator verification warning"

@@ -6,11 +6,14 @@
  * can use a persistent store (SQLite) that survives restarts.
  */
 
+import type { Seconds } from "../time.js";
+
 export interface PoolEvent {
   id: string;
   poolId: string;
   type: PoolEventType;
-  timestamp: number;
+  /** Seconds since the Unix epoch. */
+  timestamp: Seconds;
   ledger: number;
   txHash: string;
   eventIndex: number;
@@ -19,8 +22,14 @@ export interface PoolEvent {
 
 export type PoolEventType =
   | "swap"
+  | "swap_out"
   | "add_liquidity"
   | "remove_liquidity"
+  | "mint_pos"
+  | "burn_pos"
+  | "coll_fees"
+  | "governance"
+  | "staking"
   | "campaign_created"
   | "reward_distributed"
   | "fot_detected"
@@ -31,12 +40,17 @@ export interface PoolStats {
   poolId: string;
   tokenA: string;
   tokenB: string;
-  tvl: number;
+  reserveA: number;
+  reserveB: number;
+  tvl: number | null;
   volume24h: number;
   fees24h: number;
+  feeBps: number;
+  feeBpsSource: "configured" | "default";
   swapCount: number;
   priceDeviationBps: number;
-  lastUpdate: number;
+  /** Seconds since the Unix epoch. */
+  lastUpdate: Seconds;
 }
 
 export interface Position {
@@ -44,14 +58,18 @@ export interface Position {
   poolId: string;
   owner: string;
   shares: number;
-  valueUsd: number;
+  valueUsd: number | null;
+  lowerTick?: number;
+  upperTick?: number;
 }
 
 export interface PricePoint {
   poolId: string;
-  timestamp: number;
+  /** Seconds since the Unix epoch. */
+  timestamp: Seconds;
   price: number;
   feeBps: number;
+  feeBpsSource?: "configured" | "default";
 }
 
 export interface HealthAlert {
@@ -59,17 +77,26 @@ export interface HealthAlert {
   metric: string;
   threshold: number;
   currentValue: number;
-  firedAt: number;
+  /** Seconds since the Unix epoch. */
+  firedAt: Seconds;
 }
 
 export interface AlertConfig {
   poolId: string;
   metric: string;
-  thresholdBps: number;
+  thresholdBps?: number;
+  thresholdValue?: number;
 }
 
 /** Ingestion cursor tracking progress through RPC events. */
 export interface IngestionCursor {
+  /**
+   * Contract this cursor tracks progress for. A single ingester polls
+   * multiple contracts, each paginating independently, so one cursor per
+   * contract is required — otherwise each contract's progress would
+   * overwrite the others'.
+   */
+  contractId: string;
   /**
    * Last ledger sequence number successfully ingested.
    * Used to resume from where we left off.
@@ -85,8 +112,8 @@ export interface IngestionCursor {
    * Used for idempotency.
    */
   eventIndex: number;
-  /** Timestamp of last update, for monitoring lag. */
-  updatedAt: number;
+  /** Seconds since the Unix epoch of the last update, for monitoring lag. */
+  updatedAt: Seconds;
 }
 
 /**
@@ -103,17 +130,23 @@ export interface AnalyticsStore {
    * Must be idempotent: appending the same event twice by (ledger, txHash, eventIndex)
    * does not create a duplicate.
    */
-  appendEvent(event: PoolEvent): Promise<void>;
+  appendEvent(event: PoolEvent): Promise<boolean>;
+
+  /** Atomically append an event and advance its contract cursor. */
+  appendEventAndSetCursor(event: PoolEvent, cursor: IngestionCursor): Promise<boolean>;
 
   /**
    * Query events by pool and time range.
    */
-  queryEvents(poolId: string, from: number, to: number, limit?: number): Promise<PoolEvent[]>;
+  queryEvents(poolId: string, from: Seconds, to: Seconds, limit?: number): Promise<PoolEvent[]>;
 
   /**
    * Get the most recent events across all pools.
    */
   getRecentEvents(limit: number): Promise<PoolEvent[]>;
+
+  /** Read retained events in chronological order for index rebuilds. */
+  getEventsSince(from: Seconds): Promise<PoolEvent[]>;
 
   // ─── Pool stats ──────────────────────────────────────────────────────────
 
@@ -150,7 +183,7 @@ export interface AnalyticsStore {
   /**
    * Query price history for a pool over a time range.
    */
-  getPriceHistory(poolId: string, from: number, to: number): Promise<PricePoint[]>;
+  getPriceHistory(poolId: string, from: Seconds, to: Seconds): Promise<PricePoint[]>;
 
   // ─── Alerts ─────────────────────────────────────────────────────────────
 
@@ -182,15 +215,19 @@ export interface AnalyticsStore {
   // ─── Ingestion cursor ────────────────────────────────────────────────────
 
   /**
-   * Get the current ingestion cursor (progress through RPC events).
-   * Returns null if never ingested.
+   * Get the current ingestion cursor for a contract (progress through RPC
+   * events). Returns null if that contract has never been ingested.
    */
-  getCursor(): Promise<IngestionCursor | null>;
+  getCursor(contractId: string): Promise<IngestionCursor | null>;
 
   /**
-   * Update the ingestion cursor (called after successfully processing events).
+   * Update a contract's ingestion cursor (called after successfully
+   * processing its events).
    */
   setCursor(cursor: IngestionCursor): Promise<void>;
+
+  /** Delete retained historical rows older than the supplied timestamp. */
+  prune(before: Seconds): Promise<void>;
 
   // ─── Lifecycle ───────────────────────────────────────────────────────────
 

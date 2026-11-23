@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   compareThreshold, createDashboardController, formatError, formatMetric, formatTimestamp,
-  gql, healthColor, renderAlertConfigs, renderEvents, renderFiredAlerts, renderHealth,
-  renderHeatmap, renderHistory, renderStats,
+  formatTokenAmount, formatMetricWithUnit, gql, healthColor, renderAlertConfigs, renderEvents,
+  renderFiredAlerts, renderHealth, renderHeatmap, renderHistory, renderStats, renderPoolsOverview,
 } from "./dashboard.js";
 import { installFakeDocument } from "./dom-stub.js";
 
@@ -34,6 +34,11 @@ function setupRefreshTestDom() {
   ]);
   doc.getElementById("btn-retry").hidden = true;
   return doc;
+}
+
+/** All text a fake element renders: its own text/HTML plus every descendant's. */
+function renderedText(el) {
+  return [el.innerHTML, el.textContent, ...el.children.map(renderedText)].join(" ");
 }
 
 test("formats millions", () => assert.equal(formatMetric(1_250_000), "1.25M"));
@@ -147,10 +152,10 @@ const SAMPLE_STATS = {
 
 test("renderStats writes formatted metrics into their tiles", () => {
   const doc = installFakeDocument(STATS_IDS);
-  renderStats([SAMPLE_STATS]);
-  assert.equal(doc.getElementById("m-tvl").textContent, "$2.50M");
-  assert.equal(doc.getElementById("m-vol").textContent, "$12.5K");
-  assert.equal(doc.getElementById("m-fees").textContent, "$125.50");
+  renderStats([SAMPLE_STATS], "pool-a");
+  assert.ok(doc.getElementById("m-tvl").textContent.includes("tokens"));
+  assert.ok(doc.getElementById("m-vol").textContent.includes("tokens"));
+  assert.ok(doc.getElementById("m-fees").textContent.includes("tokens"));
   assert.equal(doc.getElementById("m-swaps").textContent, Number(1234).toLocaleString());
   assert.ok(doc.getElementById("m-tvl-sub").textContent.includes("AAA"));
   assert.ok(doc.getElementById("m-tvl-sub").textContent.includes("BBB"));
@@ -159,7 +164,7 @@ test("renderStats writes formatted metrics into their tiles", () => {
 test("renderStats blanks every tile when there are no stats", () => {
   const doc = installFakeDocument(STATS_IDS);
   for (const empty of [[], null, undefined]) {
-    renderStats(empty);
+    renderStats(empty, "pool-a");
     for (const id of ["m-tvl", "m-vol", "m-fees", "m-swaps"]) {
       assert.equal(doc.getElementById(id).textContent, "—", `${id} for ${JSON.stringify(empty)}`);
     }
@@ -171,7 +176,7 @@ test("renderHealth fills the gauge, sub-scores and deviation bar", () => {
   renderHealth({
     healthScore: 82, tvlScore: 90.4, volumeScore: 71.25, feeEfficiencyScore: 60,
     priceDeviationBps: 30, status: "Healthy", alertsFired: [],
-  });
+  }, []);
   assert.equal(doc.getElementById("health-score-text").textContent, "82");
   assert.equal(doc.getElementById("hd-status").textContent, "Healthy");
   assert.equal(doc.getElementById("hd-tvl").textContent, "90.4");
@@ -181,12 +186,13 @@ test("renderHealth fills the gauge, sub-scores and deviation bar", () => {
   // 82 is in the green band, and the arc is drawn as a dash offset.
   assert.equal(doc.getElementById("health-arc").getAttribute("stroke"), "var(--green)");
   assert.ok(Number(doc.getElementById("health-arc").getAttribute("stroke-dashoffset")) > 0);
-  assert.equal(doc.getElementById("dev-fill").style.width, "15%");
+  // With default threshold of 100 bps, 30 bps is 30% width
+  assert.equal(doc.getElementById("dev-fill").style.width, "30%");
 });
 
 test("renderHealth degrades to placeholders when health is unavailable", () => {
   const doc = installFakeDocument(HEALTH_IDS);
-  renderHealth(null);
+  renderHealth(null, []);
   assert.equal(doc.getElementById("health-score-text").textContent, "—");
   assert.equal(doc.getElementById("hd-status").textContent, "Unavailable");
 });
@@ -197,7 +203,7 @@ test("renderHealth forwards fired alerts to the fired-alert list", () => {
     healthScore: 20, tvlScore: 1, volumeScore: 1, feeEfficiencyScore: 1,
     priceDeviationBps: 500, status: "Critical",
     alertsFired: [{ metric: "tvl", threshold: 100, currentValue: 20, firedAt: Date.now() }],
-  });
+  }, []);
   assert.equal(doc.getElementById("health-arc").getAttribute("stroke"), "var(--red)");
   assert.equal(doc.getElementById("fired-alert-list").children.length, 1);
 });
@@ -244,18 +250,24 @@ test("renderEvents shows an empty state for no events", () => {
   }
 });
 
-test("renderHistory draws one bar per point, scaled to the maximum price", () => {
+test("renderHistory draws an axis label and one min/max range bar per point", () => {
   const doc = installFakeDocument(["price-chart"]);
   renderHistory([
     { poolId: "p", timestamp: Date.now(), price: 1, feeBps: 30 },
     { poolId: "p", timestamp: Date.now(), price: 2, feeBps: 30 },
   ]);
   const chart = doc.getElementById("price-chart");
-  assert.equal(chart.children.length, 2);
-  // The tallest bar is the max price; the other is proportionally shorter.
-  assert.equal(chart.children[1].style.height, "136px");
-  assert.equal(chart.children[0].style.height, "68px");
-  assert.ok(chart.children[0].title.includes("1.000000"));
+  // Axis label first, then one bar per point (each point is its own bucket).
+  assert.equal(chart.children.length, 3);
+  assert.ok(chart.children[0].textContent.includes("Range:"));
+  const [, low, high] = chart.children;
+  // A single-price bucket has no range, so it gets the 2px minimum height and
+  // is positioned by its price against a chart that is baselined at zero.
+  assert.equal(low.style.height, "2px");
+  assert.equal(high.style.height, "2px");
+  assert.equal(high.style.marginTop, "0px");
+  assert.equal(low.style.marginTop, "68px");
+  assert.ok(low.title.includes("1.000000"));
 });
 
 test("renderHistory shows an empty state for no history", () => {
@@ -509,4 +521,159 @@ test("refresh prefers the live api-url and pool-id inputs over the constructor v
 
   assert.ok(urls.every((u) => u === "http://live.test"));
   assert.ok(pools.every((p) => p === "pool-live"));
+});
+
+test("a refresh that throws does not block the next refresh", async () => {
+  const doc = setupRefreshTestDom();
+  installFakeFetch([]);
+  const controller = createDashboardController({ apiUrl: "http://api.test", poolId: "pool-a" });
+
+  const renderTarget = doc.getElementById("m-tvl");
+  const originalGet = doc.getElementById.bind(doc);
+  doc.getElementById = (id) => {
+    if (id === "m-tvl") throw new Error("render failed");
+    return originalGet(id);
+  };
+  await assert.rejects(controller.refresh(), /render failed/);
+
+  doc.getElementById = originalGet;
+  await controller.refresh();
+  assert.equal(renderTarget.textContent, "—");
+  assert.equal(doc.getElementById("connection-status").textContent, "Connected");
+});
+
+// ── New tests for timestamp, token formatting, and UI fixes ─────────────────
+
+test("formatTimestamp handles second-resolution timestamps", () => {
+  const result = formatTimestamp(1_700_000_000);
+  assert.notEqual(result, "—");
+  // Should render a 2023 time, not 1970
+  assert.ok(result.includes(":"));
+});
+
+test("formatTimestamp handles millisecond-resolution timestamps", () => {
+  const result = formatTimestamp(1_700_000_000_000);
+  assert.notEqual(result, "—");
+  assert.ok(result.includes(":"));
+});
+
+test("formatTokenAmount scales by decimals and adds symbol", () => {
+  assert.equal(formatTokenAmount(10_000_000, "XLM", 7), "1.00 XLM");
+  assert.equal(formatTokenAmount(5_000_000, "USDC", 6), "5.00 USDC");
+  assert.equal(formatTokenAmount("invalid", "XLM"), "—");
+});
+
+test("formatMetricWithUnit formats with K/M suffixes", () => {
+  assert.equal(formatMetricWithUnit(10_000_000_000_000, "tokens", 7), "1.00M tokens");
+  assert.equal(formatMetricWithUnit(10_000_000_000, "tokens", 7), "1.0K tokens");
+  assert.equal(formatMetricWithUnit(10_000_000, "tokens", 7), "1.00 tokens");
+  assert.equal(formatMetricWithUnit(1_000_000_000, "tokens", 7), "100.00 tokens");
+});
+
+test("renderPoolsOverview creates a table with all pools", () => {
+  const doc = installFakeDocument(["metrics-grid"]);
+  const stats = [
+    { poolId: "pool-a", tokenA: "AAA", tokenB: "BBB", tvl: 10_000_000, volume24h: 5_000_000, fees24h: 100_000, swapCount: 100, priceDeviationBps: 50 },
+    { poolId: "pool-b", tokenA: "CCC", tokenB: "DDD", tvl: 20_000_000, volume24h: 10_000_000, fees24h: 200_000, swapCount: 200, priceDeviationBps: 75 },
+  ];
+  renderPoolsOverview(stats);
+  const grid = doc.getElementById("metrics-grid");
+  const html = renderedText(grid);
+  assert.ok(html.includes("pool-a"));
+  assert.ok(html.includes("pool-b"));
+  assert.ok(html.includes("AAA"));
+  assert.ok(html.includes("CCC"));
+});
+
+test("renderPoolsOverview shows empty state when no stats", () => {
+  const doc = installFakeDocument(["metrics-grid"]);
+  renderPoolsOverview([]);
+  const grid = doc.getElementById("metrics-grid");
+  assert.ok(grid.innerHTML.includes("No pools indexed yet"));
+});
+
+test("renderStats with no poolId calls renderPoolsOverview", () => {
+  const doc = installFakeDocument(["metrics-grid"]);
+  const stats = [{ poolId: "pool-a", tokenA: "AAA", tokenB: "BBB", tvl: 10_000_000, volume24h: 5_000_000, fees24h: 100_000, swapCount: 100, priceDeviationBps: 50 }];
+  renderStats(stats, "");
+  const grid = doc.getElementById("metrics-grid");
+  assert.ok(renderedText(grid).includes("pool-a"));
+});
+
+test("renderStats with poolId shows single-pool metrics without dollar signs", () => {
+  const doc = installFakeDocument(STATS_IDS);
+  renderStats([SAMPLE_STATS], "pool-a");
+  assert.ok(!doc.getElementById("m-tvl").textContent.includes("$"));
+  assert.ok(doc.getElementById("m-tvl").textContent.includes("tokens"));
+});
+
+test("renderStats with null tvl shows dash", () => {
+  const doc = installFakeDocument(STATS_IDS);
+  const statsWithNull = { ...SAMPLE_STATS, tvl: null };
+  renderStats([statsWithNull], "pool-a");
+  assert.equal(doc.getElementById("m-tvl").textContent, "—");
+});
+
+test("renderHistory downsamples to at most 200 buckets", () => {
+  const doc = installFakeDocument(["price-chart"]);
+  const history = Array.from({ length: 10000 }, (_, i) => ({
+    poolId: "p", timestamp: Date.now() + i * 1000, price: 1 + i * 0.0001, feeBps: 30,
+  }));
+  renderHistory(history);
+  const chart = doc.getElementById("price-chart");
+  // Should have axis label + at most 200 bars
+  assert.ok(chart.children[0].textContent.includes("Range:"));
+  const barCount = chart.children.length - 1; // minus axis label
+  assert.ok(barCount <= 200);
+});
+
+test("renderHistory adds axis label with price range", () => {
+  const doc = installFakeDocument(["price-chart"]);
+  renderHistory([
+    { poolId: "p", timestamp: Date.now(), price: 1, feeBps: 30 },
+    { poolId: "p", timestamp: Date.now(), price: 2, feeBps: 30 },
+  ]);
+  const chart = doc.getElementById("price-chart");
+  const label = chart.children[0].textContent;
+  // The axis is baselined at zero, so the range runs from 0 to the max price.
+  assert.equal(label, "Range: 0.000000 - 2.000000");
+});
+
+test("renderHealth uses configured threshold for deviation gauge color", () => {
+  const doc = installFakeDocument(HEALTH_IDS);
+  const health = {
+    healthScore: 80, tvlScore: 90, volumeScore: 80, feeEfficiencyScore: 80,
+    priceDeviationBps: 150, status: "Healthy", alertsFired: [],
+  };
+  const configs = [{ poolId: "p", metric: "price_deviation", thresholdBps: 100 }];
+  renderHealth(health, configs);
+  const fill = doc.getElementById("dev-fill");
+  // 150 bps >= 100 bps threshold, should be red
+  assert.equal(fill.style.background, "var(--red)");
+});
+
+test("renderHealth deviation gauge width is percentage of threshold", () => {
+  const doc = installFakeDocument(HEALTH_IDS);
+  const health = {
+    healthScore: 80, tvlScore: 90, volumeScore: 80, feeEfficiencyScore: 80,
+    priceDeviationBps: 50, status: "Healthy", alertsFired: [],
+  };
+  const configs = [{ poolId: "p", metric: "price_deviation", thresholdBps: 100 }];
+  renderHealth(health, configs);
+  const fill = doc.getElementById("dev-fill");
+  // 50 bps is 50% of 100 bps threshold
+  assert.equal(fill.style.width, "50%");
+});
+
+test("renderHeatmap handles second-resolution timestamps", () => {
+  const doc = installFakeDocument(["heatmap"]);
+  const now = Date.now();
+  const thirtyMinutesAgoSeconds = Math.floor((now - 30 * 60 * 1000) / 1000);
+  renderHeatmap([
+    { type: "swap", timestamp: thirtyMinutesAgoSeconds, payload: '{"amountIn":100}' },
+  ]);
+  const heatmap = doc.getElementById("heatmap");
+  // Should have landed in a bucket (not all at 4px floor)
+  const hasNonZeroHeight = Array.from(heatmap.children).some(bar => parseInt(bar.style.height) > 4);
+  assert.ok(hasNonZeroHeight);
 });

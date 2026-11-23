@@ -6,6 +6,7 @@
 //!
 //! All tests run fully in-process using the Soroban test environment —
 //! no external network calls are made.
+#![allow(unexpected_cfgs)]
 
 pub mod fixture;
 
@@ -16,6 +17,9 @@ mod factory_test;
 mod upgrade_integration_test;
 
 #[cfg(test)]
+mod core_contract_upgrade_test;
+
+#[cfg(test)]
 mod multisig_emergency_withdraw_test;
 
 #[cfg(test)]
@@ -24,10 +28,19 @@ mod flash_loan_integration_test;
 #[cfg(test)]
 mod memory_leak_detection_test;
 
+#[cfg(test)]
+mod governance_locker_test;
+
+#[cfg(test)]
+mod pol_vesting_governance_test;
+
+#[cfg(test)]
+mod pol_vesting_upgrade_test;
+
 #[cfg(all(test, feature = "legacy-integration-matrix"))]
 mod tests {
     use soroban_sdk::{
-        testutils::{Address as _, Ledger, LedgerInfo},
+        testutils::{Address as _, Events as _, Ledger, LedgerInfo},
         Address, BytesN, Env,
     };
 
@@ -614,12 +627,12 @@ mod tests {
         StellarAssetClient::new(&env, &token_a).mint(&trader, &400_000_i128);
 
         // This swap should trigger the circuit breaker
-        let swap_result = amm.try_swap(&trader, &token_a, &400_000_i128, &1_i128, &DEADLINE, &None);
+        let swap_result = amm.try_swap(&trader, &token_a, &400_000_i128, &1_i128, &DEADLINE);
         assert!(
             swap_result.is_err(),
             "large swap should trigger circuit breaker and fail"
         );
-        assert_eq!(swap_result.unwrap_err(), AmmError::CircuitBreaker);
+        assert_eq!(swap_result.unwrap_err(), Ok(AmmError::CircuitBreaker));
 
         // Verify circuit-breaker-triggered event was emitted
         let events = env.events().all();
@@ -639,20 +652,19 @@ mod tests {
         // Verify subsequent swaps are rejected with CircuitBreaker error
         let trader2 = Address::generate(&env);
         StellarAssetClient::new(&env, &token_a).mint(&trader2, &10_000_i128);
-        let blocked_swap =
-            amm.try_swap(&trader2, &token_a, &10_000_i128, &1_i128, &DEADLINE, &None);
+        let blocked_swap = amm.try_swap(&trader2, &token_a, &10_000_i128, &1_i128, &DEADLINE);
         assert!(
             blocked_swap.is_err(),
             "swaps should be blocked while circuit breaker is tripped"
         );
-        assert_eq!(blocked_swap.unwrap_err(), AmmError::CircuitBreaker);
+        assert_eq!(blocked_swap.unwrap_err(), Ok(AmmError::CircuitBreaker));
 
         // Advance ledger time past the cooldown window (60s)
         set_ledger_ts(&env, 1_000 + 61);
 
         // Call try_circuit_breaker_recovery and verify the pool resumes swapping
         let recovered = amm.try_circuit_breaker_recovery();
-        assert!(recovered.unwrap(), "recovery should succeed after cooldown");
+        assert!(recovered.is_ok(), "recovery should succeed after cooldown");
 
         // Verify circuit-breaker-recovered event was emitted
         let events = env.events().all();
@@ -678,8 +690,7 @@ mod tests {
         // Verify swaps work again after recovery
         let trader3 = Address::generate(&env);
         StellarAssetClient::new(&env, &token_a).mint(&trader3, &10_000_i128);
-        let recovered_swap =
-            amm.try_swap(&trader3, &token_a, &10_000_i128, &1_i128, &DEADLINE, &None);
+        let recovered_swap = amm.try_swap(&trader3, &token_a, &10_000_i128, &1_i128, &DEADLINE);
         assert!(
             recovered_swap.is_ok(),
             "swaps should work after circuit breaker recovery"

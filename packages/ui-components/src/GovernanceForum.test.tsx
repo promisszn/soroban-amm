@@ -2,7 +2,8 @@ import { describe, it, expect, vi } from "vitest";
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { GovernanceForum } from "./GovernanceForum.js";
-import type { Proposal, VoteChoice } from "./types.js";
+import type { Proposal } from "./types.js";
+import type { GovernanceForumProps } from "./GovernanceForum.js";
 
 const proposal: Proposal = {
   id: "GIP-001",
@@ -76,7 +77,7 @@ describe("GovernanceForum", () => {
     render(<GovernanceForum {...baseProps} onVote={vi.fn()} />);
     const article = screen.getByLabelText("Proposal GIP-001: Raise the fee ceiling");
     // Initial: 100 for / 50 against → 67% for.
-    expect(within(article).getByLabelText("Voting: 67% for, 33% against")).toBeInTheDocument();
+    expect(within(article).getByLabelText("Voting: 67% for, 33% against, 0% abstain")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Vote for on GIP-001" }));
     // For votes jump by 50,000 → 50.1K.
     expect(screen.getByText("50.1K")).toBeInTheDocument();
@@ -161,15 +162,54 @@ describe("GovernanceForum", () => {
   it("filters proposals by status", async () => {
     const user = userEvent.setup();
     render(<GovernanceForum {...baseProps} />);
-    await user.selectOptions(screen.getByLabelText("Filter by status"), "passed");
+    await user.selectOptions(screen.getByLabelText("Filter by status"), "executed");
     expect(screen.getByText(/No proposals match the current filters/)).toBeInTheDocument();
+  });
+
+  it("renders an empty state when no on-chain proposals are supplied", () => {
+    render(<GovernanceForum proposals={[]} />);
+    expect(screen.getByText("No proposals yet.")).toBeInTheDocument();
+    expect(screen.queryByText("Upgrade AMM core to v2.1 (concentrated liquidity)")).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["active", "Active"], ["pending", "Pending · timelock"], ["queued", "Queued"],
+    ["executed", "Executed"], ["defeated", "Defeated"], ["expired", "Expired"],
+    ["cancelled", "Cancelled"], ["inDiscussion", "In discussion"], ["vetoed", "Vetoed"],
+  ] as const)("renders the %s lifecycle state as %s", (status, label) => {
+    render(<GovernanceForum {...baseProps} proposals={[{ ...proposal, status }]} />);
+    expect(screen.getAllByText(label).length).toBeGreaterThan(0);
+  });
+
+  it.each(["active", "pending", "queued", "executed", "defeated", "expired", "cancelled", "inDiscussion", "vetoed"] as const)(
+    "filters proposals by the %s contract state",
+    async status => {
+      const user = userEvent.setup();
+      const otherStatus = status === "active" ? "pending" : "active";
+      render(<GovernanceForum {...baseProps} proposals={[
+        { ...proposal, id: "target", status },
+        { ...proposal, id: "other", title: "Other proposal", status: otherStatus },
+      ]} />);
+      await user.selectOptions(screen.getByLabelText("Filter by status"), status);
+      expect(screen.getByLabelText(new RegExp(`Proposal target:`))).toBeInTheDocument();
+      expect(screen.queryByLabelText(/Proposal other:/)).not.toBeInTheDocument();
+    },
+  );
+
+  it("counts abstain votes toward quorum using the snapshot supply", () => {
+    render(<GovernanceForum {...baseProps} proposals={[{
+      ...proposal, forVotes: 100, againstVotes: 0, abstainVotes: 900,
+      snapshotTotalSupply: 5_000, quorumBps: 2_000,
+    }]} />);
+    expect(screen.getByText("Quorum met: 1.0K of 1.0K")).toBeInTheDocument();
+    expect(screen.getByText("◦ 900 abstain (90%)")).toBeInTheDocument();
   });
 });
 
 describe("GovernanceForum proposal wizard", () => {
   it("submits a new proposal through the wizard", async () => {
     const user = userEvent.setup();
-    const onProposalSubmit = vi.fn();
+    const onProposalSubmit = vi.fn<NonNullable<GovernanceForumProps["onProposalSubmit"]>>();
     render(<GovernanceForum {...baseProps} onProposalSubmit={onProposalSubmit} />);
     await user.click(screen.getByRole("tab", { name: "+ New Proposal" }));
 
@@ -194,7 +234,7 @@ describe("GovernanceForum proposal wizard", () => {
 
   it("blocks advancing from step 1 when required fields are empty", async () => {
     const user = userEvent.setup();
-    const onProposalSubmit = vi.fn();
+    const onProposalSubmit = vi.fn<NonNullable<GovernanceForumProps["onProposalSubmit"]>>();
     render(<GovernanceForum {...baseProps} onProposalSubmit={onProposalSubmit} />);
     await user.click(screen.getByRole("tab", { name: "+ New Proposal" }));
     await user.click(screen.getByRole("button", { name: /Next/ }));

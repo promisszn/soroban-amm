@@ -3,10 +3,24 @@
 # Sourceable: `source scripts/deploy/common.sh`
 # All functions are importable; no side effects on source.
 
+# ── Bash version guard ────────────────────────────────────────────────────────
+# Associative arrays (declare -A) require bash 4+. macOS ships bash 3.2.
+# Fail immediately with a clear message rather than an unbound-variable trap
+# deep in the script.
+if [[ "${BASH_VERSINFO[0]:-0}" -lt 4 ]]; then
+  printf '[deploy][error] bash 4 or newer is required (found %s).\n' "${BASH_VERSION:-unknown}" >&2
+  printf '[deploy][error] macOS ships bash 3.2. Install a newer version:\n' >&2
+  printf '[deploy][error]   brew install bash   # then invoke with /opt/homebrew/bin/bash\n' >&2
+  printf '[deploy][error]   or: sudo port install bash\n' >&2
+  exit 1
+fi
+
 # ── Constants ────────────────────────────────────────────────────────────────
 
 WASM_TARGET="wasm32v1-none"
 WASM_DIR="target/${WASM_TARGET}/release"
+# Directory written by scripts/optimize_contracts.sh / `make optimize`.
+OPTIMIZED_DIR="optimized-artifacts"
 
 # Recommended defaults (see docs/deployment-runbook.md)
 DEFAULT_FEE_BPS=30
@@ -33,15 +47,16 @@ ALL_CONTRACTS=(
   governance
   oracle_aggregator
   twap_consumer
+  oracle_adapters
   twal_consumer
   staking
   incentive_campaigns
   pol_vesting
   reserve_manager
   router
-  batch_router
   dex_aggregator
   batch_auction
+  batch_router
   cl_position_nft
   v2_to_v3_migration
 )
@@ -58,6 +73,7 @@ declare -A WASM_FILE=(
   [twap_consumer]="twap_consumer.wasm"
   [twal_consumer]="twal_consumer.wasm"
   [oracle_aggregator]="oracle_aggregator.wasm"
+  [oracle_adapters]="oracle_adapters.wasm"
   [router]="router.wasm"
   [batch_router]="batch_router.wasm"
   [dex_aggregator]="dex_aggregator.wasm"
@@ -248,7 +264,12 @@ invoke() {
     -- "$@"
 }
 
-# invoke_read — same but without --source (for read-only queries; pass --source anyway for consistency)
+# invoke_read — invoke for a read-only query. Like invoke, it adds the `--`
+# itself, so pass the function name straight after the contract id. Stdout is
+# only the returned value: the CLI's stderr (progress lines, event logs, and
+# usage errors, all of which can echo contract ids) is left on stderr so a
+# caller parsing an address or number out of the result cannot pick one up
+# from there instead.
 invoke_read() {
   local contract_id="$1"
   shift
@@ -256,19 +277,49 @@ invoke_read() {
     --id "$contract_id" \
     --network "$NETWORK" \
     --source "$SOURCE_ACCOUNT" \
-    -- "$@" 2>&1
+    -- "$@"
 }
 
 # ── WASM path helpers ─────────────────────────────────────────────────────
 
+# wasm_path CONTRACT
+# Returns the path to the WASM artifact that should be uploaded for CONTRACT.
+# Prefers the optimized artifact under OPTIMIZED_DIR when it exists (written
+# by `make optimize` / scripts/optimize_contracts.sh), and falls back to the
+# unoptimized release artifact.  Logs which file it resolved to.
 wasm_path() {
   local contract="$1"
   local fname="${WASM_FILE[$contract]:-}"
   if [[ -z "$fname" ]]; then
-    # Fallback: contract name itself
     fname="${contract}.wasm"
   fi
-  printf '%s/%s' "${ROOT_DIR}/${WASM_DIR}" "$fname"
+
+  local optimized="${ROOT_DIR}/${OPTIMIZED_DIR}/${fname}"
+  local unoptimized="${ROOT_DIR}/${WASM_DIR}/${fname}"
+
+  if [[ -f "$optimized" ]]; then
+    log "wasm_path: using optimized artifact for ${contract}: ${optimized#"${ROOT_DIR}/"}"
+    printf '%s' "$optimized"
+  else
+    printf '%s' "$unoptimized"
+  fi
+}
+
+# CONTRACT_MAX_SIZE_BYTES — testnet/mainnet CONFIG_SETTING_CONTRACT_MAX_SIZE_BYTES
+CONTRACT_MAX_SIZE_BYTES=131072
+
+# check_wasm_size WASM_PATH CONTRACT_NAME
+# Exits 1 with a clear message when the artifact exceeds the network cap.
+check_wasm_size() {
+  local wasm="$1"
+  local name="$2"
+  local size
+  size=$(wc -c < "$wasm")
+  if (( size > CONTRACT_MAX_SIZE_BYTES )); then
+    die "$(printf '%s (%d bytes) exceeds the %d-byte network cap. Run `make optimize` first.' \
+      "$name" "$size" "$CONTRACT_MAX_SIZE_BYTES")"
+  fi
+  log "size check ok: ${name} = ${size} bytes (limit ${CONTRACT_MAX_SIZE_BYTES})"
 }
 
 ensure_wasm_built() {
@@ -307,25 +358,45 @@ ensure_wasm_built() {
 
 # ── Verification helpers ──────────────────────────────────────────────────
 
+# verify_token CONTRACT_ID EXPECTED_ADMIN
+# Reads the admin from the token contract and asserts it equals EXPECTED_ADMIN.
+# Calls the CLI directly (rather than via invoke_read) and keeps stderr apart
+# so a failed/panicking simulation — e.g. the RPC node hasn't yet
+# caught up with the initialize tx that just landed, so admin()'s storage read
+# panics — can be detected by exit code instead of having its diagnostic
+# output (which echoes the contract's own C… address in event-log lines)
+# mistaken for the returned admin address. Retries briefly to ride out that
+# read-after-write lag before treating it as a real front-run.
 verify_token() {
   local contract_id="$1"
   local expected_admin="$2"
-  local out admin
-  out=$(invoke_read "$contract_id" -- admin 2>&1 || true)
-  admin=$(printf '%s\n' "$out" | grep -Eo 'C[A-Z0-9]{55}' | tail -n 1 || true)
-  if [[ -z "$admin" ]]; then
-    # Fallback: try balance/total_supply as liveness check
-    out=$(invoke_read "$contract_id" -- total_supply 2>&1 || true)
-    if echo "$out" | grep -qE '[0-9]+'; then
-      log "verified token $contract_id liveness (total_supply readable)"
-      return 0
+  local attempt out err admin rc
+  for attempt in 1 2 3 4 5; do
+    err=$(mktemp)
+    out=$(stellar contract invoke \
+      --id "$contract_id" \
+      --network "$NETWORK" \
+      --source "$SOURCE_ACCOUNT" \
+      -- admin 2>"$err")
+    rc=$?
+    admin=""
+    if [[ $rc -eq 0 ]]; then
+      # Match both G… (account) and C… (contract) addresses: base-32 alphabet [A-Z2-7]
+      admin=$(printf '%s\n' "$out" | grep -Eo '[GC][A-Z2-7]{55}' | tail -n 1 || true)
     fi
-    warn "could not verify token $contract_id — admin read returned empty: $out"
-    return 1
+    if [[ -n "$admin" ]]; then
+      rm -f "$err"
+      break
+    fi
+    log "token $contract_id admin read attempt $attempt/5 failed, retrying: $(cat "$err")"
+    rm -f "$err"
+    sleep 2
+  done
+  if [[ -z "$admin" ]]; then
+    die "token $contract_id admin read returned empty after retries — possible front-run or uninitialized contract"
   fi
   if [[ "$admin" != "$expected_admin" ]]; then
-    warn "token $contract_id admin mismatch: expected $expected_admin got $admin"
-    return 1
+    die "token $contract_id admin mismatch: expected $expected_admin got $admin — possible front-run, aborting deploy"
   fi
   log "verified token $contract_id admin=$admin"
 }
@@ -336,7 +407,7 @@ verify_amm_pool() {
   local expected_token_b="$3"
   local expected_fee_bps="$4"
   local out
-  out=$(invoke_read "$pool_id" -- get_info 2>&1 || true)
+  out=$(invoke_read "$pool_id" get_info 2>/dev/null || true)
   if echo "$out" | grep -q "$expected_token_a" && echo "$out" | grep -q "$expected_token_b"; then
     log "verified pool $pool_id get_info contains expected tokens"
   else
@@ -357,7 +428,7 @@ verify_factory_hashes() {
   # Factory stores hashes in instance storage; no direct getter for WASM hashes in all versions.
   # Perform liveness check via get_pool_count and all_pools
   local out
-  out=$(invoke_read "$factory_id" -- get_pool_count 2>&1 || true)
+  out=$(invoke_read "$factory_id" get_pool_count 2>/dev/null || true)
   if echo "$out" | grep -qE '[0-9]+'; then
     log "verified factory $factory_id liveness (get_pool_count readable: $out)"
     return 0
@@ -366,18 +437,110 @@ verify_factory_hashes() {
   return 1
 }
 
+verify_governance_admin() {
+  local contract_id="$1"
+  local expected_admin="$2"
+  local attempt out err admin rc
+  for attempt in 1 2 3 4 5; do
+    err=$(mktemp)
+    out=$(stellar contract invoke \
+      --id "$contract_id" \
+      --network "$NETWORK" \
+      --source "$SOURCE_ACCOUNT" \
+      -- get_admin 2>"$err")
+    rc=$?
+    admin=""
+    if [[ $rc -eq 0 ]]; then
+      admin=$(printf '%s\n' "$out" | grep -Eo '[GC][A-Z2-7]{55}' | tail -n 1 || true)
+    fi
+    if [[ -n "$admin" ]]; then
+      rm -f "$err"
+      break
+    fi
+    log "governance $contract_id admin read attempt $attempt/5 failed, retrying: $(cat "$err")"
+    rm -f "$err"
+    sleep 2
+  done
+  if [[ -z "$admin" ]]; then
+    die "governance $contract_id admin read returned empty after retries — possible front-run or uninitialized contract"
+  fi
+  if [[ "$admin" != "$expected_admin" ]]; then
+    die "governance $contract_id admin mismatch: expected $expected_admin got $admin — possible front-run, aborting deploy"
+  fi
+  log "verified governance $contract_id admin=$admin"
+}
+
+# read_back LABEL CONTRACT_ID FUNCTION [ARGS...]
+# Calls a read-only contract function and prints its stdout. The CLI's stderr
+# is kept apart so a failed simulation (typically the RPC node not yet having
+# the initialize tx that just landed, or a contract that was never
+# initialized) is detected by exit code and not mistaken for a result. Retries
+# briefly to ride out that read-after-write lag, then returns non-zero.
+# VERIFY_RETRY_DELAY (seconds, default 2) sets the pause between attempts.
+read_back() {
+  local label="$1"
+  local contract_id="$2"
+  shift 2
+  local attempt out err delay="${VERIFY_RETRY_DELAY:-2}"
+  for attempt in 1 2 3 4 5; do
+    err=$(mktemp)
+    if out=$(stellar contract invoke \
+      --id "$contract_id" \
+      --network "$NETWORK" \
+      --source "$SOURCE_ACCOUNT" \
+      -- "$@" 2>"$err"); then
+      rm -f "$err"
+      printf '%s\n' "$out"
+      return 0
+    fi
+    log "$label $contract_id read of $1 attempt $attempt/5 failed, retrying: $(cat "$err")"
+    rm -f "$err"
+    sleep "$delay"
+  done
+  return 1
+}
+
+# verify_contract_admin LABEL CONTRACT_ID EXPECTED_ADMIN [GETTER]
+# Generic read-back-and-compare for contracts whose initialize cannot be
+# authenticated (the admin may be a contract that cannot sign for itself), so
+# anyone can initialize a freshly deployed instance first. Reads the admin
+# through GETTER (default get_admin) and aborts the deploy when it is missing
+# or differs from EXPECTED_ADMIN. Matches both G... (account) and C...
+# (contract) addresses: base-32 alphabet [A-Z2-7].
+verify_contract_admin() {
+  local label="$1"
+  local contract_id="$2"
+  local expected_admin="$3"
+  local getter="${4:-get_admin}"
+  local out admin
+  out=$(read_back "$label" "$contract_id" "$getter") \
+    || die "$label $contract_id $getter returned nothing after retries — possible front-run or uninitialized contract"
+  admin=$(printf '%s\n' "$out" | grep -Eo '[GC][A-Z2-7]{55}' | tail -n 1 || true)
+  if [[ -z "$admin" ]]; then
+    die "$label $contract_id $getter returned no address — possible front-run or uninitialized contract"
+  fi
+  if [[ "$admin" != "$expected_admin" ]]; then
+    die "$label $contract_id admin mismatch: expected $expected_admin got $admin — possible front-run, aborting deploy"
+  fi
+  log "verified $label $contract_id admin=$admin"
+}
+
 verify_governance() {
   local gov_id="$1"
   local expected_pool="$2"
   local expected_lp="$3"
+  local expected_admin="${4:-}"
+  if [[ -n "$expected_admin" ]]; then
+    verify_governance_admin "$gov_id" "$expected_admin"
+  fi
   local out
-  out=$(invoke_read "$gov_id" -- get_params 2>&1 || true)
+  out=$(invoke_read "$gov_id" get_params 2>/dev/null || true)
   if echo "$out" | grep -q "$expected_pool" || echo "$out" | grep -q "$expected_lp"; then
     log "verified governance $gov_id points at pool/lp"
     return 0
   fi
   # Fallback liveness: try get_proposal or proposal_status
-  out=$(invoke_read "$gov_id" -- get_params 2>&1 || true)
+  out=$(invoke_read "$gov_id" get_params 2>/dev/null || true)
   if echo "$out" | grep -qE 'voting|quorum|Voting'; then
     log "verified governance $gov_id liveness"
     return 0

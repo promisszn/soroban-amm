@@ -40,6 +40,39 @@ mod mock_adapter {
 }
 use mock_adapter::{MockAdapter, MockAdapterClient};
 
+mod fixed_timestamp_adapter {
+    use soroban_sdk::{contract, contractimpl, symbol_short, Address, Env};
+
+    #[contract]
+    pub struct FixedTimestampAdapter;
+
+    #[contractimpl]
+    impl FixedTimestampAdapter {
+        pub fn set_quote(env: Env, price: i128, timestamp: u64) {
+            env.storage()
+                .instance()
+                .set(&symbol_short!("price"), &price);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("time"), &timestamp);
+        }
+
+        pub fn quote(env: Env, _token_a: Address, _token_b: Address) -> (i128, u64) {
+            (
+                env.storage()
+                    .instance()
+                    .get(&symbol_short!("price"))
+                    .unwrap_or(0),
+                env.storage()
+                    .instance()
+                    .get(&symbol_short!("time"))
+                    .unwrap_or(0),
+            )
+        }
+    }
+}
+use fixed_timestamp_adapter::{FixedTimestampAdapter, FixedTimestampAdapterClient};
+
 struct Harness<'a> {
     aggregator: OracleAggregatorClient<'a>,
     admin: Address,
@@ -53,8 +86,13 @@ fn deploy(env: &Env, max_staleness: u64) -> Harness<'_> {
     let aggregator_id = env.register_contract(None, OracleAggregator);
     let aggregator = OracleAggregatorClient::new(env, &aggregator_id);
     aggregator.initialize(&admin, &max_staleness);
-    let token_a = Address::generate(env);
-    let token_b = Address::generate(env);
+    let first = Address::generate(env);
+    let second = Address::generate(env);
+    let (token_a, token_b) = if first < second {
+        (first, second)
+    } else {
+        (second, first)
+    };
     Harness {
         aggregator,
         admin,
@@ -68,6 +106,19 @@ fn deploy_source(env: &Env, price: i128) -> Address {
     let client = MockAdapterClient::new(env, &id);
     client.set_price(&price);
     id
+}
+
+fn deploy_fixed_source(env: &Env, price: i128, timestamp: u64) -> Address {
+    let id = env.register_contract(None, FixedTimestampAdapter);
+    FixedTimestampAdapterClient::new(env, &id).set_quote(&price, &timestamp);
+    id
+}
+
+fn pair(h: &Harness<'_>) -> PairKey {
+    PairKey {
+        token_a: h.token_a.clone(),
+        token_b: h.token_b.clone(),
+    }
 }
 
 mod panicking_mock_adapter {
@@ -110,7 +161,12 @@ fn initialize_seeds_admin_and_staleness() {
     let h = deploy(&env, 600);
     assert_eq!(h.aggregator.get_admin(), h.admin);
     assert_eq!(h.aggregator.get_max_staleness(), 600);
-    assert_eq!(h.aggregator.list_sources().len(), 0);
+    assert_eq!(
+        h.aggregator
+            .list_sources(&pair(&h), &0, &MAX_PAGE_SIZE)
+            .len(),
+        0
+    );
 }
 
 #[test]
@@ -127,11 +183,21 @@ fn register_source_appends_to_registry() {
     let h = deploy(&env, 600);
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 110);
-    h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::External, &10_000);
-    let sources = h.aggregator.list_sources();
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s2,
+        &OracleSourceType::External,
+        &10_000,
+    );
+    let sources = h.aggregator.list_sources(&pair(&h), &0, &MAX_PAGE_SIZE);
     assert_eq!(sources.len(), 2);
     assert_eq!(sources.get_unchecked(0).source_contract, s1);
     assert_eq!(sources.get_unchecked(0).weight, 10_000);
@@ -145,10 +211,20 @@ fn register_source_rejects_duplicates() {
     let env = Env::default();
     let h = deploy(&env, 600);
     let s1 = deploy_source(&env, 100);
-    h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
 }
 
 #[test]
@@ -157,12 +233,22 @@ fn remove_source_drops_the_entry() {
     let h = deploy(&env, 600);
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 110);
-    h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::External, &10_000);
-    h.aggregator.remove_source(&h.admin, &s1);
-    let sources = h.aggregator.list_sources();
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s2,
+        &OracleSourceType::External,
+        &10_000,
+    );
+    h.aggregator.remove_source(&h.admin, &pair(&h), &s1, &true);
+    let sources = h.aggregator.list_sources(&pair(&h), &0, &MAX_PAGE_SIZE);
     assert_eq!(sources.len(), 1);
     assert_eq!(sources.get_unchecked(0).source_contract, s2);
 }
@@ -173,7 +259,8 @@ fn remove_source_panics_on_unknown_address() {
     let env = Env::default();
     let h = deploy(&env, 600);
     let ghost = Address::generate(&env);
-    h.aggregator.remove_source(&h.admin, &ghost);
+    h.aggregator
+        .remove_source(&h.admin, &pair(&h), &ghost, &false);
 }
 
 #[test]
@@ -183,12 +270,22 @@ fn get_price_returns_median_of_three_sources() {
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 110);
     let s3 = deploy_source(&env, 150);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s3,
+        &OracleSourceType::External,
+        &10_000,
+    );
     // These prices span 50%; widen the band so this stays a pure median test.
     h.aggregator.set_max_deviation_bps(&h.admin, &5_000);
     set_now(&env, 1_000);
@@ -205,10 +302,20 @@ fn get_price_returns_two_way_median_average() {
     let h = deploy(&env, 600);
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 200);
-    h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::External, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s2,
+        &OracleSourceType::External,
+        &10_000,
+    );
     // 100 vs 200 straddle the median by 33%; widen the band so both count.
     h.aggregator.set_max_deviation_bps(&h.admin, &5_000);
     set_now(&env, 1_000);
@@ -225,10 +332,20 @@ fn get_price_two_way_median_does_not_overflow_on_large_prices() {
     let lo = i128::MAX - 2;
     let s1 = deploy_source(&env, hi);
     let s2 = deploy_source(&env, lo);
-    h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::External, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s2,
+        &OracleSourceType::External,
+        &10_000,
+    );
     set_now(&env, 1_000);
     let result = h.aggregator.get_price(&h.token_a, &h.token_b);
     assert_eq!(result.price, i128::MAX - 1);
@@ -242,12 +359,22 @@ fn stale_source_excluded_after_window() {
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 110);
     let s3 = deploy_source(&env, 150);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s3,
+        &OracleSourceType::External,
+        &10_000,
+    );
     h.aggregator.set_max_deviation_bps(&h.admin, &5_000);
 
     set_now(&env, 1_000);
@@ -269,8 +396,13 @@ fn single_source_below_min_panics() {
     let env = Env::default();
     let h = deploy(&env, 600);
     let s1 = deploy_source(&env, 100);
-    h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
     set_now(&env, 1_000);
     h.aggregator.get_price(&h.token_a, &h.token_b);
 }
@@ -307,8 +439,13 @@ fn register_source_rejects_non_admin() {
     let h = deploy(&env, 600);
     let attacker = Address::generate(&env);
     let s1 = deploy_source(&env, 100);
-    h.aggregator
-        .register_source(&attacker, &s1, &OracleSourceType::AmmTwap, &10_000);
+    h.aggregator.register_source(
+        &attacker,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
 }
 
 #[test]
@@ -317,19 +454,32 @@ fn stale_src_event_emitted_when_sources_skipped() {
     let h = deploy(&env, 60);
 
     let s1 = deploy_source(&env, 100);
+    let s4 = deploy_source(&env, 101);
     let s2 = deploy_source(&env, 0);
     let s3 = deploy_source(&env, 0);
 
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
+        .register_source(&h.admin, &pair(&h), &s4, &OracleSourceType::ClTwap, &10_000);
     h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s3,
+        &OracleSourceType::External,
+        &10_000,
+    );
 
     set_now(&env, 1_000);
 
-    h.aggregator.get_price_safe(&h.token_a, &h.token_b);
+    h.aggregator.get_price(&h.token_a, &h.token_b);
 
     let events = env.events().all();
     let agg_id = h.aggregator.address.clone();
@@ -341,7 +491,9 @@ fn stale_src_event_emitted_when_sources_skipped() {
         .find(|e| e.0 == agg_id && e.1 == expected_topics)
         .expect("stale_src event must be emitted when sources are skipped");
 
-    let (stale_addrs,): (soroban_sdk::Vec<Address>,) = stale_event.2.into_val(&env);
+    let (version, (stale_addrs,)): (u32, (soroban_sdk::Vec<Address>,)) =
+        stale_event.2.into_val(&env);
+    assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
     assert_eq!(stale_addrs.len(), 2);
     assert!(stale_addrs.contains(&s2));
     assert!(stale_addrs.contains(&s3));
@@ -399,12 +551,22 @@ fn deviating_source_excluded_from_confidence_and_price() {
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 102);
     let s3 = deploy_source(&env, 300);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s3,
+        &OracleSourceType::External,
+        &10_000,
+    );
     set_now(&env, 1_000);
 
     let result = h.aggregator.get_price(&h.token_a, &h.token_b);
@@ -418,10 +580,20 @@ fn two_disagreeing_sources_report_no_confidence() {
     let h = deploy(&env, 600);
     let honest = deploy_source(&env, 100);
     let attacker = deploy_source(&env, 200);
-    h.aggregator
-        .register_source(&h.admin, &honest, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &attacker, &OracleSourceType::External, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &honest,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &attacker,
+        &OracleSourceType::External,
+        &10_000,
+    );
     set_now(&env, 1_000);
 
     let safe = h.aggregator.get_price_safe(&h.token_a, &h.token_b);
@@ -436,10 +608,20 @@ fn two_disagreeing_sources_panic_on_get_price() {
     let h = deploy(&env, 600);
     let honest = deploy_source(&env, 100);
     let attacker = deploy_source(&env, 200);
-    h.aggregator
-        .register_source(&h.admin, &honest, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &attacker, &OracleSourceType::External, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &honest,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &attacker,
+        &OracleSourceType::External,
+        &10_000,
+    );
     set_now(&env, 1_000);
     h.aggregator.get_price(&h.token_a, &h.token_b);
 }
@@ -451,12 +633,22 @@ fn widening_band_admits_previously_deviant_source() {
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 102);
     let s3 = deploy_source(&env, 150);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s3,
+        &OracleSourceType::External,
+        &10_000,
+    );
 
     set_now(&env, 1_000);
     let tight = h.aggregator.get_price(&h.token_a, &h.token_b);
@@ -476,15 +668,25 @@ fn deviant_event_lists_out_of_band_sources() {
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 102);
     let s3 = deploy_source(&env, 300);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s3,
+        &OracleSourceType::External,
+        &10_000,
+    );
     set_now(&env, 1_000);
 
-    h.aggregator.get_price_safe(&h.token_a, &h.token_b);
+    h.aggregator.get_price(&h.token_a, &h.token_b);
 
     let events = env.events().all();
     let agg_id = h.aggregator.address.clone();
@@ -495,7 +697,9 @@ fn deviant_event_lists_out_of_band_sources() {
         .find(|e| e.0 == agg_id && e.1 == expected_topics)
         .expect("deviant event must be emitted when a source is out of band");
 
-    let (deviant_addrs,): (soroban_sdk::Vec<Address>,) = deviant_event.2.into_val(&env);
+    let (version, (deviant_addrs,)): (u32, (soroban_sdk::Vec<Address>,)) =
+        deviant_event.2.into_val(&env);
+    assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
     assert_eq!(deviant_addrs.len(), 1);
     assert!(deviant_addrs.contains(&s3));
 }
@@ -509,12 +713,27 @@ fn panicking_source_is_skipped_and_does_not_abort_aggregation() {
     let honest2 = deploy_source(&env, 102);
     let panicker = deploy_panicking_source(&env);
 
-    h.aggregator
-        .register_source(&h.admin, &honest1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &honest2, &OracleSourceType::ClTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &panicker, &OracleSourceType::External, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &honest1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &honest2,
+        &OracleSourceType::ClTwap,
+        &10_000,
+    );
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &panicker,
+        &OracleSourceType::External,
+        &10_000,
+    );
 
     set_now(&env, 1_000);
 
@@ -534,12 +753,22 @@ fn equal_weight_weighted_matches_unweighted() {
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 110);
     let s3 = deploy_source(&env, 150);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s3,
+        &OracleSourceType::External,
+        &10_000,
+    );
     h.aggregator.set_max_deviation_bps(&h.admin, &5_000);
     set_now(&env, 1_000);
 
@@ -562,12 +791,22 @@ fn heavy_source_moves_result_toward_its_quote() {
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 110);
     let s3 = deploy_source(&env, 120);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s3, &OracleSourceType::External, &30_000);
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s3,
+        &OracleSourceType::External,
+        &30_000,
+    );
     h.aggregator.set_max_deviation_bps(&h.admin, &5_000);
     set_now(&env, 1_000);
 
@@ -584,7 +823,7 @@ fn register_source_rejects_zero_weight() {
     let h = deploy(&env, 600);
     let s1 = deploy_source(&env, 100);
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &0);
+        .register_source(&h.admin, &pair(&h), &s1, &OracleSourceType::AmmTwap, &0);
 }
 
 #[test]
@@ -595,6 +834,7 @@ fn register_source_rejects_weight_above_ceiling() {
     let s1 = deploy_source(&env, 100);
     h.aggregator.register_source(
         &h.admin,
+        &pair(&h),
         &s1,
         &OracleSourceType::AmmTwap,
         &(MAX_SOURCE_WEIGHT + 1),
@@ -607,9 +847,14 @@ fn set_source_weight_rejects_zero() {
     let env = Env::default();
     let h = deploy(&env, 600);
     let s1 = deploy_source(&env, 100);
-    h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator.set_source_weight(&h.admin, &s1, &0);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
+    h.aggregator.set_source_weight(&h.admin, &pair(&h), &s1, &0);
 }
 
 #[test]
@@ -618,10 +863,15 @@ fn set_source_weight_rejects_above_ceiling() {
     let env = Env::default();
     let h = deploy(&env, 600);
     let s1 = deploy_source(&env, 100);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .set_source_weight(&h.admin, &s1, &(MAX_SOURCE_WEIGHT + 1));
+        .set_source_weight(&h.admin, &pair(&h), &s1, &(MAX_SOURCE_WEIGHT + 1));
 }
 
 /// When agreeing sources sum to less than MIN_AGREEING_WEIGHT, return {0, 0}.
@@ -633,9 +883,14 @@ fn insufficient_agreeing_weight_returns_zero() {
     let s2 = deploy_source(&env, 102);
     // Each source has weight 5_000; total = 10_000 < MIN_AGREEING_WEIGHT (20_000).
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &5_000);
-    h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::External, &5_000);
+        .register_source(&h.admin, &pair(&h), &s1, &OracleSourceType::AmmTwap, &5_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s2,
+        &OracleSourceType::External,
+        &5_000,
+    );
     set_now(&env, 1_000);
 
     let result = h.aggregator.get_price_safe(&h.token_a, &h.token_b);
@@ -653,12 +908,22 @@ fn heavy_outlier_still_deviants_despite_weight() {
     let s2 = deploy_source(&env, 102);
     // Heavy source at 300 — even with 5× weight, reference median is unweighted.
     let s3 = deploy_source(&env, 300);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s3, &OracleSourceType::External, &50_000);
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s3,
+        &OracleSourceType::External,
+        &50_000,
+    );
     set_now(&env, 1_000);
 
     let result = h.aggregator.get_price(&h.token_a, &h.token_b);
@@ -676,12 +941,22 @@ fn get_price_detailed_accounts_all_sources() {
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 102);
     let s3 = deploy_source(&env, 300);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s3,
+        &OracleSourceType::External,
+        &10_000,
+    );
     set_now(&env, 1_000);
 
     let (price, source_quotes) = h.aggregator.get_price_detailed(&h.token_a, &h.token_b);
@@ -717,12 +992,22 @@ fn get_price_detailed_agreed_matches_get_price_safe() {
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 102);
     let s3 = deploy_source(&env, 150);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s3,
+        &OracleSourceType::External,
+        &10_000,
+    );
     set_now(&env, 1_000);
 
     let safe = h.aggregator.get_price_safe(&h.token_a, &h.token_b);
@@ -741,12 +1026,22 @@ fn get_price_spread_bps_computes_correctly() {
     let s1 = deploy_source(&env, 100);
     let s2 = deploy_source(&env, 110);
     let s3 = deploy_source(&env, 300); // deviant
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s3, &OracleSourceType::External, &10_000);
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s3,
+        &OracleSourceType::External,
+        &10_000,
+    );
     // Widen the band so 100 and 110 agree (100 is ~9% from the reference
     // median 110, needs > 500 bps to pass the default band).
     h.aggregator.set_max_deviation_bps(&h.admin, &5_000);
@@ -767,55 +1062,468 @@ fn migration_backfills_default_weight() {
     let s2 = deploy_source(&env, 110);
 
     // Register sources with explicit weight.
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
-    h.aggregator
-        .register_source(&h.admin, &s2, &OracleSourceType::ClTwap, &20_000);
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &20_000);
 
     // Simulate a pre-upgrade record with weight=0 by manually overwriting
     // the stored sources vector via env.as_contract.
-    let mut sources = h.aggregator.list_sources();
+    let mut sources = h.aggregator.list_sources(&pair(&h), &0, &MAX_PAGE_SIZE);
     let mut src1 = sources.get_unchecked(0);
     src1.weight = 0;
     sources.set(0, src1);
     let agg_id = h.aggregator.address.clone();
     env.as_contract(&agg_id, || {
-        env.storage().instance().set(&DataKey::Sources, &sources);
+        env.storage()
+            .persistent()
+            .set(&DataKey::PairSources(pair(&h)), &sources);
     });
 
     // migrate_sources should backfill weight=0 → DEFAULT_SOURCE_WEIGHT.
     h.aggregator.migrate_sources(&h.admin);
 
-    let migrated = h.aggregator.list_sources();
+    let migrated = h.aggregator.list_sources(&pair(&h), &0, &MAX_PAGE_SIZE);
     assert_eq!(migrated.get_unchecked(0).weight, DEFAULT_SOURCE_WEIGHT);
     // s2's weight should be unchanged.
     assert_eq!(migrated.get_unchecked(1).weight, 20_000);
 }
 
-/// set_source_weight emits a src_wt event with old and new weight.
+// ── Issue #916: every oracle_aggregator event carries EVENT_SCHEMA_VERSION ──
+//
+// `get_price`, `set_source_weight`, and `aggregate_price`'s `stale_src` /
+// `deviant` events used to call `env.events().publish(...)` directly, so
+// their payloads were not version-stamped and an indexer reading
+// `(version, ...rest)` would have decoded the first real field as the
+// version number. These tests pin the stamp in place for all four.
+
+/// Fetch the payload of the most recent event this contract published under
+/// `topic`, decoded as a version-stamped `(u32, T)` pair.
+fn last_versioned_event<T>(env: &Env, contract_id: &Address, topic: &str) -> (u32, T)
+where
+    T: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>,
+{
+    let wanted: soroban_sdk::Vec<soroban_sdk::Val> =
+        (soroban_sdk::Symbol::new(env, topic),).into_val(env);
+    let evt = env
+        .events()
+        .all()
+        .iter()
+        .rfind(|e| &e.0 == contract_id && e.1 == wanted)
+        .unwrap_or_else(|| panic!("no `{topic}` event found"));
+    evt.2.into_val(env)
+}
+
+/// set_source_weight emits a version-stamped src_wt event with old and new
+/// weight.
 #[test]
-fn set_source_weight_emits_event() {
+fn set_source_weight_emits_versioned_event() {
     let env = Env::default();
     let h = deploy(&env, 600);
     let s1 = deploy_source(&env, 100);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
+
     h.aggregator
-        .register_source(&h.admin, &s1, &OracleSourceType::AmmTwap, &10_000);
+        .set_source_weight(&h.admin, &pair(&h), &s1, &25_000);
 
-    h.aggregator.set_source_weight(&h.admin, &s1, &25_000);
-
-    let events = env.events().all();
-    let agg_id = h.aggregator.address.clone();
-    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> =
-        (symbol_short!("src_wt"),).into_val(&env);
-    let wt_event = events
-        .iter()
-        .find(|e| e.0 == agg_id && e.1 == expected_topics)
-        .expect("src_wt event must be emitted");
-
-    let (src_addr, old_w, new_w): (Address, u32, u32) = wt_event.2.into_val(&env);
+    let (version, (event_pair, src_addr, old_w, new_w)): (u32, (PairKey, Address, u32, u32)) =
+        last_versioned_event(&env, &h.aggregator.address, "src_wt");
+    assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+    assert_eq!(
+        event_pair,
+        canonical_pair(&env, h.token_a.clone(), h.token_b.clone()).0
+    );
     assert_eq!(src_addr, s1);
     assert_eq!(old_w, 10_000);
     assert_eq!(new_w, 25_000);
+}
+
+/// get_price emits a version-stamped price event with the aggregated price
+/// and confidence.
+#[test]
+fn get_price_emits_versioned_event() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let s1 = deploy_source(&env, 100);
+    let s2 = deploy_source(&env, 102);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
+    h.aggregator
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &10_000);
+    set_now(&env, 1_000);
+
+    let result = h.aggregator.get_price(&h.token_a, &h.token_b);
+
+    let (version, (token_a, token_b, price, confidence)): (u32, (Address, Address, i128, u32)) =
+        last_versioned_event(&env, &h.aggregator.address, "price");
+    assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+    assert_eq!(token_a, h.token_a);
+    assert_eq!(token_b, h.token_b);
+    assert_eq!(price, result.price);
+    assert_eq!(confidence, result.confidence);
+}
+
+/// A stale (never-quoting) source triggers a version-stamped stale_src event.
+#[test]
+fn stale_source_emits_versioned_event() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let s1 = deploy_source(&env, 100);
+    let s2 = deploy_source(&env, 101);
+    let stale = deploy_source(&env, 0); // never reports a positive price
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
+    h.aggregator
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &stale,
+        &OracleSourceType::External,
+        &10_000,
+    );
+    set_now(&env, 1_000);
+
+    h.aggregator.get_price(&h.token_a, &h.token_b);
+
+    let (version, (stale_sources,)): (u32, (soroban_sdk::Vec<Address>,)) =
+        last_versioned_event(&env, &h.aggregator.address, "stale_src");
+    assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+    assert!(stale_sources.contains(&stale));
+}
+
+/// A source outside the deviation band triggers a version-stamped deviant
+/// event.
+#[test]
+fn deviant_source_emits_versioned_event() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let s1 = deploy_source(&env, 100);
+    let s2 = deploy_source(&env, 102);
+    let outlier = deploy_source(&env, 300);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
+    h.aggregator
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &outlier,
+        &OracleSourceType::External,
+        &10_000,
+    );
+    set_now(&env, 1_000);
+
+    h.aggregator.get_price(&h.token_a, &h.token_b);
+
+    let (version, (deviant_sources,)): (u32, (soroban_sdk::Vec<Address>,)) =
+        last_versioned_event(&env, &h.aggregator.address, "deviant");
+    assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+    assert!(deviant_sources.contains(&outlier));
+}
+
+#[test]
+fn pair_sources_are_isolated_and_reverse_price_is_inverted() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    set_now(&env, 1_000);
+    let a1 = deploy_source(&env, 2_000_000);
+    let a2 = deploy_source(&env, 2_000_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &a1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
+    h.aggregator
+        .register_source(&h.admin, &pair(&h), &a2, &OracleSourceType::ClTwap, &10_000);
+
+    let first = Address::generate(&env);
+    let second = Address::generate(&env);
+    let other_pair = PairKey {
+        token_a: first,
+        token_b: second,
+    };
+    let b1 = deploy_source(&env, 3_000_000);
+    let b2 = deploy_source(&env, 3_000_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &other_pair,
+        &b1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
+    h.aggregator.register_source(
+        &h.admin,
+        &other_pair,
+        &b2,
+        &OracleSourceType::ClTwap,
+        &10_000,
+    );
+
+    assert_eq!(
+        h.aggregator.get_price_safe(&h.token_a, &h.token_b).price,
+        2_000_000
+    );
+    assert_eq!(
+        h.aggregator.get_price_safe(&h.token_b, &h.token_a).price,
+        500_000
+    );
+    assert_eq!(h.aggregator.list_pairs(&0, &MAX_PAGE_SIZE).len(), 2);
+    assert_eq!(h.aggregator.list_sources(&other_pair, &0, &1).len(), 1);
+}
+
+#[test]
+fn pair_config_overrides_globals_without_affecting_other_pairs() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    set_now(&env, 1_000);
+    let s1 = deploy_fixed_source(&env, 100, 500);
+    let s2 = deploy_fixed_source(&env, 100, 500);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
+    h.aggregator
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &10_000);
+
+    assert_eq!(
+        h.aggregator
+            .get_price_safe(&h.token_a, &h.token_b)
+            .confidence,
+        20_000
+    );
+    h.aggregator
+        .set_pair_config(&h.admin, &pair(&h), &Some(100), &None, &Some(2));
+    assert_eq!(
+        h.aggregator
+            .get_price_safe(&h.token_a, &h.token_b)
+            .confidence,
+        0
+    );
+    assert_eq!(h.aggregator.get_max_staleness(), 600);
+
+    let config = h.aggregator.get_pair_config(&pair(&h));
+    assert_eq!(config.max_staleness_seconds, Some(100));
+    assert_eq!(config.max_deviation_bps, None);
+    assert_eq!(config.min_valid_sources, Some(2));
+}
+
+#[test]
+fn legacy_sources_fallback_until_assigned_to_a_pair() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let s1 = deploy_source(&env, 100);
+    let s2 = deploy_source(&env, 101);
+    let mut legacy = soroban_sdk::Vec::new(&env);
+    legacy.push_back(OracleSource {
+        source_contract: s1.clone(),
+        source_type: OracleSourceType::AmmTwap,
+        last_updated_at: 0,
+        weight: 10_000,
+    });
+    legacy.push_back(OracleSource {
+        source_contract: s2.clone(),
+        source_type: OracleSourceType::ClTwap,
+        last_updated_at: 0,
+        weight: 10_000,
+    });
+    let aggregator = h.aggregator.address.clone();
+    env.as_contract(&aggregator, || {
+        env.storage().instance().set(&DataKey::Sources, &legacy);
+    });
+
+    assert_eq!(
+        h.aggregator
+            .list_sources(&pair(&h), &0, &MAX_PAGE_SIZE)
+            .len(),
+        2
+    );
+    let mut selected = soroban_sdk::Vec::new(&env);
+    selected.push_back(s1.clone());
+    h.aggregator
+        .assign_legacy_sources(&h.admin, &pair(&h), &selected);
+
+    let assigned = h.aggregator.list_sources(&pair(&h), &0, &MAX_PAGE_SIZE);
+    assert_eq!(assigned.len(), 1);
+    assert_eq!(assigned.get_unchecked(0).source_contract, s1);
+
+    let other_pair = PairKey {
+        token_a: Address::generate(&env),
+        token_b: Address::generate(&env),
+    };
+    let fallback = h.aggregator.list_sources(&other_pair, &0, &MAX_PAGE_SIZE);
+    assert_eq!(fallback.len(), 1);
+    assert_eq!(fallback.get_unchecked(0).source_contract, s2);
+}
+
+#[test]
+fn remove_pair_allows_a_configured_pair_without_sources() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    h.aggregator
+        .set_pair_config(&h.admin, &pair(&h), &None, &None, &Some(2));
+    assert_eq!(h.aggregator.list_pairs(&0, &MAX_PAGE_SIZE).len(), 1);
+
+    h.aggregator.remove_pair(&h.admin, &pair(&h));
+
+    assert_eq!(h.aggregator.list_pairs(&0, &MAX_PAGE_SIZE).len(), 0);
+}
+
+#[test]
+fn stale_quote_equal_to_agreeing_price_remains_stale() {
+    let env = Env::default();
+    let h = deploy(&env, 60);
+    set_now(&env, 1_000);
+    let fresh1 = deploy_source(&env, 100);
+    let fresh2 = deploy_source(&env, 100);
+    let stale = deploy_fixed_source(&env, 100, 1);
+    for (source, source_type) in [
+        (fresh1, OracleSourceType::AmmTwap),
+        (fresh2, OracleSourceType::ClTwap),
+        (stale.clone(), OracleSourceType::External),
+    ] {
+        h.aggregator
+            .register_source(&h.admin, &pair(&h), &source, &source_type, &10_000);
+    }
+    let (_, quotes) = h.aggregator.get_price_detailed(&h.token_a, &h.token_b);
+    let stale_quote = quotes.iter().find(|quote| quote.source == stale).unwrap();
+    assert_eq!(stale_quote.status, QuoteStatus::Stale);
+}
+
+#[test]
+fn preview_price_calls_do_not_emit_alert_events() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    set_now(&env, 1_000);
+    let s1 = deploy_source(&env, 100);
+    let s2 = deploy_source(&env, 102);
+    let outlier = deploy_source(&env, 300);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
+    h.aggregator
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &10_000);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &outlier,
+        &OracleSourceType::External,
+        &10_000,
+    );
+    let before = env.events().all().len();
+
+    h.aggregator.get_price_safe(&h.token_a, &h.token_b);
+    h.aggregator.get_price_detailed(&h.token_a, &h.token_b);
+    h.aggregator.get_price_spread_bps(&h.token_a, &h.token_b);
+
+    assert_eq!(env.events().all().len(), before);
+}
+
+#[test]
+fn remove_source_requires_force_below_pair_minimum() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let s1 = deploy_source(&env, 100);
+    let s2 = deploy_source(&env, 101);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &s1,
+        &OracleSourceType::AmmTwap,
+        &10_000,
+    );
+    h.aggregator
+        .register_source(&h.admin, &pair(&h), &s2, &OracleSourceType::ClTwap, &10_000);
+
+    assert!(h
+        .aggregator
+        .try_remove_source(&h.admin, &pair(&h), &s1, &false)
+        .is_err());
+    h.aggregator.remove_source(&h.admin, &pair(&h), &s1, &true);
+    assert_eq!(
+        h.aggregator
+            .list_sources(&pair(&h), &0, &MAX_PAGE_SIZE)
+            .len(),
+        1
+    );
+}
+
+// ── #907: instance TTL is extended on every entrypoint ───────────────────────
+
+/// Advancing the ledger far past the default instance-entry TTL and then
+/// calling entrypoints must keep the contract responsive rather than trapping
+/// on an archived instance entry.
+///
+/// The oracle aggregator holds global state and its pair index in instance
+/// storage, so if that entry lapses every call traps. Each entrypoint now bumps
+/// the instance TTL; this test walks the
+/// ledger forward in steps smaller than the bump window, calling in between,
+/// and asserts the reads still return. Without the extension the first call
+/// after the advance would trap.
+#[test]
+fn instance_ttl_is_extended_on_access_across_ledger_advance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|li| {
+        li.sequence_number = 1_000;
+        li.max_entry_ttl = 6_312_000;
+    });
+
+    let aggregator_id = env.register_contract(None, OracleAggregator);
+    let aggregator = OracleAggregatorClient::new(&env, &aggregator_id);
+    let admin = Address::generate(&env);
+    aggregator.initialize(&admin, &3_600);
+    let token_a = Address::generate(&env);
+    let token_b = Address::generate(&env);
+    let pair = PairKey { token_a, token_b };
+
+    // Register a source so the read paths have state to walk as well.
+    let source = deploy_source(&env, 1_000);
+    aggregator.register_source(&admin, &pair, &source, &OracleSourceType::External, &10_000);
+
+    // Step forward in increments smaller than the TTL bump (518_400), calling
+    // an entrypoint each step. Each call re-bumps, so the next step stays live.
+    for _ in 0..4 {
+        env.ledger().with_mut(|li| li.sequence_number += 400_000);
+        assert_eq!(aggregator.get_admin(), admin);
+        assert_eq!(aggregator.list_sources(&pair, &0, &MAX_PAGE_SIZE).len(), 1);
+        assert_eq!(aggregator.get_max_staleness(), 3_600);
+    }
 }
 
 #[test]
@@ -931,11 +1639,15 @@ fn test_read_views_callable_when_paused() {
     let h = deploy(&env, 600);
     h.aggregator.pause(&h.admin);
 
-    // Read-only views remain callable
-    let _ = h.aggregator.get_price_safe(&h.token_a, &h.token_b);
-    let _ = h.aggregator.get_price_detailed(&h.token_a, &h.token_b);
-    let _ = h.aggregator.get_price_spread_bps(&h.token_a, &h.token_b);
-    let _ = h.aggregator.list_sources();
+    // Price previews remain callable but fail closed with zero confidence.
+    let safe = h.aggregator.get_price_safe(&h.token_a, &h.token_b);
+    assert_eq!(safe.price, 0);
+    assert_eq!(safe.confidence, 0);
+    let (detailed, quotes) = h.aggregator.get_price_detailed(&h.token_a, &h.token_b);
+    assert_eq!(detailed.confidence, 0);
+    assert!(quotes.is_empty());
+    assert_eq!(h.aggregator.get_price_spread_bps(&h.token_a, &h.token_b), 0);
+    let _ = h.aggregator.list_sources(&pair(&h), &0, &MAX_PAGE_SIZE);
     let _ = h.aggregator.get_max_staleness();
     let _ = h.aggregator.get_max_deviation_bps();
     let _ = h.aggregator.get_admin();

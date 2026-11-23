@@ -50,7 +50,7 @@ deploy_reserve_manager() {
       CURRENT_STEP="initialize reserve_manager"
       log "initializing reserve_manager governance=$GOVERNANCE_CONTRACT_ID factory=$FACTORY_CONTRACT_ID"
       if ! invoke "$RESERVE_MANAGER_CONTRACT_ID" initialize --governance "$GOVERNANCE_CONTRACT_ID" --factory "$FACTORY_CONTRACT_ID" >/dev/null 2>&1; then
-        if invoke_read "$RESERVE_MANAGER_CONTRACT_ID" -- get_governance 2>&1 | grep -q "$GOVERNANCE_CONTRACT_ID"; then
+        if invoke_read "$RESERVE_MANAGER_CONTRACT_ID" get_governance 2>/dev/null | grep -q "$GOVERNANCE_CONTRACT_ID"; then
           log "reserve_manager already initialized"
         else
           warn "failed to initialize reserve_manager"
@@ -63,7 +63,7 @@ deploy_reserve_manager() {
   fi
 
   CURRENT_STEP="verify reserve_manager"
-  if invoke_read "$RESERVE_MANAGER_CONTRACT_ID" -- get_governance >/dev/null 2>&1; then
+  if invoke_read "$RESERVE_MANAGER_CONTRACT_ID" get_governance >/dev/null 2>/dev/null; then
     log "verified reserve_manager liveness"
   else
     warn "reserve_manager verification warning"

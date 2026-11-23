@@ -42,7 +42,7 @@ deploy_batch_auction() {
       CURRENT_STEP="initialize batch_auction"
       log "initializing batch_auction admin=$ADMIN_ADDRESS window=$DEFAULT_BATCH_WINDOW_SECS"
       if ! invoke "$BATCH_AUCTION_CONTRACT_ID" initialize --admin "$ADMIN_ADDRESS" --batch_window_secs "$DEFAULT_BATCH_WINDOW_SECS" >/dev/null 2>&1; then
-        if invoke_read "$BATCH_AUCTION_CONTRACT_ID" -- get_admin 2>&1 | grep -q "$ADMIN_ADDRESS" || invoke_read "$BATCH_AUCTION_CONTRACT_ID" -- get_batch_window >/dev/null 2>&1; then
+        if invoke_read "$BATCH_AUCTION_CONTRACT_ID" get_admin 2>/dev/null | grep -q "$ADMIN_ADDRESS" || invoke_read "$BATCH_AUCTION_CONTRACT_ID" get_batch_window >/dev/null 2>/dev/null; then
           log "batch_auction already initialized"
         else
           warn "failed to initialize batch_auction"
@@ -55,7 +55,7 @@ deploy_batch_auction() {
   fi
 
   CURRENT_STEP="verify batch_auction"
-  if invoke_read "$BATCH_AUCTION_CONTRACT_ID" -- get_admin 2>&1 | grep -q "$ADMIN_ADDRESS" || invoke_read "$BATCH_AUCTION_CONTRACT_ID" -- get_batch_window >/dev/null 2>&1; then
+  if invoke_read "$BATCH_AUCTION_CONTRACT_ID" get_admin 2>/dev/null | grep -q "$ADMIN_ADDRESS" || invoke_read "$BATCH_AUCTION_CONTRACT_ID" get_batch_window >/dev/null 2>/dev/null; then
     log "verified batch_auction liveness"
   else
     warn "batch_auction verification warning"

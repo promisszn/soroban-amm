@@ -195,6 +195,10 @@ fn perturb_trades(
                     min_a,
                     min_b,
                 },
+                action @ (TradeAction::RemoveLiquidityOneSided { .. }
+                | TradeAction::SetFees { .. }
+                | TradeAction::Pause
+                | TradeAction::Unpause) => action,
             };
 
             trade

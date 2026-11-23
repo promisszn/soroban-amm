@@ -9,8 +9,9 @@
 //! established on `main`.
 #![no_std]
 
+use soroban_amm_sdk::emit_versioned_event;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Vec,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env, Vec,
 };
 
 // ── WASM bytes for test harness ──────────────────────────────────────────────
@@ -33,18 +34,26 @@ pub enum NftError {
     /// #697: `mint` would push an owner's new-index holdings past
     /// `MAX_POSITIONS_PER_OWNER`.
     TooManyPositions = 7,
+    ReceiverRefused = 8,
+    NoPendingAdmin = 9,
+    WrongAdmin = 10,
+    InvalidAddress = 11,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
 #[contracttype]
 #[derive(Clone, Debug, PartialEq)]
 pub enum DataKey {
-    /// Admin address, set once during `initialize`. Instance storage.
+    /// Current admin address. Instance storage.
     Admin,
-    /// Registered cl_pool contract, set once during `initialize`. Instance storage.
+    /// Proposed successor admin. Instance storage.
+    PendingAdmin,
+    /// Registered cl_pool contract. Instance storage.
     ClPool,
     /// Monotonically-increasing counter; next token id to assign. Instance storage.
     NextTokenId,
+    /// Number of burned token ids. Instance storage.
+    BurnedCount,
     /// Owner of a token: `Owner(token_id) → Address`. Persistent.
     Owner(u64),
     /// Approved address for a single token: `Approved(token_id) → Address`. Persistent.
@@ -52,6 +61,8 @@ pub enum DataKey {
     /// Operator approval over all of an owner's tokens:
     /// `OperatorApproval(owner, operator) → bool`. Persistent.
     OperatorApproval(Address, Address),
+    /// Whether an address accepts incoming NFT transfers; absent means true.
+    AcceptTransfers(Address),
     /// Position metadata: `TokenPosition(token_id) → PositionMeta`. Persistent.
     TokenPosition(u64),
     /// Legacy (pre-#697) ownership list: `OwnedTokens(owner) → Vec<u64>`.
@@ -257,10 +268,19 @@ impl ClPositionNft {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(NftError::AlreadyInitialized);
         }
+        if admin == cl_pool {
+            return Err(NftError::InvalidAddress);
+        }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::ClPool, &cl_pool);
         env.storage().instance().set(&DataKey::NextTokenId, &0_u64);
+        env.storage().instance().set(&DataKey::BurnedCount, &0_u64);
         Self::bump_instance(&env);
+        emit_versioned_event!(
+            env,
+            (soroban_sdk::Symbol::new(&env, "initialized"),),
+            (admin, cl_pool)
+        );
         Ok(())
     }
 
@@ -358,9 +378,8 @@ impl ClPositionNft {
         Self::index_add(&env, &to, token_id);
         Self::bump_instance(&env);
 
-        // Emit mint event: topic=(nft_mint, to), data=token_id.
-        env.events()
-            .publish((symbol_short!("nft_mint"), to), token_id);
+        // Emit mint event: topic=(nft_mint, to), data=(token_id,).
+        emit_versioned_event!(env, (symbol_short!("nft_mint"), to), (token_id,));
 
         Ok(token_id)
     }
@@ -388,6 +407,14 @@ impl ClPositionNft {
         env.storage()
             .persistent()
             .remove(&DataKey::TokenPosition(token_id));
+        let burned_count: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BurnedCount)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::BurnedCount, &(burned_count + 1));
 
         // #697: O(1) via the index for a token minted post-upgrade (or
         // already migrated); O(n) legacy fallback for a token that still
@@ -414,9 +441,8 @@ impl ClPositionNft {
 
         Self::bump_instance(&env);
 
-        // Emit burn event: topic=(nft_burn, owner), data=token_id.
-        env.events()
-            .publish((symbol_short!("nft_burn"), owner), token_id);
+        // Emit burn event: topic=(nft_burn, owner), data=(token_id,).
+        emit_versioned_event!(env, (symbol_short!("nft_burn"), owner), (token_id,));
 
         Ok(())
     }
@@ -577,9 +603,20 @@ impl ClPositionNft {
         Ok(moved)
     }
 
-    /// Returns the total number of tokens ever minted (cumulative; not reduced by burns).
-    pub fn total_supply(env: Env) -> u64 {
+    /// Returns the number of tokens ever minted, including tokens later burned.
+    pub fn total_minted(env: Env) -> u64 {
         Self::next_token_id(env)
+    }
+
+    /// Returns the number of currently-live position NFTs.
+    pub fn total_supply(env: Env) -> u64 {
+        let minted = Self::next_token_id(env.clone());
+        let burned: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::BurnedCount)
+            .unwrap_or(0);
+        minted.saturating_sub(burned)
     }
 
     /// Approve `approved` to transfer `token_id`. Callable by the token owner or an approved operator.
@@ -607,10 +644,12 @@ impl ClPositionNft {
         let approved_key = DataKey::Approved(token_id);
         env.storage().persistent().set(&approved_key, &approved);
         Self::bump_persistent(&env, &approved_key);
+        Self::bump_instance(&env);
 
-        env.events().publish(
+        emit_versioned_event!(
+            env,
             (soroban_sdk::Symbol::new(&env, "approve"), caller, approved),
-            token_id,
+            (token_id,)
         );
 
         Ok(())
@@ -622,13 +661,15 @@ impl ClPositionNft {
         let key = DataKey::OperatorApproval(owner.clone(), operator.clone());
         env.storage().persistent().set(&key, &approved);
         Self::bump_persistent(&env, &key);
-        env.events().publish(
+        Self::bump_instance(&env);
+        emit_versioned_event!(
+            env,
             (
                 soroban_sdk::Symbol::new(&env, "approval_for_all"),
                 owner,
                 operator,
             ),
-            approved,
+            (approved,)
         );
     }
 
@@ -676,6 +717,12 @@ impl ClPositionNft {
             return Err(NftError::NotOwnerOrApproved);
         }
 
+        if !Self::accepts_transfers(env.clone(), to.clone())
+            && !Self::is_approved_for_all(env.clone(), to.clone(), caller.clone())
+        {
+            return Err(NftError::ReceiverRefused);
+        }
+
         // #697: defence in depth — a transfer must not be usable to bypass
         // the per-owner cap that mint() enforces.
         if Self::owner_token_count(&env, &to) >= Self::MAX_POSITIONS_PER_OWNER {
@@ -685,6 +732,7 @@ impl ClPositionNft {
         // Update Owner
         env.storage().persistent().set(&owner_key, &to);
         Self::bump_persistent(&env, &owner_key);
+        Self::bump_persistent(&env, &DataKey::TokenPosition(token_id));
 
         // Clear Approved
         env.storage()
@@ -719,11 +767,13 @@ impl ClPositionNft {
         // before this upgrade become fully O(1) the moment it changes hands,
         // even without an explicit admin migration call.
         Self::index_add(&env, &to, token_id);
+        Self::bump_instance(&env);
 
         // Emit transfer event
-        env.events().publish(
+        emit_versioned_event!(
+            env,
             (soroban_sdk::Symbol::new(&env, "transfer"), from, to),
-            token_id,
+            (token_id,)
         );
 
         Ok(())
@@ -747,6 +797,137 @@ impl ClPositionNft {
     /// Returns the registered `cl_pool` address.
     pub fn cl_pool(env: Env) -> Address {
         env.storage().instance().get(&DataKey::ClPool).unwrap()
+    }
+
+    /// Returns the nominated successor admin, if a handover is pending.
+    pub fn pending_admin(env: Env) -> Option<Address> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None)
+    }
+
+    /// Returns whether `owner` accepts incoming transfers (true by default).
+    pub fn accepts_transfers(env: Env, owner: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AcceptTransfers(owner))
+            .unwrap_or(true)
+    }
+
+    /// Set whether this address accepts incoming NFT transfers.
+    pub fn set_accept_transfers(env: Env, owner: Address, accepts: bool) {
+        owner.require_auth();
+        let key = DataKey::AcceptTransfers(owner);
+        env.storage().persistent().set(&key, &accepts);
+        Self::bump_persistent(&env, &key);
+        Self::bump_instance(&env);
+    }
+
+    /// Nominate a successor admin. The nominee completes the transfer by calling `accept_admin`.
+    pub fn propose_admin(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), NftError> {
+        Self::bump_instance(&env);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(NftError::Unauthorized)?;
+        if admin != current_admin {
+            return Err(NftError::Unauthorized);
+        }
+        current_admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &Some(new_admin.clone()));
+        emit_versioned_event!(
+            env,
+            (soroban_sdk::Symbol::new(&env, "admin_nominated"),),
+            (current_admin, new_admin)
+        );
+        Ok(())
+    }
+
+    /// Accept a pending admin nomination.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), NftError> {
+        Self::bump_instance(&env);
+        new_admin.require_auth();
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None);
+        if pending.is_none() {
+            return Err(NftError::NoPendingAdmin);
+        }
+        if pending != Some(new_admin.clone()) {
+            return Err(NftError::WrongAdmin);
+        }
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &Option::<Address>::None);
+        emit_versioned_event!(
+            env,
+            (soroban_sdk::Symbol::new(&env, "admin_transferred"),),
+            (new_admin,)
+        );
+        Ok(())
+    }
+
+    /// Replace the contract WASM. State is preserved; the new WASM must already be uploaded.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), NftError> {
+        Self::bump_instance(&env);
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(NftError::Unauthorized)?;
+        admin.require_auth();
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        emit_versioned_event!(
+            env,
+            (soroban_sdk::Symbol::new(&env, "upgraded"),),
+            (new_wasm_hash,)
+        );
+        Ok(())
+    }
+
+    /// Admin-only migration tool for replacing the pool allowed to mint and burn.
+    pub fn set_cl_pool(env: Env, admin: Address, new_pool: Address) -> Result<(), NftError> {
+        Self::bump_instance(&env);
+        let current_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(NftError::Unauthorized)?;
+        if current_admin != admin {
+            return Err(NftError::Unauthorized);
+        }
+        admin.require_auth();
+        let current_pool: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::ClPool)
+            .ok_or(NftError::Unauthorized)?;
+        let zero_account = Address::from_string(&soroban_sdk::String::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        if new_pool == current_pool || new_pool == zero_account {
+            return Err(NftError::InvalidAddress);
+        }
+        env.storage().instance().set(&DataKey::ClPool, &new_pool);
+        emit_versioned_event!(
+            env,
+            (soroban_sdk::Symbol::new(&env, "pool_changed"),),
+            (current_pool, new_pool)
+        );
+        Ok(())
     }
 
     /// Returns the next token id that will be assigned.
@@ -834,6 +1015,30 @@ mod tests {
             .unwrap_err()
             .unwrap();
         assert_eq!(err, NftError::AlreadyInitialized);
+    }
+
+    #[test]
+    fn initialize_rejects_same_admin_and_pool() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ClPositionNft);
+        let client = ClPositionNftClient::new(&env, &contract_id);
+        let address = Address::generate(&env);
+        assert_eq!(
+            client
+                .try_initialize(&address, &address)
+                .unwrap_err()
+                .unwrap(),
+            NftError::InvalidAddress
+        );
+    }
+
+    #[test]
+    fn initialize_emits_admin_and_pool() {
+        let (env, client, admin, pool, _) = setup();
+        let (version, data): (u32, (Address, Address)) =
+            last_versioned_event(&env, &client.address, "initialized");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(data, (admin, pool));
     }
 
     // ── mint ─────────────────────────────────────────────────────────────────
@@ -1023,7 +1228,7 @@ mod tests {
     }
 
     #[test]
-    fn total_supply_tracks_all_mints() {
+    fn total_supply_tracks_live_mints_and_burns() {
         let (_env, client, _admin, pool, user) = setup();
         assert_eq!(client.total_supply(), 0);
 
@@ -1034,7 +1239,18 @@ mod tests {
         assert_eq!(client.total_supply(), 2);
 
         client.burn(&id0);
-        // Burning does not decrease total_supply.
+        assert_eq!(client.total_supply(), 1);
+        assert_eq!(client.total_minted(), 2);
+    }
+
+    #[test]
+    fn total_supply_is_minted_minus_burned() {
+        let (_env, client, _admin, pool, user) = setup();
+        let first = client.mint(&user, &pool, &-100, &100);
+        client.mint(&user, &pool, &-200, &200);
+        client.mint(&user, &pool, &-300, &300);
+        client.burn(&first);
+        assert_eq!(client.total_minted(), 3);
         assert_eq!(client.total_supply(), 2);
     }
 
@@ -1053,6 +1269,50 @@ mod tests {
         let b_tokens = client.tokens_of(&user_b);
         assert_eq!(b_tokens.len(), 1);
         assert_eq!(b_tokens.get(0).unwrap(), id);
+    }
+
+    #[test]
+    fn receiver_accepts_transfers_by_default() {
+        let (env, client, _admin, _pool, _user) = setup();
+        let receiver = Address::generate(&env);
+        assert!(client.accepts_transfers(&receiver));
+    }
+
+    #[test]
+    fn opted_out_receiver_rejects_stranger_transfer() {
+        let (env, client, _admin, pool, owner) = setup();
+        let receiver = Address::generate(&env);
+        let id = client.mint(&owner, &pool, &-100, &100);
+        client.set_accept_transfers(&receiver, &false);
+        assert_eq!(
+            client
+                .try_transfer(&owner, &owner, &receiver, &id)
+                .unwrap_err()
+                .unwrap(),
+            NftError::ReceiverRefused
+        );
+    }
+
+    #[test]
+    fn opted_out_receiver_accepts_transfer_from_approved_operator() {
+        let (env, client, _admin, pool, owner) = setup();
+        let receiver = Address::generate(&env);
+        let operator = Address::generate(&env);
+        let id = client.mint(&owner, &pool, &-100, &100);
+        client.set_accept_transfers(&receiver, &false);
+        client.set_approval_for_all(&owner, &operator, &true);
+        client.set_approval_for_all(&receiver, &operator, &true);
+        client.transfer(&operator, &owner, &receiver, &id);
+        assert_eq!(client.owner_of(&id), receiver);
+    }
+
+    #[test]
+    fn receiver_can_opt_back_in() {
+        let (env, client, _admin, _pool, _owner) = setup();
+        let receiver = Address::generate(&env);
+        client.set_accept_transfers(&receiver, &false);
+        client.set_accept_transfers(&receiver, &true);
+        assert!(client.accepts_transfers(&receiver));
     }
 
     #[test]
@@ -1107,6 +1367,201 @@ mod tests {
         assert_eq!(res.unwrap_err().unwrap(), NftError::Unauthorized);
     }
 
+    #[test]
+    fn admin_nomination_is_readable_and_completes() {
+        let (env, client, admin, _pool, _) = setup();
+        let successor = Address::generate(&env);
+        client.propose_admin(&admin, &successor);
+        assert_eq!(client.pending_admin(), Some(successor.clone()));
+        client.accept_admin(&successor);
+        assert_eq!(client.admin(), successor);
+        assert_eq!(client.pending_admin(), None);
+    }
+
+    #[test]
+    fn accept_admin_without_nomination_fails() {
+        let (env, client, _admin, _pool, _) = setup();
+        let nominee = Address::generate(&env);
+        assert_eq!(
+            client.try_accept_admin(&nominee).unwrap_err().unwrap(),
+            NftError::NoPendingAdmin
+        );
+    }
+
+    #[test]
+    fn wrong_admin_nominee_is_rejected() {
+        let (env, client, admin, _pool, _) = setup();
+        let nominee = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        client.propose_admin(&admin, &nominee);
+        assert_eq!(
+            client.try_accept_admin(&stranger).unwrap_err().unwrap(),
+            NftError::WrongAdmin
+        );
+    }
+
+    #[test]
+    fn old_admin_cannot_propose_after_handover() {
+        let (env, client, admin, _pool, _) = setup();
+        let successor = Address::generate(&env);
+        let next = Address::generate(&env);
+        client.propose_admin(&admin, &successor);
+        client.accept_admin(&successor);
+        assert_eq!(
+            client
+                .try_propose_admin(&admin, &next)
+                .unwrap_err()
+                .unwrap(),
+            NftError::Unauthorized
+        );
+    }
+
+    #[test]
+    fn set_cl_pool_rejects_non_admin() {
+        let (env, client, _admin, _pool, _) = setup();
+        let stranger = Address::generate(&env);
+        let new_pool = Address::generate(&env);
+        assert_eq!(
+            client
+                .try_set_cl_pool(&stranger, &new_pool)
+                .unwrap_err()
+                .unwrap(),
+            NftError::Unauthorized
+        );
+    }
+
+    #[test]
+    fn set_cl_pool_rejects_current_pool() {
+        let (_env, client, admin, pool, _) = setup();
+        assert_eq!(
+            client.try_set_cl_pool(&admin, &pool).unwrap_err().unwrap(),
+            NftError::InvalidAddress
+        );
+    }
+
+    #[test]
+    fn set_cl_pool_rejects_zero_address() {
+        let (env, client, admin, _pool, _) = setup();
+        let zero = Address::from_string(&soroban_sdk::String::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        assert_eq!(
+            client.try_set_cl_pool(&admin, &zero).unwrap_err().unwrap(),
+            NftError::InvalidAddress
+        );
+    }
+
+    #[test]
+    fn set_cl_pool_updates_registered_pool() {
+        let (env, client, admin, _pool, _) = setup();
+        let new_pool = Address::generate(&env);
+        client.set_cl_pool(&admin, &new_pool);
+        assert_eq!(client.cl_pool(), new_pool);
+    }
+
+    #[test]
+    fn old_admin_cannot_replace_pool_after_handover() {
+        let (env, client, admin, _pool, _) = setup();
+        let successor = Address::generate(&env);
+        let another_pool = Address::generate(&env);
+        client.propose_admin(&admin, &successor);
+        client.accept_admin(&successor);
+        assert_eq!(
+            client
+                .try_set_cl_pool(&admin, &another_pool)
+                .unwrap_err()
+                .unwrap(),
+            NftError::Unauthorized
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn old_pool_cannot_mint_after_pool_replacement() {
+        use soroban_sdk::{
+            testutils::{MockAuth, MockAuthInvoke},
+            IntoVal,
+        };
+
+        let (env, client, admin, old_pool, owner) = setup();
+        let new_pool = Address::generate(&env);
+        client.set_cl_pool(&admin, &new_pool);
+        env.mock_auths(&[MockAuth {
+            address: &old_pool,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "mint",
+                args: (owner.clone(), old_pool.clone(), -1_i32, 1_i32).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.mint(&owner, &old_pool, &-1, &1);
+    }
+
+    #[test]
+    fn new_pool_can_mint_after_pool_replacement() {
+        use soroban_sdk::{
+            testutils::{MockAuth, MockAuthInvoke},
+            IntoVal,
+        };
+
+        let (env, client, admin, _old_pool, owner) = setup();
+        let new_pool = Address::generate(&env);
+        client.set_cl_pool(&admin, &new_pool);
+        env.mock_auths(&[MockAuth {
+            address: &new_pool,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "mint",
+                args: (owner.clone(), new_pool.clone(), -1_i32, 1_i32).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert_eq!(client.mint(&owner, &new_pool, &-1, &1), 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn upgrade_rejects_missing_admin_auth() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ClPositionNft);
+        let client = ClPositionNftClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pool = Address::generate(&env);
+        env.mock_all_auths();
+        client.initialize(&admin, &pool);
+        env.set_auths(&[]);
+        client.upgrade(&BytesN::from_array(&env, &[7u8; 32]));
+    }
+
+    #[cfg(feature = "testutils")]
+    #[test]
+    fn upgrade_preserves_nft_state() {
+        let (env, client, _admin, pool, owner) = setup();
+        let id = client.mint(&owner, &pool, &-100, &100);
+        let new_hash = env.deployer().upload_contract_wasm(WASM);
+        client.upgrade(&new_hash);
+        assert_eq!(client.owner_of(&id), owner);
+        assert_eq!(client.position_meta(&id).pool, pool);
+        assert_eq!(client.total_supply(), 1);
+    }
+
+    #[test]
+    #[should_panic]
+    fn propose_admin_requires_admin_auth() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, ClPositionNft);
+        let client = ClPositionNftClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pool = Address::generate(&env);
+        let successor = Address::generate(&env);
+        env.mock_all_auths();
+        client.initialize(&admin, &pool);
+        env.set_auths(&[]);
+        client.propose_admin(&admin, &successor);
+    }
+
     // ── TTL configuration (#353) ───────────────────────────────────────────────
 
     #[test]
@@ -1115,6 +1570,43 @@ mod tests {
         let (min_ttl, bump_to) = client.ttl_params();
         assert_eq!(min_ttl, ClPositionNft::DEFAULT_MIN_TTL);
         assert_eq!(bump_to, ClPositionNft::DEFAULT_BUMP_TO);
+    }
+
+    #[test]
+    fn transfer_bumps_owner_metadata_and_instance_ttls() {
+        use soroban_sdk::testutils::{
+            storage::{Instance as _, Persistent as _},
+            Ledger as _,
+        };
+
+        let (env, client, _admin, pool, owner) = setup();
+        // `extend_ttl` is a no-op while the TTL is above `min_ttl`, and a fresh
+        // test instance starts around 4_095 ledgers, so the threshold has to sit
+        // above that for the first bump to fire.
+        client.set_ttl_params(&5_000, &10_000);
+        let recipient = Address::generate(&env);
+        let id = client.mint(&owner, &pool, &-100, &100);
+        env.ledger()
+            .with_mut(|ledger| ledger.sequence_number += 9_000);
+
+        client.transfer(&owner, &owner, &recipient, &id);
+
+        env.as_contract(&client.address, || {
+            assert_eq!(
+                env.storage()
+                    .persistent()
+                    .get_ttl(&DataKey::TokenPosition(id)),
+                10_000
+            );
+            assert_eq!(
+                env.storage().persistent().get_ttl(&DataKey::Owner(id)),
+                10_000
+            );
+            // `initialize` already bumped the instance to the (much larger)
+            // default, and `extend_ttl` never shortens, so the instance can only
+            // be asserted to be at least the configured bump.
+            assert!(env.storage().instance().get_ttl() >= 10_000);
+        });
     }
 
     #[test]
@@ -1729,5 +2221,96 @@ mod tests {
         for (&id, &owner_idx) in &live {
             assert_eq!(client.owner_of(&id), owners[owner_idx]);
         }
+    }
+
+    // ── Issue #915: every event carries EVENT_SCHEMA_VERSION ────────────────
+    //
+    // `mint`, `burn`, `approve`, `set_approval_for_all`, and `transfer` used
+    // to call `env.events().publish(...)` directly, so their payloads were
+    // not version-stamped and an indexer reading `(version, ...rest)` would
+    // have decoded the first real field as the version number. These tests
+    // pin the stamp in place for all five.
+
+    /// Fetch the payload of the most recent event this contract published
+    /// under `topic`, decoded as a version-stamped `(u32, T)` pair.
+    fn last_versioned_event<T>(env: &Env, contract_id: &Address, topic: &str) -> (u32, T)
+    where
+        T: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>,
+    {
+        use soroban_sdk::{IntoVal, Symbol, TryFromVal};
+
+        let wanted = Symbol::new(env, topic);
+        let evt = env
+            .events()
+            .all()
+            .iter()
+            .rfind(|e| {
+                &e.0 == contract_id
+                    && e.1.get(0).and_then(|v| Symbol::try_from_val(env, &v).ok())
+                        == Some(wanted.clone())
+            })
+            .unwrap_or_else(|| panic!("no `{topic}` event found"));
+        evt.2.into_val(env)
+    }
+
+    #[test]
+    fn mint_emits_versioned_event() {
+        let (env, client, _admin, pool, user) = setup();
+        let id = client.mint(&user, &pool, &-100, &100);
+
+        let (version, (token_id,)): (u32, (u64,)) =
+            last_versioned_event(&env, &client.address, "nft_mint");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(token_id, id);
+    }
+
+    #[test]
+    fn burn_emits_versioned_event() {
+        let (env, client, _admin, pool, user) = setup();
+        let id = client.mint(&user, &pool, &-100, &100);
+        client.burn(&id);
+
+        let (version, (token_id,)): (u32, (u64,)) =
+            last_versioned_event(&env, &client.address, "nft_burn");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(token_id, id);
+    }
+
+    #[test]
+    fn approve_emits_versioned_event() {
+        let (env, client, _admin, pool, user) = setup();
+        let id = client.mint(&user, &pool, &-100, &100);
+        let approved_addr = Address::generate(&env);
+        client.approve(&user, &approved_addr, &id);
+
+        let (version, (token_id,)): (u32, (u64,)) =
+            last_versioned_event(&env, &client.address, "approve");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(token_id, id);
+    }
+
+    #[test]
+    fn set_approval_for_all_emits_versioned_event() {
+        let (env, client, _admin, _pool, user) = setup();
+        let operator = Address::generate(&env);
+        client.set_approval_for_all(&user, &operator, &true);
+
+        let (version, (approved,)): (u32, (bool,)) =
+            last_versioned_event(&env, &client.address, "approval_for_all");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert!(approved);
+    }
+
+    #[test]
+    fn transfer_emits_versioned_event() {
+        let (env, client, _admin, pool, user) = setup();
+        let id = client.mint(&user, &pool, &-100, &100);
+        let recipient = Address::generate(&env);
+        client.transfer(&user, &user, &recipient, &id);
+
+        let (version, (token_id,)): (u32, (u64,)) =
+            last_versioned_event(&env, &client.address, "transfer");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(token_id, id);
     }
 }

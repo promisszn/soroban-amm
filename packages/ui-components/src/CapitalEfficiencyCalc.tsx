@@ -11,6 +11,12 @@
 
 import React, { useMemo, useId } from "react";
 import type { BaseProps, PriceRange } from "./types.js";
+import {
+  computeEfficiency,
+  formatEfficiency,
+  isInRange,
+  rangePct,
+} from "./lib/capitalEfficiency.js";
 
 export interface CapitalEfficiencyCalcProps extends BaseProps {
   /** Current spot price. */
@@ -27,24 +33,9 @@ export interface CapitalEfficiencyCalcProps extends BaseProps {
 }
 
 /**
- * Computes the capital efficiency multiplier for a [lower, upper] range
- * relative to [0, ∞) using the Uniswap v3 formula:
- *
- *   efficiency = 1 / (1 - sqrt(lower/upper))
- *
- * when the current price is inside the range.
+ * Displays the shared sqrt-price capital-efficiency calculation from
+ * `lib/capitalEfficiency`, including the current price's position in range.
  */
-function computeEfficiency(
-  currentPrice: number,
-  lower: number,
-  upper: number,
-): number {
-  if (lower <= 0 || upper <= 0 || lower >= upper) return 1;
-  if (currentPrice < lower || currentPrice > upper) return 1;
-  const sqrtRatio = Math.sqrt(lower / upper);
-  return Math.max(1, 1 / (1 - sqrtRatio));
-}
-
 export function CapitalEfficiencyCalc({
   currentPrice,
   priceRange,
@@ -63,12 +54,10 @@ export function CapitalEfficiencyCalc({
   );
 
   const concentratedCapital = depositUsd / efficiency;
-  const rangePct =
-    ((priceRange.upper - priceRange.lower) / currentPrice) * 100;
-  const inRange =
-    currentPrice >= priceRange.lower && currentPrice <= priceRange.upper;
+  const widthPct = rangePct(priceRange.lower, priceRange.upper, currentPrice);
+  const inRange = isInRange(currentPrice, priceRange);
 
-  const effStr = efficiency >= 1000 ? ">1000" : efficiency.toFixed(1);
+  const effStr = formatEfficiency(efficiency);
   const barWidth = Math.min(100, ((efficiency - 1) / 99) * 100);
 
   return (
@@ -123,7 +112,7 @@ export function CapitalEfficiencyCalc({
       <div style={styles.infoGrid}>
         <div style={styles.infoCell}>
           <div style={styles.infoLabel}>Range width</div>
-          <div style={styles.infoValue}>{rangePct.toFixed(1)}%</div>
+          <div style={styles.infoValue}>{widthPct.toFixed(1)}%</div>
         </div>
         <div style={styles.infoCell}>
           <div style={styles.infoLabel}>Lower bound</div>

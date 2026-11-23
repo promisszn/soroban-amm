@@ -14,6 +14,9 @@ import {
 } from "@stellar/stellar-sdk";
 import type { NetworkConfig } from "./types.js";
 import { simulateRead } from "./internal/simulate.js";
+import { invoke } from "./internal/invoke.js";
+import type { InvocationResult, InvokeOptions, Signer } from "./internal/invoke.js";
+import { toBigInt, toText } from "./internal/decode.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -85,6 +88,11 @@ export class RouterClient {
     return simulateRead(this.server, this.contract, this.networkPassphrase, method, args);
   }
 
+  private async execute<T>(method: string, args: xdr.ScVal[], signer: Signer, options?: InvokeOptions): Promise<InvocationResult<T>> {
+    return invoke<T>({ server: this.server, contract: this.contract, method, args,
+      source: await signer.publicKey(), signer, networkPassphrase: this.networkPassphrase, ...options });
+  }
+
   // ── Read-only methods ──────────────────────────────────────────────────────
 
   /**
@@ -102,13 +110,13 @@ export class RouterClient {
       addressVec(path),
       i128(amountIn)
     );
-    return BigInt(String(scValToNative(raw)));
+    return toBigInt(scValToNative(raw));
   }
 
   /** Returns the factory address this router resolves pools through. */
   async getFactory(): Promise<string> {
     const raw = await this.simulate("get_factory");
-    return String(scValToNative(raw));
+    return toText(scValToNative(raw));
   }
 
   // ── Write-method parameter types ───────────────────────────────────────────
@@ -157,5 +165,13 @@ export class RouterClient {
       i128(input.maxIn),
       u64(input.deadline),
     ];
+  }
+
+  async swapExactIn(input: SwapExactInInput, signer: Signer, options?: InvokeOptions): Promise<InvocationResult<bigint>> {
+    return this.execute("swap_exact_in", this.swapExactInParams(input), signer, options);
+  }
+
+  async swapExactOut(input: SwapExactOutInput, signer: Signer, options?: InvokeOptions): Promise<InvocationResult<bigint>> {
+    return this.execute("swap_exact_out", this.swapExactOutParams(input), signer, options);
   }
 }

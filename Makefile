@@ -6,8 +6,8 @@ WASM_DIR := target/wasm32v1-none/release
 
 SHELL := bash
 
-.PHONY: all help build release-build optimize test test-all fmt lint check check-docs \
-        size size-check doc audit bench deploy e2e clean fuzz-cl
+.PHONY: all help build release-build optimize abi check-abi test-abi test test-all fmt lint lint-js check-node-versions check check-docs check-branch-protection check-branch-protection-remote check-storage-keys check-deploy-scripts check-test-modules check-reachability \
+        size size-check doc audit bench deploy e2e clean fuzz-amm fuzz-amm-nightly fuzz-cl
 
 # Bare `make` explains itself instead of building.
 .DEFAULT_GOAL := help
@@ -38,11 +38,34 @@ optimize: build ## Optimize every WASM artifact produced by `make build`
 		stellar contract optimize --wasm "$$f"; \
 	done
 
+abi: build ## Regenerate docs/abi.json from deployable contract WASM
+	bash scripts/generate_abi.sh
+
+check-abi: build ## Verify docs/abi.json matches committed contract WASM interfaces
+	bash scripts/check_abi.sh
+
+test-abi: ## Run ABI generator/checker script tests
+	node --test scripts/check_abi.test.mjs
+
+check-doc-commands: build ## Verify documented contract invokes against built WASM interfaces
+	node scripts/check_doc_commands.mjs $(WASM_DIR)
+
+test-doc-commands: ## Run fixture tests for the documentation command checker
+	node --test scripts/check_doc_commands.test.mjs
+
 test: build ## Build, then run the full workspace test suite
 	cargo test --workspace
 
 test-all: ## Run tests for the whole workspace
 	cargo test --workspace
+
+fuzz-amm: ## Build AMM WASM and run the deployed stateful invariant suite (CI case count)
+	cargo build --release --target wasm32v1-none -p amm -p token
+	PROPTEST_CASES=$${PROPTEST_CASES:-256} cargo test -p amm_fuzz contract_stateful_invariants -- --nocapture
+
+fuzz-amm-nightly: ## Run 10,000 deployed AMM state-machine cases
+	cargo build --release --target wasm32v1-none -p amm -p token
+	PROPTEST_CASES=$${PROPTEST_CASES:-10000} cargo test -p amm_fuzz contract_stateful_invariants -- --nocapture
 
 fuzz-cl: ## Build the wasm deps amm_fuzz imports, then run the full amm_fuzz suite incl. CL stateful properties
 	cargo build --release --target wasm32v1-none -p concentrated_liquidity -p amm -p token
@@ -54,8 +77,33 @@ fmt: ## cargo fmt --all
 lint: ## cargo clippy --all -- -D warnings
 	cargo clippy --all -- -D warnings
 
+lint-js: ## ESLint every JS/TS workspace (run `npm ci` at the root and in each workspace first)
+	npm run lint
+
+check-node-versions: ## Verify every JS package's @types/node and engines.node match .nvmrc
+	node scripts/check_node_versions.mjs
+
 check-docs: ## Verify docs/error-codes.md matches #[contracterror] enums
 	bash scripts/check_error_docs.sh
+
+check-branch-protection: ## Verify BRANCH_PROTECTION.md lists match ci.yml job names (ARGS="--write" regenerates)
+	node scripts/check_branch_protection_doc.mjs $(ARGS)
+
+check-branch-protection-remote: ## Verify the live branch protection against ci.yml (needs admin scope)
+	node scripts/check_branch_protection_doc.mjs --verify-remote
+
+check-storage-keys: ## Fail if a TWAP/TWAL storage key is built from the ledger timestamp or sequence
+	bash scripts/check_storage_keys.sh
+
+check-deploy-scripts: ## Fail if a deployable contract has no scripts/deploy/ module wired into deploy.sh
+	bash scripts/check_deploy_scripts.sh
+
+check-test-modules: ## Fail if a contract *_test.rs file is not declared as a mod, so cargo never runs it
+	bash scripts/check_test_modules.sh
+
+check-reachability: ## Fail if a module under a package's src/ is not reachable from its entrypoint
+	node scripts/check_reachability.mjs
+	node --test scripts/check_reachability.test.mjs
 
 size: ## Print a WASM size report for all built contracts
 	bash scripts/size_report.sh
@@ -73,9 +121,13 @@ audit: ## Run a security audit of dependencies (cargo install cargo-audit if mis
 	}
 	cargo audit
 
-check: fmt lint test check-docs size-check doc ## Run the checks CI enforces before pushing
+check: fmt lint test check-docs check-branch-protection check-storage-keys check-deploy-scripts check-test-modules check-reachability size-check doc ## Run the checks CI enforces before pushing
 
-bench: ## Run hot-path benchmarks
+bench: build ## Run hot-path benchmarks against the optimized pool WASM (what CI measures)
+	@mkdir -p $(WASM_DIR)/optimized
+	@for c in amm token; do \
+		stellar contract optimize --wasm $(WASM_DIR)/$$c.wasm --wasm-out $(WASM_DIR)/optimized/$$c.wasm || exit 1; \
+	done
 	cargo run -p benches -- --check
 
 deploy: ## Deploy contracts via scripts/deploy.sh

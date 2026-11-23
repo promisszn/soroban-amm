@@ -18,19 +18,20 @@ import {
   Address,
 } from "@stellar/stellar-sdk";
 import type {
+  AddLiquidityParams,
   NetworkConfig,
   Signer,
   PoolInfo,
+  RemoveLiquidityParams,
   SwapParams,
   SwapSimulation,
-  AddLiquidityParams,
-  RemoveLiquidityParams,
-  LiquidityResult,
-  FlashLoanParams,
 } from "./types.js";
 import { AmmErrors, AmmErrorNames } from "./types.js";
 import type { AmmErrorCode, AmmErrorKey } from "./types.js";
 import { simulateRead } from "./internal/simulate.js";
+import { invoke } from "./internal/invoke.js";
+import type { InvocationResult, InvokeOptions, Signer } from "./internal/invoke.js";
+import { requireBigInt, requireText, toBigInt } from "./internal/decode.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -123,25 +124,60 @@ export class AmmPool {
     );
   }
 
+  private async execute<T>(method: string, args: xdr.ScVal[], signer: Signer, options?: InvokeOptions): Promise<InvocationResult<T>> {
+    return invoke<T>({
+      server: this.server,
+      contract: this.contract,
+      method,
+      args,
+      source: await signer.publicKey(),
+      signer,
+      networkPassphrase: this.networkPassphrase,
+      decodeError,
+      ...options,
+    });
+  }
+
   // ── Pool info ──────────────────────────────────────────────────────────────
 
-  /** Fetch full pool state. */
-  async getInfo(): Promise<PoolInfo> {
-    const raw = await this.simulate("get_info");
-    const native = scValToNative(raw) as Record<string, unknown>;
+  private decodeInfo(native: Record<string, unknown>): Omit<PoolInfo, "isPaused"> {
     return {
-      tokenA: String(native.token_a),
-      tokenB: String(native.token_b),
-      reserveA: BigInt(String(native.reserve_a ?? 0)),
-      reserveB: BigInt(String(native.reserve_b ?? 0)),
-      totalShares: BigInt(String(native.total_shares ?? 0)),
-      feeBps: BigInt(String(native.fee_bps ?? 0)),
-      protocolFeeBps: BigInt(String(native.protocol_fee_bps ?? 0)),
-      feeRecipient: native.fee_recipient ? String(native.fee_recipient) : null,
-      flashLoanFeeBps: BigInt(String(native.flash_loan_fee_bps ?? 0)),
-      admin: native.admin ? String(native.admin) : null,
-      isPaused: Boolean(native.is_paused),
-      name: native.name ? String(native.name) : null,
+      tokenA: requireText(native, "token_a", "PoolInfo"),
+      tokenB: requireText(native, "token_b", "PoolInfo"),
+      reserveA: requireBigInt(native, "reserve_a", "PoolInfo"),
+      reserveB: requireBigInt(native, "reserve_b", "PoolInfo"),
+      totalShares: requireBigInt(native, "total_shares", "PoolInfo"),
+      feeBps: requireBigInt(native, "fee_bps", "PoolInfo"),
+      protocolFeeBps: requireBigInt(native, "protocol_fee_bps", "PoolInfo"),
+      lpRebateBps: requireBigInt(native, "lp_rebate_bps", "PoolInfo"),
+      feeRecipient: requireText(native, "fee_recipient", "PoolInfo"),
+      flashLoanFeeBps: requireBigInt(native, "flash_loan_fee_bps", "PoolInfo"),
+      admin: requireText(native, "admin", "PoolInfo"),
+    };
+  }
+
+  /** Fetch pool fields in one RPC call, without querying pause status. */
+  async getInfoLight(): Promise<Omit<PoolInfo, "isPaused">> {
+    const raw = await this.simulate("get_info");
+    return this.decodeInfo(scValToNative(raw) as Record<string, unknown>);
+  }
+
+  /**
+   * Fetch full pool state, including pause status. `get_info` and `is_paused`
+   * are simulated concurrently, so this performs two RPC calls.
+   */
+  async getInfo(): Promise<PoolInfo> {
+    const [infoRaw, pausedRaw] = await Promise.all([
+      this.simulate("get_info"),
+      this.simulate("is_paused"),
+    ]);
+    const paused: unknown = scValToNative(pausedRaw);
+    if (typeof paused !== "boolean") {
+      throw new TypeError(`expected a boolean contract value for is_paused, got ${typeof paused}`);
+    }
+    return {
+      ...this.decodeInfo(scValToNative(infoRaw) as Record<string, unknown>),
+      isPaused: paused,
     };
   }
 
@@ -150,76 +186,88 @@ export class AmmPool {
     const raw = await this.simulate("get_accrued_fees");
     const native = scValToNative(raw) as [unknown, unknown];
     return {
-      accruedA: BigInt(String(native[0] ?? 0)),
-      accruedB: BigInt(String(native[1] ?? 0)),
+      accruedA: toBigInt(native[0]),
+      accruedB: toBigInt(native[1]),
     };
   }
 
-  /** Return the human-readable pool name (or null). */
-  async getName(): Promise<string | null> {
-    const raw = await this.simulate("get_name");
-    const native = scValToNative(raw);
-    return native !== null ? String(native) : null;
-  }
-
-  /** Return the flash-loan fee in basis points. */
+  /**
+   * Return the flash-loan fee in basis points.
+   *
+   * The contract has no exported `get_flash_loan_fee_bps` view — it is a private
+   * helper — so this reads the field from `get_info` instead.
+   */
   async getFlashLoanFeeBps(): Promise<bigint> {
-    const raw = await this.simulate("get_flash_loan_fee_bps");
-    return BigInt(scValToNative(raw) as number);
+    const info = await this.getInfoLight();
+    return info.flashLoanFeeBps;
   }
 
   /** Return the LP share balance of `address`. */
   async sharesOf(address: string): Promise<bigint> {
     const raw = await this.simulate("shares_of", addr(address));
-    return BigInt(scValToNative(raw) as number);
+    return toBigInt(scValToNative(raw));
   }
 
   // ── Swap simulation ────────────────────────────────────────────────────────
 
   /**
-   * Simulate a swap and return amount out + price impact.
+   * Simulate a swap and return the output, fee and price impact.
    *
-   * Composes `get_amount_out` — no transaction is submitted.
+   * Calls the contract's `simulate_swap` and decodes its `SwapSimulation`
+   * verbatim — fee, spot price, effective price and price impact are all
+   * computed in-contract, so this can never disagree with the swap the pool
+   * would execute. No transaction is submitted.
    */
   async simulateSwap(
     tokenIn: string,
     amountIn: bigint
   ): Promise<SwapSimulation> {
-    const info = await this.getInfo();
-    const [reserveIn, reserveOut] =
-      tokenIn === info.tokenA
-        ? [info.reserveA, info.reserveB]
-        : [info.reserveB, info.reserveA];
-
-    // x*y = k constant-product formula with fee
-    const feeMul = 10_000n - info.feeBps;
-    const amountInWithFee = amountIn * feeMul;
-    const numerator = amountInWithFee * reserveOut;
-    const denominator = reserveIn * 10_000n + amountInWithFee;
-    const amountOut = denominator > 0n ? numerator / denominator : 0n;
-    const feeAmount = (amountIn * info.feeBps) / 10_000n;
-
-    const spotPrice = reserveIn > 0n ? (reserveOut * 10_000n) / reserveIn : 0n;
-    const executionPrice =
-      amountOut > 0n ? (amountIn * 10_000n) / amountOut : 0n;
-    const priceImpactBps =
-      spotPrice > 0n
-        ? Number(((executionPrice - spotPrice) * 10_000n) / spotPrice)
-        : 0;
-
-    return { amountIn, amountOut, priceImpactBps, feeAmount };
+    const raw = await this.simulate("simulate_swap", addr(tokenIn), i128(amountIn));
+    const native = scValToNative(raw) as Record<string, unknown>;
+    return {
+      amountIn,
+      amountOut: requireBigInt(native, "amount_out", "SwapSimulation"),
+      feeAmount: requireBigInt(native, "fee_amount", "SwapSimulation"),
+      priceImpactBps: Number(requireBigInt(native, "price_impact_bps", "SwapSimulation")),
+      effectivePrice: requireBigInt(native, "effective_price", "SwapSimulation"),
+      spotPrice: requireBigInt(native, "spot_price", "SwapSimulation"),
+    };
   }
 
   /** Return the amount out for `amountIn` of `tokenIn` (on-chain query). */
   async getAmountOut(tokenIn: string, amountIn: bigint): Promise<bigint> {
     const raw = await this.simulate("get_amount_out", addr(tokenIn), i128(amountIn));
-    return BigInt(scValToNative(raw) as number);
+    return toBigInt(scValToNative(raw));
   }
 
   /** Return the amount in required to receive `amountOut` of `tokenOut`. */
   async getAmountIn(tokenOut: string, amountOut: bigint): Promise<bigint> {
     const raw = await this.simulate("get_amount_in", addr(tokenOut), i128(amountOut));
-    return BigInt(scValToNative(raw) as number);
+    return toBigInt(scValToNative(raw));
+  }
+
+  async swap(input: SwapParams, signer: Signer, options?: InvokeOptions): Promise<InvocationResult<bigint>> {
+    return this.execute("swap", [addr(input.trader), addr(input.tokenIn), i128(input.amountIn), i128(input.minAmountOut), nativeToScVal(input.deadline, { type: "u64" })], signer, options);
+  }
+
+  async swapExactOut(trader: string, tokenOut: string, amountOut: bigint, maxIn: bigint, deadline: bigint, signer: Signer, options?: InvokeOptions): Promise<InvocationResult<bigint>> {
+    return this.execute("swap_exact_out", [addr(trader), addr(tokenOut), i128(amountOut), i128(maxIn), nativeToScVal(deadline, { type: "u64" })], signer, options);
+  }
+
+  async addLiquidity(input: AddLiquidityParams, signer: Signer, options?: InvokeOptions): Promise<InvocationResult<bigint>> {
+    return this.execute("add_liquidity", [addr(input.provider), i128(input.amountA), i128(input.amountB), i128(input.minShares), nativeToScVal(input.deadline, { type: "u64" })], signer, options);
+  }
+
+  async removeLiquidity(input: RemoveLiquidityParams, signer: Signer, options?: InvokeOptions): Promise<InvocationResult<[bigint, bigint]>> {
+    return this.execute("remove_liquidity", [addr(input.provider), i128(input.shares), i128(input.minAmountA), i128(input.minAmountB), nativeToScVal(input.deadline, { type: "u64" })], signer, options);
+  }
+
+  async removeLiquidityOneSided(provider: string, shares: bigint, tokenOut: string, minOut: bigint, deadline: bigint, signer: Signer, options?: InvokeOptions): Promise<InvocationResult<bigint>> {
+    return this.execute("remove_liquidity_one_sided", [addr(provider), i128(shares), addr(tokenOut), i128(minOut), nativeToScVal(deadline, { type: "u64" })], signer, options);
+  }
+
+  async flashLoan(receiver: string, amountA: bigint, amountB: bigint, data: Uint8Array, signer: Signer, options?: InvokeOptions): Promise<InvocationResult<[bigint, bigint]>> {
+    return this.execute("flash_loan", [addr(receiver), i128(amountA), i128(amountB), nativeToScVal(data, { type: "bytes" })], signer, options);
   }
 
   // ── Signed write methods ───────────────────────────────────────────────────

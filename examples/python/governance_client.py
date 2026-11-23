@@ -8,15 +8,23 @@ from stellar_sdk import Keypair, Network, scval
 from stellar_sdk.contract import ContractClient
 
 from common import (
+    decode_enum_variant,
+    encode_unit_variant,
     format_json,
     required_env,
     simulate_contract_call,
     submit_contract_call,
 )
 
+VOTE_CHOICES = ("For", "Against", "Abstain")
 
-def main() -> int:
-    argparse.ArgumentParser(description="Soroban AMM integration example").parse_args()
+
+def main(argv: list[str] | None = None) -> int:
+    # Explicit empty-by-default argv, not the implicit sys.argv[1:] default,
+    # so main() is safely callable as a plain function (e.g. from tests running
+    # under pytest) without this no-op parser choking on the caller's own CLI
+    # flags and exiting the whole process with SystemExit(2).
+    argparse.ArgumentParser(description="Soroban AMM integration example").parse_args(argv if argv is not None else [])
     rpc_url = os.getenv("STELLAR_RPC_URL", "https://soroban-testnet.stellar.org")
     network_passphrase = os.getenv(
         "STELLAR_NETWORK_PASSPHRASE",
@@ -64,7 +72,7 @@ def main() -> int:
     print(format_json(proposal_info))
 
     # 4. Vote on the proposal (if active)
-    if status == "Active" or (isinstance(status, dict) and "Active" in status) or status == {"Active": []}:
+    if status == "Active":
         vote_choice = os.getenv("VOTE_CHOICE", "For")  # For, Against, Abstain
         print(f"\n4. Voting '{vote_choice}' on proposal {proposal_id}...")
         try:
@@ -72,6 +80,10 @@ def main() -> int:
             print("Vote cast successfully!")
         except Exception as e:
             print(f"Failed to cast vote: {e}")
+            client.server.close()
+            return 1
+    else:
+        print(f"\n4. Skipping vote — proposal status is '{status}', not 'Active'.")
 
     client.server.close()
     return 0
@@ -95,10 +107,12 @@ def propose(client: ContractClient, proposer_kp: Keypair, new_fee_bps: int) -> i
 
 def vote(client: ContractClient, voter_kp: Keypair, proposal_id: int, choice: str) -> None:
     # choice must be For, Against, or Abstain
-    if choice not in ("For", "Against", "Abstain"):
+    if choice not in VOTE_CHOICES:
         raise ValueError(f"Invalid vote choice '{choice}'. Must be For, Against, or Abstain.")
-    
-    choice_scval = scval.to_symbol(choice)
+
+    # Vote is a #[contracttype] union, so it is encoded as a one-element vector
+    # holding the variant symbol (matching the TypeScript SDK's encodeVote).
+    choice_scval = encode_unit_variant(choice)
     submit_contract_call(
         client,
         voter_kp,
@@ -119,20 +133,25 @@ def get_proposal(client: ContractClient, proposal_id: int) -> dict[str, Any]:
 
 
 def proposal_status(client: ContractClient, proposal_id: int) -> str:
+    """Return the proposal status as a plain variant-name string.
+
+    ``scval.to_native`` decodes a Soroban unit-enum variant such as
+    ``ProposalStatus::Active`` as ``['Active']``, not as the bare string
+    ``"Active"``.  ``decode_enum_variant`` normalises all shapes (list,
+    dict, and bare string) to a plain string so the caller can compare
+    with ``== "Active"``.
+    """
     result = simulate_contract_call(
         client,
         "proposal_status",
         scval.to_uint32(proposal_id),
     )
-    if isinstance(result, dict):
-        # Enums are parsed as dictionaries like {"Active": []} or "Active"
-        return next(iter(result.keys()))
-    return str(result)
+    return decode_enum_variant(result)
 
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        raise SystemExit(main(sys.argv[1:]))
     except Exception as exc:
         print(exc, file=sys.stderr)
         raise SystemExit(1) from exc
