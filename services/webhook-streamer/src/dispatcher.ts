@@ -332,16 +332,12 @@ export class WebhookDispatcher {
     }
 
     const body = JSON.stringify(event);
-    const headers: Record<string, string> = {
+    const baseHeaders: Record<string, string> = {
       "Content-Type": "application/json",
       [EVENT_ID_HEADER]: event.id,
     };
-    if (sub.secret) {
-      // Signed once per delivery, so a dead-letter replay gets a fresh timestamp.
-      headers[SIGNATURE_HEADER] = signPayload(sub.secret, body);
-      if (this.legacySecretHeader) {
-        headers["X-Webhook-Secret"] = sub.secret;
-      }
+    if (sub.secret && this.legacySecretHeader) {
+      baseHeaders["X-Webhook-Secret"] = sub.secret;
     }
 
     const attempts: AttemptOutcome[] = [];
@@ -357,6 +353,19 @@ export class WebhookDispatcher {
 
       const attemptedAt = Date.now();
       this.counters.attempted += 1;
+
+      // Re-sign each attempt with its own timestamp (matching README.md) while
+      // keeping X-Webhook-Id constant so receivers can deduplicate retries.
+      const headers: Record<string, string> = sub.secret
+        ? {
+            ...baseHeaders,
+            [SIGNATURE_HEADER]: signPayload(
+              sub.secret,
+              body,
+              Math.floor(attemptedAt / 1000),
+            ),
+          }
+        : baseHeaders;
 
       const outcome = await this._attempt(
         sub,
