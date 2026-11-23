@@ -1001,12 +1001,13 @@ Notes:
 
 ### TypeScript Client Example
 
-A standalone TypeScript client is available in [examples/client](examples/client). It demonstrates connecting to Stellar testnet RPC, reading `get_info()`, quoting with `get_amount_out()`, executing `swap()`, and reading LP shares with `shares_of()`.
+A standalone TypeScript client is available in [examples/client](examples/client). It demonstrates connecting to Stellar testnet RPC, reading `get_info()`, quoting a swap with `simulateSwap()` (off-chain, no transaction), applying slippage and deadline bounds, signing and submitting the swap via `AmmPool.swap()`, and reading LP shares with `shares_of()`. Add-liquidity and remove-liquidity follow the same signed flow and are opt-in via environment variables.
 
 ```sh
 cd examples/client
 npm install
 npm run build
+# Set AMM_CONTRACT_ID, TOKEN_IN_CONTRACT_ID, SOURCE_ADDRESS, SIGNING_SECRET_KEY
 npm start
 ```
 

@@ -7,8 +7,10 @@
  */
 
 import {
+  Account,
   Contract,
   Networks,
+  TransactionBuilder,
   rpc as StellarRpc,
   nativeToScVal,
   scValToNative,
@@ -17,6 +19,7 @@ import {
 } from "@stellar/stellar-sdk";
 import type {
   NetworkConfig,
+  Signer,
   PoolInfo,
   SwapParams,
   SwapSimulation,
@@ -33,6 +36,10 @@ import { simulateRead } from "./internal/simulate.js";
 
 function i128(value: bigint): xdr.ScVal {
   return nativeToScVal(value, { type: "i128" });
+}
+
+function u64(value: bigint): xdr.ScVal {
+  return nativeToScVal(value, { type: "u64" });
 }
 
 function addr(address: string): xdr.ScVal {
@@ -213,6 +220,128 @@ export class AmmPool {
   async getAmountIn(tokenOut: string, amountOut: bigint): Promise<bigint> {
     const raw = await this.simulate("get_amount_in", addr(tokenOut), i128(amountOut));
     return BigInt(scValToNative(raw) as number);
+  }
+
+  // ── Signed write methods ───────────────────────────────────────────────────
+
+  /**
+   * Build, assemble, sign, and submit a `swap` call.
+   *
+   * The `signer` callback receives the base64-encoded unsigned transaction XDR
+   * and must return the base64-encoded signed XDR. This keeps key material out
+   * of the SDK: pass a {@link KeypairSigner} for an in-process secret key, or
+   * a remote/HSM implementation for production.
+   *
+   * Returns the amount of output token received.
+   */
+  async swap(params: SwapParams, signer: Signer): Promise<bigint> {
+    const args = [
+      addr(params.trader),
+      addr(params.tokenIn),
+      i128(params.amountIn),
+      i128(params.minAmountOut),
+      u64(params.deadline),
+    ];
+    const raw = await this.submitSigned("swap", args, params.trader, signer);
+    return BigInt(String(scValToNative(raw) ?? 0));
+  }
+
+  /**
+   * Build, assemble, sign, and submit an `add_liquidity` call.
+   *
+   * Returns the amounts deposited and LP shares minted.
+   */
+  async addLiquidity(params: AddLiquidityParams, signer: Signer): Promise<LiquidityResult> {
+    const args = [
+      addr(params.provider),
+      i128(params.amountA),
+      i128(params.amountB),
+      i128(params.minShares),
+      u64(params.deadline),
+    ];
+    const raw = await this.submitSigned("add_liquidity", args, params.provider, signer);
+    const native = scValToNative(raw) as [unknown, unknown, unknown];
+    return {
+      amountA: BigInt(String(native[0] ?? 0)),
+      amountB: BigInt(String(native[1] ?? 0)),
+      shares: BigInt(String(native[2] ?? 0)),
+    };
+  }
+
+  /**
+   * Build, assemble, sign, and submit a `remove_liquidity` call.
+   *
+   * Returns the amounts of token A and token B returned, and shares burned.
+   */
+  async removeLiquidity(params: RemoveLiquidityParams, signer: Signer): Promise<LiquidityResult> {
+    const args = [
+      addr(params.provider),
+      i128(params.shares),
+      i128(params.minAmountA),
+      i128(params.minAmountB),
+      u64(params.deadline),
+    ];
+    const raw = await this.submitSigned("remove_liquidity", args, params.provider, signer);
+    const native = scValToNative(raw) as [unknown, unknown, unknown];
+    return {
+      amountA: BigInt(String(native[0] ?? 0)),
+      amountB: BigInt(String(native[1] ?? 0)),
+      shares: BigInt(String(native[2] ?? 0)),
+    };
+  }
+
+  // ── Internal signed-submit helper ──────────────────────────────────────────
+
+  /**
+   * Simulate, assemble (adds auth entries and footprint), sign via `signer`,
+   * submit, and await the transaction.
+   *
+   * The source account sequence number is fetched from the RPC server so the
+   * envelope is valid when sent. Auth entries are built for `sourceAddress`.
+   */
+  private async submitSigned(
+    method: string,
+    args: xdr.ScVal[],
+    sourceAddress: string,
+    signer: Signer
+  ): Promise<xdr.ScVal> {
+    const source = await this.server.getAccount(sourceAddress);
+    const tx = new TransactionBuilder(source, {
+      fee: "100",
+      networkPassphrase: this.networkPassphrase,
+    })
+      .addOperation(this.contract.call(method, ...args))
+      .setTimeout(30)
+      .build();
+
+    const simResult = await this.server.simulateTransaction(tx);
+    if (StellarRpc.Api.isSimulationError(simResult)) {
+      throw decodeError(simResult.error);
+    }
+
+    const assembled = StellarRpc.assembleTransaction(tx, simResult).build();
+    const signedXdr = await signer(assembled.toXDR());
+    const signed = TransactionBuilder.fromXDR(signedXdr, this.networkPassphrase);
+
+    const sendResult = await this.server.sendTransaction(signed);
+    if (sendResult.status === "ERROR") {
+      throw decodeError(sendResult.errorResult?.toXDR() ?? "transaction submission failed");
+    }
+
+    // Poll until the transaction is confirmed or rejected.
+    let getResult: StellarRpc.Api.GetTransactionResponse;
+    do {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      getResult = await this.server.getTransaction(sendResult.hash);
+    } while (getResult.status === StellarRpc.Api.GetTransactionStatus.NOT_FOUND);
+
+    if (getResult.status !== StellarRpc.Api.GetTransactionStatus.SUCCESS) {
+      throw decodeError(`transaction ${sendResult.hash} failed: ${getResult.status}`);
+    }
+
+    const meta = getResult.resultMetaXdr;
+    const ops = meta?.v3?.()?.sorobanMeta?.()?.returnValue?.();
+    return ops ?? xdr.ScVal.scvVoid();
   }
 
   // ── Contract ID ────────────────────────────────────────────────────────────

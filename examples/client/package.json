@@ -6,9 +6,10 @@
   "scripts": {
     "prebuild": "npm --prefix ../../packages/sdk install --ignore-scripts && npm --prefix ../../packages/sdk run build",
     "build": "tsc",
+    "lint": "tsc --noEmit",
     "start": "node dist/index.js",
     "pretest": "npm --prefix ../../packages/sdk install --ignore-scripts && npm --prefix ../../packages/sdk run build && tsc",
-    "test": "tsc --noEmit && node --test dist/config.test.js"
+    "test": "tsc --noEmit && node --test dist/config.test.js dist/swap.test.js"
   },
   "dependencies": {
     "@soroban-amm/sdk": "file:../../packages/sdk",

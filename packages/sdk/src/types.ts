@@ -9,6 +9,21 @@ export interface NetworkConfig {
   contractId: string;
 }
 
+/**
+ * A signer callback used by the SDK's write methods.
+ *
+ * Receives the base64-encoded XDR of an unsigned transaction envelope and
+ * must return the base64-encoded XDR of the signed envelope. This keeps
+ * private key material entirely outside the SDK.
+ *
+ * Example implementations:
+ * - `KeypairSigner` in `examples/client/signer.ts`: signs with a secret key
+ *   read from `SIGNING_SECRET_KEY` in the environment.
+ * - A remote/HSM adapter: forwards the XDR to a signing service and returns
+ *   the signed XDR it receives back.
+ */
+export type Signer = (unsignedXdr: string) => Promise<string>;
+
 /** Full pool state returned by `get_info`. */
 export interface PoolInfo {
   tokenA: string;
