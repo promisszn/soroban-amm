@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  DEFAULT_REQUEST_TIMEOUT_MS,
   compareThreshold, createDashboardController, formatError, formatMetric, formatTimestamp,
-  formatTokenAmount, formatMetricWithUnit, gql, healthColor, renderAlertConfigs, renderEvents,
-  renderFiredAlerts, renderHealth, renderHeatmap, renderHistory, renderStats, renderPoolsOverview,
+  formatTokenAmount, formatMetricWithUnit, gql, healthColor, parseTimeoutMs, renderAlertConfigs,
+  renderEvents, renderFiredAlerts, renderHealth, renderHeatmap, renderHistory, renderStats,
+  renderPoolsOverview,
 } from "./dashboard.js";
 import { installFakeDocument } from "./dom-stub.js";
 
@@ -676,4 +678,103 @@ test("renderHeatmap handles second-resolution timestamps", () => {
   // Should have landed in a bucket (not all at 4px floor)
   const hasNonZeroHeight = Array.from(heatmap.children).some(bar => parseInt(bar.style.height) > 4);
   assert.ok(hasNonZeroHeight);
+});
+
+test("parseTimeoutMs validates positive numeric ?timeout= overrides and rejects invalid inputs", () => {
+  assert.equal(parseTimeoutMs(null), DEFAULT_REQUEST_TIMEOUT_MS);
+  assert.equal(parseTimeoutMs(""), DEFAULT_REQUEST_TIMEOUT_MS);
+  assert.equal(parseTimeoutMs("abc"), DEFAULT_REQUEST_TIMEOUT_MS);
+  assert.equal(parseTimeoutMs("0"), DEFAULT_REQUEST_TIMEOUT_MS);
+  assert.equal(parseTimeoutMs("-50"), DEFAULT_REQUEST_TIMEOUT_MS);
+  assert.equal(parseTimeoutMs("2500"), 2500);
+  assert.equal(parseTimeoutMs(150), 150);
+});
+
+test("gql rejects a hung fetch within timeoutMs and aborts the request AbortSignal", async () => {
+  /** @type {AbortSignal | undefined} */
+  let seenSignal;
+  let aborted = false;
+  globalThis.fetch = async (_url, options) => {
+    seenSignal = options?.signal;
+    seenSignal?.addEventListener("abort", () => {
+      aborted = true;
+    });
+    return new Promise(() => {});
+  };
+
+  await assert.rejects(
+    gql("http://api.test", "query Stats { poolStats { poolId } }", {}, { timeoutMs: 25 }),
+    /timed out after 25ms/,
+  );
+  assert.ok(seenSignal, "expected gql to forward an AbortSignal to fetch");
+  assert.equal(seenSignal.aborted, true);
+  assert.equal(aborted, true);
+});
+
+test("gql propagates external AbortSignal cancellations immediately", async () => {
+  const external = new AbortController();
+  let seenSignal;
+  globalThis.fetch = async (_url, options) => {
+    seenSignal = options?.signal;
+    return new Promise(() => {});
+  };
+
+  const pending = gql(
+    "http://api.test",
+    "query Stats { poolStats { poolId } }",
+    {},
+    { timeoutMs: 5000, signal: external.signal },
+  );
+  external.abort(new Error("cancelled by caller"));
+
+  await assert.rejects(pending, /cancelled by caller/);
+  assert.equal(seenSignal?.aborted, true);
+});
+
+test("hung fetch leaves controller in Error state with retry visible and next refresh recovers", async () => {
+  const doc = setupRefreshTestDom();
+  globalThis.fetch = async () => new Promise(() => {});
+
+  const controller = createDashboardController({
+    apiUrl: "http://api.test",
+    poolId: "pool-a",
+    requestTimeoutMs: 25,
+  });
+
+  await controller.refresh();
+
+  assert.equal(doc.getElementById("connection-status").textContent, "Error");
+  assert.match(doc.getElementById("dashboard-state").textContent, /timed out after 25ms/);
+  assert.equal(doc.getElementById("btn-retry").hidden, false);
+
+  // A subsequent refresh must not remain wedged on refreshing=true.
+  installFakeFetch([]);
+  await controller.refresh();
+
+  assert.equal(doc.getElementById("connection-status").textContent, "Connected");
+  assert.equal(doc.getElementById("btn-retry").hidden, true);
+});
+
+test("single hung query degrades the dashboard instead of stalling refresh", async () => {
+  const doc = setupRefreshTestDom();
+  globalThis.fetch = async (_url, options) => {
+    const { query } = JSON.parse(options.body);
+    const key = Object.keys(QUERY_RESPONSES).find((k) => query.includes(`query ${k}`));
+    if (key === "History") {
+      return new Promise(() => {});
+    }
+    return { ok: true, json: async () => ({ data: QUERY_RESPONSES[key] }) };
+  };
+
+  const controller = createDashboardController({
+    apiUrl: "http://api.test",
+    poolId: "pool-a",
+    requestTimeoutMs: 25,
+  });
+
+  await controller.refresh();
+
+  assert.equal(doc.getElementById("connection-status").textContent, "Degraded");
+  assert.match(doc.getElementById("dashboard-state").textContent, /history: .*timed out after 25ms/);
+  assert.equal(doc.getElementById("btn-retry").hidden, false);
 });
