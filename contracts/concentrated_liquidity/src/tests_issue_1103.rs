@@ -370,3 +370,29 @@ fn test_upgrade_extends_instance_ttl() {
     assert!(ttl_after > ttl_before);
     assert!(ttl_after >= 3_110_400 - 1);
 }
+
+#[test]
+fn initialize_emits_versioned_configuration() {
+    let env = Env::default();
+    let pool = env.register_contract(None, ConcentratedLiquidity);
+    let client = ConcentratedLiquidityClient::new(&env, &pool);
+    let admin = Address::generate(&env);
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+    client.initialize(&admin, &a, &b, &30, &-10, &5);
+    assert_eq!(
+        last_versioned_event(&env, &pool, "initialized"),
+        (soroban_amm_sdk::EVENT_SCHEMA_VERSION, (admin, a, b, 30_i128, -10_i32, 5_i32))
+    );
+}
+
+#[test]
+fn oracle_cardinality_emits_old_and_new_values() {
+    let te = setup_test();
+    let old = crate::DEFAULT_ORACLE_CARDINALITY;
+    te.client.set_oracle_cardinality(&te.admin, &(old + 1));
+    assert_eq!(
+        last_versioned_event(&te.env, &te.pool_addr, "oracle_cardinality_set"),
+        (soroban_amm_sdk::EVENT_SCHEMA_VERSION, (old, old + 1))
+    );
+}

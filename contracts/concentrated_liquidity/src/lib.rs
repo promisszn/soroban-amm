@@ -400,6 +400,11 @@ impl ConcentratedLiquidity {
             .persistent()
             .set(&DataKey::TickBitmapWords, &Vec::<i32>::new(&env));
         Self::bump_position(&env, &DataKey::TickBitmapWords);
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "initialized"),),
+            (admin, token_a, token_b, fee_bps, initial_tick, tick_spacing)
+        );
         Ok(())
     }
 
@@ -3478,7 +3483,8 @@ impl ConcentratedLiquidity {
             return Err(ClError::InvalidOracleCardinality);
         }
 
-        if new_cardinality > header.cardinality {
+        let old_cardinality = header.cardinality;
+        if new_cardinality > old_cardinality {
             // If the ring buffer had wrapped around under the old cardinality,
             // normalize the existing `count` observations into contiguous slots
             // `0..count` in chronological order so the invariant (`count < cardinality`
@@ -3514,6 +3520,11 @@ impl ConcentratedLiquidity {
                 .set(&DataKey::OracleHeader, &header);
         }
 
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "oracle_cardinality_set"),),
+            (old_cardinality, new_cardinality)
+        );
         Ok(())
     }
 

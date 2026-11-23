@@ -197,6 +197,8 @@ a representative call sequence and asserts every pool event carries the leading
 
 | Event | Topics | Payload |
 |---|---|---|
+| `initialized` | none | `(admin: Address, token_a: Address, token_b: Address, fee_bps: i128, initial_tick: i32, tick_spacing: i32)` |
+| `oracle_cardinality_set` | none | `(old_cardinality: u32, new_cardinality: u32)` |
 | `mint_pos` | `provider` | `(lower_tick: i32, upper_tick: i32, liquidity: i128, amount_a: i128, amount_b: i128)` |
 | `mod_pos` | `provider` | `(lower_tick: i32, upper_tick: i32, liquidity_delta: i128, amount_a: i128, amount_b: i128)` |
 | `mint_1t` | `provider` | `(lower_tick: i32, upper_tick: i32, liquidity: i128, amount_used: i128, dust: i128)` |
