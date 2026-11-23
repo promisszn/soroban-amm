@@ -16,8 +16,10 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SEMVER_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 const ACTION_RE = /\buses:\s*['"]?stellar\/stellar-cli@([^\s'"#]+)['"]?/;
 const HARDCODED_VERSION_RES = [
+  /\.stellar-version[^#\n]*==?\s*["']?v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?["']?/,
   /\.stellar-version[^#\n]*["']v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?["']/,
   /\bstellar-cli\b[^#\n]*--version(?:=|\s+)["']?v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?["']?/,
+  /--version(?:=|\s+)["']?v?\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?["']?[^#\n]*\bstellar-cli\b/,
 ];
 
 /** Reads and validates `.stellar-version` from `root`. */

@@ -117,3 +117,18 @@ test("zero workflow pins fails rather than silently passing", (t) => {
   assert.equal(result.checked, 0);
   assert.match(result.errors[0], /found no stellar\/stellar-cli/);
 });
+
+test("unquoted .stellar-version comparison and reversed-flag cargo install fail", (t) => {
+  const root = makeFixture(t, "27.1.0\n", {
+    "release.yml": [
+      "steps:",
+      "  - uses: stellar/stellar-cli@v27.1.0",
+      '  - run: test "$(cat .stellar-version)" = 27.1.0',
+      "  - run: cargo install --locked --version 27.1.0 stellar-cli",
+    ].join("\n"),
+  });
+  const result = checkStellarVersions(root);
+  assert.equal(result.errors.length, 2);
+  assert.match(result.errors[0], /\.github\/workflows\/release\.yml:3:/);
+  assert.match(result.errors[1], /\.github\/workflows\/release\.yml:4:/);
+});
