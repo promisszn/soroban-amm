@@ -364,6 +364,7 @@ impl ReserveManager {
     }
 
     pub fn pause(env: Env) -> Result<(), ReserveManagerError> {
+        Self::extend_instance_ttl(&env);
         let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
         gov.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
@@ -372,6 +373,7 @@ impl ReserveManager {
     }
 
     pub fn unpause(env: Env) -> Result<(), ReserveManagerError> {
+        Self::extend_instance_ttl(&env);
         let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
         gov.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
@@ -380,6 +382,7 @@ impl ReserveManager {
     }
 
     pub fn is_paused(env: Env) -> bool {
+        Self::extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::Paused)
@@ -1716,6 +1719,44 @@ mod tests {
 
         assert_instance_ttl_bumped(&s.env, &s.rm_addr);
         assert!(rm.check_reserves(&s.pool));
+    }
+
+    #[test]
+    fn test_pause_restores_lapsed_instance_ttl() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+
+        lower_instance_ttl_below_threshold(&s.env, &s.rm_addr);
+
+        rm.pause();
+
+        assert_instance_ttl_bumped(&s.env, &s.rm_addr);
+        assert!(rm.is_paused());
+    }
+
+    #[test]
+    fn test_unpause_restores_lapsed_instance_ttl() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        rm.pause();
+
+        lower_instance_ttl_below_threshold(&s.env, &s.rm_addr);
+
+        rm.unpause();
+
+        assert_instance_ttl_bumped(&s.env, &s.rm_addr);
+        assert!(!rm.is_paused());
+    }
+
+    #[test]
+    fn test_is_paused_restores_lapsed_instance_ttl() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+
+        lower_instance_ttl_below_threshold(&s.env, &s.rm_addr);
+
+        assert!(!rm.is_paused());
+        assert_instance_ttl_bumped(&s.env, &s.rm_addr);
     }
 
     #[test]
