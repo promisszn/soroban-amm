@@ -85,6 +85,12 @@ export async function gql(
   { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, signal } = {},
 ) {
   const effectiveTimeoutMs = parseTimeoutMs(timeoutMs);
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new Error("GraphQL API request aborted");
+  }
+
   const controller = new AbortController();
   let timedOut = false;
   /** @type {ReturnType<typeof setTimeout> | undefined} */
@@ -94,13 +100,7 @@ export async function gql(
     controller.abort(signal?.reason);
   };
 
-  if (signal) {
-    if (signal.aborted) {
-      controller.abort(signal.reason);
-    } else {
-      signal.addEventListener("abort", onExternalAbort, { once: true });
-    }
-  }
+  signal?.addEventListener("abort", onExternalAbort, { once: true });
 
   /** @type {() => void} */
   let cleanupAbortListener = () => {};
@@ -114,20 +114,14 @@ export async function gql(
             : new Error("GraphQL API request aborted"),
       );
     };
-    if (controller.signal.aborted) {
-      onAbort();
-      return;
-    }
     controller.signal.addEventListener("abort", onAbort, { once: true });
     cleanupAbortListener = () => controller.signal.removeEventListener("abort", onAbort);
   });
 
-  if (!controller.signal.aborted) {
-    timer = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-    }, effectiveTimeoutMs);
-  }
+  timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, effectiveTimeoutMs);
 
   try {
     const requestPromise = (async () => {
@@ -143,6 +137,11 @@ export async function gql(
       return payload.data;
     })();
     return await Promise.race([requestPromise, abortPromise]);
+  } catch (error) {
+    if (timedOut) {
+      throw new Error(`GraphQL API request timed out after ${effectiveTimeoutMs}ms`, { cause: error });
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
     cleanupAbortListener();

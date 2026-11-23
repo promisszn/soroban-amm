@@ -778,3 +778,33 @@ test("single hung query degrades the dashboard instead of stalling refresh", asy
   assert.match(doc.getElementById("dashboard-state").textContent, /history: .*timed out after 25ms/);
   assert.equal(doc.getElementById("btn-retry").hidden, false);
 });
+
+test("gql short-circuits an already-aborted external AbortSignal without calling fetch", async () => {
+  let fetchCalls = 0;
+  globalThis.fetch = async () => {
+    fetchCalls += 1;
+    return { ok: true, json: async () => ({ data: {} }) };
+  };
+
+  const external = new AbortController();
+  external.abort(new Error("already aborted"));
+
+  await assert.rejects(
+    gql("http://api.test", "query Stats { poolStats { poolId } }", {}, { timeoutMs: 5000, signal: external.signal }),
+    /already aborted/,
+  );
+  assert.equal(fetchCalls, 0);
+});
+
+test("gql surfaces clean timeout error when an abort-aware fetch rejects with AbortError", async () => {
+  globalThis.fetch = (_url, options) => new Promise((_resolve, reject) => {
+    options?.signal?.addEventListener("abort", () => {
+      reject(new DOMException("The operation was aborted", "AbortError"));
+    }, { once: true });
+  });
+
+  await assert.rejects(
+    gql("http://api.test", "query Stats { poolStats { poolId } }", {}, { timeoutMs: 25 }),
+    /timed out after 25ms/,
+  );
+});
