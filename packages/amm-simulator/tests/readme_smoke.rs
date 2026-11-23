@@ -351,6 +351,51 @@ fn cl_replay_runs_from_state_and_swaps_file() {
     assert!(o.status.success());
 }
 
+fn cl_replay_with(swaps: &str) -> std::process::Output {
+    let mut cl = ClPoolState::new("XLM", "USDC", 30, 10).unwrap();
+    cl.initialize_at_tick(0).unwrap();
+    cl.add_liquidity("lp", -600, 600, 10_000_000_000_000)
+        .unwrap();
+    let p = file("cl.json", &serde_json::to_string(&cl).unwrap());
+    let s = file("swaps.json", swaps);
+    run(&[
+        "cl-replay",
+        "--pool",
+        p.to_str().unwrap(),
+        "--swaps",
+        s.to_str().unwrap(),
+    ])
+}
+#[test]
+fn cl_replay_prints_every_step_then_fails_on_a_mid_file_swap_error() {
+    let o = cl_replay_with(
+        r#"[{"zero_for_one":true,"amount_in":1000000},{"zero_for_one":true,"amount_in":1000000,"min_out":170141183460469231731687303715884105727},{"zero_for_one":true,"amount_in":2000000}]"#,
+    );
+    assert_eq!(o.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&o.stderr).contains("1 failed swap(s)"));
+    let report: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let steps = report["results"].as_array().unwrap();
+    assert_eq!(steps.len(), 3);
+    assert!(steps[0]["result"]["amount_out"].as_i64().unwrap() > 0);
+    assert_eq!(steps[1]["error"], "slippage guard failed");
+    assert!(steps[2]["result"]["amount_out"].as_i64().unwrap() > 0);
+    assert_eq!(report["failed_swaps"], 1);
+}
+#[test]
+fn cl_replay_reports_all_failed_swaps_before_exiting_non_zero() {
+    let o = cl_replay_with(
+        r#"[{"zero_for_one":true,"amount_in":0},{"zero_for_one":false,"amount_in":0}]"#,
+    );
+    assert_eq!(o.status.code(), Some(3));
+    let report: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(report["failed_swaps"], 2);
+    assert!(report["results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|step| step["error"] == "amount must be positive"));
+}
+
 // Keep the documented JSON fixture's shape tied to PoolState deserialization.
 #[test]
 fn readme_example_has_documented_values() {

@@ -263,21 +263,26 @@ fn cl_quote(args: ClQuoteArgs) -> Result<()> {
     )
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct ClReplaySwap {
+    zero_for_one: bool,
+    amount_in: i128,
+    #[serde(default)]
+    sqrt_price_limit_x96: i128,
+    #[serde(default)]
+    min_out: i128,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ClReplayStep {
+    swap: ClReplaySwap,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<crate::cl::ClSwapResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
 fn cl_replay(args: ClReplayArgs) -> Result<()> {
-    #[derive(serde::Serialize)]
-    struct Output<'a> {
-        results: &'a [crate::cl::ClSwapResult],
-        pool: &'a ClPoolState,
-    }
-    #[derive(serde::Deserialize)]
-    struct Swap {
-        zero_for_one: bool,
-        amount_in: i128,
-        #[serde(default)]
-        sqrt_price_limit_x96: i128,
-        #[serde(default)]
-        min_out: i128,
-    }
     let p = args.pool;
     let text = std::fs::read_to_string(&p).map_err(|source| SimulationError::Io {
         path: p.display().to_string(),
@@ -293,26 +298,171 @@ fn cl_replay(args: ClReplayArgs) -> Result<()> {
         path: p.display().to_string(),
         source,
     })?;
-    let swaps: Vec<Swap> = serde_json::from_str(&text).map_err(|source| SimulationError::Json {
-        path: p.display().to_string(),
-        source,
-    })?;
-    let mut results = Vec::new();
-    for s in swaps {
-        results.push(pool.swap(
-            s.zero_for_one,
-            s.amount_in,
-            s.sqrt_price_limit_x96,
-            s.min_out,
-        )?);
+    let swaps: Vec<ClReplaySwap> =
+        serde_json::from_str(&text).map_err(|source| SimulationError::Json {
+            path: p.display().to_string(),
+            source,
+        })?;
+    run_cl_replay(&mut pool, swaps, &mut io::stdout().lock(), args.pretty)
+}
+
+fn run_cl_replay(
+    pool: &mut ClPoolState,
+    swaps: Vec<ClReplaySwap>,
+    out: &mut impl Write,
+    pretty: bool,
+) -> Result<()> {
+    #[derive(serde::Serialize)]
+    struct Output<'a> {
+        results: &'a [ClReplayStep],
+        failed_swaps: usize,
+        pool: &'a ClPoolState,
     }
-    let mut out = io::stdout().lock();
+    let results: Vec<ClReplayStep> = swaps
+        .into_iter()
+        .map(|swap| {
+            match pool.swap(
+                swap.zero_for_one,
+                swap.amount_in,
+                swap.sqrt_price_limit_x96,
+                swap.min_out,
+            ) {
+                Ok(result) => ClReplayStep {
+                    swap,
+                    result: Some(result),
+                    error: None,
+                },
+                Err(err) => ClReplayStep {
+                    swap,
+                    result: None,
+                    error: Some(err.to_string()),
+                },
+            }
+        })
+        .collect();
+    let failed_swaps = results.iter().filter(|step| step.error.is_some()).count();
     write_json(
-        &mut out,
+        out,
         &Output {
             results: &results,
-            pool: &pool,
+            failed_swaps,
+            pool,
         },
-        args.pretty,
-    )
+        pretty,
+    )?;
+    if failed_swaps > 0 {
+        Err(SimulationError::FailedSwaps(failed_swaps))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cl::ClSwapResult;
+
+    #[derive(serde::Deserialize)]
+    struct Step {
+        swap: ClReplaySwap,
+        result: Option<ClSwapResult>,
+        error: Option<String>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct Report {
+        results: Vec<Step>,
+        failed_swaps: usize,
+        pool: ClPoolState,
+    }
+
+    fn pool() -> ClPoolState {
+        let mut pool = ClPoolState::new("XLM", "USDC", 30, 10).unwrap();
+        pool.initialize_at_tick(0).unwrap();
+        pool.add_liquidity("lp", -600, 600, 10_000_000_000_000)
+            .unwrap();
+        pool
+    }
+
+    fn swap(amount_in: i128, min_out: i128) -> ClReplaySwap {
+        ClReplaySwap {
+            zero_for_one: true,
+            amount_in,
+            sqrt_price_limit_x96: 0,
+            min_out,
+        }
+    }
+
+    fn replay(swaps: Vec<ClReplaySwap>) -> (Result<()>, Report, ClPoolState) {
+        let mut pool = pool();
+        let mut out = Vec::new();
+        let result = run_cl_replay(&mut pool, swaps, &mut out, false);
+        (result, serde_json::from_slice(&out).unwrap(), pool)
+    }
+
+    #[test]
+    fn all_successful_swaps_report_results_and_succeed() {
+        let mut expected_pool = pool();
+        let expected = [
+            expected_pool.swap(true, 1_000_000, 0, 0).unwrap(),
+            expected_pool.swap(true, 2_000_000, 0, 0).unwrap(),
+        ];
+
+        let (result, report, final_pool) = replay(vec![swap(1_000_000, 0), swap(2_000_000, 0)]);
+
+        assert!(result.is_ok());
+        assert_eq!(report.failed_swaps, 0);
+        assert_eq!(report.results.len(), 2);
+        for (step, expected) in report.results.iter().zip(&expected) {
+            assert_eq!(step.result.as_ref(), Some(expected));
+            assert_eq!(step.error, None);
+        }
+        assert_eq!(final_pool, expected_pool);
+        assert_eq!(report.pool, expected_pool);
+    }
+
+    #[test]
+    fn mid_file_failure_keeps_earlier_and_later_results() {
+        let mut expected_pool = pool();
+        let first = expected_pool.swap(true, 1_000_000, 0, 0).unwrap();
+        let last = expected_pool.swap(true, 3_000_000, 0, 0).unwrap();
+
+        let (result, report, final_pool) = replay(vec![
+            swap(1_000_000, 0),
+            swap(2_000_000, i128::MAX),
+            swap(3_000_000, 0),
+        ]);
+
+        assert!(matches!(result, Err(SimulationError::FailedSwaps(1))));
+        assert_eq!(report.failed_swaps, 1);
+        assert_eq!(report.results.len(), 3);
+        assert_eq!(report.results[0].result, Some(first));
+        assert_eq!(report.results[1].result, None);
+        assert_eq!(
+            report.results[1].error.as_deref(),
+            Some("slippage guard failed")
+        );
+        assert_eq!(report.results[1].swap.amount_in, 2_000_000);
+        assert_eq!(report.results[2].result, Some(last));
+        assert_eq!(final_pool, expected_pool);
+        assert_eq!(report.pool, expected_pool);
+    }
+
+    #[test]
+    fn all_failed_swaps_still_print_every_step() {
+        let (result, report, final_pool) = replay(vec![swap(0, 0), swap(1_000_000, i128::MAX)]);
+
+        assert!(matches!(result, Err(SimulationError::FailedSwaps(2))));
+        assert_eq!(report.failed_swaps, 2);
+        let errors: Vec<_> = report.results.iter().map(|s| s.error.as_deref()).collect();
+        assert_eq!(
+            errors,
+            [
+                Some("amount must be positive"),
+                Some("slippage guard failed")
+            ]
+        );
+        assert!(report.results.iter().all(|s| s.result.is_none()));
+        assert_eq!(final_pool, pool());
+    }
 }

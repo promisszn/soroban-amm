@@ -18,6 +18,8 @@ pub enum SimulationError {
     Paused,
     #[error("replay completed with {0} failed trade(s)")]
     FailedTrades(usize),
+    #[error("cl-replay completed with {0} failed swap(s)")]
+    FailedSwaps(usize),
     #[error("{0}")]
     InvalidInput(String),
     #[error("invalid fee bps {fee_bps}")]
