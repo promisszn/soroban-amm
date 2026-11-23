@@ -206,7 +206,7 @@ Defined in [contracts/concentrated_liquidity/src/lib.rs](../contracts/concentrat
 | 11 | `Paused` | Pool is paused. | Wait for admin to unpause. |
 | 12 | `Unauthorized` | Admin mismatch. | Use the stored admin address. |
 | 13 | `TickNotAligned` | A tick was not a multiple of `tick_spacing`. | Round ticks to the nearest multiple of `tick_spacing`. |
-| 14 | `InvalidTickSpacing` | `tick_spacing ≤ 0` during initialization. | Use a positive tick spacing (common values: 1, 10, 60, 200). |
+| 14 | `InvalidTickSpacing` | `tick_spacing` is outside `[1, MAX_TICK]` during initialization. | Use a positive tick spacing no greater than `MAX_TICK` (887 272). |
 | 15 | `TickNotInitialized` | A swap crossed into a tick that has no liquidity (never been used by any position). | Ensure positions cover the full swap range, or use a smaller swap amount. |
 | 16 | `InvalidToken` | `token_in` is not `token_a` or `token_b`. | Check `get_info()` for valid token addresses. |
 | 17 | `RangeOrderInRange` | `place_range_order` called when current tick is inside `[lower_tick, upper_tick)`. | Select a tick range strictly above or below current tick. |
