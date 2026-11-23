@@ -76,7 +76,7 @@ pub enum ClError {
     Paused = 11,
     Unauthorized = 12,
     TickNotAligned = 13,     // tick is not a multiple of tick_spacing
-    InvalidTickSpacing = 14, // tick_spacing must be > 0
+    InvalidTickSpacing = 14, // tick_spacing must be in 1..=MAX_TICK
     TickNotInitialized = 15, // requested tick has no liquidity (never touched by a position)
     InvalidToken = 16,       // token_in is not token_a or token_b
     RangeOrderInRange = 17,  // range order must be fully out-of-range at creation
@@ -326,8 +326,8 @@ impl ConcentratedLiquidity {
 
     /// One-time initialisation. Sets admin, token pair, fee, starting tick, and tick spacing.
     ///
-    /// `tick_spacing` must be > 0. Only tick values that are exact multiples of
-    /// `tick_spacing` may be used as position boundaries in `mint_position`.
+    /// `tick_spacing` must be in `1..=MAX_TICK`. Only tick values that are exact
+    /// multiples of `tick_spacing` may be used as position boundaries in `mint_position`.
     /// Suggested defaults: fee 5 bps → spacing 1, fee 30 bps → spacing 10,
     /// fee 100 bps → spacing 60.
     pub fn initialize(
@@ -352,7 +352,7 @@ impl ConcentratedLiquidity {
         if !(MIN_TICK..=MAX_TICK).contains(&initial_tick) {
             return Err(ClError::TickOutOfRange);
         }
-        if tick_spacing <= 0 {
+        if !(1..=MAX_TICK).contains(&tick_spacing) {
             return Err(ClError::InvalidTickSpacing);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -6744,6 +6744,61 @@ mod test_tick_spacing {
 
         let result = client.try_initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &0_i32);
         assert_eq!(result, Err(Ok(ClError::InvalidTickSpacing)));
+    }
+
+    /// A spacing above the tick domain cannot produce a valid position range.
+    #[test]
+    fn test_tick_spacing_above_max_tick_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        env.budget().reset_unlimited();
+        let token_a = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_b = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+
+        let result = client.try_initialize(
+            &admin, &token_a, &token_b, &30_i128, &0_i32, &(MAX_TICK + 1),
+        );
+        assert_eq!(result, Err(Ok(ClError::InvalidTickSpacing)));
+    }
+
+    /// The largest i32 spacing must also be rejected without overflow.
+    #[test]
+    fn test_i32_max_tick_spacing_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        env.budget().reset_unlimited();
+        let token_a = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let token_b = env.register_stellar_asset_contract_v2(admin.clone()).address();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+
+        let result = client.try_initialize(
+            &admin, &token_a, &token_b, &30_i128, &0_i32, &i32::MAX,
+        );
+        assert_eq!(result, Err(Ok(ClError::InvalidTickSpacing)));
+    }
+
+    /// MAX_TICK is a valid spacing and its two boundary ticks can be minted.
+    #[test]
+    fn test_max_tick_spacing_allows_mint() {
+        let env = Env::default();
+        let (provider, _ta, _tb, client) = setup_cl(&env, MAX_TICK);
+
+        let result = client.try_mint_position(
+            &provider,
+            &-MAX_TICK,
+            &MAX_TICK,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+        assert!(result.is_ok(), "MAX_TICK spacing must permit the full-domain range");
     }
 
     /// get_pool_state must include tick_spacing set at initialize time.
