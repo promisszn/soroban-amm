@@ -6759,7 +6759,12 @@ mod test_tick_spacing {
         let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
 
         let result = client.try_initialize(
-            &admin, &token_a, &token_b, &30_i128, &0_i32, &(MAX_TICK + 1),
+            &admin,
+            &token_a,
+            &token_b,
+            &30_i128,
+            &0_i32,
+            &(MAX_TICK + 1),
         );
         assert_eq!(result, Err(Ok(ClError::InvalidTickSpacing)));
     }
@@ -6777,7 +6782,12 @@ mod test_tick_spacing {
         let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
 
         let result = client.try_initialize(
-            &admin, &token_a, &token_b, &30_i128, &0_i32, &i32::MAX,
+            &admin,
+            &token_a,
+            &token_b,
+            &30_i128,
+            &0_i32,
+            &i32::MAX,
         );
         assert_eq!(result, Err(Ok(ClError::InvalidTickSpacing)));
     }
@@ -6798,7 +6808,10 @@ mod test_tick_spacing {
             &0_i128,
             &u64::MAX,
         );
-        assert!(result.is_ok(), "MAX_TICK spacing must permit the full-domain range");
+        assert!(
+            result.is_ok(),
+            "MAX_TICK spacing must permit the full-domain range"
+        );
     }
 
     /// get_pool_state must include tick_spacing set at initialize time.
