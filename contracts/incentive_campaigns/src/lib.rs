@@ -658,6 +658,7 @@ impl IncentiveCampaigns {
 
     /// Return the build version of this contract (`CONTRACT_VERSION`).
     pub fn version(_env: Env) -> u32 {
+        extend_instance_ttl(&_env);
         CONTRACT_VERSION
     }
 
@@ -693,11 +694,13 @@ impl IncentiveCampaigns {
 
     /// Return the active governance address.
     pub fn get_governance(env: Env) -> Result<Address, IncentiveError> {
+        extend_instance_ttl(&env);
         Self::read_governance(&env)
     }
 
     /// Return the pending governance nominee, if any.
     pub fn get_pending_governance(env: Env) -> Option<Address> {
+        extend_instance_ttl(&env);
         env.storage()
             .instance()
             .get(&DataKey::PendingGovernance)
