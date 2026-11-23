@@ -2048,6 +2048,8 @@ name = "twap_consumer"
 version = "0.1.0"
 dependencies = [
  "amm",
+ "concentrated_liquidity",
+ "factory",
  "soroban-sdk",
  "soroban_amm_sdk",
  "token",

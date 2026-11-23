@@ -1217,6 +1217,7 @@ mod tests {
     use super::*;
 
     use amm::{AmmPool, AmmPoolClient};
+    use factory::{Factory, FactoryClient};
     use soroban_sdk::{
         testutils::{storage::Instance as _, Address as _, Events as _, Ledger},
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
@@ -1304,6 +1305,79 @@ mod tests {
         consumer.save_snapshot(&amm_addr);
 
         (amm_addr, consumer)
+    }
+
+    fn setup_real_factory_pools(
+        env: &Env,
+    ) -> (Address, Address, Address, TwapConsumerClient<'_>) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+        let cl_hash = env
+            .deployer()
+            .upload_contract_wasm(concentrated_liquidity::WASM);
+
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+        factory.set_cl_wasm_hash(&cl_hash);
+
+        let (ta, _ta_sac) = create_sac(env, &admin);
+        let (tb, _tb_sac) = create_sac(env, &admin);
+        let (amm_pool, _gov) =
+            factory.create_pool_with_fee_bps(&admin, &ta.address, &tb.address, &30, &None);
+        let cl_pool =
+            factory.create_cl_pool(&admin, &ta.address, &tb.address, &30, &0);
+
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(env, &consumer_addr);
+        consumer.initialize(&admin);
+        consumer.configure_public_snapshots(&factory_addr, &300);
+
+        (amm_pool, cl_pool, factory_addr, consumer)
+    }
+
+    #[test]
+    fn test_public_cl_save_succeeds_for_factory_cl_pool_and_bumps_count() {
+        let env = Env::default();
+        env.ledger().set_timestamp(10_000);
+        let (amm_pool, cl_pool, _factory_addr, consumer) =
+            setup_real_factory_pools(&env);
+
+        assert!(amm_pool != cl_pool);
+        assert_eq!(consumer.get_snapshot_count(&cl_pool), 0);
+        consumer.save_cl_snapshot_public(&cl_pool);
+        assert_eq!(consumer.get_snapshot_count(&cl_pool), 1);
+    }
+
+    #[test]
+    fn test_public_cl_save_rejects_unknown_pool() {
+        let env = Env::default();
+        env.ledger().set_timestamp(10_000);
+        let (_amm_pool, _cl_pool, _factory_addr, consumer) =
+            setup_real_factory_pools(&env);
+        let unknown = env.register_contract(None, MockClPool);
+
+        assert_eq!(
+            consumer.try_save_cl_snapshot_public(&unknown),
+            Err(Ok(TwapError::PoolNotRegistered))
+        );
+    }
+
+    #[test]
+    fn test_public_cl_save_second_save_is_rate_limited() {
+        let env = Env::default();
+        env.ledger().set_timestamp(10_000);
+        let (_amm_pool, cl_pool, _factory_addr, consumer) =
+            setup_real_factory_pools(&env);
+
+        consumer.save_cl_snapshot_public(&cl_pool);
+        assert_eq!(
+            consumer.try_save_cl_snapshot_public(&cl_pool),
+            Err(Ok(TwapError::SnapshotRateLimited))
+        );
+        assert_eq!(consumer.get_snapshot_count(&cl_pool), 1);
     }
 
     #[test]

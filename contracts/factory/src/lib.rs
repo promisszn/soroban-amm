@@ -17,7 +17,7 @@
 
 #![no_std]
 
-use pool_interfaces::ClPoolClient;
+use pool_interfaces::{ClPoolClient, ConcentratedLiquidityClient};
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, token as sdk_token,
     Address, BytesN, Env, Symbol, Vec,
@@ -842,6 +842,10 @@ impl Factory {
         env.storage()
             .persistent()
             .set(&DataKey::ClPoolRegistered(pool_addr.clone()), &true);
+        env.storage().persistent().set(
+            &DataKey::PoolTokens(pool_addr.clone()),
+            &(ta.clone(), tb.clone()),
+        );
 
         // Bump the CL registry entries on the same call path that writes them
         // (issue #904).
@@ -858,6 +862,13 @@ impl Factory {
             Self::MIN_TTL,
             Self::BUMP_TO,
         );
+        env.storage()
+            .persistent()
+            .extend_ttl(
+                &DataKey::PoolTokens(pool_addr.clone()),
+                Self::MIN_TTL,
+                Self::BUMP_TO,
+            );
 
         soroban_amm_sdk::emit_versioned_event!(
             env,
@@ -1363,6 +1374,14 @@ impl Factory {
     /// Check if an address is a registered AMM pool in this factory.
     pub fn is_amm_pool(env: Env, pool: Address) -> bool {
         Self::extend_ttl(&env);
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::ClPoolRegistered(pool.clone()))
+            .unwrap_or(false)
+        {
+            return false;
+        }
         env.storage()
             .persistent()
             .get::<_, bool>(&DataKey::AmmPoolRegistered(pool.clone()))
@@ -1420,6 +1439,15 @@ impl Factory {
                 env.storage()
                     .persistent()
                     .extend_ttl(&key, Self::MIN_TTL, Self::BUMP_TO);
+                if let Ok(Ok(tokens)) =
+                    ConcentratedLiquidityClient::new(&env, &pool).try_get_tokens()
+                {
+                    let tokens_key = DataKey::PoolTokens(pool);
+                    env.storage().persistent().set(&tokens_key, &tokens);
+                    env.storage()
+                        .persistent()
+                        .extend_ttl(&tokens_key, Self::MIN_TTL, Self::BUMP_TO);
+                }
                 indexed += 1;
             }
         }
@@ -1493,6 +1521,11 @@ impl Factory {
             .storage()
             .persistent()
             .has(&DataKey::PoolTokens(pool.clone()))
+            || env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&DataKey::ClPoolRegistered(pool.clone()))
+                .unwrap_or(false)
         {
             return None;
         }
@@ -1508,7 +1541,40 @@ impl Factory {
     /// Return the token pair `(token_a, token_b)` recorded for `pool`, or `None`.
     pub fn get_pool_tokens(env: Env, pool: Address) -> Option<(Address, Address)> {
         Self::extend_ttl(&env);
-        env.storage().persistent().get(&DataKey::PoolTokens(pool))
+        if let Some(tokens) = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolTokens(pool.clone()))
+        {
+            return Some(tokens);
+        }
+
+        // Legacy CL pools may predate the PoolTokens entry. Resolve them through
+        // the pool contract, but only for addresses marked as CL pools.
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::ClPoolRegistered(pool.clone()))
+            .unwrap_or(false)
+        {
+            if let Ok(Ok(tokens)) =
+                ConcentratedLiquidityClient::new(&env, &pool).try_get_tokens()
+            {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::PoolTokens(pool.clone()), &tokens);
+                env.storage()
+                    .persistent()
+                    .extend_ttl(
+                        &DataKey::PoolTokens(pool),
+                        Self::MIN_TTL,
+                        Self::BUMP_TO,
+                    );
+                return Some(tokens);
+            }
+        }
+
+        None
     }
 
     /// Set and propagate the global protocol fee configuration to all
@@ -1849,15 +1915,27 @@ impl Factory {
                     continue;
                 }
 
-                // Guard: only AMM pools have a PoolTokens entry. CL pools (which
-                // use a different interface and don't implement set_protocol_fee)
-                // never have this key, so we skip them. This also handles any
-                // legacy CL pool addresses that may exist in PoolByIndex from
-                // before CL pools were given their own separate index.
-                let is_amm_pool = env
+                // Guard: CL pools now share PoolTokens for identity lookups,
+                // but use a different interface and do not implement
+                // set_protocol_fee. Skip them explicitly.
+                let is_cl_pool = env
                     .storage()
                     .persistent()
-                    .has(&DataKey::PoolTokens(pool_addr.clone()));
+                    .get::<_, bool>(&DataKey::ClPoolRegistered(pool_addr.clone()))
+                    .unwrap_or(false);
+                let is_amm_pool =
+                    !is_cl_pool
+                        && (env
+                            .storage()
+                            .persistent()
+                            .get::<_, bool>(&DataKey::AmmPoolRegistered(
+                                pool_addr.clone(),
+                            ))
+                            .unwrap_or(false)
+                            || env
+                                .storage()
+                                .persistent()
+                                .has(&DataKey::PoolTokens(pool_addr.clone())));
                 if !is_amm_pool {
                     continue;
                 }

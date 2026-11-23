@@ -28,11 +28,23 @@ run_twap_consumer_flow() {
   factory=$(e2e_new_factory)
   pool=$(e2e_new_seeded_pool "$factory" "$ta" "$tb" 10000000)
   pass "twap_consumer: seeded pool $pool"
+  local cl_hash cl_pool
+  cl_hash=$(e2e_upload concentrated_liquidity)
+  invoke "$factory" set_cl_wasm_hash --cl_wasm_hash "$cl_hash" >/dev/null
+  cl_pool=$(invoke "$factory" create_cl_pool \
+    --caller "$SOURCE_PUBLIC_KEY" \
+    --token_a "$ta" \
+    --token_b "$tb" \
+    --fee_bps 30 \
+    --initial_tick 0 | extract_contract_id)
+  [[ -n "$cl_pool" ]] || die "twap_consumer: factory did not create CL pool"
+  pass "twap_consumer: factory-created CL pool $cl_pool"
 
   # ── initialize ──────────────────────────────────────────────────────────
   local twap
   twap=$(e2e_deploy twap_consumer)
   invoke "$twap" initialize --keeper "$keeper" >/dev/null
+  invoke "$twap" configure_public_snapshots --factory "$factory" --min_interval_seconds 300 >/dev/null
   assert_eq "twap_consumer: keeper reads back" '@cmd:invoke "$twap" get_keeper | parse_address' "$keeper"
   expect_fail "twap_consumer: second initialize is rejected" \
     invoke "$twap" initialize --keeper "$keeper"
@@ -52,6 +64,15 @@ run_twap_consumer_flow() {
     '@cmd:invoke "$twap" list_snapshot_timestamps --pool "$pool" --offset 0 --limit 10 | count_matches '\''[0-9]+'\''' "1"
   assert_contains "twap_consumer: pool is tracked after its first snapshot" \
     '@cmd:invoke "$twap" get_tracked_pools' "$pool"
+
+  # ── permissionless CL save ──────────────────────────────────────────────
+  assert_eq "twap_consumer: no CL snapshots before public save" \
+    '@cmd:invoke "$twap" get_snapshot_count --pool "$cl_pool" | parse_i128' "0"
+  invoke "$twap" save_cl_snapshot_public --pool "$cl_pool" >/dev/null
+  assert_eq "twap_consumer: CL public save bumps snapshot count" \
+    '@cmd:invoke "$twap" get_snapshot_count --pool "$cl_pool" | parse_i128' "1"
+  expect_fail "twap_consumer: second CL public save is rate limited" \
+    invoke "$twap" save_cl_snapshot_public --pool "$cl_pool"
 
   # ── swap so the pool's cumulative price advances past the snapshot ──────
   # Wait out the window first so the snapshot is at or before now - window
