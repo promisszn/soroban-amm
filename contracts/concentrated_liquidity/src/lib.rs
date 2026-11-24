@@ -2382,6 +2382,13 @@ impl ConcentratedLiquidity {
                 zero_for_one,
             );
 
+            // A saturated tick can map to the exact current sqrt price. There
+            // is then no trade to execute and crossing it again cannot advance
+            // the walk; leave the remaining amount untouched (issue #1305).
+            if target_price_x96 == sqrt_price_x96 {
+                break;
+            }
+
             let amount_in_after_fee = amount_remaining * (10000 - fee_bps) / 10000;
 
             let (amount_in_step_after_fee, amount_out_step) = if active_liquidity == 0 {
@@ -2870,6 +2877,13 @@ impl ConcentratedLiquidity {
                 sqrt_price_limit_x96,
                 zero_for_one,
             );
+
+            // A saturated tick can map to the exact current sqrt price. There
+            // is then no trade to execute and crossing it again cannot advance
+            // the walk; leave the remaining amount untouched (issue #1305).
+            if target_price_x96 == sqrt_price_x96 {
+                break;
+            }
 
             let (amount_in_step_after_fee, amount_out_step) = if active_liquidity == 0 {
                 (0, 0)
@@ -4435,6 +4449,13 @@ impl ConcentratedLiquidity {
                 sqrt_price_limit_x96,
                 zero_for_one,
             );
+
+            // A saturated tick can map to the exact current sqrt price. There
+            // is then no trade to execute and crossing it again cannot advance
+            // the walk; leave the remaining amount untouched (issue #1305).
+            if target_price_x96 == sqrt_price_x96 {
+                break;
+            }
 
             let amount_in_after_fee = amount_remaining * (10000 - fee_bps) / 10000;
 
@@ -11136,6 +11157,9 @@ mod test_range_order_fill_status {
         assert!((2990..=3010).contains(&collected_a));
     }
 }
+
+#[cfg(test)]
+mod tests_boundary_progress;
 
 #[cfg(test)]
 mod tests_issue_1100;
