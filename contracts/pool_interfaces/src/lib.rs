@@ -103,6 +103,10 @@ pub trait AmmPoolInterface {
     fn get_info(env: Env) -> PoolInfo;
 
     fn is_paused(env: Env) -> bool;
+
+    /// Returns `true` once the pool has been permanently drained through an
+    /// emergency withdrawal; those pools refuse every quote.
+    fn is_drained(env: Env) -> bool;
 }
 
 // ── factory ──────────────────────────────────────────────────────────────────
