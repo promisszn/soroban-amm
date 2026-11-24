@@ -1307,9 +1307,8 @@ mod tests {
         (amm_addr, consumer)
     }
 
-    fn setup_real_factory_pools(
-        env: &Env,
-    ) -> (Address, Address, Address, TwapConsumerClient<'_>) {
+    fn setup_real_factory_pools(env: &Env) -> (Address, Address, Address, TwapConsumerClient<'_>) {
+        env.budget().reset_unlimited();
         env.mock_all_auths();
         let admin = Address::generate(env);
         let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
@@ -1327,8 +1326,7 @@ mod tests {
         let (tb, _tb_sac) = create_sac(env, &admin);
         let (amm_pool, _gov) =
             factory.create_pool_with_fee_bps(&admin, &ta.address, &tb.address, &30, &None);
-        let cl_pool =
-            factory.create_cl_pool(&admin, &ta.address, &tb.address, &30, &0);
+        let cl_pool = factory.create_cl_pool(&admin, &ta.address, &tb.address, &30, &0);
 
         let consumer_addr = env.register_contract(None, TwapConsumer);
         let consumer = TwapConsumerClient::new(env, &consumer_addr);
@@ -1342,8 +1340,7 @@ mod tests {
     fn test_public_cl_save_succeeds_for_factory_cl_pool_and_bumps_count() {
         let env = Env::default();
         env.ledger().set_timestamp(10_000);
-        let (amm_pool, cl_pool, _factory_addr, consumer) =
-            setup_real_factory_pools(&env);
+        let (amm_pool, cl_pool, _factory_addr, consumer) = setup_real_factory_pools(&env);
 
         assert!(amm_pool != cl_pool);
         assert_eq!(consumer.get_snapshot_count(&cl_pool), 0);
@@ -1355,8 +1352,7 @@ mod tests {
     fn test_public_cl_save_rejects_unknown_pool() {
         let env = Env::default();
         env.ledger().set_timestamp(10_000);
-        let (_amm_pool, _cl_pool, _factory_addr, consumer) =
-            setup_real_factory_pools(&env);
+        let (_amm_pool, _cl_pool, _factory_addr, consumer) = setup_real_factory_pools(&env);
         let unknown = env.register_contract(None, MockClPool);
 
         assert_eq!(
@@ -1369,8 +1365,7 @@ mod tests {
     fn test_public_cl_save_second_save_is_rate_limited() {
         let env = Env::default();
         env.ledger().set_timestamp(10_000);
-        let (_amm_pool, cl_pool, _factory_addr, consumer) =
-            setup_real_factory_pools(&env);
+        let (_amm_pool, cl_pool, _factory_addr, consumer) = setup_real_factory_pools(&env);
 
         consumer.save_cl_snapshot_public(&cl_pool);
         assert_eq!(

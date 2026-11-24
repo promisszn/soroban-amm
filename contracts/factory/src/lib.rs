@@ -862,13 +862,11 @@ impl Factory {
             Self::MIN_TTL,
             Self::BUMP_TO,
         );
-        env.storage()
-            .persistent()
-            .extend_ttl(
-                &DataKey::PoolTokens(pool_addr.clone()),
-                Self::MIN_TTL,
-                Self::BUMP_TO,
-            );
+        env.storage().persistent().extend_ttl(
+            &DataKey::PoolTokens(pool_addr.clone()),
+            Self::MIN_TTL,
+            Self::BUMP_TO,
+        );
 
         soroban_amm_sdk::emit_versioned_event!(
             env,
@@ -1434,7 +1432,7 @@ impl Factory {
                 .persistent()
                 .get::<_, Address>(&DataKey::ClPoolByIndex(i))
             {
-                let key = DataKey::ClPoolRegistered(pool);
+                let key = DataKey::ClPoolRegistered(pool.clone());
                 env.storage().persistent().set(&key, &true);
                 env.storage()
                     .persistent()
@@ -1444,9 +1442,11 @@ impl Factory {
                 {
                     let tokens_key = DataKey::PoolTokens(pool);
                     env.storage().persistent().set(&tokens_key, &tokens);
-                    env.storage()
-                        .persistent()
-                        .extend_ttl(&tokens_key, Self::MIN_TTL, Self::BUMP_TO);
+                    env.storage().persistent().extend_ttl(
+                        &tokens_key,
+                        Self::MIN_TTL,
+                        Self::BUMP_TO,
+                    );
                 }
                 indexed += 1;
             }
@@ -1557,19 +1557,15 @@ impl Factory {
             .get::<_, bool>(&DataKey::ClPoolRegistered(pool.clone()))
             .unwrap_or(false)
         {
-            if let Ok(Ok(tokens)) =
-                ConcentratedLiquidityClient::new(&env, &pool).try_get_tokens()
-            {
+            if let Ok(Ok(tokens)) = ConcentratedLiquidityClient::new(&env, &pool).try_get_tokens() {
                 env.storage()
                     .persistent()
                     .set(&DataKey::PoolTokens(pool.clone()), &tokens);
-                env.storage()
-                    .persistent()
-                    .extend_ttl(
-                        &DataKey::PoolTokens(pool),
-                        Self::MIN_TTL,
-                        Self::BUMP_TO,
-                    );
+                env.storage().persistent().extend_ttl(
+                    &DataKey::PoolTokens(pool),
+                    Self::MIN_TTL,
+                    Self::BUMP_TO,
+                );
                 return Some(tokens);
             }
         }
@@ -1923,19 +1919,16 @@ impl Factory {
                     .persistent()
                     .get::<_, bool>(&DataKey::ClPoolRegistered(pool_addr.clone()))
                     .unwrap_or(false);
-                let is_amm_pool =
-                    !is_cl_pool
-                        && (env
+                let is_amm_pool = !is_cl_pool
+                    && (env
+                        .storage()
+                        .persistent()
+                        .get::<_, bool>(&DataKey::AmmPoolRegistered(pool_addr.clone()))
+                        .unwrap_or(false)
+                        || env
                             .storage()
                             .persistent()
-                            .get::<_, bool>(&DataKey::AmmPoolRegistered(
-                                pool_addr.clone(),
-                            ))
-                            .unwrap_or(false)
-                            || env
-                                .storage()
-                                .persistent()
-                                .has(&DataKey::PoolTokens(pool_addr.clone())));
+                            .has(&DataKey::PoolTokens(pool_addr.clone())));
                 if !is_amm_pool {
                     continue;
                 }
