@@ -457,7 +457,10 @@ impl TwalConsumer {
         if window_used == 0 {
             return Err(TwalError::ElapsedZero);
         }
-        let delta = (extrapolated as u128).wrapping_sub(snapshot_cumulative as u128) as i128;
+        let delta = extrapolated
+            .checked_sub(snapshot_cumulative)
+            .filter(|&d| d >= 0)
+            .ok_or(TwalError::ArithmeticOverflow)?;
         Ok(TwalResult {
             twal: delta / window_used as i128,
             window_used,
@@ -2405,5 +2408,81 @@ mod tests {
         let env = Env::default();
         let (_keeper, consumer) = setup_consumer(&env);
         assert_eq!(consumer.max_servable_window(&Address::generate(&env)), 0);
+    }
+
+    mod backwards_amm_pool {
+        use super::AmmPoolInfo;
+        use soroban_sdk::{contract, contractimpl, symbol_short, Env};
+
+        #[contract]
+        pub struct BackwardsAmmPool;
+
+        #[contractimpl]
+        impl BackwardsAmmPool {
+            pub fn set_cumulative(env: Env, cum: i128, ts: u64) {
+                env.storage()
+                    .instance()
+                    .set(&symbol_short!("cum"), &(cum, ts));
+            }
+
+            pub fn get_liquidity_cumulative(env: Env) -> (i128, u64) {
+                env.storage()
+                    .instance()
+                    .get(&symbol_short!("cum"))
+                    .unwrap_or((100_000_000_i128, 10_000_u64))
+            }
+
+            pub fn get_info(env: Env) -> AmmPoolInfo {
+                let addr = env.current_contract_address();
+                AmmPoolInfo {
+                    token_a: addr.clone(),
+                    token_b: addr.clone(),
+                    reserve_a: 1_000_000,
+                    reserve_b: 1_000_000,
+                    total_shares: 1_000_000,
+                    fee_bps: 30,
+                    flash_loan_fee_bps: 0,
+                    admin: addr.clone(),
+                    fee_recipient: addr,
+                    protocol_fee_bps: 0,
+                    lp_rebate_bps: 0,
+                }
+            }
+        }
+    }
+
+    use backwards_amm_pool::{BackwardsAmmPool, BackwardsAmmPoolClient};
+
+    #[test]
+    fn backwards_amm_cumulative_returns_arithmetic_overflow() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(10_000);
+
+        let (_keeper, consumer) = setup_consumer(&env);
+        let pool_addr = env.register_contract(None, BackwardsAmmPool);
+        let pool = BackwardsAmmPoolClient::new(&env, &pool_addr);
+
+        pool.set_cumulative(&500_000_000_i128, &10_000_u64);
+        consumer.save_snapshot(&pool_addr);
+
+        env.ledger().with_mut(|l| l.timestamp = 10_060);
+        // Cumulative is lower at read time than at snapshot time.
+        pool.set_cumulative(&100_000_000_i128, &10_060_u64);
+
+        assert_eq!(
+            consumer.try_get_twal_liquidity(&pool_addr, &60),
+            Err(Ok(TwalError::ArithmeticOverflow))
+        );
+        assert_eq!(
+            consumer.try_get_twal_liquidity_detailed(&pool_addr, &60),
+            Err(Ok(TwalError::ArithmeticOverflow))
+        );
+        let entries = consumer.get_twal_all_safe(&60);
+        assert_eq!(entries.len(), 1);
+        let entry = entries.get(0).unwrap();
+        assert!(!entry.ok);
+        assert_eq!(entry.error_code, TwalError::ArithmeticOverflow as u32);
+        assert_eq!(entry.twal, 0);
     }
 }

@@ -35,6 +35,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Setup Node for Stellar CLI pin check
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+
+      - name: Check Stellar CLI version pins
+        run: node scripts/check_stellar_version.mjs
+
       - name: Install pinned Rust toolchain
         run: rustup show
 
@@ -75,9 +83,6 @@ jobs:
 
       - name: Install Stellar CLI
         uses: stellar/stellar-cli@v27.1.0
-
-      - name: Confirm Stellar CLI pin
-        run: test "$(cat .stellar-version)" = "27.1.0"
 
       - name: ABI check
         run: bash scripts/check_abi.sh

@@ -51,6 +51,8 @@ export default defineConfig(
             "services/graphql-api/scripts/*.mjs",
             "scripts/check_reachability.mjs",
             "scripts/check_reachability.test.mjs",
+            "scripts/check_stellar_version.mjs",
+            "scripts/check_stellar_version.test.mjs",
           ],
         },
         tsconfigRootDir: import.meta.dirname,

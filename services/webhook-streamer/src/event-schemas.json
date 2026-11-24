@@ -1972,6 +1972,31 @@
             ]
           }
         ],
+        "min_reserve_set": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "token_a",
+              "token_b",
+              "min_reserve_a",
+              "min_reserve_b",
+              "removed"
+            ]
+          }
+        ],
+        "pool_kind_set": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "pool",
+              "kind"
+            ]
+          }
+        ],
         "res_warn": [
           {
             "version": 1,

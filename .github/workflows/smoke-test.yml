@@ -63,6 +63,14 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Setup Node for Stellar CLI pin check
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+
+      - name: Check Stellar CLI version pins
+        run: node scripts/check_stellar_version.mjs
+
       # Channel and target come from rust-toolchain.toml.
       - name: Setup Rust
         run: rustup show

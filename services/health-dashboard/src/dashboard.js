@@ -1,6 +1,19 @@
 // @ts-check
 export const DEFAULT_API_URL = "http://localhost:4000/graphql";
 export const DEFAULT_POLL_INTERVAL_MS = 5000;
+export const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+
+/**
+ * Parses a positive timeout in milliseconds, falling back when missing or invalid.
+ * @param {string | number | null | undefined} raw
+ * @param {number} [fallback]
+ * @returns {number}
+ */
+export function parseTimeoutMs(raw, fallback = DEFAULT_REQUEST_TIMEOUT_MS) {
+  if (raw === null || raw === undefined || raw === "") return fallback;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
 
 export function formatMetric(value) {
   const number = Number(value);
@@ -58,16 +71,82 @@ export function formatError(error) {
   return error instanceof Error ? error.message : String(error || "Unknown error");
 }
 
-export async function gql(apiUrl, query, variables = {}) {
-  const response = await fetch(apiUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ query, variables }),
+/**
+ * Executes a GraphQL request with an AbortController-backed timeout.
+ * @param {string} apiUrl
+ * @param {string} query
+ * @param {Record<string, unknown>} [variables]
+ * @param {{ timeoutMs?: number, signal?: AbortSignal }} [options]
+ */
+export async function gql(
+  apiUrl,
+  query,
+  variables = {},
+  { timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, signal } = {},
+) {
+  const effectiveTimeoutMs = parseTimeoutMs(timeoutMs);
+  if (signal?.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new Error("GraphQL API request aborted");
+  }
+
+  const controller = new AbortController();
+  let timedOut = false;
+  /** @type {ReturnType<typeof setTimeout> | undefined} */
+  let timer;
+
+  const onExternalAbort = () => {
+    controller.abort(signal?.reason);
+  };
+
+  signal?.addEventListener("abort", onExternalAbort, { once: true });
+
+  /** @type {() => void} */
+  let cleanupAbortListener = () => {};
+  const abortPromise = new Promise((_, reject) => {
+    const onAbort = () => {
+      reject(
+        timedOut
+          ? new Error(`GraphQL API request timed out after ${effectiveTimeoutMs}ms`)
+          : controller.signal.reason instanceof Error
+            ? controller.signal.reason
+            : new Error("GraphQL API request aborted"),
+      );
+    };
+    controller.signal.addEventListener("abort", onAbort, { once: true });
+    cleanupAbortListener = () => controller.signal.removeEventListener("abort", onAbort);
   });
-  if (!response.ok) throw new Error(`GraphQL API returned HTTP ${response.status}`);
-  const payload = await response.json();
-  if (payload.errors?.length) throw new Error(payload.errors.map((item) => item.message).join("; "));
-  return payload.data;
+
+  timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, effectiveTimeoutMs);
+
+  try {
+    const requestPromise = (async () => {
+      const response = await fetch(apiUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query, variables }),
+        signal: controller.signal,
+      });
+      if (!response.ok) throw new Error(`GraphQL API returned HTTP ${response.status}`);
+      const payload = await response.json();
+      if (payload.errors?.length) throw new Error(payload.errors.map((item) => item.message).join("; "));
+      return payload.data;
+    })();
+    return await Promise.race([requestPromise, abortPromise]);
+  } catch (error) {
+    if (timedOut) {
+      throw new Error(`GraphQL API request timed out after ${effectiveTimeoutMs}ms`, { cause: error });
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    cleanupAbortListener();
+    signal?.removeEventListener("abort", onExternalAbort);
+  }
 }
 
 const QUERY = {
@@ -244,23 +323,50 @@ export function renderHistory(history) {
   }
 }
 
-export function renderHeatmap(events) {
+export function renderHeatmap(events, pool) {
   const heatmap = $("heatmap");
   if (!heatmap) return;
   heatmap.replaceChildren();
   const buckets = new Array(24).fill(0);
   const now = Date.now();
-  for (const event of events || []) {
+  const { tokenA, tokenB } = pool ?? {};
+  const swaps = tokenA && tokenB && tokenA !== tokenB ? events ?? [] : [];
+  for (const event of swaps) {
     if (event.type !== "swap") continue;
+    const ts = Number(event.timestamp);
+    const ms = ts < 1_000_000_00000 ? ts * 1000 : ts;
+    const hoursAgo = Math.floor((now - ms) / 3_600_000);
+    if (!(hoursAgo >= 0 && hoursAgo < 24)) continue;
+
+    let payload;
     try {
-      const ts = Number(event.timestamp);
-      const ms = ts < 1_000_000_00000 ? ts * 1000 : ts;
-      const hoursAgo = Math.floor((now - ms) / 3_600_000);
-      if (hoursAgo >= 0 && hoursAgo < 24) buckets[23 - hoursAgo] += Number(JSON.parse(event.payload || "{}").amountIn || 0);
-    } catch { /* malformed payloads do not break the dashboard */ }
+      payload = JSON.parse(event.payload);
+    } catch {
+      continue; // A malformed event should not invalidate the rest of the chart.
+    }
+    const tokenIn = payload?.token_in ?? payload?.tokenA;
+    const tokenOut = payload?.token_out ?? payload?.tokenB;
+    let rawAmount;
+    if (tokenIn === tokenA && tokenOut === tokenB) rawAmount = payload.amountOut;
+    else if (tokenIn === tokenB && tokenOut === tokenA) rawAmount = payload.amountIn;
+    else continue;
+
+    if (typeof rawAmount !== "number" &&
+        (typeof rawAmount !== "string" || !rawAmount.trim())) continue;
+    const quoteAmount = Number(rawAmount);
+    if (Number.isFinite(quoteAmount) && quoteAmount >= 0) {
+      buckets[23 - hoursAgo] += quoteAmount;
+    }
   }
   const max = Math.max(...buckets, 1);
-  buckets.forEach((amount, index) => { const bar = document.createElement("div"); bar.className = "heatmap-bar"; bar.style.height = `${Math.max(4, amount / max * 56)}px`; bar.title = `${23 - index}h ago: ${formatMetric(amount)}`; heatmap.appendChild(bar); });
+  const unit = tokenB ? ` ${tokenB} base units` : "";
+  buckets.forEach((amount, index) => {
+    const bar = document.createElement("div");
+    bar.className = "heatmap-bar";
+    bar.style.height = `${Math.max(4, amount / max * 56)}px`;
+    bar.title = `${23 - index}h ago: ${formatMetric(amount)}${unit}`;
+    heatmap.appendChild(bar);
+  });
 }
 
 export function renderAlertConfigs(configs, onRemove) {
@@ -278,13 +384,14 @@ function addDashboardMessages() {
   if (!$("dashboard-state")) { const state = document.createElement("div"); state.id = "dashboard-state"; state.className = "dashboard-state"; state.setAttribute("role", "status"); document.querySelector("main")?.prepend(state); }
 }
 
-/** @param {{ apiUrl?: string, poolId?: string, pollIntervalMs?: number }} [options] */
-export function createDashboardController({ apiUrl, poolId, pollIntervalMs = DEFAULT_POLL_INTERVAL_MS } = {}) {
+/** @param {{ apiUrl?: string, poolId?: string, pollIntervalMs?: number, requestTimeoutMs?: number }} [options] */
+export function createDashboardController({ apiUrl, poolId, pollIntervalMs = DEFAULT_POLL_INTERVAL_MS, requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS } = {}) {
   /** @type {Array<{ poolId: string, metric: string, thresholdBps?: number, thresholdValue?: number }>} */
   let configs = [];
   /** @type {ReturnType<typeof setInterval> | undefined} */
   let timer;
   let refreshing = false;
+  const timeoutMs = parseTimeoutMs(requestTimeoutMs);
   const url = apiUrl || DEFAULT_API_URL;
   const pool = poolId || "";
   const status = $("connection-status");
@@ -299,12 +406,15 @@ export function createDashboardController({ apiUrl, poolId, pollIntervalMs = DEF
       ["m-tvl", "m-vol", "m-fees", "m-swaps", "health-score-text"].forEach((id) => setText(id, "—"));
       const currentUrl = field("api-url")?.value.trim() || url;
       const currentPool = field("pool-id")?.value.trim() || pool;
-      const entries = Object.entries(QUERY).map(async ([key, query]) => [key, await gql(currentUrl, query, { poolId: currentPool })]);
+      const entries = Object.entries(QUERY).map(async ([key, query]) => [key, await gql(currentUrl, query, { poolId: currentPool }, { timeoutMs })]);
       const results = await Promise.allSettled(entries);
       /** @type {Record<string, any>} */ const data = {};
       /** @type {string[]} */ const failures = [];
       results.forEach((result, index) => { const key = Object.keys(QUERY)[index]; if (result.status === "fulfilled") data[key] = result.value; else failures.push(`${key}: ${formatError(result.reason)}`); });
-      renderStats(data.stats?.poolStats, currentPool); renderHealth(currentPool ? data.health?.poolHealth : null, configs); renderEvents(currentPool ? data.events?.poolEvents : []); renderHistory(currentPool ? data.history?.priceHistory : []); renderHeatmap(currentPool ? data.events?.poolEvents : []); if (data.alerts?.alertConfigs) { configs = data.alerts.alertConfigs; renderAlertConfigs(configs, removeAlert); }
+      renderStats(data.stats?.poolStats, currentPool); renderHealth(currentPool ? data.health?.poolHealth : null, configs); renderEvents(currentPool ? data.events?.poolEvents : []); renderHistory(currentPool ? data.history?.priceHistory : []);
+      const selectedPool = currentPool ? data.stats?.poolStats?.find((item) => item.poolId === currentPool) : undefined;
+      renderHeatmap(currentPool ? data.events?.poolEvents : [], selectedPool);
+      if (data.alerts?.alertConfigs) { configs = data.alerts.alertConfigs; renderAlertConfigs(configs, removeAlert); }
       if (failures.length === Object.keys(QUERY).length) { setStatus("Error", "error", failures.join("; ")); setSectionState(`Unable to load dashboard data. ${failures[0]}`); const retry = $("btn-retry"); if (retry) retry.hidden = false; }
       // Retry is only useful when something failed; hide it on a fully successful refresh.
       else { setStatus(failures.length ? "Degraded" : "Connected", failures.length ? "error" : "connected", failures.join("; ")); setSectionState(failures.length ? `Degraded: ${failures.join("; ")}` : data.stats?.poolStats?.length ? "" : "No pools indexed yet"); const retry = $("btn-retry"); if (retry) retry.hidden = !failures.length; setText("last-updated", `Last updated ${new Date().toLocaleTimeString()}`); }
@@ -324,12 +434,12 @@ export function createDashboardController({ apiUrl, poolId, pollIntervalMs = DEF
     // for the same metric when the Pool ID field is blank (alertConfigs(poolId: undefined) spans all pools).
     const previous = configs; const next = [...configs.filter((item) => !(item.metric === metric && item.poolId === currentPool)), { poolId: currentPool, metric, thresholdBps, thresholdValue }]; configs = next; renderAlertConfigs(configs, removeAlert); if (thresholdInput) thresholdInput.value = "";
     const currentUrl = field("api-url")?.value.trim() || url;
-    try { await gql(currentUrl, `mutation SetAlert($poolId: ID!, $metric: String!, $thresholdBps: Int, $thresholdValue: Float) { setAlertConfig(poolId: $poolId, metric: $metric, thresholdBps: $thresholdBps, thresholdValue: $thresholdValue) { poolId metric thresholdBps thresholdValue } }`, { poolId: currentPool, metric, thresholdBps, thresholdValue }); } catch (error) { configs = previous; renderAlertConfigs(configs, removeAlert); setSectionState(`Alert was not saved: ${formatError(error)}`); }
+    try { await gql(currentUrl, `mutation SetAlert($poolId: ID!, $metric: String!, $thresholdBps: Int, $thresholdValue: Float) { setAlertConfig(poolId: $poolId, metric: $metric, thresholdBps: $thresholdBps, thresholdValue: $thresholdValue) { poolId metric thresholdBps thresholdValue } }`, { poolId: currentPool, metric, thresholdBps, thresholdValue }, { timeoutMs }); } catch (error) { configs = previous; renderAlertConfigs(configs, removeAlert); setSectionState(`Alert was not saved: ${formatError(error)}`); }
   }
   async function removeAlert(alert) {
     const previous = configs; configs = configs.filter((item) => !(item.metric === alert.metric && item.poolId === alert.poolId)); renderAlertConfigs(configs, removeAlert);
     const currentUrl = field("api-url")?.value.trim() || url;
-    try { await gql(currentUrl, `mutation RemoveAlert($poolId: ID!, $metric: String!) { removeAlertConfig(poolId: $poolId, metric: $metric) }`, { poolId: alert.poolId, metric: alert.metric }); } catch (error) { configs = previous; renderAlertConfigs(configs, removeAlert); setSectionState(`Alert deletion failed: ${formatError(error)}`); }
+    try { await gql(currentUrl, `mutation RemoveAlert($poolId: ID!, $metric: String!) { removeAlertConfig(poolId: $poolId, metric: $metric) }`, { poolId: alert.poolId, metric: alert.metric }, { timeoutMs }); } catch (error) { configs = previous; renderAlertConfigs(configs, removeAlert); setSectionState(`Alert deletion failed: ${formatError(error)}`); }
   }
 
   // Listeners and timers drop the promise a handler returns, so route every
@@ -343,6 +453,11 @@ export function createDashboardController({ apiUrl, poolId, pollIntervalMs = DEF
 
 if (typeof window !== "undefined") {
   const params = new URLSearchParams(window.location.search);
-  const controller = createDashboardController({ apiUrl: params.get("api") || params.get("apiUrl") || DEFAULT_API_URL, poolId: params.get("pool") || "", pollIntervalMs: Math.max(1000, Number(params.get("interval")) || DEFAULT_POLL_INTERVAL_MS) });
+  const controller = createDashboardController({
+    apiUrl: params.get("api") || params.get("apiUrl") || DEFAULT_API_URL,
+    poolId: params.get("pool") || "",
+    pollIntervalMs: Math.max(1000, Number(params.get("interval")) || DEFAULT_POLL_INTERVAL_MS),
+    requestTimeoutMs: parseTimeoutMs(params.get("timeout")),
+  });
   controller.start();
 }

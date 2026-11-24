@@ -20,6 +20,7 @@ import {
     InvalidWebhookUrlError,
     validateWebhookUrl,
 } from "./url-validation.js";
+import { verifySignature } from "./signing.js";
 import type { PoolEvent } from "./types.js";
 
 describe("WebhookRegistry", () => {
@@ -533,6 +534,70 @@ describe("local webhook delivery integration", () => {
                 await d.dispatch(EVENT);
                 assert.equal(d.metrics().retries, 2);
             } finally {
+                await srv.close();
+            }
+        });
+
+        it("re-signs each retry attempt with a fresh timestamp while keeping X-Webhook-Id stable", async () => {
+            const srv = await startServer((hit) => ({
+                status: hit < 3 ? 500 : 200,
+            }));
+            const secret = "test-retry-secret";
+            const realDateNow = Date.now;
+            const baseSec = 1_700_000_000;
+            let nowMs = baseSec * 1_000;
+            Date.now = () => nowMs;
+            try {
+                const reg = new WebhookRegistry();
+                reg.register(srv.url, { secret });
+                const d = new WebhookDispatcher(reg, {
+                    timeoutMs: 200,
+                    maxRetries: 2,
+                    baseDelayMs: 10,
+                    maxDelayMs: 20,
+                    random: () => 0.5,
+                    deadLetterQueue: new DeadLetterQueue(100),
+                    circuitBreaker: new CircuitBreaker({
+                        failureThreshold: 100,
+                    }),
+                    sleep: async () => {
+                        nowMs += 200_000;
+                    },
+                });
+                const [r] = await d.dispatch(EVENT);
+                assert.equal(r.success, true);
+                assert.equal(srv.hits(), 3);
+
+                const reqHeaders = srv.headers();
+                const reqBodies = srv.bodies();
+                const ids = reqHeaders.map((h) => h["x-webhook-id"]);
+                assert.deepEqual(ids, [EVENT.id, EVENT.id, EVENT.id]);
+
+                const sigHeaders = reqHeaders.map((h, idx) => {
+                    const sigHeader = h["x-webhook-signature"];
+                    if (typeof sigHeader !== "string") {
+                        assert.fail("expected string X-Webhook-Signature header");
+                    }
+                    const match = /^t=(\d+),v1=[0-9a-f]{64}$/.exec(sigHeader);
+                    assert.ok(match, `invalid signature header: ${sigHeader}`);
+                    const expectedTs = baseSec + idx * 200;
+                    assert.equal(Number(match[1]), expectedTs);
+                    assert.deepEqual(
+                        verifySignature({
+                            secret,
+                            body: reqBodies[idx],
+                            header: sigHeader,
+                            now: expectedTs,
+                        }),
+                        { valid: true },
+                    );
+                    return sigHeader;
+                });
+
+                assert.notEqual(sigHeaders[0], sigHeaders[1]);
+                assert.notEqual(sigHeaders[1], sigHeaders[2]);
+            } finally {
+                Date.now = realDateNow;
                 await srv.close();
             }
         });

@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `packages/ui-components`: governance proposal statuses now mirror the nine contract lifecycle states. Abstain votes count toward turnout and snapshot-based quorum, analytics no longer invent turnout or timing data, and empty embeds show an empty state. Seed proposals are exported as `demoProposals` for examples and tests.
 
 ### Fixed
+- The TypeScript SDK's `FactoryClient.createPool` now returns named pool and optional governance addresses in its confirmed transaction result (#1382).
+- The health dashboard's 24-hour heatmap now reports swap volume in the pool's quote token for both trade directions (#1378).
 - `amm::remove_liquidity` no longer checks the pause flag, so a paused pool (admin pause or a circuit breaker trip) cannot trap LP funds (#1172). `remove_liquidity_one_sided` stays blocked while paused: it swaps against the reserves, so leaving it open would let trading continue through a pause. Swaps, deposits and flash loans are unchanged. The new `exits_allowed_when_paused()` view returns `true` to confirm that `remove_liquidity` stays open for integrators and UIs.
 - `pol_vesting::create_vesting` rejects an LP token that the given `pool` does not administer, with the new `VestingError::LpTokenMismatch = 13`. A mistyped pair used to create a schedule for a token the pool never issued (#1136).
 - `pol_vesting` schedules outlive the default 180-day bump. A schedule is stored with a TTL covering its `end_ledger` plus a claim window, clamped to the network maximum. Reads of a schedule refresh it and its token's committed total, and the instance is refreshed to the network maximum (#1136).

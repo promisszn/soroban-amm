@@ -177,6 +177,18 @@ test('DUPLICATE is treated as accepted and polled', async () => {
   assert.equal((await submitter.sendTransaction({})).hash, 'D')
 })
 
+test('an unexpected send status rejects with SEND_REJECTED without retrying', async () => {
+  const rpc = fakeRpc({ sends: [{ status: 'WEIRD', hash: 'X' }] })
+  const { submitter, time } = submitterFor(rpc)
+
+  const error = await failure(submitter.sendTransaction({}))
+  assert.equal(error.code, 'SEND_REJECTED')
+  assert.equal(error.hash, 'X')
+  assert.match(error.message, /WEIRD/)
+  assert.equal(rpc.calls.filter(([name]) => name === 'send').length, 1)
+  assert.deepEqual(time.sleeps, [])
+})
+
 test('works as the AdvancedClient submitter, with retry covering submission', async () => {
   let simulations = 0
   const rpc = fakeRpc({ polls: [{ status: 'SUCCESS', returnValue: 'done' }] })

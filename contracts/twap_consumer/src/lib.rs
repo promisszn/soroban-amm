@@ -884,7 +884,10 @@ impl TwapConsumer {
         if elapsed == 0 {
             return Err(TwapError::ElapsedZero);
         }
-        let delta = (cum_a_now as u128).wrapping_sub(snapshot.1 as u128) as i128;
+        let delta = cum_a_now
+            .checked_sub(snapshot.1)
+            .filter(|&d| d >= 0)
+            .ok_or(TwapError::InvalidTwapPrice)?;
         Ok(TwapResult {
             twap: delta / i128::from(elapsed),
             window_used: elapsed,
@@ -980,8 +983,14 @@ impl TwapConsumer {
         let snapshot = Self::floor_snapshot_entry(&env, &pool, then_ts)
             .ok_or(TwapError::InsufficientHistory)?;
 
-        let delta_a = (cum_a_now as u128).wrapping_sub(snapshot.1 as u128) as i128;
-        let delta_b = (cum_b_now as u128).wrapping_sub(snapshot.2 as u128) as i128;
+        let delta_a = cum_a_now
+            .checked_sub(snapshot.1)
+            .filter(|&d| d >= 0)
+            .ok_or(TwapError::InvalidTwapPrice)?;
+        let delta_b = cum_b_now
+            .checked_sub(snapshot.2)
+            .filter(|&d| d >= 0)
+            .ok_or(TwapError::InvalidTwapPrice)?;
         let elapsed = i128::from(ledger_ts_now - snapshot.0);
         if elapsed <= 0 {
             return Err(TwapError::ElapsedZero);
@@ -3660,5 +3669,86 @@ mod tests {
         assert_bumps_instance_ttl(|_, c| {
             c.get_pending_keeper();
         });
+    }
+
+    // Backwards AMM accumulator -------------------------------------------------
+
+    mod mock_amm_pool {
+        use super::AmmPoolInfo;
+        use soroban_sdk::{contract, contractimpl, symbol_short, Env};
+
+        #[contract]
+        pub struct MockAmmPool;
+
+        #[contractimpl]
+        impl MockAmmPool {
+            pub fn set_cumulative(env: Env, cum_a: i128, cum_b: i128, ts: u64) {
+                env.storage()
+                    .instance()
+                    .set(&symbol_short!("cum"), &(cum_a, cum_b, ts));
+            }
+
+            pub fn get_price_cumulative(env: Env) -> (i128, i128, u64) {
+                env.storage()
+                    .instance()
+                    .get(&symbol_short!("cum"))
+                    .unwrap_or((100_000_000_i128, 100_000_000_i128, 10_000_u64))
+            }
+
+            pub fn get_info(env: Env) -> AmmPoolInfo {
+                let addr = env.current_contract_address();
+                AmmPoolInfo {
+                    token_a: addr.clone(),
+                    token_b: addr.clone(),
+                    reserve_a: 1_000_000,
+                    reserve_b: 1_000_000,
+                    total_shares: 1_000_000,
+                    fee_bps: 30,
+                    flash_loan_fee_bps: 0,
+                    admin: addr.clone(),
+                    fee_recipient: addr,
+                    protocol_fee_bps: 0,
+                    lp_rebate_bps: 0,
+                }
+            }
+        }
+    }
+
+    use mock_amm_pool::{MockAmmPool, MockAmmPoolClient};
+
+    #[test]
+    fn test_backwards_amm_cumulative_returns_invalid_twap_price() {
+        let env = test_env();
+        let admin = Address::generate(&env);
+        let consumer = new_consumer(&env, &admin);
+        let pool_addr = env.register_contract(None, MockAmmPool);
+        let pool = MockAmmPoolClient::new(&env, &pool_addr);
+
+        pool.set_cumulative(&500_000_000_i128, &500_000_000_i128, &10_000_u64);
+        consumer.save_snapshot(&pool_addr);
+
+        env.ledger().set_timestamp(10_060);
+        // Cumulative goes backwards (e.g. pool upgrade / reset).
+        pool.set_cumulative(&100_000_000_i128, &600_000_000_i128, &10_060_u64);
+
+        assert_eq!(
+            consumer.try_get_twap_price(&pool_addr, &60),
+            Err(Ok(TwapError::InvalidTwapPrice))
+        );
+        assert_eq!(
+            consumer.try_get_twap_price_detailed(&pool_addr, &60),
+            Err(Ok(TwapError::InvalidTwapPrice))
+        );
+        assert_eq!(
+            consumer.try_get_twap_both(&pool_addr, &60),
+            Err(Ok(TwapError::InvalidTwapPrice))
+        );
+
+        // Also test when cum_a increases normally but cum_b goes backwards.
+        pool.set_cumulative(&600_000_000_i128, &100_000_000_i128, &10_060_u64);
+        assert_eq!(
+            consumer.try_get_twap_both(&pool_addr, &60),
+            Err(Ok(TwapError::InvalidTwapPrice))
+        );
     }
 }

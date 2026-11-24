@@ -153,6 +153,13 @@ export class SorobanSubmitter<TTransaction extends Transaction, TReturn = unknow
             )
           }
           await this.sleep(this.pollIntervalMs)
+          break
+        default:
+          throw new SorobanSubmissionError(
+            'SEND_REJECTED',
+            `unexpected sendTransaction status: ${String(response.status)}`,
+            response.hash,
+          )
       }
     }
   }

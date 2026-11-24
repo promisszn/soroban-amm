@@ -24,9 +24,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # no need (and it would be wrong) to add wasm32-unknown-unknown here.
 
 # Install the Stellar CLI at the repo-wide pinned version. `.stellar-version`
-# is the single source of truth for this pin (also read by
-# .github/workflows/release.yml and .github/workflows/smoke-test.yml), so the
-# optimizer that produces release artifacts, the container contributors build
+# is the single source of truth for this pin — this Dockerfile reads it directly,
+# and .github/workflows/ci.yml, .github/workflows/release.yml, and
+# .github/workflows/smoke-test.yml pin the matching `stellar/stellar-cli@vX`
+# action tag (enforced by scripts/check_stellar_version.mjs) — so the optimizer
 # in, and the smoke test that verifies a deploy cannot drift to different
 # versions. `--locked` builds its own Cargo.lock with this image's compiler,
 # so the pinned version must be a release whose locked tree still compiles on

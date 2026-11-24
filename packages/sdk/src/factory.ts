@@ -11,12 +11,13 @@ import {
   scValToNative,
   xdr,
   Address,
+  StrKey,
 } from "@stellar/stellar-sdk";
 import type { NetworkConfig } from "./types.js";
 import { simulateRead } from "./internal/simulate.js";
 import { invoke } from "./internal/invoke.js";
 import type { InvocationResult, InvokeOptions, Signer } from "./internal/invoke.js";
-import { toBigInt, toText } from "./internal/decode.js";
+import { ContractDecodeError, toBigInt, toText } from "./internal/decode.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -181,7 +182,26 @@ export class FactoryClient {
   }
 
   async createPool(caller: string, tokenA: string, tokenB: string, feeTier: bigint, signer: Signer, governanceWasmHash?: string, options?: InvokeOptions): Promise<InvocationResult<CreatePoolResult>> {
-    return this.execute("create_pool", this.createPoolParams(caller, tokenA, tokenB, feeTier, governanceWasmHash), signer, options);
+    const result = await this.execute<unknown>(
+      "create_pool", this.createPoolParams(caller, tokenA, tokenB, feeTier, governanceWasmHash), signer, options
+    );
+    const raw = result.returnValue;
+    if (!Array.isArray(raw) || raw.length !== 2) {
+      throw new ContractDecodeError("CreatePoolResult", "tuple", Array.isArray(raw) ? Object.keys(raw) : []);
+    }
+
+    const tuple: readonly unknown[] = raw;
+    const [pool, governance] = tuple;
+    const poolAddress = toText(pool);
+    const governanceAddress = governance === null ? null : toText(governance);
+    if (!StrKey.isValidContract(poolAddress)) {
+      throw new TypeError("expected a contract address for CreatePoolResult.poolAddress");
+    }
+    if (governanceAddress !== null && !StrKey.isValidContract(governanceAddress)) {
+      throw new TypeError("expected a contract address for CreatePoolResult.governanceAddress");
+    }
+
+    return { ...result, returnValue: { poolAddress, governanceAddress } };
   }
 
   async createClPool(caller: string, tokenA: string, tokenB: string, feeBps: bigint, initialTick: number, signer: Signer, options?: InvokeOptions): Promise<InvocationResult<string>> {
