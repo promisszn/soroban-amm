@@ -641,6 +641,14 @@ impl ClPositionNft {
             return Err(NftError::Unauthorized);
         }
 
+        let zero_account = Address::from_string(&soroban_sdk::String::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        if approved == zero_account || approved == owner {
+            return Err(NftError::InvalidAddress);
+        }
+
         let approved_key = DataKey::Approved(token_id);
         env.storage().persistent().set(&approved_key, &approved);
         Self::bump_persistent(&env, &approved_key);
@@ -2312,5 +2320,81 @@ mod tests {
             last_versioned_event(&env, &client.address, "transfer");
         assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
         assert_eq!(token_id, id);
+    }
+
+    #[test]
+    fn approve_rejects_zero_address_and_preserves_prior_approval() {
+        let (env, client, _admin, pool, user) = setup();
+        let id = client.mint(&user, &pool, &-100, &100);
+        let zero_account = Address::from_string(&soroban_sdk::String::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+
+        // Rejects zero address when no prior approval exists
+        assert_eq!(
+            client.try_approve(&user, &zero_account, &id),
+            Err(Ok(NftError::InvalidAddress))
+        );
+        assert_eq!(client.get_approved(&id), None);
+
+        // Rejects zero address and preserves existing approval
+        let spender = Address::generate(&env);
+        client.approve(&user, &spender, &id);
+        assert_eq!(client.get_approved(&id), Some(spender.clone()));
+
+        assert_eq!(
+            client.try_approve(&user, &zero_account, &id),
+            Err(Ok(NftError::InvalidAddress))
+        );
+        assert_eq!(client.get_approved(&id), Some(spender));
+    }
+
+    #[test]
+    fn approve_rejects_self_approval_and_preserves_prior_approval() {
+        let (env, client, _admin, pool, user) = setup();
+        let id = client.mint(&user, &pool, &-100, &100);
+
+        // Rejects owner approving themselves
+        assert_eq!(
+            client.try_approve(&user, &user, &id),
+            Err(Ok(NftError::InvalidAddress))
+        );
+        assert_eq!(client.get_approved(&id), None);
+
+        // Preserves existing approval on self-approval attempt
+        let spender = Address::generate(&env);
+        client.approve(&user, &spender, &id);
+        assert_eq!(client.get_approved(&id), Some(spender.clone()));
+
+        assert_eq!(
+            client.try_approve(&user, &user, &id),
+            Err(Ok(NftError::InvalidAddress))
+        );
+        assert_eq!(client.get_approved(&id), Some(spender.clone()));
+
+        // Also rejects an approved operator approving the owner
+        let operator = Address::generate(&env);
+        client.set_approval_for_all(&user, &operator, &true);
+        assert_eq!(
+            client.try_approve(&operator, &user, &id),
+            Err(Ok(NftError::InvalidAddress))
+        );
+        assert_eq!(client.get_approved(&id), Some(spender));
+    }
+
+    #[test]
+    fn approve_and_transfer_clears_approval() {
+        let (env, client, _admin, pool, user) = setup();
+        let id = client.mint(&user, &pool, &-100, &100);
+        let spender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+
+        client.approve(&user, &spender, &id);
+        assert_eq!(client.get_approved(&id), Some(spender.clone()));
+
+        client.transfer(&spender, &user, &recipient, &id);
+        assert_eq!(client.owner_of(&id), recipient);
+        assert_eq!(client.get_approved(&id), None);
     }
 }
