@@ -7,6 +7,7 @@ const {
   MiddlewareStack,
   plugin,
   priceFeedMiddleware,
+  retryMiddleware,
   signerMiddleware,
 } = require('../lib/index.js')
 
@@ -230,6 +231,39 @@ test('plugin hooks run around submission and see the processed transaction and r
     ['submit', { kind: 'swap', audited: true }],
     ['afterSend', { hash: 'abc' }],
   ])
+})
+
+test('throwing afterSend is not retried and reaches the caller', async () => {
+  const hookError = new Error('after-send failed')
+  let submitCalls = 0
+  const client = new AdvancedClient({
+    async sendTransaction() {
+      submitCalls += 1
+      return { hash: 'abc' }
+    },
+  })
+  client.middleware().use(retryMiddleware({
+    attempts: 3,
+    backoffMs: 0,
+    retryOn: () => true,
+  }))
+  client.plugin(
+    plugin({
+      name: 'audit',
+      middleware: async (_ctx, next) => next(),
+      hooks: {
+        afterSend: () => {
+          throw hookError
+        },
+      },
+    }),
+  )
+
+  await assert.rejects(
+    () => client.sendTransaction({ kind: 'swap' }),
+    (error) => error === hookError,
+  )
+  assert.equal(submitCalls, 1)
 })
 
 test('plugin hooks do not run when the chain aborts', async () => {

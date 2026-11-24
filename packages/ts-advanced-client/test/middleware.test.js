@@ -8,6 +8,7 @@ const {
   deadlineRule,
   loggingMiddleware,
   nonZeroAmountRule,
+  plugin,
   retryMiddleware,
   slippageRule,
   validationMiddleware,
@@ -230,6 +231,38 @@ test('retry gives up after the configured attempts with the last error', async (
   }
   await outcome
   assert.equal(calls, 3)
+})
+
+test('retry re-runs beforeSend but submits only after the hook succeeds', async () => {
+  let beforeSendCalls = 0
+  let submitCalls = 0
+  const client = new AdvancedClient({
+    async sendTransaction() {
+      submitCalls += 1
+      return { ok: true }
+    },
+  })
+  client.middleware().use(retryMiddleware({
+    attempts: 3,
+    backoffMs: 0,
+    retryOn: () => true,
+  }))
+  client.plugin(
+    plugin({
+      name: 'gate',
+      middleware: async (_ctx, next) => next(),
+      hooks: {
+        beforeSend: () => {
+          beforeSendCalls += 1
+          if (beforeSendCalls === 1) throw new Error('before-send failed')
+        },
+      },
+    }),
+  )
+
+  assert.deepEqual(await client.sendTransaction({}), { ok: true })
+  assert.equal(beforeSendCalls, 2)
+  assert.equal(submitCalls, 1)
 })
 
 test('retry does not retry errors retryOn rejects', async () => {
