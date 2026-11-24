@@ -641,6 +641,16 @@ describe("cl.swapParams", () => {
   });
 });
 
+describe("cl.quotePositionParams", () => {
+  it("matches quote_position arity, order and types (lower_tick, upper_tick, liquidity)", () => {
+    const ep = entrypoint("concentrated_liquidity", "quote_position");
+    expect(ep.inputs.map((i) => i.name)).toEqual(["lower_tick", "upper_tick", "liquidity"]);
+    const args = cl.quotePositionParams(-60, 60, 2_500n);
+    expectTypes(args, ["scvI32", "scvI32", "scvI128"]);
+    expect(scValToNative(args[2])).toBe(2_500n);
+  });
+});
+
 describe("cl.burnPositionParams / cl.collectFeesParams", () => {
   it("burn_position takes the liquidity amount as the 4th argument", () => {
     const args = cl.burnPositionParams(ALICE, -60, 60, 2_500n);
