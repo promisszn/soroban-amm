@@ -377,22 +377,29 @@ fn initialize_emits_versioned_configuration() {
     let pool = env.register_contract(None, ConcentratedLiquidity);
     let client = ConcentratedLiquidityClient::new(&env, &pool);
     let admin = Address::generate(&env);
-    let a = Address::generate(&env);
-    let b = Address::generate(&env);
-    client.initialize(&admin, &a, &b, &30, &-10, &5);
-    assert_eq!(
-        last_versioned_event(&env, &pool, "initialized"),
-        (soroban_amm_sdk::EVENT_SCHEMA_VERSION, (admin, a, b, 30_i128, -10_i32, 5_i32))
-    );
+    let token_a = Address::generate(&env);
+    let token_b = Address::generate(&env);
+    client.initialize(&admin, &token_a, &token_b, &30, &-10, &5);
+
+    let (version, payload): (u32, (Address, Address, Address, i128, i32, i32)) =
+        last_versioned_event(&env, &pool, "initialized");
+
+    assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+    assert_eq!(payload, (admin, token_a, token_b, 30, -10, 5));
 }
 
 #[test]
 fn oracle_cardinality_emits_old_and_new_values() {
     let te = setup_test();
-    let old = crate::DEFAULT_ORACLE_CARDINALITY;
-    te.client.set_oracle_cardinality(&te.admin, &(old + 1));
-    assert_eq!(
-        last_versioned_event(&te.env, &te.pool_addr, "oracle_cardinality_set"),
-        (soroban_amm_sdk::EVENT_SCHEMA_VERSION, (old, old + 1))
-    );
+    let initial = crate::DEFAULT_ORACLE_CARDINALITY;
+
+    for (old, new) in [(initial, initial + 1), (initial + 1, initial + 2)] {
+        te.client.set_oracle_cardinality(&te.admin, &new);
+
+        let (version, payload) =
+            last_versioned_event::<(u32, u32)>(&te.env, &te.pool_addr, "oracle_cardinality_set");
+
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(payload, (old, new));
+    }
 }
