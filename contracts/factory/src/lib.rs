@@ -17,7 +17,7 @@
 
 #![no_std]
 
-use pool_interfaces::ClPoolClient;
+use pool_interfaces::{ClPoolClient, ConcentratedLiquidityClient};
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, token as sdk_token,
     Address, BytesN, Env, Symbol, Vec,
@@ -193,9 +193,16 @@ const DEFAULT_MIN_FEE_BPS: i128 = 1;
 /// Default upper bound of the AMM swap-fee window, in bps.
 const DEFAULT_MAX_FEE_BPS: i128 = 1_000;
 
-/// Whether `fee_bps` is one of the standard fee tiers (see `fee_tier_to_bps`).
+/// Whether `fee_bps` is one of the standard AMM fee tiers (see `fee_tier_to_bps`).
 fn is_standard_tier_bps(fee_bps: i128) -> bool {
     (0..=3).any(|tier| fee_tier_to_bps(tier) == Ok(fee_bps))
+}
+
+/// Whether `fee_bps` is one of the standard concentrated-liquidity fee tiers
+/// (`5`, `30`, `100`, `500` bps — matching the CL tick-spacing tier table in
+/// `create_cl_pool`, as opposed to the AMM tiers `1`, `5`, `30`, `100` bps).
+fn is_standard_cl_tier_bps(fee_bps: i128) -> bool {
+    matches!(fee_bps, 5 | 30 | 100 | 500)
 }
 
 /// Protocol fee actually applied to a pool with swap fee `pool_fee_bps` when the
@@ -368,28 +375,8 @@ impl Factory {
         // so a caller is never charged or rate-limited for a request that
         // would have been rejected anyway.
 
-        if !(0..10_000).contains(&fee_bps) {
-            return Err(FactoryError::InvalidFeeBps);
-        }
-
-        let admin = Self::read_admin(&env)?;
-        let permissionless: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::PermissionlessMode)
-            .unwrap_or(false);
-
-        // Custom fees are an admin-only capability. A permissionless caller that
-        // is not the admin must pick a standard tier, otherwise the first caller
-        // could squat a pair with an arbitrary fee (issue #1109).
-        let is_admin_path = !permissionless || caller == admin;
-        if !is_admin_path && !is_standard_tier_bps(fee_bps) {
-            return Err(FactoryError::InvalidFeeBps);
-        }
-        let (min_fee, max_fee) = Self::fee_window(&env);
-        if fee_bps < min_fee || fee_bps > max_fee {
-            return Err(FactoryError::FeeOutOfRange);
-        }
+        let (admin, permissionless) =
+            Self::validate_fee_policy(&env, &caller, fee_bps, is_standard_tier_bps)?;
 
         // Normalise: smaller address is always token_a.
         let (ta, tb) = if token_a < token_b {
@@ -752,12 +739,12 @@ impl Factory {
         Self::ensure_creation_unpaused(&env)?;
 
         // ── Validate BEFORE charging (issue #520) ─────────────────────────
-        // The CL pool's own `initialize` rejects `fee_bps >= 10_000`; reject it
-        // here so the caller gets a clear error before any rate-limit slot or
-        // creation fee is consumed (issue #1109).
-        if !(0..10_000).contains(&fee_bps) {
-            return Err(FactoryError::InvalidFeeBps);
-        }
+        // Enforce the same pre-charge fee policy as `create_pool_with_fee_bps`:
+        // `fee_bps` must be in `0..10_000`, non-admin callers in permissionless
+        // mode must use a standard CL fee tier (5/30/100/500 bps), and every
+        // caller is bound to `[min_fee_bps, max_fee_bps]` (issues #1109, #1299).
+        let (admin, permissionless) =
+            Self::validate_fee_policy(&env, &caller, fee_bps, is_standard_cl_tier_bps)?;
 
         // Normalise token order.
         let (ta, tb) = if token_a < token_b {
@@ -772,13 +759,6 @@ impl Factory {
         }
 
         // ── Auth, rate-limit, fee ─────────────────────────────────────────
-        let admin = Self::read_admin(&env)?;
-        let permissionless: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::PermissionlessMode)
-            .unwrap_or(false);
-
         if permissionless {
             caller.require_auth();
             Self::check_and_update_rate_limit(&env, &caller)?;
@@ -842,6 +822,10 @@ impl Factory {
         env.storage()
             .persistent()
             .set(&DataKey::ClPoolRegistered(pool_addr.clone()), &true);
+        env.storage().persistent().set(
+            &DataKey::PoolTokens(pool_addr.clone()),
+            &(ta.clone(), tb.clone()),
+        );
 
         // Bump the CL registry entries on the same call path that writes them
         // (issue #904).
@@ -855,6 +839,11 @@ impl Factory {
         );
         env.storage().persistent().extend_ttl(
             &DataKey::ClPoolRegistered(pool_addr.clone()),
+            Self::MIN_TTL,
+            Self::BUMP_TO,
+        );
+        env.storage().persistent().extend_ttl(
+            &DataKey::PoolTokens(pool_addr.clone()),
             Self::MIN_TTL,
             Self::BUMP_TO,
         );
@@ -1363,6 +1352,14 @@ impl Factory {
     /// Check if an address is a registered AMM pool in this factory.
     pub fn is_amm_pool(env: Env, pool: Address) -> bool {
         Self::extend_ttl(&env);
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::ClPoolRegistered(pool.clone()))
+            .unwrap_or(false)
+        {
+            return false;
+        }
         env.storage()
             .persistent()
             .get::<_, bool>(&DataKey::AmmPoolRegistered(pool.clone()))
@@ -1415,11 +1412,22 @@ impl Factory {
                 .persistent()
                 .get::<_, Address>(&DataKey::ClPoolByIndex(i))
             {
-                let key = DataKey::ClPoolRegistered(pool);
+                let key = DataKey::ClPoolRegistered(pool.clone());
                 env.storage().persistent().set(&key, &true);
                 env.storage()
                     .persistent()
                     .extend_ttl(&key, Self::MIN_TTL, Self::BUMP_TO);
+                if let Ok(Ok(tokens)) =
+                    ConcentratedLiquidityClient::new(&env, &pool).try_get_tokens()
+                {
+                    let tokens_key = DataKey::PoolTokens(pool);
+                    env.storage().persistent().set(&tokens_key, &tokens);
+                    env.storage().persistent().extend_ttl(
+                        &tokens_key,
+                        Self::MIN_TTL,
+                        Self::BUMP_TO,
+                    );
+                }
                 indexed += 1;
             }
         }
@@ -1493,6 +1501,11 @@ impl Factory {
             .storage()
             .persistent()
             .has(&DataKey::PoolTokens(pool.clone()))
+            || env
+                .storage()
+                .persistent()
+                .get::<_, bool>(&DataKey::ClPoolRegistered(pool.clone()))
+                .unwrap_or(false)
         {
             return None;
         }
@@ -1508,7 +1521,36 @@ impl Factory {
     /// Return the token pair `(token_a, token_b)` recorded for `pool`, or `None`.
     pub fn get_pool_tokens(env: Env, pool: Address) -> Option<(Address, Address)> {
         Self::extend_ttl(&env);
-        env.storage().persistent().get(&DataKey::PoolTokens(pool))
+        if let Some(tokens) = env
+            .storage()
+            .persistent()
+            .get(&DataKey::PoolTokens(pool.clone()))
+        {
+            return Some(tokens);
+        }
+
+        // Legacy CL pools may predate the PoolTokens entry. Resolve them through
+        // the pool contract, but only for addresses marked as CL pools.
+        if env
+            .storage()
+            .persistent()
+            .get::<_, bool>(&DataKey::ClPoolRegistered(pool.clone()))
+            .unwrap_or(false)
+        {
+            if let Ok(Ok(tokens)) = ConcentratedLiquidityClient::new(&env, &pool).try_get_tokens() {
+                env.storage()
+                    .persistent()
+                    .set(&DataKey::PoolTokens(pool.clone()), &tokens);
+                env.storage().persistent().extend_ttl(
+                    &DataKey::PoolTokens(pool),
+                    Self::MIN_TTL,
+                    Self::BUMP_TO,
+                );
+                return Some(tokens);
+            }
+        }
+
+        None
     }
 
     /// Set and propagate the global protocol fee configuration to all
@@ -1795,6 +1837,48 @@ impl Factory {
         (min, max)
     }
 
+    /// Validate `fee_bps` against the factory's pre-charge fee policy:
+    /// 1. `fee_bps` must be in `0..10_000`.
+    /// 2. Non-admin callers in permissionless mode must select a standard tier
+    ///    (`is_standard_tier` distinguishes AMM tiers `1/5/30/100` from CL
+    ///    tiers `5/30/100/500`).
+    /// 3. Every caller is bound to the configured `[min_fee_bps, max_fee_bps]`
+    ///    window.
+    ///
+    /// Returns `(admin, permissionless)` so the caller can reuse them without
+    /// re-reading storage.
+    fn validate_fee_policy(
+        env: &Env,
+        caller: &Address,
+        fee_bps: i128,
+        is_standard_tier: fn(i128) -> bool,
+    ) -> Result<(Address, bool), FactoryError> {
+        if !(0..10_000).contains(&fee_bps) {
+            return Err(FactoryError::InvalidFeeBps);
+        }
+
+        let admin = Self::read_admin(env)?;
+        let permissionless: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::PermissionlessMode)
+            .unwrap_or(false);
+
+        // Custom fees are an admin-only capability. A permissionless caller that
+        // is not the admin must pick a standard tier, otherwise the first caller
+        // could squat a pair with an arbitrary fee (issues #1109, #1299).
+        let is_admin_path = !permissionless || *caller == admin;
+        if !is_admin_path && !is_standard_tier(fee_bps) {
+            return Err(FactoryError::InvalidFeeBps);
+        }
+        let (min_fee, max_fee) = Self::fee_window(env);
+        if fee_bps < min_fee || fee_bps > max_fee {
+            return Err(FactoryError::FeeOutOfRange);
+        }
+
+        Ok((admin, permissionless))
+    }
+
     fn creation_paused(env: &Env) -> bool {
         env.storage()
             .instance()
@@ -1849,15 +1933,24 @@ impl Factory {
                     continue;
                 }
 
-                // Guard: only AMM pools have a PoolTokens entry. CL pools (which
-                // use a different interface and don't implement set_protocol_fee)
-                // never have this key, so we skip them. This also handles any
-                // legacy CL pool addresses that may exist in PoolByIndex from
-                // before CL pools were given their own separate index.
-                let is_amm_pool = env
+                // Guard: CL pools now share PoolTokens for identity lookups,
+                // but use a different interface and do not implement
+                // set_protocol_fee. Skip them explicitly.
+                let is_cl_pool = env
                     .storage()
                     .persistent()
-                    .has(&DataKey::PoolTokens(pool_addr.clone()));
+                    .get::<_, bool>(&DataKey::ClPoolRegistered(pool_addr.clone()))
+                    .unwrap_or(false);
+                let is_amm_pool = !is_cl_pool
+                    && (env
+                        .storage()
+                        .persistent()
+                        .get::<_, bool>(&DataKey::AmmPoolRegistered(pool_addr.clone()))
+                        .unwrap_or(false)
+                        || env
+                            .storage()
+                            .persistent()
+                            .has(&DataKey::PoolTokens(pool_addr.clone())));
                 if !is_amm_pool {
                     continue;
                 }
@@ -4642,6 +4735,110 @@ mod tests {
             factory.try_create_cl_pool(&user, &ta, &tb, &30, &0),
             Err(Ok(FactoryError::ClWasmNotSet))
         );
+    }
+
+    #[test]
+    fn test_cl_permissionless_rejects_non_standard_fee_before_charge() {
+        let f = fx();
+        let factory = FactoryClient::new(&f.env, &f.factory_addr);
+        let cl_hash = f
+            .env
+            .deployer()
+            .upload_contract_wasm(concentrated_liquidity::WASM);
+        factory.set_cl_wasm_hash(&cl_hash);
+        let user = permissionless(&f);
+        factory.set_rate_limit(&100);
+        let (ta, tb) = tokens(&f);
+        let before = fee_balance(&f, &user);
+
+        // 1 bps is an AMM-only tier, not a standard CL tier (5/30/100/500).
+        for bad in [0_i128, 1, 7, 50, 999, 10_000] {
+            let res = factory.try_create_cl_pool(&user, &ta, &tb, &bad, &0);
+            assert_eq!(res, Err(Ok(FactoryError::InvalidFeeBps)), "fee {bad}");
+        }
+        // Rejected calls never charge the creation fee or consume the rate-limit slot.
+        assert_eq!(fee_balance(&f, &user), before);
+        let pool = factory.create_cl_pool(&user, &ta, &tb, &30, &0);
+        assert_eq!(factory.get_cl_pool(&ta, &tb, &30), Some(pool));
+        assert_eq!(fee_balance(&f, &user), before - 10);
+    }
+
+    #[test]
+    fn test_cl_permissionless_standard_tiers_allowed() {
+        let f = fx();
+        let factory = FactoryClient::new(&f.env, &f.factory_addr);
+        let cl_hash = f
+            .env
+            .deployer()
+            .upload_contract_wasm(concentrated_liquidity::WASM);
+        factory.set_cl_wasm_hash(&cl_hash);
+        let user = permissionless(&f);
+        let (ta, tb) = tokens(&f);
+        let before = fee_balance(&f, &user);
+
+        for tier in [5_i128, 30, 100, 500] {
+            let pool = factory.create_cl_pool(&user, &ta, &tb, &tier, &0);
+            assert_eq!(factory.get_cl_pool(&ta, &tb, &tier), Some(pool));
+        }
+        assert_eq!(fee_balance(&f, &user), before - 40);
+    }
+
+    #[test]
+    fn test_cl_permissionless_rejects_out_of_window_fee_before_charge() {
+        let f = fx();
+        let factory = FactoryClient::new(&f.env, &f.factory_addr);
+        let cl_hash = f
+            .env
+            .deployer()
+            .upload_contract_wasm(concentrated_liquidity::WASM);
+        factory.set_cl_wasm_hash(&cl_hash);
+        let user = permissionless(&f);
+        factory.set_rate_limit(&100);
+        // Narrow the fee window so standard CL tiers 5 and 500 fall outside.
+        factory.set_fee_bps_window(&10, &200);
+        let (ta, tb) = tokens(&f);
+        let before = fee_balance(&f, &user);
+
+        for out_of_range in [5_i128, 500] {
+            let res = factory.try_create_cl_pool(&user, &ta, &tb, &out_of_range, &0);
+            assert_eq!(
+                res,
+                Err(Ok(FactoryError::FeeOutOfRange)),
+                "fee {out_of_range}"
+            );
+        }
+        // Rejected calls never charge the creation fee or consume the rate-limit slot.
+        assert_eq!(fee_balance(&f, &user), before);
+        let pool = factory.create_cl_pool(&user, &ta, &tb, &30, &0);
+        assert_eq!(factory.get_cl_pool(&ta, &tb, &30), Some(pool));
+        assert_eq!(fee_balance(&f, &user), before - 10);
+    }
+
+    #[test]
+    fn test_cl_admin_custom_fee_allowed_and_bound_to_window() {
+        let f = fx();
+        let factory = FactoryClient::new(&f.env, &f.factory_addr);
+        let cl_hash = f
+            .env
+            .deployer()
+            .upload_contract_wasm(concentrated_liquidity::WASM);
+        factory.set_cl_wasm_hash(&cl_hash);
+        let (ta, tb) = tokens(&f);
+
+        // Permissioned mode: admin can use a custom fee inside the window.
+        let pool_17 = factory.create_cl_pool(&f.admin, &ta, &tb, &17, &0);
+        assert_eq!(factory.get_cl_pool(&ta, &tb, &17), Some(pool_17));
+
+        // Permissioned mode: admin is still bound to [min_fee_bps, max_fee_bps].
+        for bad in [0_i128, 1_001, 9_999] {
+            let res = factory.try_create_cl_pool(&f.admin, &ta, &tb, &bad, &0);
+            assert_eq!(res, Err(Ok(FactoryError::FeeOutOfRange)), "fee {bad}");
+        }
+
+        // Permissionless mode: admin as caller can still use a custom fee inside the window.
+        let _ = permissionless(&f);
+        let pool_25 = factory.create_cl_pool(&f.admin, &ta, &tb, &25, &0);
+        assert_eq!(factory.get_cl_pool(&ta, &tb, &25), Some(pool_25));
     }
 
     // ── Protocol fee plumbing (#1108) ─────────────────────────────────────────

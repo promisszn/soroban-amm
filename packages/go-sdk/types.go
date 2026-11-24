@@ -123,6 +123,25 @@ type SwapParams struct {
 	Deadline uint64
 }
 
+// SwapExactOutParams are the arguments to Client.SwapExactOut. Deadline and
+// MaxIn are safety parameters and are never defaulted.
+type SwapExactOutParams struct {
+	// PoolID is the AMM pool contract address.
+	PoolID string
+	// Trader is the address whose tokens are swapped; it must match the Signer.
+	Trader string
+	// TokenOut is the contract address of the token being bought.
+	TokenOut string
+	// AmountOut is the exact quantity of TokenOut to receive.
+	AmountOut *big.Int
+	// MaxIn is the slippage bound: the swap reverts with ErrSlippageExceeded
+	// if the required input would exceed it.
+	MaxIn *big.Int
+	// Deadline is a ledger timestamp (seconds); the swap reverts with
+	// ErrDeadlineExceeded once it passes.
+	Deadline uint64
+}
+
 // AddLiquidityParams are the arguments to Client.AddLiquidity.
 type AddLiquidityParams struct {
 	// PoolID is the AMM pool contract address.
@@ -153,6 +172,42 @@ type RemoveLiquidityParams struct {
 	MinB *big.Int
 	// Deadline is a ledger timestamp (seconds).
 	Deadline uint64
+}
+
+// RemoveLiquidityOneSidedParams are the arguments to
+// Client.RemoveLiquidityOneSided.
+type RemoveLiquidityOneSidedParams struct {
+	// PoolID is the AMM pool contract address.
+	PoolID string
+	// Provider is the liquidity provider's address; it must match the Signer.
+	Provider string
+	// Shares is the quantity of LP shares to burn.
+	Shares *big.Int
+	// TokenOut is the contract address of the single pool token to receive.
+	TokenOut string
+	// MinOut is the slippage bound on the total TokenOut returned after the
+	// internal swap.
+	MinOut *big.Int
+	// Deadline is a ledger timestamp (seconds).
+	Deadline uint64
+}
+
+// FlashLoanParams are the arguments to Client.FlashLoan. At least one of
+// AmountA and AmountB must be positive, and neither may be nil or negative.
+type FlashLoanParams struct {
+	// PoolID is the AMM pool contract address.
+	PoolID string
+	// Receiver is the flash-loan receiver contract address.
+	Receiver string
+	// AmountA is the quantity of the pool's first token to borrow (zero when
+	// borrowing only the second token).
+	AmountA *big.Int
+	// AmountB is the quantity of the pool's second token to borrow (zero when
+	// borrowing only the first token).
+	AmountB *big.Int
+	// Data is the opaque payload forwarded to the receiver's on_flash_loan
+	// callback.
+	Data []byte
 }
 
 // LiquidityResult is the pair of token amounts returned by RemoveLiquidity.

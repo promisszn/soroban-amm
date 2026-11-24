@@ -501,11 +501,12 @@ bash scripts/e2e.sh
 ```
 
 The flows live in `scripts/e2e/`. The shared flows (`v2`, `factory`, `cl`,
-`governance`, `staking`) run against the addresses `deploy.sh` persists. The
-self-contained flows (`token`, `router`, `dex_aggregator`,
-`oracle_aggregator`, `cl_position_nft`, `pol_vesting`, `twap_consumer`)
-deploy their own instances and can be run one at a time without a full
-deployment, e.g. `bash scripts/e2e/router.sh`. Select flows with
+`governance`, `staking`, `twap`) run against the addresses `deploy.sh`
+persists. The self-contained flows (`token`, `router`, `dex_aggregator`,
+`oracle_aggregator`, `cl_position_nft`, `pol_vesting`, `twap_consumer`,
+`twal_consumer`, `incentive_campaigns`) deploy their own instances and can be
+run one at a time without a full deployment, e.g.
+`bash scripts/e2e/router.sh`. Select flows with
 `--only`/`--skip` (see `bash scripts/e2e/run.sh --help`); the self-contained
 flows fund extra signers through friendbot, so they target testnet.
 

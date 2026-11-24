@@ -22,6 +22,17 @@ jobs:
                   bash scripts/check_twap_consumer_deploy.test.sh
                   bash scripts/check_batch_router_deploy.test.sh
                   bash scripts/e2e/common.test.sh
+                  bash scripts/e2e/flows.test.sh
+            - name: Check release manifest
+              run: make check-release-manifest
+            - name: Setup Node
+              uses: actions/setup-node@v7
+              with:
+                  node-version-file: .nvmrc
+            - name: Check Stellar CLI version pins
+              run: |
+                  node scripts/check_stellar_version.mjs
+                  node --test scripts/check_stellar_version.test.mjs
             # Channel, components and targets all come from
             # rust-toolchain.toml, so CI cannot drift onto a newer stable than
             # contributors are running; `rustup show` installs what it asks
@@ -59,10 +70,6 @@ jobs:
             # locked dependency tree the way `cargo install` would.
             - name: Install Stellar CLI
               uses: stellar/stellar-cli@v27.1.0
-            - name: Setup Node for documentation checks
-              uses: actions/setup-node@v7
-              with:
-                  node-version-file: .nvmrc
             - name: Check committed ABI against contract interfaces
               run: make check-abi
             - name: Test ABI generator and checker
@@ -301,6 +308,13 @@ jobs:
               run: npm ci
             - name: Build
               run: npm run build
+            # packages/sdk's ABI fixture is the conformance oracle for its
+            # builders. Nothing regenerates it during `npm test`, so a contract
+            # signature could change while the stale fixture kept every SDK
+            # test green (#1350). The package's own drift check is the gate.
+            - name: Check ABI fixture against contract sources
+              if: matrix.dir == 'packages/sdk'
+              run: npm run check:abi
             # Runs after Build because type-aware rules need resolvable
             # imports (examples/client resolves @soroban-amm/sdk from the SDK
             # its prebuild step compiles). Any lint error fails the job, the

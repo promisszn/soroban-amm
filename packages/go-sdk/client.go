@@ -1,7 +1,7 @@
-// Package gosdk is the Go client for the Soroban AMM protocol. It mirrors the
-// surface of the TypeScript SDK in packages/sdk: read methods run through
-// simulation and need no signer, while write methods build, simulate, sign,
-// submit and poll a transaction.
+// Package gosdk is the Go client for the Soroban AMM pool contract
+// (contracts/amm). It mirrors the pool surface of the TypeScript SDK's AmmPool
+// in packages/sdk: read methods run through simulation and need no signer,
+// while write methods build, simulate, sign, submit and poll a transaction.
 package gosdk
 
 import (
@@ -208,6 +208,28 @@ func (c *Client) Swap(ctx context.Context, p SwapParams) (*TxResult, error) {
 	})
 }
 
+// SwapExactOut buys an exact AmountOut of TokenOut from the pool, spending at
+// most MaxIn of the other pool token. Neither MaxIn nor Deadline is defaulted.
+func (c *Client) SwapExactOut(ctx context.Context, p SwapExactOutParams) (*TxResult, error) {
+	if err := requirePositive(p.AmountOut, "AmountOut"); err != nil {
+		return nil, err
+	}
+	if err := requireBound(p.MaxIn, ErrSlippageRequired, "MaxIn"); err != nil {
+		return nil, err
+	}
+	if p.Deadline == 0 {
+		return nil, fmt.Errorf("%w: Deadline must be a future ledger timestamp", ErrDeadlineRequired)
+	}
+
+	return c.invoke(ctx, p.PoolID, "swap_exact_out", []ScValue{
+		Addr(p.Trader),
+		Addr(p.TokenOut),
+		I128(p.AmountOut),
+		I128(p.MaxIn),
+		U64(p.Deadline),
+	})
+}
+
 // AddLiquidity deposits both tokens and mints LP shares. MinShares bounds
 // slippage and Deadline bounds inclusion; neither is defaulted.
 func (c *Client) AddLiquidity(ctx context.Context, p AddLiquidityParams) (*TxResult, error) {
@@ -255,6 +277,51 @@ func (c *Client) RemoveLiquidity(ctx context.Context, p RemoveLiquidityParams) (
 		I128(p.MinA),
 		I128(p.MinB),
 		U64(p.Deadline),
+	})
+}
+
+// RemoveLiquidityOneSided burns LP shares and returns the entire withdrawal in
+// TokenOut after an internal swap. MinOut bounds slippage and Deadline bounds
+// inclusion; neither is defaulted.
+func (c *Client) RemoveLiquidityOneSided(ctx context.Context, p RemoveLiquidityOneSidedParams) (*TxResult, error) {
+	if err := requirePositive(p.Shares, "Shares"); err != nil {
+		return nil, err
+	}
+	if err := requireBound(p.MinOut, ErrSlippageRequired, "MinOut"); err != nil {
+		return nil, err
+	}
+	if p.Deadline == 0 {
+		return nil, fmt.Errorf("%w: Deadline must be a future ledger timestamp", ErrDeadlineRequired)
+	}
+
+	return c.invoke(ctx, p.PoolID, "remove_liquidity_one_sided", []ScValue{
+		Addr(p.Provider),
+		I128(p.Shares),
+		Addr(p.TokenOut),
+		I128(p.MinOut),
+		U64(p.Deadline),
+	})
+}
+
+// FlashLoan borrows AmountA and/or AmountB from the pool and invokes Receiver's
+// on_flash_loan callback with Data. At least one of AmountA and AmountB must be
+// positive, and neither may be nil or negative.
+func (c *Client) FlashLoan(ctx context.Context, p FlashLoanParams) (*TxResult, error) {
+	if p.AmountA == nil || p.AmountA.Sign() < 0 {
+		return nil, fmt.Errorf("%w: AmountA must be non-negative", ErrZeroAmount)
+	}
+	if p.AmountB == nil || p.AmountB.Sign() < 0 {
+		return nil, fmt.Errorf("%w: AmountB must be non-negative", ErrZeroAmount)
+	}
+	if p.AmountA.Sign() == 0 && p.AmountB.Sign() == 0 {
+		return nil, fmt.Errorf("%w: at least one of AmountA or AmountB must be positive", ErrZeroAmount)
+	}
+
+	return c.invoke(ctx, p.PoolID, "flash_loan", []ScValue{
+		Addr(p.Receiver),
+		I128(p.AmountA),
+		I128(p.AmountB),
+		Bytes(p.Data),
 	})
 }
 

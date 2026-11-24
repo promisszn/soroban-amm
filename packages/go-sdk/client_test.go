@@ -509,6 +509,13 @@ func TestWriteMethodsRequireASigner(t *testing.T) {
 	if _, err := c.Swap(ctx, validSwap()); !errors.Is(err, ErrNoSigner) {
 		t.Fatalf("Swap: expected ErrNoSigner, got %v", err)
 	}
+	swapExactOut := SwapExactOutParams{
+		PoolID: zeroContract, Trader: zeroAccount, TokenOut: zeroContract,
+		AmountOut: big.NewInt(1_000), MaxIn: big.NewInt(1_100), Deadline: 1_900_000_000,
+	}
+	if _, err := c.SwapExactOut(ctx, swapExactOut); !errors.Is(err, ErrNoSigner) {
+		t.Fatalf("SwapExactOut: expected ErrNoSigner, got %v", err)
+	}
 	add := AddLiquidityParams{
 		PoolID: zeroContract, Provider: zeroAccount,
 		AmountA: big.NewInt(1), AmountB: big.NewInt(1),
@@ -524,17 +531,69 @@ func TestWriteMethodsRequireASigner(t *testing.T) {
 	if _, err := c.RemoveLiquidity(ctx, remove); !errors.Is(err, ErrNoSigner) {
 		t.Fatalf("RemoveLiquidity: expected ErrNoSigner, got %v", err)
 	}
+	oneSided := RemoveLiquidityOneSidedParams{
+		PoolID: zeroContract, Provider: zeroAccount, Shares: big.NewInt(1),
+		TokenOut: zeroContract, MinOut: big.NewInt(0), Deadline: 1_900_000_000,
+	}
+	if _, err := c.RemoveLiquidityOneSided(ctx, oneSided); !errors.Is(err, ErrNoSigner) {
+		t.Fatalf("RemoveLiquidityOneSided: expected ErrNoSigner, got %v", err)
+	}
+	flash := FlashLoanParams{
+		PoolID: zeroContract, Receiver: zeroContract,
+		AmountA: big.NewInt(1_000), AmountB: big.NewInt(0), Data: []byte("cb"),
+	}
+	if _, err := c.FlashLoan(ctx, flash); !errors.Is(err, ErrNoSigner) {
+		t.Fatalf("FlashLoan: expected ErrNoSigner, got %v", err)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("missing-signer checks must fail before any RPC call, saw %v", rec.calls)
+	}
 }
 
 func TestWriteMethodsRequireADeadline(t *testing.T) {
 	rec := newRecordedRPC(t)
 	c := newTestClient(t, rec, &testSigner{addr: zeroAccount})
+	ctx := context.Background()
 
 	p := validSwap()
 	p.Deadline = 0
-	if _, err := c.Swap(context.Background(), p); !errors.Is(err, ErrDeadlineRequired) {
-		t.Fatalf("expected ErrDeadlineRequired, got %v", err)
+	if _, err := c.Swap(ctx, p); !errors.Is(err, ErrDeadlineRequired) {
+		t.Fatalf("Swap: expected ErrDeadlineRequired, got %v", err)
 	}
+
+	swapExactOut := SwapExactOutParams{
+		PoolID: zeroContract, Trader: zeroAccount, TokenOut: zeroContract,
+		AmountOut: big.NewInt(1_000), MaxIn: big.NewInt(1_100), Deadline: 0,
+	}
+	if _, err := c.SwapExactOut(ctx, swapExactOut); !errors.Is(err, ErrDeadlineRequired) {
+		t.Fatalf("SwapExactOut: expected ErrDeadlineRequired, got %v", err)
+	}
+
+	add := AddLiquidityParams{
+		PoolID: zeroContract, Provider: zeroAccount,
+		AmountA: big.NewInt(1), AmountB: big.NewInt(1),
+		MinShares: big.NewInt(0), Deadline: 0,
+	}
+	if _, err := c.AddLiquidity(ctx, add); !errors.Is(err, ErrDeadlineRequired) {
+		t.Fatalf("AddLiquidity: expected ErrDeadlineRequired, got %v", err)
+	}
+
+	remove := RemoveLiquidityParams{
+		PoolID: zeroContract, Provider: zeroAccount, Shares: big.NewInt(1),
+		MinA: big.NewInt(0), MinB: big.NewInt(0), Deadline: 0,
+	}
+	if _, err := c.RemoveLiquidity(ctx, remove); !errors.Is(err, ErrDeadlineRequired) {
+		t.Fatalf("RemoveLiquidity: expected ErrDeadlineRequired, got %v", err)
+	}
+
+	oneSided := RemoveLiquidityOneSidedParams{
+		PoolID: zeroContract, Provider: zeroAccount, Shares: big.NewInt(1),
+		TokenOut: zeroContract, MinOut: big.NewInt(0), Deadline: 0,
+	}
+	if _, err := c.RemoveLiquidityOneSided(ctx, oneSided); !errors.Is(err, ErrDeadlineRequired) {
+		t.Fatalf("RemoveLiquidityOneSided: expected ErrDeadlineRequired, got %v", err)
+	}
+
 	if len(rec.calls) != 0 {
 		t.Fatalf("a missing deadline must fail before any RPC call, saw %v", rec.calls)
 	}
@@ -549,6 +608,19 @@ func TestWriteMethodsRequireASlippageBound(t *testing.T) {
 	swap.MinOut = nil
 	if _, err := c.Swap(ctx, swap); !errors.Is(err, ErrSlippageRequired) {
 		t.Fatalf("Swap: expected ErrSlippageRequired, got %v", err)
+	}
+
+	swapExactOutNil := SwapExactOutParams{
+		PoolID: zeroContract, Trader: zeroAccount, TokenOut: zeroContract,
+		AmountOut: big.NewInt(1_000), MaxIn: nil, Deadline: 1_900_000_000,
+	}
+	if _, err := c.SwapExactOut(ctx, swapExactOutNil); !errors.Is(err, ErrSlippageRequired) {
+		t.Fatalf("SwapExactOut nil MaxIn: expected ErrSlippageRequired, got %v", err)
+	}
+	swapExactOutNeg := swapExactOutNil
+	swapExactOutNeg.MaxIn = big.NewInt(-1)
+	if _, err := c.SwapExactOut(ctx, swapExactOutNeg); !errors.Is(err, ErrSlippageRequired) {
+		t.Fatalf("SwapExactOut negative MaxIn: expected ErrSlippageRequired, got %v", err)
 	}
 
 	add := AddLiquidityParams{
@@ -566,6 +638,397 @@ func TestWriteMethodsRequireASlippageBound(t *testing.T) {
 	}
 	if _, err := c.RemoveLiquidity(ctx, remove); !errors.Is(err, ErrSlippageRequired) {
 		t.Fatalf("RemoveLiquidity: expected ErrSlippageRequired, got %v", err)
+	}
+
+	oneSidedNil := RemoveLiquidityOneSidedParams{
+		PoolID: zeroContract, Provider: zeroAccount, Shares: big.NewInt(1),
+		TokenOut: zeroContract, MinOut: nil, Deadline: 1_900_000_000,
+	}
+	if _, err := c.RemoveLiquidityOneSided(ctx, oneSidedNil); !errors.Is(err, ErrSlippageRequired) {
+		t.Fatalf("RemoveLiquidityOneSided nil MinOut: expected ErrSlippageRequired, got %v", err)
+	}
+	oneSidedNeg := oneSidedNil
+	oneSidedNeg.MinOut = big.NewInt(-1)
+	if _, err := c.RemoveLiquidityOneSided(ctx, oneSidedNeg); !errors.Is(err, ErrSlippageRequired) {
+		t.Fatalf("RemoveLiquidityOneSided negative MinOut: expected ErrSlippageRequired, got %v", err)
+	}
+
+	if len(rec.calls) != 0 {
+		t.Fatalf("a missing slippage bound must fail before any RPC call, saw %v", rec.calls)
+	}
+}
+
+func TestWriteMethodsRejectInvalidAmounts(t *testing.T) {
+	rec := newRecordedRPC(t)
+	c := newTestClient(t, rec, &testSigner{addr: zeroAccount})
+	ctx := context.Background()
+
+	for name, call := range map[string]func() error{
+		"Swap zero AmountIn": func() error {
+			p := validSwap()
+			p.AmountIn = big.NewInt(0)
+			_, err := c.Swap(ctx, p)
+			return err
+		},
+		"SwapExactOut nil AmountOut": func() error {
+			_, err := c.SwapExactOut(ctx, SwapExactOutParams{
+				PoolID: zeroContract, Trader: zeroAccount, TokenOut: zeroContract,
+				AmountOut: nil, MaxIn: big.NewInt(100), Deadline: 1_900_000_000,
+			})
+			return err
+		},
+		"SwapExactOut zero AmountOut": func() error {
+			_, err := c.SwapExactOut(ctx, SwapExactOutParams{
+				PoolID: zeroContract, Trader: zeroAccount, TokenOut: zeroContract,
+				AmountOut: big.NewInt(0), MaxIn: big.NewInt(100), Deadline: 1_900_000_000,
+			})
+			return err
+		},
+		"SwapExactOut negative AmountOut": func() error {
+			_, err := c.SwapExactOut(ctx, SwapExactOutParams{
+				PoolID: zeroContract, Trader: zeroAccount, TokenOut: zeroContract,
+				AmountOut: big.NewInt(-5), MaxIn: big.NewInt(100), Deadline: 1_900_000_000,
+			})
+			return err
+		},
+		"AddLiquidity zero AmountA": func() error {
+			_, err := c.AddLiquidity(ctx, AddLiquidityParams{
+				PoolID: zeroContract, Provider: zeroAccount,
+				AmountA: big.NewInt(0), AmountB: big.NewInt(1),
+				MinShares: big.NewInt(0), Deadline: 1_900_000_000,
+			})
+			return err
+		},
+		"AddLiquidity zero AmountB": func() error {
+			_, err := c.AddLiquidity(ctx, AddLiquidityParams{
+				PoolID: zeroContract, Provider: zeroAccount,
+				AmountA: big.NewInt(1), AmountB: big.NewInt(0),
+				MinShares: big.NewInt(0), Deadline: 1_900_000_000,
+			})
+			return err
+		},
+		"RemoveLiquidity zero Shares": func() error {
+			_, err := c.RemoveLiquidity(ctx, RemoveLiquidityParams{
+				PoolID: zeroContract, Provider: zeroAccount, Shares: big.NewInt(0),
+				MinA: big.NewInt(0), MinB: big.NewInt(0), Deadline: 1_900_000_000,
+			})
+			return err
+		},
+		"RemoveLiquidity nil MinA": func() error {
+			_, err := c.RemoveLiquidity(ctx, RemoveLiquidityParams{
+				PoolID: zeroContract, Provider: zeroAccount, Shares: big.NewInt(1),
+				MinA: nil, MinB: big.NewInt(0), Deadline: 1_900_000_000,
+			})
+			return err
+		},
+		"RemoveLiquidityOneSided nil Shares": func() error {
+			_, err := c.RemoveLiquidityOneSided(ctx, RemoveLiquidityOneSidedParams{
+				PoolID: zeroContract, Provider: zeroAccount, Shares: nil,
+				TokenOut: zeroContract, MinOut: big.NewInt(0), Deadline: 1_900_000_000,
+			})
+			return err
+		},
+		"RemoveLiquidityOneSided zero Shares": func() error {
+			_, err := c.RemoveLiquidityOneSided(ctx, RemoveLiquidityOneSidedParams{
+				PoolID: zeroContract, Provider: zeroAccount, Shares: big.NewInt(0),
+				TokenOut: zeroContract, MinOut: big.NewInt(0), Deadline: 1_900_000_000,
+			})
+			return err
+		},
+		"FlashLoan nil AmountA": func() error {
+			_, err := c.FlashLoan(ctx, FlashLoanParams{
+				PoolID: zeroContract, Receiver: zeroContract,
+				AmountA: nil, AmountB: big.NewInt(100),
+			})
+			return err
+		},
+		"FlashLoan nil AmountB": func() error {
+			_, err := c.FlashLoan(ctx, FlashLoanParams{
+				PoolID: zeroContract, Receiver: zeroContract,
+				AmountA: big.NewInt(100), AmountB: nil,
+			})
+			return err
+		},
+		"FlashLoan negative AmountA": func() error {
+			_, err := c.FlashLoan(ctx, FlashLoanParams{
+				PoolID: zeroContract, Receiver: zeroContract,
+				AmountA: big.NewInt(-1), AmountB: big.NewInt(100),
+			})
+			return err
+		},
+		"FlashLoan negative AmountB": func() error {
+			_, err := c.FlashLoan(ctx, FlashLoanParams{
+				PoolID: zeroContract, Receiver: zeroContract,
+				AmountA: big.NewInt(100), AmountB: big.NewInt(-1),
+			})
+			return err
+		},
+		"FlashLoan both zero": func() error {
+			_, err := c.FlashLoan(ctx, FlashLoanParams{
+				PoolID: zeroContract, Receiver: zeroContract,
+				AmountA: big.NewInt(0), AmountB: big.NewInt(0),
+			})
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := call()
+			if !errors.Is(err, ErrZeroAmount) && !errors.Is(err, ErrSlippageRequired) {
+				t.Fatalf("%s: expected ErrZeroAmount or ErrSlippageRequired, got %v", name, err)
+			}
+		})
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("amount validation must fail before any RPC call, saw %v", rec.calls)
+	}
+}
+
+// decodeSimulatedInvocation extracts the contract ID, method name, and ScValue
+// arguments from the TransactionEnvelope sent to simulateTransaction.
+func decodeSimulatedInvocation(t *testing.T, rec *recordedRPC) (string, string, []ScValue) {
+	t.Helper()
+	rawParams, ok := rec.requests["simulateTransaction"]
+	if !ok {
+		t.Fatal("simulateTransaction was never called")
+	}
+	var params struct {
+		Transaction string `json:"transaction"`
+	}
+	if err := json.Unmarshal(rawParams, &params); err != nil {
+		t.Fatalf("unmarshaling simulateTransaction params: %v", err)
+	}
+	raw, err := base64.StdEncoding.DecodeString(params.Transaction)
+	if err != nil {
+		t.Fatalf("decoding envelope base64: %v", err)
+	}
+	r := &xdrReader{buf: raw}
+
+	if got := readInt32OrFail(t, r); got != envelopeTypeTx {
+		t.Fatalf("envelope type = %d, want %d", got, envelopeTypeTx)
+	}
+	if got := readInt32OrFail(t, r); got != muxedAccountEd25519 {
+		t.Fatalf("muxed account type = %d, want %d", got, muxedAccountEd25519)
+	}
+	if _, err := r.readRaw(32); err != nil {
+		t.Fatalf("reading source account: %v", err)
+	}
+	readUint32OrFail(t, r)
+	if _, err := r.readUint64(); err != nil {
+		t.Fatalf("reading sequence: %v", err)
+	}
+	cond := readInt32OrFail(t, r)
+	if cond == txPreconditionsTime {
+		if _, err := r.readUint64(); err != nil {
+			t.Fatalf("reading min time: %v", err)
+		}
+		if _, err := r.readUint64(); err != nil {
+			t.Fatalf("reading max time: %v", err)
+		}
+	}
+	// memo, operation count, operation source-account flag
+	readInt32OrFail(t, r)
+	readUint32OrFail(t, r)
+	readUint32OrFail(t, r)
+	if op := readInt32OrFail(t, r); op != opTypeInvokeHostFn {
+		t.Fatalf("operation type = %d, want %d", op, opTypeInvokeHostFn)
+	}
+	if fn := readInt32OrFail(t, r); fn != hostFnTypeInvoke {
+		t.Fatalf("host function type = %d, want %d", fn, hostFnTypeInvoke)
+	}
+	if kind := readInt32OrFail(t, r); kind != scAddressCntrct {
+		t.Fatalf("contract address kind = %d, want %d", kind, scAddressCntrct)
+	}
+	contractRaw, err := r.readRaw(32)
+	if err != nil {
+		t.Fatalf("reading contract id: %v", err)
+	}
+	contractID, err := EncodeStrkey(contractRaw, StrkeyContract)
+	if err != nil {
+		t.Fatalf("encoding contract strkey: %v", err)
+	}
+	methodBytes, err := r.readBytes()
+	if err != nil {
+		t.Fatalf("reading function name: %v", err)
+	}
+	argc := readUint32OrFail(t, r)
+	args := make([]ScValue, 0, argc)
+	for i := uint32(0); i < argc; i++ {
+		arg, err := readScVal(r)
+		if err != nil {
+			t.Fatalf("reading argument %d: %v", i, err)
+		}
+		args = append(args, arg)
+	}
+	return contractID, string(methodBytes), args
+}
+
+func distinctStrkey(t *testing.T, fill byte, kind StrkeyKind) string {
+	t.Helper()
+	buf := make([]byte, 32)
+	for i := range buf {
+		buf[i] = fill
+	}
+	s, err := EncodeStrkey(buf, kind)
+	if err != nil {
+		t.Fatalf("EncodeStrkey: %v", err)
+	}
+	return s
+}
+
+func TestSwapExactOutEncodesMethodAndArgumentOrder(t *testing.T) {
+	rec := successfulWriteRPC(t)
+	signer := &testSigner{addr: zeroAccount}
+	c := newTestClient(t, rec, signer)
+
+	poolID := distinctStrkey(t, 1, StrkeyContract)
+	trader := distinctStrkey(t, 2, StrkeyAccount)
+	tokenOut := distinctStrkey(t, 3, StrkeyContract)
+	amountOut := big.NewInt(2_500)
+	maxIn := big.NewInt(3_100)
+	const deadline uint64 = 1_900_000_123
+
+	res, err := c.SwapExactOut(context.Background(), SwapExactOutParams{
+		PoolID:    poolID,
+		Trader:    trader,
+		TokenOut:  tokenOut,
+		AmountOut: amountOut,
+		MaxIn:     maxIn,
+		Deadline:  deadline,
+	})
+	if err != nil {
+		t.Fatalf("SwapExactOut: %v", err)
+	}
+	if res.Hash != "abc123" || res.Status != "SUCCESS" {
+		t.Fatalf("result = %+v", res)
+	}
+
+	gotPool, gotMethod, gotArgs := decodeSimulatedInvocation(t, rec)
+	if gotPool != poolID {
+		t.Fatalf("pool = %q, want %q", gotPool, poolID)
+	}
+	if gotMethod != "swap_exact_out" {
+		t.Fatalf("method = %q, want swap_exact_out", gotMethod)
+	}
+	wantArgs := []ScValue{
+		Addr(trader),
+		Addr(tokenOut),
+		I128(amountOut),
+		I128(maxIn),
+		U64(deadline),
+	}
+	if len(gotArgs) != len(wantArgs) {
+		t.Fatalf("arg count = %d, want %d", len(gotArgs), len(wantArgs))
+	}
+	for i := range wantArgs {
+		assertScValEqual(t, gotArgs[i], wantArgs[i])
+	}
+}
+
+func TestRemoveLiquidityOneSidedEncodesMethodAndArgumentOrder(t *testing.T) {
+	rec := successfulWriteRPC(t)
+	signer := &testSigner{addr: zeroAccount}
+	c := newTestClient(t, rec, signer)
+
+	poolID := distinctStrkey(t, 4, StrkeyContract)
+	provider := distinctStrkey(t, 5, StrkeyAccount)
+	tokenOut := distinctStrkey(t, 6, StrkeyContract)
+	shares := big.NewInt(7_500)
+	minOut := big.NewInt(14_900)
+	const deadline uint64 = 1_900_000_456
+
+	res, err := c.RemoveLiquidityOneSided(context.Background(), RemoveLiquidityOneSidedParams{
+		PoolID:   poolID,
+		Provider: provider,
+		Shares:   shares,
+		TokenOut: tokenOut,
+		MinOut:   minOut,
+		Deadline: deadline,
+	})
+	if err != nil {
+		t.Fatalf("RemoveLiquidityOneSided: %v", err)
+	}
+	if res.Hash != "abc123" || res.Status != "SUCCESS" {
+		t.Fatalf("result = %+v", res)
+	}
+
+	gotPool, gotMethod, gotArgs := decodeSimulatedInvocation(t, rec)
+	if gotPool != poolID {
+		t.Fatalf("pool = %q, want %q", gotPool, poolID)
+	}
+	if gotMethod != "remove_liquidity_one_sided" {
+		t.Fatalf("method = %q, want remove_liquidity_one_sided", gotMethod)
+	}
+	wantArgs := []ScValue{
+		Addr(provider),
+		I128(shares),
+		Addr(tokenOut),
+		I128(minOut),
+		U64(deadline),
+	}
+	if len(gotArgs) != len(wantArgs) {
+		t.Fatalf("arg count = %d, want %d", len(gotArgs), len(wantArgs))
+	}
+	for i := range wantArgs {
+		assertScValEqual(t, gotArgs[i], wantArgs[i])
+	}
+}
+
+func TestFlashLoanEncodesMethodAndArgumentOrder(t *testing.T) {
+	rec := successfulWriteRPC(t)
+	signer := &testSigner{addr: zeroAccount}
+	c := newTestClient(t, rec, signer)
+
+	poolID := distinctStrkey(t, 7, StrkeyContract)
+	receiver := distinctStrkey(t, 8, StrkeyContract)
+	amountA := big.NewInt(50_000)
+	amountB := big.NewInt(0)
+	data := []byte{0xde, 0xad, 0xbe, 0xef}
+
+	res, err := c.FlashLoan(context.Background(), FlashLoanParams{
+		PoolID:   poolID,
+		Receiver: receiver,
+		AmountA:  amountA,
+		AmountB:  amountB,
+		Data:     data,
+	})
+	if err != nil {
+		t.Fatalf("FlashLoan: %v", err)
+	}
+	if res.Hash != "abc123" || res.Status != "SUCCESS" {
+		t.Fatalf("result = %+v", res)
+	}
+
+	gotPool, gotMethod, gotArgs := decodeSimulatedInvocation(t, rec)
+	if gotPool != poolID {
+		t.Fatalf("pool = %q, want %q", gotPool, poolID)
+	}
+	if gotMethod != "flash_loan" {
+		t.Fatalf("method = %q, want flash_loan", gotMethod)
+	}
+	wantArgs := []ScValue{
+		Addr(receiver),
+		I128(amountA),
+		I128(amountB),
+		Bytes(data),
+	}
+	if len(gotArgs) != len(wantArgs) {
+		t.Fatalf("arg count = %d, want %d", len(gotArgs), len(wantArgs))
+	}
+	for i := range wantArgs {
+		assertScValEqual(t, gotArgs[i], wantArgs[i])
+	}
+
+	// Borrowing only token B (amount_a == 0, amount_b > 0) is also valid.
+	recB := successfulWriteRPC(t)
+	cB := newTestClient(t, recB, &testSigner{addr: zeroAccount})
+	if _, err := cB.FlashLoan(context.Background(), FlashLoanParams{
+		PoolID:   poolID,
+		Receiver: receiver,
+		AmountA:  big.NewInt(0),
+		AmountB:  big.NewInt(25_000),
+		Data:     nil,
+	}); err != nil {
+		t.Fatalf("FlashLoan token B only: %v", err)
 	}
 }
 

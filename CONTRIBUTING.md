@@ -73,9 +73,10 @@ you'd like to work on and we'll help you find a starting point.
 
     The pin is deliberate — see
     [Why the Stellar CLI version is pinned](#why-the-stellar-cli-version-is-pinned).
-    To move it, bump the single line in `.stellar-version` in its own PR; the
-    container follows from it, and `release.yml` pins the same version
-    through the `stellar/stellar-cli` action.
+    To move it, bump `.stellar-version` and update every
+    `stellar/stellar-cli@vX` workflow pin (`ci.yml`, `release.yml`, and
+    `smoke-test.yml`) together in one PR; `Dockerfile` reads `.stellar-version`
+    directly, and `make check-stellar-version` fails CI on any drift.
 - `make` (optional but recommended — the `Makefile` wraps the common commands).
 
 ### Why the Stellar CLI version is pinned
@@ -87,8 +88,9 @@ to be written out in three places — `Dockerfile` (25.1.0), `release.yml`
 release artifact and the CLI the smoke test deployed it with were four major
 versions apart, and `stellar contract optimize` output changing between them
 would have gone unnoticed. That is the same hazard `rust-toolchain.toml` guards
-against for the compiler, so the CLI version now lives in one file that the
-container reads, with `release.yml` pinning the same version explicitly.
+against for the compiler, so `.stellar-version` is the single source of truth
+that `Dockerfile` reads directly, while `scripts/check_stellar_version.mjs`
+enforces that `ci.yml`, `release.yml`, and `smoke-test.yml` pin the matching tag.
 
 The version is chosen deliberately rather than by taking the newest release.
 `27.1.0` is what this image can build: `--locked` compiles the CLI's own
@@ -155,6 +157,14 @@ make clean      # cargo clean
 When changing a public contract interface, regenerate `docs/abi.json` with
 `make abi` and include the updated file in the same pull request. CI runs
 `make check-abi` to catch stale ABI documentation.
+
+The TypeScript SDK keeps a second oracle for the contracts it wraps:
+`packages/sdk/src/__fixtures__/contract-abi.json`, generated from the Rust
+sources. After changing a wrapped contract's entrypoints, run
+`npm run generate:abi` in `packages/sdk` and commit the result. CI runs
+`npm run check:abi` for that package alongside `make check-abi`, so a stale
+fixture fails the build instead of letting the SDK test against a signature
+that no longer exists.
 
 Before opening a PR, run:
 

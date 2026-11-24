@@ -389,7 +389,7 @@ Defined in [contracts/governance/src/lib.rs](../contracts/governance/src/lib.rs)
 | 27 | `DelegationCycle` | The delegation would create a cycle (A → B → … → A). | Choose a delegate that is not already part of this principal's delegation chain. |
 | 28 | `ProposalVetoed` | A veto multisig vetoed the proposal. | Create a new proposal; adjust to address the veto reason. |
 | 29 | `VetoWindowExpired` | Veto attempted after the veto window closed. | Vetoes must be cast within the veto window after voting ends. |
-| 30 | `NotVetoMultisig` | Veto called by an address that is not the configured veto multisig. | Only the veto multisig can veto proposals. |
+| 30 | `NotVetoMultisig` | **Reserved — never returned.** `veto` takes no caller argument: it reads the configured veto multisig and requires *that* address's authorization, so a non-multisig caller is rejected by Soroban's host auth check before any typed error is produced. Kept so no existing discriminant moves. | Do not handle this code; ensure the veto call is authorized by the configured multisig. |
 | 31 | `InsufficientSnapshotBal` | Snapshot balance at proposal creation was insufficient. | Acquire more LP tokens before the proposal snapshot block. |
 | 32 | `VetoMultisigNotSet` | Veto-related operation called when no veto multisig is configured. | Configure the veto multisig during governance initialization. |
 | 33 | `NoPendingAdmin` | `accept_admin` called without a prior `propose_admin`. | Call `propose_admin` first to nominate a successor. |
@@ -564,6 +564,7 @@ Defined in [contracts/oracle_adapters/src/lib.rs](../contracts/oracle_adapters/s
 | 6 | `StaleSnapshot` | The newest snapshot is older than the configured `max_age_seconds`. | Wait for a fresh snapshot from the keeper. |
 | 7 | `InvalidPrice` | The computed TWAP price is zero or negative. | Check that the pool reserves and cumulative prices are positive. |
 | 8 | `ArithmeticOverflow` | A price conversion or scaling step overflowed. | Use a smaller amount or a pool with less extreme reserves. |
+| 9 | `CrossContractCallFailed` | A cross-contract call to the configured factory or TWAP consumer failed or panicked. | Verify the configured factory and TWAP consumer addresses and ensure the callee contracts are healthy. |
 
 ---
 

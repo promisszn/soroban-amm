@@ -6,7 +6,6 @@
 //!
 //! All tests run fully in-process using the Soroban test environment —
 //! no external network calls are made.
-#![allow(unexpected_cfgs)]
 
 pub mod fixture;
 
@@ -37,11 +36,11 @@ mod pol_vesting_governance_test;
 #[cfg(test)]
 mod pol_vesting_upgrade_test;
 
-#[cfg(all(test, feature = "legacy-integration-matrix"))]
+#[cfg(test)]
 mod tests {
     use soroban_sdk::{
         testutils::{Address as _, Events as _, Ledger, LedgerInfo},
-        Address, BytesN, Env,
+        Address, BytesN, Env, Symbol, TryFromVal,
     };
 
     // WASM blobs compiled via `cargo build --release --target wasm32v1-none`.
@@ -66,7 +65,7 @@ mod tests {
         env.ledger().set(LedgerInfo {
             timestamp: ts,
             protocol_version: 21,
-            sequence_number: env.ledger().sequence(),
+            sequence_number: env.ledger().sequence() + 1,
             network_id: Default::default(),
             base_reserve: 10,
             min_temp_entry_ttl: 16,
@@ -102,8 +101,8 @@ mod tests {
             .register_stellar_asset_contract_v2(admin.clone())
             .address();
 
-        // Deploy AMM pool via factory.
-        let (pool_addr, _gov) = factory.create_pool(&token_a, &token_b, &30_i128, &None);
+        // Deploy AMM pool via factory (fee_tier 2 = 30 bps).
+        let (pool_addr, _gov) = factory.create_pool(&admin, &token_a, &token_b, &2_i128, &None);
         assert!(factory.get_pool(&token_a, &token_b).is_some());
 
         let lp_addr = factory.get_lp_token(&pool_addr).unwrap();
@@ -126,12 +125,13 @@ mod tests {
         // Deploy TWAP consumer and record snapshot at t=1000.
         let twap_addr = env.register_contract(None, TwapConsumer);
         let twap = TwapConsumerClient::new(&env, &twap_addr);
+        twap.initialize(&admin);
         twap.save_snapshot(&pool_addr);
 
         // Perform a swap at t=1000.
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &token_a).mint(&trader, &10_000_i128);
-        amm.swap(&trader, &token_a, &10_000_i128, &1_i128, &DEADLINE, &None);
+        amm.swap(&trader, &token_a, &10_000_i128, &1_i128, &DEADLINE);
         let trader_b_bal = soroban_sdk::token::Client::new(&env, &token_b).balance(&trader);
         assert!(
             trader_b_bal > 0,
@@ -143,7 +143,7 @@ mod tests {
         twap.save_snapshot(&pool_addr);
 
         let twap_price = twap.get_twap_price(&pool_addr, &1_000_u64);
-        assert!(twap_price >= 0, "TWAP price should be non-negative");
+        assert!(twap_price > 0, "TWAP price should be positive");
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -169,8 +169,8 @@ mod tests {
         let cl_addr = env.register_contract(None, concentrated_liquidity::ConcentratedLiquidity);
         let cl = ConcentratedLiquidityClient::new(&env, &cl_addr);
 
-        // Initialize at tick 0, 30 bps fee.
-        cl.initialize(&token_a, &token_b, &30_i128, &0_i32);
+        // Initialize at tick 0, 30 bps fee, tick spacing 10.
+        cl.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &10_i32);
 
         // Fund provider.
         StellarAssetClient::new(&env, &token_a).mint(&provider, &100_000_i128);
@@ -190,8 +190,8 @@ mod tests {
         assert!(dep_a > 0 || dep_b > 0, "should deposit at least one token");
 
         // ── Tick registry verification (#178) ────────────────────────────────
-        let tick_lower = cl.get_tick(&-100_i32);
-        let tick_upper = cl.get_tick(&100_i32);
+        let tick_lower = cl.get_tick_info(&-100_i32);
+        let tick_upper = cl.get_tick_info(&100_i32);
         assert!(tick_lower.initialized, "lower tick should be initialized");
         assert!(tick_upper.initialized, "upper tick should be initialized");
         assert!(
@@ -216,15 +216,14 @@ mod tests {
         // Pre-fund contract with token_b so the swap can transfer out.
         StellarAssetClient::new(&env, &token_b).mint(&cl_addr, &10_000_i128);
 
-        // Execute swap (moves price to tick 50, crossing the range boundary).
+        // Execute swap (token_a -> token_b, zero_for_one = true).
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &token_a).mint(&trader, &1_000_i128);
-        let out_amt = cl.swap(&trader, &token_a, &1_000_i128, &50_i32);
+        let out_amt = cl.swap(&trader, &true, &1_000_i128, &0_u128, &1_i128, &DEADLINE);
         assert!(out_amt > 0, "swap should return positive amount");
-        assert_eq!(
-            cl.current_tick(),
-            50_i32,
-            "current tick should update to 50"
+        assert!(
+            cl.current_tick() <= 0_i32,
+            "current tick should move downward or stay at 0 on zero_for_one swap"
         );
 
         // Burn full position and collect tokens back.
@@ -236,15 +235,13 @@ mod tests {
         );
 
         // After full burn, tick entries must be cleaned up (#178 + #179).
-        let tick_lower_after = cl.get_tick(&-100_i32);
-        let tick_upper_after = cl.get_tick(&100_i32);
         assert!(
-            !tick_lower_after.initialized,
-            "lower tick should be uninitialized after full burn"
+            cl.try_get_tick_info(&-100_i32).is_err(),
+            "lower tick should be removed after full burn"
         );
         assert!(
-            !tick_upper_after.initialized,
-            "upper tick should be uninitialized after full burn"
+            cl.try_get_tick_info(&100_i32).is_err(),
+            "upper tick should be removed after full burn"
         );
     }
 
@@ -275,9 +272,9 @@ mod tests {
             .register_stellar_asset_contract_v2(admin.clone())
             .address();
 
-        // Deploy pool with governance.
+        // Deploy pool with governance (fee_tier 2 = 30 bps).
         let (pool_addr, gov_opt) =
-            factory.create_pool(&token_a, &token_b, &30_i128, &Some(gov_hash));
+            factory.create_pool(&admin, &token_a, &token_b, &2_i128, &Some(gov_hash));
         let gov_addr = gov_opt.unwrap();
 
         let amm = AmmPoolClient::new(&env, &pool_addr);
@@ -290,12 +287,18 @@ mod tests {
         set_ledger_ts(&env, 100);
         amm.add_liquidity(&lp_holder, &500_000_i128, &500_000_i128, &1_i128, &DEADLINE);
 
+        // Advance ledger sequence so governance's (seq - 1) snapshot sees the minted LP tokens.
+        set_ledger_ts(&env, 101);
+
         // Create fee-change proposal and vote For.
         let proposal_id = gov.propose(&lp_holder, &ProposalKind::UpdateFee(50_i128));
         gov.vote(&lp_holder, &proposal_id, &Vote::For);
 
         // Advance past voting period (7 days) + timelock (2 days).
         set_ledger_ts(&env, 100 + 604_800 + 172_800 + 1);
+
+        // Verify initial fee is 30 bps before governance execution.
+        assert_eq!(amm.get_info().fee_bps, 30_i128);
 
         // Execute proposal — should update fee on the pool.
         gov.execute(&proposal_id);
@@ -334,13 +337,13 @@ mod tests {
             .register_stellar_asset_contract_v2(admin.clone())
             .address();
 
-        let (pool_addr, _) = factory.create_pool(&token_a, &token_b, &30_i128, &None);
+        let (pool_addr, _) = factory.create_pool(&admin, &token_a, &token_b, &2_i128, &None);
         let amm = AmmPoolClient::new(&env, &pool_addr);
 
         // Attempt swap on empty pool — must fail (no liquidity).
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &token_a).mint(&trader, &1_000_i128);
-        let result = amm.try_swap(&trader, &token_a, &1_000_i128, &1_i128, &DEADLINE, &None);
+        let result = amm.try_swap(&trader, &token_a, &1_000_i128, &1_i128, &DEADLINE);
         assert!(result.is_err(), "swap on empty pool should fail");
     }
 
@@ -368,7 +371,7 @@ mod tests {
             .address();
 
         let (pool_addr, gov_opt) =
-            factory.create_pool(&token_a, &token_b, &30_i128, &Some(gov_hash));
+            factory.create_pool(&admin, &token_a, &token_b, &2_i128, &Some(gov_hash));
         let gov_addr = gov_opt.unwrap();
 
         let amm = AmmPoolClient::new(&env, &pool_addr);
@@ -381,17 +384,25 @@ mod tests {
         set_ledger_ts(&env, 100);
         amm.add_liquidity(&lp_holder, &500_000_i128, &500_000_i128, &1_i128, &DEADLINE);
 
+        // Advance ledger sequence so governance's (seq - 1) snapshot sees the minted LP tokens.
+        set_ledger_ts(&env, 101);
+
         // Create a proposal but do not vote → quorum is not met.
         let proposal_id = gov.propose(&lp_holder, &ProposalKind::UpdateFee(50_i128));
 
         // Advance past voting + timelock.
         set_ledger_ts(&env, 100 + 604_800 + 172_800 + 1);
 
-        // Executing a below-quorum proposal must fail.
+        // Executing a below-quorum proposal must fail and leave fee unchanged.
         let result = gov.try_execute(&proposal_id);
         assert!(
             result.is_err(),
             "proposal without quorum should not execute"
+        );
+        assert_eq!(
+            amm.get_info().fee_bps,
+            30_i128,
+            "fee_bps should remain unchanged after defeated proposal"
         );
     }
 
@@ -415,7 +426,7 @@ mod tests {
 
         let cl_addr = env.register_contract(None, concentrated_liquidity::ConcentratedLiquidity);
         let cl = ConcentratedLiquidityClient::new(&env, &cl_addr);
-        cl.initialize(&token_a, &token_b, &30_i128, &0_i32);
+        cl.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &10_i32);
 
         let p1 = Address::generate(&env);
         let p2 = Address::generate(&env);
@@ -449,7 +460,7 @@ mod tests {
         );
 
         // Tick 0 is shared by both positions: upper for p1, lower for p2.
-        let t0 = cl.get_tick(&0_i32);
+        let t0 = cl.get_tick_info(&0_i32);
         assert!(t0.initialized, "tick 0 should be initialized");
         // Both positions reference tick 0 → liquidity_gross = liq_p1 + liq_p2.
         assert!(
@@ -462,7 +473,7 @@ mod tests {
         cl.burn_position(&p2, &0_i32, &200_i32, &pos2.liquidity);
 
         // Tick 0 still referenced by position 1 — must remain initialized.
-        let t0_after_p2 = cl.get_tick(&0_i32);
+        let t0_after_p2 = cl.get_tick_info(&0_i32);
         assert!(
             t0_after_p2.initialized,
             "tick 0 should still be initialized while position 1 exists"
@@ -473,12 +484,10 @@ mod tests {
         cl.burn_position(&p1, &-200_i32, &0_i32, &pos1.liquidity);
 
         // Now tick 0 has no references → must be cleaned up.
-        let t0_cleaned = cl.get_tick(&0_i32);
         assert!(
-            !t0_cleaned.initialized,
-            "tick 0 should be uninitialized after all positions burned"
+            cl.try_get_tick_info(&0_i32).is_err(),
+            "tick 0 should be removed after all positions burned"
         );
-        assert_eq!(t0_cleaned.liquidity_gross, 0);
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -509,8 +518,8 @@ mod tests {
             .register_stellar_asset_contract_v2(admin.clone())
             .address();
 
-        let (pool_ab, _) = factory.create_pool(&token_a, &token_b, &30_i128, &None);
-        let (pool_bc, _) = factory.create_pool(&token_b, &token_c, &30_i128, &None);
+        let (pool_ab, _) = factory.create_pool(&admin, &token_a, &token_b, &2_i128, &None);
+        let (pool_bc, _) = factory.create_pool(&admin, &token_b, &token_c, &2_i128, &None);
 
         let provider = Address::generate(&env);
         StellarAssetClient::new(&env, &token_a).mint(&provider, &2_000_000_i128);
@@ -535,6 +544,7 @@ mod tests {
 
         let twal_addr = env.register_contract(None, TwalConsumer);
         let twal = TwalConsumerClient::new(&env, &twal_addr);
+        twal.initialize(&admin);
         twal.save_snapshot(&pool_ab);
         set_ledger_ts(&env, 10_600);
         twal.save_snapshot(&pool_ab);
@@ -545,9 +555,8 @@ mod tests {
         let agg = DexAggregatorClient::new(&env, &agg_addr);
         let agg_admin = Address::generate(&env);
         agg.initialize(&agg_admin, &factory_addr);
-        let quote = agg
-            .find_best_route(&token_a, &token_c, &50_000_i128, &4u32)
-            .unwrap();
+        agg.set_routing_tokens(&soroban_sdk::vec![&env, token_b.clone()]);
+        let quote = agg.find_best_route(&token_a, &token_c, &50_000_i128, &4u32);
         assert!(quote.amount_out > 0);
         assert!(quote.hops.len() >= 2);
     }
@@ -603,7 +612,7 @@ mod tests {
             .register_stellar_asset_contract_v2(admin.clone())
             .address();
 
-        let (pool_addr, _) = factory.create_pool(&token_a, &token_b, &30_i128, &None);
+        let (pool_addr, _) = factory.create_pool(&admin, &token_a, &token_b, &2_i128, &None);
         let amm = AmmPoolClient::new(&env, &pool_addr);
 
         // Set up pool with liquidity
@@ -626,19 +635,28 @@ mod tests {
         let trader = Address::generate(&env);
         StellarAssetClient::new(&env, &token_a).mint(&trader, &400_000_i128);
 
-        // This swap should trigger the circuit breaker
-        let swap_result = amm.try_swap(&trader, &token_a, &400_000_i128, &1_i128, &DEADLINE);
-        assert!(
-            swap_result.is_err(),
-            "large swap should trigger circuit breaker and fail"
+        // This swap should trigger the circuit breaker and return Ok(0) without spending input
+        // (so the tripped state and event are persisted rather than rolled back).
+        let swap_out = amm.swap(&trader, &token_a, &400_000_i128, &1_i128, &DEADLINE);
+        assert_eq!(
+            swap_out, 0,
+            "breaching swap should return 0 and trip the circuit breaker"
         );
-        assert_eq!(swap_result.unwrap_err(), Ok(AmmError::CircuitBreaker));
+        assert_eq!(
+            soroban_sdk::token::Client::new(&env, &token_a).balance(&trader),
+            400_000_i128,
+            "trader input must not be spent when circuit breaker trips"
+        );
 
         // Verify circuit-breaker-triggered event was emitted
+        let cb_topic = Symbol::new(&env, "circuit_break");
         let events = env.events().all();
-        let cb_triggered = events
-            .iter()
-            .any(|e| e.topics[0].to_string() == "circuit_break");
+        let cb_triggered = events.iter().any(|(_, topics, _)| {
+            topics
+                .get(0)
+                .and_then(|v| Symbol::try_from_val(&env, &v).ok())
+                == Some(cb_topic.clone())
+        });
         assert!(
             cb_triggered,
             "circuit-breaker-triggered event should be emitted"
@@ -649,7 +667,11 @@ mod tests {
         assert!(config_after.tripped, "circuit breaker should be tripped");
         assert!(config_after.triggered_at > 0, "triggered_at should be set");
 
-        // Verify subsequent swaps are rejected with CircuitBreaker error
+        // Verify subsequent swaps are rejected while the pool is paused by the circuit breaker
+        assert!(
+            amm.is_paused(),
+            "pool should be paused when circuit breaker trips"
+        );
         let trader2 = Address::generate(&env);
         StellarAssetClient::new(&env, &token_a).mint(&trader2, &10_000_i128);
         let blocked_swap = amm.try_swap(&trader2, &token_a, &10_000_i128, &1_i128, &DEADLINE);
@@ -657,20 +679,24 @@ mod tests {
             blocked_swap.is_err(),
             "swaps should be blocked while circuit breaker is tripped"
         );
-        assert_eq!(blocked_swap.unwrap_err(), Ok(AmmError::CircuitBreaker));
+        assert_eq!(blocked_swap.unwrap_err(), Ok(AmmError::Paused));
 
         // Advance ledger time past the cooldown window (60s)
         set_ledger_ts(&env, 1_000 + 61);
 
         // Call try_circuit_breaker_recovery and verify the pool resumes swapping
         let recovered = amm.try_circuit_breaker_recovery();
-        assert!(recovered.is_ok(), "recovery should succeed after cooldown");
+        assert!(recovered, "recovery should succeed after cooldown");
 
         // Verify circuit-breaker-recovered event was emitted
+        let cb_rec_topic = Symbol::new(&env, "cb_recovered");
         let events = env.events().all();
-        let cb_recovered = events
-            .iter()
-            .any(|e| e.topics[0].to_string() == "cb_recovered");
+        let cb_recovered = events.iter().any(|(_, topics, _)| {
+            topics
+                .get(0)
+                .and_then(|v| Symbol::try_from_val(&env, &v).ok())
+                == Some(cb_rec_topic.clone())
+        });
         assert!(
             cb_recovered,
             "circuit-breaker-recovered event should be emitted"

@@ -112,7 +112,10 @@ For `cl-quote` and `cl-replay`, `--pool` is the JSON serialization of the
 simulator's `ClPoolState` (`token_a`, `token_b`, price, tick, liquidity, fee
 growth, initialized `ticks`, and `positions`). `cl-replay --swaps` takes a JSON
 array with `zero_for_one`, `amount_in`, and optional
-`sqrt_price_limit_x96`/`min_out` fields per swap.
+`sqrt_price_limit_x96`/`min_out` fields per swap. Like `replay`, a failed swap
+does not stop the run: each entry in `results` holds the `swap` plus either its
+`result` or its `error`, `failed_swaps` counts the failures, and the command
+exits non-zero only after printing the full report.
 
 Replay also accepts `remove_liquidity_one_sided` records with `shares`,
 `token_out`, and optional `min_out`; `set_fees` records with `fee_bps`,

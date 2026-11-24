@@ -436,3 +436,40 @@ func TestGetInfoRejectsMalformedReturnValue(t *testing.T) {
 		})
 	}
 }
+
+func TestWriteParamStructsPreserveFields(t *testing.T) {
+	exactOut := SwapExactOutParams{
+		PoolID:    zeroContract,
+		Trader:    zeroAccount,
+		TokenOut:  zeroContract,
+		AmountOut: big.NewInt(100),
+		MaxIn:     big.NewInt(120),
+		Deadline:  1_900_000_000,
+	}
+	if exactOut.AmountOut.Int64() != 100 || exactOut.MaxIn.Int64() != 120 || exactOut.Deadline != 1_900_000_000 {
+		t.Fatalf("unexpected SwapExactOutParams: %+v", exactOut)
+	}
+
+	oneSided := RemoveLiquidityOneSidedParams{
+		PoolID:   zeroContract,
+		Provider: zeroAccount,
+		Shares:   big.NewInt(50),
+		TokenOut: zeroContract,
+		MinOut:   big.NewInt(95),
+		Deadline: 1_900_000_000,
+	}
+	if oneSided.Shares.Int64() != 50 || oneSided.MinOut.Int64() != 95 || oneSided.TokenOut != zeroContract {
+		t.Fatalf("unexpected RemoveLiquidityOneSidedParams: %+v", oneSided)
+	}
+
+	flash := FlashLoanParams{
+		PoolID:   zeroContract,
+		Receiver: zeroContract,
+		AmountA:  big.NewInt(500),
+		AmountB:  big.NewInt(0),
+		Data:     []byte{1, 2, 3},
+	}
+	if flash.AmountA.Int64() != 500 || flash.AmountB.Sign() != 0 || !bytes.Equal(flash.Data, []byte{1, 2, 3}) {
+		t.Fatalf("unexpected FlashLoanParams: %+v", flash)
+	}
+}

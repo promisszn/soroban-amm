@@ -1558,6 +1558,20 @@ mod tests {
         assert_instance_ttl_bumped(&s);
     }
 
+    #[test]
+    fn test_pending_views_restore_lapsed_instance_ttl() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+
+        lower_instance_ttl_below_min(&s);
+        assert_eq!(client.get_pending_governance(), None);
+        assert_instance_ttl_bumped(&s);
+
+        lower_instance_ttl_below_min(&s);
+        assert_eq!(client.get_pending_treasury(), None);
+        assert_instance_ttl_bumped(&s);
+    }
+
     // ── Funding / commitment accounting (issue #1044) ───────────────────────
     //
     // On main, `create_vesting` never compared `total` against the contract's

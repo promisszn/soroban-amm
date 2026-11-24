@@ -452,17 +452,48 @@ impl MigrationContract {
         let (liquidity, deposit_a, deposit_b) =
             Self::size_position(&env, &quote, lower, upper, withdraw_a, withdraw_b)?;
 
+        let (leftover_a, leftover_b) =
+            Self::leftover_amounts(withdraw_a, withdraw_b, deposit_a, deposit_b)?;
+
         Ok(MigrationPreview {
             withdraw_a,
             withdraw_b,
             deposit_a,
             deposit_b,
             liquidity,
-            leftover_a: withdraw_a - deposit_a,
-            leftover_b: withdraw_b - deposit_b,
+            leftover_a,
+            leftover_b,
             tick_lower: lower,
             tick_upper: upper,
         })
+    }
+
+    /// Leftover amounts of a preview: the withdrawal the position does not
+    /// consume.
+    ///
+    /// The deposit should never exceed the withdrawal, but the two are sized by
+    /// independent quotes, so a quoting or rounding inconsistency can make it
+    /// do so. `checked_sub` alone would not catch that — a signed subtraction
+    /// of two in-range amounts yields a negative number instead of overflowing
+    /// — so reject a negative leftover too and report `PreviewFailed`.
+    /// `PreviewFailed` already means "could not quote the position", and
+    /// `preview_migration` is the read-only path callers use to decide whether
+    /// to sign `migrate`.
+    fn leftover_amounts(
+        withdraw_a: i128,
+        withdraw_b: i128,
+        deposit_a: i128,
+        deposit_b: i128,
+    ) -> Result<(i128, i128), MigrationError> {
+        let leftover_a = withdraw_a
+            .checked_sub(deposit_a)
+            .filter(|leftover| *leftover >= 0)
+            .ok_or(MigrationError::PreviewFailed)?;
+        let leftover_b = withdraw_b
+            .checked_sub(deposit_b)
+            .filter(|leftover| *leftover >= 0)
+            .ok_or(MigrationError::PreviewFailed)?;
+        Ok((leftover_a, leftover_b))
     }
 
     /// Preview the final V3 tick range for `v3_pool` without executing.
@@ -2842,6 +2873,29 @@ mod tests {
         assert_eq!((preview.deposit_a, preview.deposit_b), (0, 1_000_000));
         assert_eq!((preview.leftover_a, preview.leftover_b), (1_000_000, 0));
         assert_eq!(preview.liquidity, 1_000_000);
+    }
+
+    #[test]
+    fn test_preview_leftover_reports_quoting_inconsistency_as_typed_error() {
+        // `deposit > withdraw` is only reachable through a quoting or rounding
+        // inconsistency between the reference quote in `size_position` and the
+        // final quote, which the public path cannot force with a conforming CL
+        // pool, so drive the leftover computation directly. Plain subtraction
+        // reports a negative leftover here instead of an error.
+        assert_eq!(
+            MigrationContract::leftover_amounts(1_000, 1_000, 1_001, 1_000),
+            Err(MigrationError::PreviewFailed)
+        );
+        assert_eq!(
+            MigrationContract::leftover_amounts(1_000, 1_000, 1_000, 1_001),
+            Err(MigrationError::PreviewFailed)
+        );
+
+        // The consistent case still reports the leftovers unchanged.
+        assert_eq!(
+            MigrationContract::leftover_amounts(1_000, 1_000, 400, 1_000),
+            Ok((600, 0))
+        );
     }
 
     #[test]

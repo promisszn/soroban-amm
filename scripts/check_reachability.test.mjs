@@ -57,15 +57,39 @@ test("fails on a deliberately orphaned module in a test fixture", () => {
   }
 });
 
-test("ignores test and declaration files", () => {
+test("ignores test, test-support stub and declaration files", () => {
   const { root, cleanup } = fixture({
     "pkg/src/index.ts": 'export { a } from "./a.js";\n',
     "pkg/src/a.ts": "export const a = 1;\n",
     "pkg/src/a.test.ts": 'import { a } from "./a.js";\n',
+    "pkg/src/dom-stub.js": "export function installFakeDocument() {}\n",
+    "pkg/src/api.stub.ts": "export const fakeApi = {};\n",
     "pkg/src/types.d.ts": "export type T = number;\n",
   });
   try {
     assert.deepEqual(findOrphanedModules(PKG, root), []);
+  } finally {
+    cleanup();
+  }
+});
+
+test("findProblems scans multiple packages and reports orphans per package", () => {
+  const packages = [
+    { name: "alpha", entry: "packages/alpha/src/index.ts" },
+    { name: "beta", entry: "services/beta/src/index.ts" },
+  ];
+  const { root, cleanup } = fixture({
+    "packages/alpha/src/index.ts": 'export { a } from "./a.js";\n',
+    "packages/alpha/src/a.ts": "export const a = 1;\n",
+    "services/beta/src/index.ts": 'export { b } from "./b.js";\n',
+    "services/beta/src/b.ts": "export const b = 2;\n",
+    "services/beta/src/orphan.ts": "export const dead = 3;\n",
+    "services/beta/src/dom-stub.js": "export const stub = {};\n",
+  });
+  try {
+    const problems = findProblems(root, packages);
+    assert.equal(problems.length, 1);
+    assert.match(problems[0], /^beta: services\/beta\/src\/orphan\.ts is not reachable/);
   } finally {
     cleanup();
   }
@@ -132,6 +156,16 @@ test("the real package graph is fully reachable", () => {
   assert.deepEqual(findProblems(), []);
 });
 
-test("the guard is configured for at least one package", () => {
-  assert.ok(PACKAGES.some((p) => p.name === "ui-components"));
+test("the guard is configured for every checked package and service", () => {
+  const names = PACKAGES.map((p) => p.name);
+  for (const expected of [
+    "sdk",
+    "ui-components",
+    "ts-advanced-client",
+    "graphql-api",
+    "webhook-streamer",
+    "health-dashboard",
+  ]) {
+    assert.ok(names.includes(expected), `expected PACKAGES to include ${expected}`);
+  }
 });

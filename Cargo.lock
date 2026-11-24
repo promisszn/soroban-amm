@@ -200,6 +200,7 @@ dependencies = [
  "factory",
  "governance",
  "incentive_campaigns",
+ "pol_vesting",
  "router",
  "serde",
  "serde_json",
@@ -208,6 +209,7 @@ dependencies = [
  "token",
  "twal_consumer",
  "twap_consumer",
+ "v2_to_v3_migration",
 ]
 
 [[package]]
@@ -2048,6 +2050,8 @@ name = "twap_consumer"
 version = "0.1.0"
 dependencies = [
  "amm",
+ "concentrated_liquidity",
+ "factory",
  "soroban-sdk",
  "soroban_amm_sdk",
  "token",

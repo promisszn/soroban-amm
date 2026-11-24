@@ -24,7 +24,12 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 /** Packages whose `src/` is checked, with the entrypoint that must reach all of it. */
 export const PACKAGES = [
+  { name: "sdk", entry: "packages/sdk/src/index.ts" },
   { name: "ui-components", entry: "packages/ui-components/src/index.ts" },
+  { name: "ts-advanced-client", entry: "packages/ts-advanced-client/src/index.ts" },
+  { name: "graphql-api", entry: "services/graphql-api/src/index.ts" },
+  { name: "webhook-streamer", entry: "services/webhook-streamer/src/index.ts" },
+  { name: "health-dashboard", entry: "services/health-dashboard/src/dashboard.js" },
 ];
 
 const MODULE_EXTENSIONS = [".ts", ".tsx", ".mts", ".js", ".jsx", ".mjs"];
@@ -36,6 +41,8 @@ function isIgnored(relPath) {
   return (
     base.includes(".test.") ||
     base.includes(".spec.") ||
+    base.includes(".stub.") ||
+    /(?:^|[-_])stub\.[cm]?[jt]sx?$/.test(base) ||
     base.endsWith(".d.ts") ||
     base.endsWith(".stories.tsx") ||
     // Test-support directories (vitest setup, fixtures, harnesses).

@@ -15,6 +15,7 @@ use dex_aggregator::{DexAggregator, DexAggregatorClient};
 use factory::{Factory, FactoryClient};
 use governance::{Governance, GovernanceClient, ProposalKind, Vote};
 use incentive_campaigns::{IncentiveCampaigns, IncentiveCampaignsClient};
+use pol_vesting::{PolVestingContract, PolVestingContractClient};
 use router::{Router, RouterClient};
 use soroban_sdk::{
     contract, contractimpl, contracttype,
@@ -26,6 +27,7 @@ use staking::{Staking, StakingClient};
 use token::{LpToken, LpTokenClient};
 use twal_consumer::{PoolType as TwalPoolType, TwalConsumer, TwalConsumerClient};
 use twap_consumer::{TwapConsumer, TwapConsumerClient};
+use v2_to_v3_migration::{MigrateParams, MigrationContract, MigrationContractClient};
 
 const BASELINE_PATH: &str = "benches/baseline.json";
 const ALLOWLIST_PATH: &str = "benches/allowlist.json";
@@ -255,6 +257,14 @@ fn run_all() -> Vec<Metric> {
         measure(
             "incentive_campaigns.claim_rewards",
             bench_incentive_claim_rewards,
+        ),
+        measure("pol_vesting.create_vesting", bench_pol_vesting_create),
+        measure("pol_vesting.release", bench_pol_vesting_release),
+        measure("pol_vesting.revoke_vesting", bench_pol_vesting_revoke),
+        measure("v2_to_v3_migration.migrate", bench_migration),
+        measure(
+            "v2_to_v3_migration.preview_migration",
+            bench_migration_preview,
         ),
     ];
 
@@ -654,6 +664,257 @@ fn bench_incentive_claim_rewards(env: &Env) {
     let (campaigns, campaign_id, provider) = setup_incentive_campaigns(env);
     env.budget().reset_default();
     campaigns.claim_rewards(&provider, &campaign_id);
+}
+
+// ── POL vesting and V2 → V3 migration ───────────────────────────────────────
+
+fn setup_pol_vesting(
+    env: &Env,
+) -> (
+    PolVestingContractClient<'_>,
+    Address,
+    Address,
+    Address,
+    Address,
+) {
+    let governance = Address::generate(env);
+    let treasury = Address::generate(env);
+    let beneficiary = Address::generate(env);
+    let pool = Address::generate(env);
+    let lp_token = env
+        .register_stellar_asset_contract_v2(pool.clone())
+        .address();
+    let vesting_addr = env.register_contract(None, PolVestingContract);
+    let vesting = PolVestingContractClient::new(env, &vesting_addr);
+    vesting.initialize(&governance, &treasury);
+    StellarAssetClient::new(env, &lp_token).mint(&vesting_addr, &1_000_000);
+    (vesting, governance, beneficiary, lp_token, pool)
+}
+
+fn create_pol_schedule(
+    vesting: &PolVestingContractClient<'_>,
+    governance: &Address,
+    beneficiary: &Address,
+    lp_token: &Address,
+    pool: &Address,
+) -> u32 {
+    vesting.create_vesting(
+        governance,
+        beneficiary,
+        lp_token,
+        pool,
+        &1_000_000,
+        &1,
+        &10,
+        &1_000,
+    )
+}
+
+fn bench_pol_vesting_create(env: &Env) {
+    let governance = Address::generate(env);
+    let treasury = Address::generate(env);
+    let beneficiary = Address::generate(env);
+    let pool = Address::generate(env);
+    let lp_token = env
+        .register_stellar_asset_contract_v2(pool.clone())
+        .address();
+    let vesting_addr = env.register_contract(None, PolVestingContract);
+    let vesting = PolVestingContractClient::new(env, &vesting_addr);
+    vesting.initialize(&governance, &treasury);
+    StellarAssetClient::new(env, &lp_token).mint(&vesting_addr, &1_000_000);
+    env.budget().reset_default();
+    let _ = vesting.create_vesting(
+        &governance,
+        &beneficiary,
+        &lp_token,
+        &pool,
+        &1_000_000,
+        &1,
+        &10,
+        &1_000,
+    );
+}
+
+fn bench_pol_vesting_release(env: &Env) {
+    let (vesting, governance, beneficiary, lp_token, pool) = setup_pol_vesting(env);
+    let schedule_id = create_pol_schedule(&vesting, &governance, &beneficiary, &lp_token, &pool);
+    env.ledger().set_sequence_number(500);
+    env.budget().reset_default();
+    let released = vesting.release(&beneficiary, &schedule_id);
+    assert!(
+        released > 0,
+        "release benchmark must transfer vested tokens"
+    );
+}
+
+fn bench_pol_vesting_revoke(env: &Env) {
+    let (vesting, governance, beneficiary, lp_token, pool) = setup_pol_vesting(env);
+    let schedule_id = create_pol_schedule(&vesting, &governance, &beneficiary, &lp_token, &pool);
+    env.ledger().set_sequence_number(500);
+    env.budget().reset_default();
+    vesting.revoke_vesting(&governance, &beneficiary, &schedule_id);
+}
+
+#[contracttype]
+enum BenchFactoryKey {
+    Pool(Address, Address),
+    PoolTokens(Address),
+    ClPool(Address, Address, i128),
+    IsCl(Address),
+}
+
+#[contract]
+struct BenchMigrationFactory;
+
+fn sorted_addresses(a: Address, b: Address) -> (Address, Address) {
+    if a < b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+#[contractimpl]
+impl BenchMigrationFactory {
+    pub fn register_v2(env: Env, pool: Address, token_a: Address, token_b: Address) {
+        let (a, b) = sorted_addresses(token_a.clone(), token_b.clone());
+        env.storage()
+            .persistent()
+            .set(&BenchFactoryKey::Pool(a, b), &pool);
+        env.storage()
+            .persistent()
+            .set(&BenchFactoryKey::PoolTokens(pool), &(token_a, token_b));
+    }
+
+    pub fn register_cl(env: Env, pool: Address, token_a: Address, token_b: Address, fee: i128) {
+        let (a, b) = sorted_addresses(token_a, token_b);
+        env.storage()
+            .persistent()
+            .set(&BenchFactoryKey::ClPool(a, b, fee), &pool);
+        env.storage()
+            .persistent()
+            .set(&BenchFactoryKey::IsCl(pool), &true);
+    }
+
+    pub fn get_pool_tokens(env: Env, pool: Address) -> Option<(Address, Address)> {
+        env.storage()
+            .persistent()
+            .get(&BenchFactoryKey::PoolTokens(pool))
+    }
+
+    pub fn get_pool(env: Env, token_a: Address, token_b: Address) -> Option<Address> {
+        let (a, b) = sorted_addresses(token_a, token_b);
+        env.storage().persistent().get(&BenchFactoryKey::Pool(a, b))
+    }
+
+    pub fn get_cl_pool(env: Env, token_a: Address, token_b: Address, fee: i128) -> Option<Address> {
+        let (a, b) = sorted_addresses(token_a, token_b);
+        env.storage()
+            .persistent()
+            .get(&BenchFactoryKey::ClPool(a, b, fee))
+    }
+
+    pub fn is_cl_pool(env: Env, pool: Address) -> bool {
+        env.storage()
+            .persistent()
+            .get(&BenchFactoryKey::IsCl(pool))
+            .unwrap_or(false)
+    }
+}
+
+struct MigrationBenchFixture<'a> {
+    migration: MigrationContractClient<'a>,
+    provider: Address,
+    v2_pool: Address,
+    v3_pool: Address,
+    lp_shares: i128,
+}
+
+fn setup_migration(env: &Env) -> MigrationBenchFixture<'_> {
+    let admin = Address::generate(env);
+    let provider = Address::generate(env);
+    let fee_recipient = Address::generate(env);
+    let token_a = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let token_b = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    let v2_pool = env.register_contract(None, AmmPool);
+    let v2_lp = env.register_contract(None, LpToken);
+    LpTokenClient::new(env, &v2_lp).initialize(
+        &v2_pool,
+        &SorobanString::from_str(env, "V2 LP"),
+        &SorobanString::from_str(env, "V2LP"),
+        &7,
+    );
+    let v2 = AmmPoolClient::new(env, &v2_pool);
+    v2.initialize(&admin, &token_a, &token_b, &v2_lp, &30, &fee_recipient, &0);
+    StellarAssetClient::new(env, &token_a).mint(&admin, &10_000_000);
+    StellarAssetClient::new(env, &token_b).mint(&admin, &10_000_000);
+    v2.add_liquidity(&admin, &6_000_000, &6_000_000, &0, &u64::MAX);
+    StellarAssetClient::new(env, &token_a).mint(&provider, &1_000_000);
+    StellarAssetClient::new(env, &token_b).mint(&provider, &1_000_000);
+    let lp_shares = v2.add_liquidity(&provider, &1_000_000, &1_000_000, &0, &u64::MAX);
+
+    let v3_pool = env.register_contract(None, ConcentratedLiquidity);
+    let v3 = ConcentratedLiquidityClient::new(env, &v3_pool);
+    v3.initialize(&admin, &token_a, &token_b, &30, &0, &1);
+
+    let factory = env.register_contract(None, BenchMigrationFactory);
+    let factory_client = BenchMigrationFactoryClient::new(env, &factory);
+    factory_client.register_v2(&v2_pool, &token_a, &token_b);
+    factory_client.register_cl(&v3_pool, &token_a, &token_b, &30);
+    let migration_addr = env.register_contract(None, MigrationContract);
+    let migration = MigrationContractClient::new(env, &migration_addr);
+    migration.initialize(&admin, &factory);
+    MigrationBenchFixture {
+        migration,
+        provider,
+        v2_pool,
+        v3_pool,
+        lp_shares,
+    }
+}
+
+fn migration_params(shares: i128) -> MigrateParams {
+    MigrateParams {
+        v2_shares: shares,
+        min_a: 0,
+        min_b: 0,
+        tick_lower: -887_272,
+        tick_upper: 887_272,
+        range_width_ticks: 500,
+        min_deposit_a: 0,
+        min_deposit_b: 0,
+        deadline: u64::MAX,
+    }
+}
+
+fn bench_migration(env: &Env) {
+    let f = setup_migration(env);
+    env.budget().reset_default();
+    let result = f.migration.migrate(
+        &f.provider,
+        &f.v2_pool,
+        &f.v3_pool,
+        &migration_params(f.lp_shares),
+    );
+    assert!(result.position_token_id.is_some() || result.deposited_a > 0 || result.deposited_b > 0);
+}
+
+fn bench_migration_preview(env: &Env) {
+    let f = setup_migration(env);
+    env.budget().reset_default();
+    let preview = f.migration.preview_migration(
+        &f.v2_pool,
+        &f.v3_pool,
+        &f.lp_shares,
+        &-887_272,
+        &887_272,
+        &500,
+    );
+    assert!(preview.deposit_a > 0 || preview.deposit_b > 0);
 }
 
 fn bench_batch_settle(env: &Env) {

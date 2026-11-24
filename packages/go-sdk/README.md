@@ -1,8 +1,9 @@
 # Go SDK for the Soroban AMM
 
-A Go client for the AMM pool contract (`contracts/amm`). Read methods run
-through simulation and need no signer; write methods build, simulate, sign,
-submit and poll a transaction.
+A Go client for the AMM pool contract (`contracts/amm`). It mirrors the user-facing
+read and write surface of `AmmPool` in the TypeScript SDK (`packages/sdk`): read
+methods run through simulation and need no signer; write methods build,
+simulate, sign, submit and poll a transaction.
 
 The runtime SDK has **no third-party Go dependencies**: ScVal encoding, the
 strkey codec and the transaction envelope builder are implemented in this
@@ -103,8 +104,18 @@ transaction, and none consumes fees.
 
 ## Write methods
 
-`Swap`, `AddLiquidity` and `RemoveLiquidity` each take a params struct, and
-each requires a `Signer`.
+`Swap`, `SwapExactOut`, `AddLiquidity`, `RemoveLiquidity`,
+`RemoveLiquidityOneSided` and `FlashLoan` each take a params struct, and each
+requires a `Signer`.
+
+| Method | Contract entrypoint | Params struct |
+|--------|---------------------|---------------|
+| `Swap(ctx, p)` | `swap(trader, token_in, amount_in, min_out, deadline)` | `SwapParams` |
+| `SwapExactOut(ctx, p)` | `swap_exact_out(trader, token_out, amount_out, max_in, deadline)` | `SwapExactOutParams` |
+| `AddLiquidity(ctx, p)` | `add_liquidity(provider, amount_a, amount_b, min_shares, deadline)` | `AddLiquidityParams` |
+| `RemoveLiquidity(ctx, p)` | `remove_liquidity(provider, shares, min_a, min_b, deadline)` | `RemoveLiquidityParams` |
+| `RemoveLiquidityOneSided(ctx, p)` | `remove_liquidity_one_sided(provider, shares, token_out, min_out, deadline)` | `RemoveLiquidityOneSidedParams` |
+| `FlashLoan(ctx, p)` | `flash_loan(receiver, amount_a, amount_b, data)` | `FlashLoanParams` |
 
 Before signing, the client reads the source account sequence, simulates the
 invocation, copies the returned authorization entries and
@@ -114,13 +125,16 @@ archived state, it submits and confirms `RestoreFootprint`, then re-simulates
 the invocation. `TRY_AGAIN_LATER` submissions are retried with the configured
 polling backoff.
 
-**Deadlines and slippage bounds are never defaulted.** A zero `Deadline`
-returns `ErrDeadlineRequired` and a nil slippage bound returns
+**Deadlines and slippage bounds are never defaulted.** On methods that take a
+deadline and slippage bound (`Swap`, `SwapExactOut`, `AddLiquidity`,
+`RemoveLiquidity`, `RemoveLiquidityOneSided`), a zero `Deadline` returns
+`ErrDeadlineRequired` and a nil or negative slippage bound returns
 `ErrSlippageRequired`, before any RPC call is made. Both are safety parameters:
 a silently-defaulted bound is how a swap gets sandwiched, and a
 silently-defaulted deadline is how one sits in the mempool until the price has
 moved. A bound of zero is accepted, because that is an explicit decision to
-take any price.
+take any price. `FlashLoan` validates that neither `AmountA` nor `AmountB` is
+nil or negative and that at least one is positive (`ErrZeroAmount`).
 
 Derive the bound from a fresh quote:
 
@@ -179,7 +193,7 @@ case errors.Is(err, gosdk.ErrInsufficientLiquidity): // AmmError #11
 }
 ```
 
-All twenty-one `AmmError` discriminants from
+All thirty `AmmError` discriminants (30 variants) from
 [docs/error-codes.md](../../docs/error-codes.md) are mapped. An unrecognised
 discriminant still yields a `*ContractError` carrying `Code` and the raw RPC
 text, so a new contract error is legible rather than opaque.
@@ -228,5 +242,9 @@ responses. No test touches the network. CI runs the same four commands.
 
 ## Scope
 
-This SDK covers the AMM pool. Governance, staking and concentrated-liquidity
-clients are not implemented here.
+This SDK covers the user-facing read and write surface of the constant-product
+AMM pool (`contracts/amm`), matching `AmmPool` in `packages/sdk`. Pool
+admin/governance/multisig entrypoints, event decoding, transaction inspection,
+and separate clients for the other protocol contracts (factory, router,
+governance, staking, concentrated liquidity, incentives, vesting, oracles,
+aggregator, batch auction) are not implemented here.
