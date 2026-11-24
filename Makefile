@@ -6,7 +6,7 @@ WASM_DIR := target/wasm32v1-none/release
 
 SHELL := bash
 
-.PHONY: all help build release-build optimize abi check-abi test-abi test test-all fmt lint lint-js check-node-versions check check-docs check-branch-protection check-branch-protection-remote check-storage-keys check-deploy-scripts check-test-modules check-reachability \
+.PHONY: all help build release-build optimize abi check-abi test-abi test test-all fmt lint lint-js check-node-versions check check-docs check-branch-protection check-branch-protection-remote check-storage-keys check-deploy-scripts check-test-modules check-reachability check-release-manifest \
         size size-check doc audit bench deploy e2e clean fuzz-amm fuzz-amm-nightly fuzz-cl
 
 # Bare `make` explains itself instead of building.
@@ -104,6 +104,9 @@ check-test-modules: ## Fail if a contract *_test.rs file is not declared as a mo
 check-reachability: ## Fail if a module under a package's src/ is not reachable from its entrypoint
 	node scripts/check_reachability.mjs
 	node --test scripts/check_reachability.test.mjs
+
+check-release-manifest: ## Run the release manifest and artifact-set regression suite
+	bash scripts/release_manifest.test.sh
 
 size: ## Print a WASM size report for all built contracts
 	bash scripts/size_report.sh
