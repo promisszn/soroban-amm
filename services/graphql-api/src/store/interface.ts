@@ -86,6 +86,13 @@ export interface AlertConfig {
   metric: string;
   thresholdBps?: number;
   thresholdValue?: number;
+  /**
+   * Optional re-notify window in seconds. When absent, the alert notifies
+   * only on a threshold crossing (and re-arms after a dip below the
+   * threshold). When set, a metric that stays over threshold notifies again
+   * once this many seconds have elapsed since the last fire.
+   */
+  cooldownSeconds?: number;
 }
 
 /** Ingestion cursor tracking progress through RPC events. */

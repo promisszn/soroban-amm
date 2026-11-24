@@ -92,6 +92,8 @@ const MIGRATIONS = [
       updated_at INTEGER NOT NULL
     );
   `,
+  // v2: optional re-notify window for alert configs (repeat-fire fix).
+  `ALTER TABLE alert_configs ADD COLUMN cooldown_seconds REAL;`,
 ] as const;
 
 export class SqliteStore implements AnalyticsStore {
@@ -250,15 +252,18 @@ export class SqliteStore implements AnalyticsStore {
   async setAlertConfig(config: AlertConfig): Promise<AlertConfig> {
     this.db.prepare(`
       INSERT INTO alert_configs
-        (pool_id, metric, threshold_bps, threshold_value)
-      VALUES (@poolId, @metric, @thresholdBps, @thresholdValue)
+        (pool_id, metric, threshold_bps, threshold_value, cooldown_seconds)
+      VALUES (@poolId, @metric, @thresholdBps, @thresholdValue, @cooldownSeconds)
       ON CONFLICT(pool_id, metric) DO UPDATE SET
         threshold_bps=excluded.threshold_bps,
-        threshold_value=excluded.threshold_value
+        threshold_value=excluded.threshold_value,
+        cooldown_seconds=excluded.cooldown_seconds
     `).run({
-      ...config,
+      poolId: config.poolId,
+      metric: config.metric,
       thresholdBps: config.thresholdBps ?? null,
       thresholdValue: config.thresholdValue ?? null,
+      cooldownSeconds: config.cooldownSeconds ?? null,
     });
     return config;
   }
@@ -387,6 +392,7 @@ function toAlertConfig(row: SqlRow): AlertConfig {
     poolId: String(row["pool_id"]), metric: String(row["metric"]),
     thresholdBps: nullableNumber(row, "threshold_bps") ?? undefined,
     thresholdValue: nullableNumber(row, "threshold_value") ?? undefined,
+    cooldownSeconds: nullableNumber(row, "cooldown_seconds") ?? undefined,
   };
 }
 

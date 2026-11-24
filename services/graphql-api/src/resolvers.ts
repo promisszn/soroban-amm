@@ -73,11 +73,13 @@ export const resolvers = {
         metric,
         thresholdBps,
         thresholdValue,
+        cooldownSeconds,
       }: {
         poolId: string;
         metric: string;
         thresholdBps?: number;
         thresholdValue?: number;
+        cooldownSeconds?: number;
       },
       context?: GraphQLContext,
     ): AlertConfig | Promise<AlertConfig> => {
@@ -88,6 +90,9 @@ export const resolvers = {
           metric: metric as AlertMetric,
           thresholdBps,
           thresholdValue,
+          // Only add the key when it was actually supplied so the stored
+          // config shape stays identical for callers that omit it.
+          ...(cooldownSeconds === undefined ? {} : { cooldownSeconds }),
         });
         // Durable first: a store failure must leave the in-memory indexer
         // untouched, otherwise memory and the store diverge permanently.

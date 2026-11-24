@@ -13,6 +13,7 @@ import {
   seedDemoData,
   type PoolEvent,
 } from "./indexer.js";
+import { MemoryStore } from "./store/memory.js";
 import { asSeconds, type Seconds } from "./time.js";
 
 /** Fixed "now" (seconds) so tests don't depend on the wall clock. */
@@ -189,6 +190,134 @@ describe("health alerts", () => {
   });
 });
 
+// ── Repeat-fire suppression (notify on crossing, not per event) ──────────
+
+describe("alert repeat-fire suppression", () => {
+  it("fires exactly one alert across 10 consecutive over-threshold events", () => {
+    const idx = makeIndexer();
+    idx.setAlertConfig({ poolId: "p1", metric: "volume24h", thresholdValue: 100 });
+
+    let emitted = 0;
+    for (let i = 0; i < 10; i += 1) {
+      emitted += idx.indexEvent(swapEvent({ id: `over-${i}`, poolId: "p1" })).alerts.length;
+    }
+
+    assert.equal(emitted, 1, "only the threshold crossing notifies");
+    assert.equal(idx.getPoolHealth("p1")!.alertsFired.length, 1);
+  });
+
+  it("re-arms after a dip below the threshold and fires again on the next rise", () => {
+    const idx = makeIndexer();
+    idx.setAlertConfig({ poolId: "p1", metric: "tvl", thresholdValue: 10_000 });
+
+    // Cross upward: tvl 20_000 > 10_000.
+    assert.equal(
+      idx.indexEvent(addLiquidityEvent({
+        id: "t1", poolId: "p1",
+        payload: { amountA: 10_000, amountB: 10_000, tokenA: "XLM", tokenB: "USDC" },
+      })).alerts.length,
+      1,
+    );
+    // Still over threshold (tvl 30_000): no repeat notification.
+    assert.equal(
+      idx.indexEvent(addLiquidityEvent({
+        id: "t2", poolId: "p1",
+        payload: { amountA: 5_000, amountB: 5_000, tokenA: "XLM", tokenB: "USDC" },
+      })).alerts.length,
+      0,
+    );
+    // Dip below the threshold: remove the liquidity (tvl clamps to 0).
+    assert.equal(
+      idx.indexEvent(removeLiquidityEvent({
+        id: "t3", poolId: "p1",
+        payload: { amountA: 28_000, amountB: 28_000, tokenA: "XLM", tokenB: "USDC" },
+      })).alerts.length,
+      0,
+    );
+    assert.ok((idx.getPoolStats("p1")[0].tvl ?? 0) <= 10_000, "tvl should be back under the threshold");
+
+    // Rise again: the fresh crossing notifies a second time.
+    assert.equal(
+      idx.indexEvent(addLiquidityEvent({
+        id: "t4", poolId: "p1",
+        payload: { amountA: 10_000, amountB: 10_000, tokenA: "XLM", tokenB: "USDC" },
+      })).alerts.length,
+      1,
+    );
+    assert.equal(idx.getPoolHealth("p1")!.alertsFired.length, 2);
+  });
+
+  it("re-notifies after cooldownSeconds while the metric stays over threshold", () => {
+    let now = NOW;
+    const idx = new PoolIndexer(() => now, {
+      p1: { tokenA: "XLM", tokenB: "USDC", tokenPrices: { XLM: 1, USDC: 1 } },
+    });
+    idx.setAlertConfig({
+      poolId: "p1", metric: "volume24h", thresholdValue: 100, cooldownSeconds: 3600,
+    });
+
+    // Crossing notifies immediately.
+    assert.equal(idx.indexEvent(swapEvent({ id: "c1", poolId: "p1", timestamp: now })).alerts.length, 1);
+    // Inside the cooldown window: suppressed even though still over threshold.
+    now = at(60);
+    assert.equal(
+      idx.indexEvent(swapEvent({ id: "c2", poolId: "p1", timestamp: now })).alerts.length,
+      0,
+      "still inside the cooldown window",
+    );
+    now = at(3599);
+    assert.equal(
+      idx.indexEvent(swapEvent({ id: "c3", poolId: "p1", timestamp: now })).alerts.length,
+      0,
+      "one second short of the window",
+    );
+    // Window elapsed: re-notify without a dip.
+    now = at(3600);
+    assert.equal(
+      idx.indexEvent(swapEvent({ id: "c4", poolId: "p1", timestamp: now })).alerts.length,
+      1,
+      "elapsed cooldown re-notifies",
+    );
+    assert.equal(idx.getPoolHealth("p1")!.alertsFired.length, 2);
+    // Re-enters the window after the re-notify.
+    now = at(3660);
+    assert.equal(
+      idx.indexEvent(swapEvent({ id: "c5", poolId: "p1", timestamp: now })).alerts.length,
+      0,
+      "cooldown restarts after each notification",
+    );
+  });
+
+  it("does not re-spam the same incident after a restart (persisted last-fired marker)", async () => {
+    const store = new MemoryStore();
+    const now = NOW;
+    const poolConfigs = { p1: { tokenA: "XLM", tokenB: "USDC", tokenPrices: { XLM: 1, USDC: 1 } } };
+    const config = { poolId: "p1", metric: "volume24h" as const, thresholdValue: 100 };
+
+    const before = new PoolIndexer(() => now, poolConfigs);
+    before.setAlertConfig(config);
+    await store.setAlertConfig(config);
+    for (let i = 0; i < 3; i += 1) {
+      const event = {
+        ...swapEvent({ id: `pre-${i}`, poolId: "p1", timestamp: now }),
+        ledger: i + 1, txHash: `tx-${i}`, eventIndex: 0,
+      };
+      const update = before.indexEvent(event);
+      await store.appendEvent(event);
+      for (const alert of update.alerts) await store.recordAlert(alert);
+    }
+    assert.equal((await store.getFiredAlerts()).length, 1, "the crossing was persisted");
+
+    const after = new PoolIndexer(() => now, poolConfigs);
+    await after.rebuild(store);
+    assert.equal(after.getPoolHealth("p1")!.alertsFired.length, 1, "history restored from the store");
+
+    const next = after.indexEvent(swapEvent({ id: "post-restart", poolId: "p1", timestamp: now }));
+    assert.equal(next.alerts.length, 0, "an ongoing incident must not notify again after restart");
+    assert.equal(after.getPoolHealth("p1")!.alertsFired.length, 1);
+  });
+});
+
 describe("analytics correctness", () => {
   it("keeps reciprocal swap directions at the same canonical price", () => {
     const idx = makeIndexer();
@@ -304,6 +433,19 @@ describe("alert config validation", () => {
       () => idx.setAlertConfig({ poolId: "pool-a", metric: "tvl" }),
       InvalidThresholdError,
     );
+  });
+
+  it("rejects a negative or non-finite cooldownSeconds", () => {
+    const idx = makeIndexer();
+    assert.throws(
+      () => idx.setAlertConfig({ poolId: "pool-a", metric: "tvl", thresholdValue: 10, cooldownSeconds: -1 }),
+      InvalidThresholdError,
+    );
+    assert.throws(
+      () => idx.setAlertConfig({ poolId: "pool-a", metric: "tvl", thresholdValue: 10, cooldownSeconds: Number.NaN }),
+      InvalidThresholdError,
+    );
+    assert.deepEqual(idx.getAlertConfigs("pool-a"), []);
   });
 });
 

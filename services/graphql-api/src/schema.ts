@@ -71,13 +71,16 @@ export const typeDefs = `#graphql
   Configured alert threshold for a pool metric. metric must be one of
   "price_deviation", "tvl", "volume24h". "price_deviation" uses thresholdBps
   (basis points); "tvl" and "volume24h" use thresholdValue (a raw value in
-  the metric's native units, not basis points).
+  the metric's native units, not basis points). cooldownSeconds, when set,
+  is the minimum seconds between re-notifications while the metric stays
+  over threshold; null means the alert notifies only on a threshold crossing.
   """
   type AlertConfig {
     poolId: ID!
     metric: String!
     thresholdBps: Int
     thresholdValue: Float
+    cooldownSeconds: Float
   }
 
   type Query {
@@ -95,9 +98,11 @@ export const typeDefs = `#graphql
     """
     metric must be one of "price_deviation", "tvl", "volume24h". Pass
     thresholdBps for "price_deviation"; pass thresholdValue for "tvl" and
-    "volume24h". Both fields must be >= 0.
+    "volume24h". Both fields must be >= 0. cooldownSeconds (optional, >= 0)
+    enables periodic re-notifications while the metric stays over threshold;
+    omit it to notify only when the threshold is crossed.
     """
-    setAlertConfig(poolId: ID!, metric: String!, thresholdBps: Int, thresholdValue: Float): AlertConfig!
+    setAlertConfig(poolId: ID!, metric: String!, thresholdBps: Int, thresholdValue: Float, cooldownSeconds: Float): AlertConfig!
     removeAlertConfig(poolId: ID!, metric: String!): Boolean!
   }
 
