@@ -496,6 +496,7 @@ Defined in [contracts/router/src/lib.rs](../contracts/router/src/lib.rs) as `Rou
 | 10 | `Unauthorized` | An admin-only operation used the wrong admin, or `accept_admin` was called by an address other than the nominee. | Pass the stored or nominated address and sign with its key. |
 | 11 | `InvalidFactory` | `initialize` could not call the factory's `get_pool_count` interface. | Pass a deployed factory contract address. |
 | 12 | `NoPendingAdmin` | `accept_admin` was called without a pending nomination. | Call `propose_admin` first. |
+| 13 | `PoolCallFailed` | A hop pool rejected a swap or quote call (e.g. paused, empty reserves, or another pool-level error). | Inspect the hop pools along the path (pause state, reserves, liquidity) before retrying. |
 
 ---
 
@@ -634,6 +635,7 @@ Defined in [contracts/twap_consumer/src/lib.rs](../contracts/twap_consumer/src/l
 | 19 | `TooManyPools` | `get_twap_batch` was called with more pools than `MAX_TRACKED_POOLS`. | Split the request into smaller batches. |
 | 20 | `NoPendingKeeper` | `accept_keeper` was called while no `propose_keeper` nomination is pending. | Have the current keeper call `propose_keeper` first. |
 | 21 | `WrongPendingKeeper` | `accept_keeper` was called with an address other than the pending keeper. | Sign and call `accept_keeper` as the nominated address. |
+| 22 | `CannotDeleteRequiredSnapshot` | `delete_snapshot` was called on the newest remaining snapshot or when fewer than 3 snapshots are stored (which would leave fewer than 2 retained snapshots for TWAP reads). | Save additional snapshots first, or delete only older non-newest snapshots while at least 3 are retained. |
 
 ---
 
