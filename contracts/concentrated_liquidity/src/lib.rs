@@ -3862,6 +3862,15 @@ impl ConcentratedLiquidity {
         if lower_tick < MIN_TICK || upper_tick > MAX_TICK {
             return Err(ClError::TickOutOfRange);
         }
+        // Enforce tick spacing: ticks must be multiples of tick_spacing.
+        let tick_spacing: i32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TickSpacing)
+            .unwrap_or(1);
+        if lower_tick % tick_spacing != 0 || upper_tick % tick_spacing != 0 {
+            return Err(ClError::TickNotAligned);
+        }
         if liquidity <= 0 {
             return Err(ClError::ZeroLiquidity);
         }
@@ -6757,6 +6766,40 @@ mod test_tick_spacing {
             state.tick_spacing, 60,
             "get_pool_state must return tick_spacing = 60"
         );
+    }
+
+    /// quote_position must reject a misaligned lower tick with TickNotAligned.
+    #[test]
+    fn test_quote_position_misaligned_lower_tick_rejected() {
+        let env = Env::default();
+        let (_provider, _ta, _tb, client) = setup_cl(&env, 10);
+
+        let result = client.try_quote_position(&-7_i32, &10_i32, &10_000_i128);
+        assert_eq!(result, Err(Ok(ClError::TickNotAligned)));
+    }
+
+    /// quote_position must reject a misaligned upper tick with TickNotAligned.
+    #[test]
+    fn test_quote_position_misaligned_upper_tick_rejected() {
+        let env = Env::default();
+        let (_provider, _ta, _tb, client) = setup_cl(&env, 10);
+
+        let result = client.try_quote_position(&-10_i32, &7_i32, &10_000_i128);
+        assert_eq!(result, Err(Ok(ClError::TickNotAligned)));
+    }
+
+    /// quote_position with aligned ticks on a spacing-10 pool must succeed and return
+    /// the exact same amounts as on a spacing-1 pool.
+    #[test]
+    fn test_quote_position_aligned_ticks_unchanged() {
+        let env = Env::default();
+        let (_provider1, _ta1, _tb1, client_spacing_1) = setup_cl(&env, 1);
+        let (_provider10, _ta10, _tb10, client_spacing_10) = setup_cl(&env, 10);
+
+        let expected = client_spacing_1.quote_position(&-100_i32, &100_i32, &10_000_i128);
+        let actual = client_spacing_10.quote_position(&-100_i32, &100_i32, &10_000_i128);
+        assert_eq!(actual, expected);
+        assert!(actual.0 > 0 && actual.1 > 0);
     }
 
     /// tick_spacing = 1 allows every tick (no restriction).

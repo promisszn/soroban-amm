@@ -158,6 +158,14 @@ When changing a public contract interface, regenerate `docs/abi.json` with
 `make abi` and include the updated file in the same pull request. CI runs
 `make check-abi` to catch stale ABI documentation.
 
+The TypeScript SDK keeps a second oracle for the contracts it wraps:
+`packages/sdk/src/__fixtures__/contract-abi.json`, generated from the Rust
+sources. After changing a wrapped contract's entrypoints, run
+`npm run generate:abi` in `packages/sdk` and commit the result. CI runs
+`npm run check:abi` for that package alongside `make check-abi`, so a stale
+fixture fails the build instead of letting the SDK test against a signature
+that no longer exists.
+
 Before opening a PR, run:
 
 ```bash

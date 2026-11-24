@@ -602,13 +602,23 @@ impl TwalConsumer {
             .ok_or(TwalError::MissingClAccumulator)?;
 
         let elapsed_since_update = ledger_ts_now.saturating_sub(accumulator.last_ts) as i128;
-        let cum_now = accumulator.cum_liquidity + accumulator.last_active * elapsed_since_update;
+        let pending = accumulator
+            .last_active
+            .checked_mul(elapsed_since_update)
+            .ok_or(TwalError::ArithmeticOverflow)?;
+        let cum_now = accumulator
+            .cum_liquidity
+            .checked_add(pending)
+            .ok_or(TwalError::ArithmeticOverflow)?;
 
         let elapsed = ledger_ts_now.saturating_sub(snapshot_ts) as i128;
         if elapsed <= 0 {
             return Err(TwalError::ElapsedZero);
         }
-        Ok((cum_now - snapshot_cumulative) / elapsed)
+        let window_integral = cum_now
+            .checked_sub(snapshot_cumulative)
+            .ok_or(TwalError::ArithmeticOverflow)?;
+        Ok(window_integral / elapsed)
     }
 
     /// Computes a single pool's TWAL entry without ever panicking or
@@ -798,7 +808,13 @@ impl TwalConsumer {
         {
             Some(prev) => {
                 let elapsed = ledger_ts.saturating_sub(prev.last_ts) as i128;
-                prev.cum_liquidity + prev.last_active * elapsed
+                let pending = prev
+                    .last_active
+                    .checked_mul(elapsed)
+                    .ok_or(TwalError::ArithmeticOverflow)?;
+                prev.cum_liquidity
+                    .checked_add(pending)
+                    .ok_or(TwalError::ArithmeticOverflow)?
             }
             // First snapshot for this pool: cumulative starts at zero.
             None => 0,
@@ -870,6 +886,9 @@ impl TwalConsumer {
     ///   pool; call `save_cl_snapshot` first.
     /// - [`TwalError::ElapsedZero`] — pool time did not advance across the
     ///   window.
+    /// - [`TwalError::ArithmeticOverflow`] — extrapolating the accumulator to
+    ///   the current ledger time, or differencing it against the snapshot,
+    ///   would overflow `i128`.
     pub fn get_cl_twal(env: Env, pool: Address, window_seconds: u64) -> Result<i128, TwalError> {
         Self::extend_ttl(&env);
         Self::get_cl_twal_checked(&env, &pool, window_seconds)
@@ -1845,6 +1864,118 @@ mod tests {
             Ok(Ok(5_000_i128))
         );
         assert_eq!(consumer.get_cl_twal(&pool_addr, &600), 5_000);
+    }
+
+    // -- CL accumulator arithmetic overflow (issue #1334) ---------------------
+
+    /// Replace the running CL accumulator with one whose `last_active` is
+    /// `i128::MAX`, so any non-zero elapsed interval overflows it. The baseline
+    /// snapshot `setup_cl_pool` saved at t=10_000 stays in place, so readers
+    /// still find a floor snapshot.
+    fn seed_overflowing_cl_accumulator(
+        env: &Env,
+        consumer: &TwalConsumerClient<'_>,
+        pool_addr: &Address,
+    ) {
+        let consumer_addr = consumer.address.clone();
+        env.as_contract(&consumer_addr, || {
+            env.storage().persistent().set(
+                &DataKey::ClAccumulator(pool_addr.clone()),
+                &ClLiquidityAccumulator {
+                    cum_liquidity: 0,
+                    last_ts: 10_000,
+                    last_active: i128::MAX,
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn test_cl_twal_accumulator_overflow_returns_typed_error() {
+        let env = Env::default();
+        let (pool_addr, consumer) = setup_cl_pool(&env);
+        seed_overflowing_cl_accumulator(&env, &consumer, &pool_addr);
+
+        // `last_active * elapsed` = i128::MAX * 600 overflows the
+        // multiplication, which used to trap the whole calling transaction.
+        env.ledger().with_mut(|l| l.timestamp = 10_600);
+
+        assert_eq!(
+            consumer.try_get_cl_twal(&pool_addr, &600),
+            Err(Ok(TwalError::ArithmeticOverflow))
+        );
+
+        // The fault-isolated batch path shares the implementation, so it must
+        // report the same typed code rather than letting the pool abort it.
+        let entries = consumer.get_twal_all_safe(&600);
+        assert_eq!(entries.len(), 1);
+        let entry = entries.get(0).unwrap();
+        assert!(!entry.ok);
+        assert_eq!(entry.error_code, TwalError::ArithmeticOverflow as u32);
+    }
+
+    #[test]
+    fn test_save_cl_snapshot_overflow_returns_typed_error_without_writing() {
+        let env = Env::default();
+        let (pool_addr, consumer) = setup_cl_pool(&env);
+        seed_overflowing_cl_accumulator(&env, &consumer, &pool_addr);
+        let consumer_addr = consumer.address.clone();
+
+        env.ledger().with_mut(|l| l.timestamp = 10_600);
+        assert_eq!(
+            consumer.try_save_cl_snapshot(&pool_addr),
+            Err(Ok(TwalError::ArithmeticOverflow))
+        );
+
+        // A rejected update must not advance the accumulator or record a
+        // snapshot: the failed save leaves storage exactly as it was.
+        assert_eq!(consumer.get_snapshot_count(&pool_addr), 1);
+        env.as_contract(&consumer_addr, || {
+            let stored: ClLiquidityAccumulator = env
+                .storage()
+                .persistent()
+                .get(&DataKey::ClAccumulator(pool_addr.clone()))
+                .expect("accumulator still present");
+            assert_eq!(stored.cum_liquidity, 0);
+            assert_eq!(stored.last_ts, 10_000);
+            assert_eq!(stored.last_active, i128::MAX);
+        });
+    }
+
+    #[test]
+    fn test_cl_twal_cumulative_underflow_returns_typed_error() {
+        let env = Env::default();
+        let (pool_addr, consumer) = setup_cl_pool(&env);
+        let consumer_addr = consumer.address.clone();
+
+        // A snapshot cumulative that cannot be differenced from the
+        // accumulator can only come from a corrupted or replayed entry, but
+        // the reader must still surface the typed error rather than a
+        // subtraction panic. `i128::MIN - i128::MAX` is the shortest pair that
+        // crosses the lower bound; a flat accumulator leaves the multiply/add
+        // steps at zero so only the difference is under test.
+        env.as_contract(&consumer_addr, || {
+            let key = DataKey::Snapshots(pool_addr.clone());
+            let snapshots: Vec<SnapshotEntry> = env.storage().persistent().get(&key).unwrap();
+            let (ts, _, pool_ts) = snapshots.get(0).unwrap();
+            let mut corrupted = Vec::new(&env);
+            corrupted.push_back((ts, i128::MAX, pool_ts));
+            env.storage().persistent().set(&key, &corrupted);
+            env.storage().persistent().set(
+                &DataKey::ClAccumulator(pool_addr.clone()),
+                &ClLiquidityAccumulator {
+                    cum_liquidity: i128::MIN,
+                    last_ts: 10_000,
+                    last_active: 0,
+                },
+            );
+        });
+
+        env.ledger().with_mut(|l| l.timestamp = 10_600);
+        assert_eq!(
+            consumer.try_get_cl_twal(&pool_addr, &600),
+            Err(Ok(TwalError::ArithmeticOverflow))
+        );
     }
 
     #[test]

@@ -87,6 +87,10 @@ pub enum GovernanceError {
     DelegationCycle = 27,
     ProposalVetoed = 28,
     VetoWindowExpired = 29,
+    /// Reserved: never returned. `veto` takes no caller argument; it reads the
+    /// stored veto multisig and requires that address's authorization, so a
+    /// non-multisig caller fails the host auth check before any typed error is
+    /// produced.
     NotVetoMultisig = 30,
     InsufficientSnapshotBal = 31,
     VetoMultisigNotSet = 32,

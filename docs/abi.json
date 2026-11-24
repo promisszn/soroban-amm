@@ -19760,7 +19760,7 @@
               "value": 29
             },
             {
-              "doc": "",
+              "doc": "Reserved: never returned. `veto` takes no caller argument; it reads the\\nstored veto multisig and requires that address's authorization, so a\\nnon-multisig caller fails the host auth check before any typed error is\\nproduced.",
               "name": "NotVetoMultisig",
               "value": 30
             },

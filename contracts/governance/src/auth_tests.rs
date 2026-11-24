@@ -154,6 +154,35 @@ fn test_set_veto_multisig_requires_admin_auth() {
     f.check(&f.admin, "set_veto_multisig", (multisig,));
 }
 
+/// `veto` takes no caller argument: it authorizes the address stored by
+/// `set_veto_multisig`, so any other caller is stopped by the host auth check.
+/// It must never report `GovernanceError::NotVetoMultisig` — that discriminant
+/// is reserved and unreachable (issue #1326), and a typed error would make
+/// `assert_auth_err` fail here instead.
+#[test]
+fn test_veto_requires_stored_multisig_auth() {
+    let f = Fixture::new();
+    let multisig = Address::generate(&f.env);
+    let stranger = Address::generate(&f.env);
+    f.client().set_veto_multisig(&multisig);
+
+    let invoke = MockAuthInvoke {
+        contract: &f.addr,
+        fn_name: "veto",
+        args: (0_u32,).into_val(&f.env),
+        sub_invokes: &[],
+    };
+
+    f.env.set_auths(&[]);
+    assert_auth_err(&f.env, &invoke, "no authorizations");
+
+    f.env.mock_auths(&[MockAuth {
+        address: &stranger,
+        invoke: &invoke,
+    }]);
+    assert_auth_err(&f.env, &invoke, "a non-multisig caller's authorization");
+}
+
 #[test]
 fn test_propose_admin_requires_admin_auth() {
     let f = Fixture::new();
