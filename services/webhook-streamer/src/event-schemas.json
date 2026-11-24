@@ -686,6 +686,21 @@
     },
     "concentrated_liquidity": {
       "events": {
+        "initialized": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "admin",
+              "token_a",
+              "token_b",
+              "fee_bps",
+              "initial_tick",
+              "tick_spacing"
+            ]
+          }
+        ],
         "upgraded": [
           {
             "version": 1,
@@ -839,6 +854,17 @@
             "fields": [
               "old_oracle",
               "new_oracle"
+            ]
+          }
+        ],
+        "oracle_cardinality_set": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "old_cardinality",
+              "new_cardinality"
             ]
           }
         ],

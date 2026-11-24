@@ -711,6 +711,7 @@ count. Events marked unversioned carry their payload without the
 
 | Event | Topics | Payload fields | Envelope |
 |---|---|---|---|
+| `initialized` | 1 | `admin`, `token_a`, `token_b`, `fee_bps`, `initial_tick`, `tick_spacing` | v1 |
 | `upgraded` | 1 | `new_wasm_hash` | v1 |
 | `mint_pos` | 2 | `lower_tick`, `upper_tick`, `liquidity`, `amount_a`, `amount_b` | v1 |
 | `mod_pos` | 2 | `lower_tick`, `upper_tick`, `liquidity_delta`, `amount_a`, `amount_b` | v1 |
@@ -723,6 +724,7 @@ count. Events marked unversioned carry their payload without the
 | `price_upd` | 3 | `amount_in`, `amount_out`, `sqrt_price_x96`, `tick` | v1 |
 | `swap_out` | 2 | `zero_for_one`, `amount_in`, `amount_out`, `sqrt_price_x96`, `tick` | v1 |
 | `oracle_set` | 1 | `old_oracle`, `new_oracle` | v1 |
+| `oracle_cardinality_set` | 1 | `old_cardinality`, `new_cardinality` | v1 |
 | `position_nft_set` | 1 | `old_position_nft`, `new_position_nft` | v1 |
 | `max_oracle_deviation_set` | 1 | `old_deviation_bps`, `new_deviation_bps` | v1 |
 | `pause` | 1 | `admin` | v1 |
