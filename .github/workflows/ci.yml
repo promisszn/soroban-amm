@@ -23,6 +23,8 @@ jobs:
                   bash scripts/check_batch_router_deploy.test.sh
                   bash scripts/e2e/common.test.sh
                   bash scripts/e2e/flows.test.sh
+                  bash scripts/e2e/run.test.sh
+                  python3 -m unittest discover -s scripts/tests
             - name: Check release manifest
               run: make check-release-manifest
             - name: Setup Node
@@ -69,7 +71,7 @@ jobs:
             # fast, and does not need this job's compiler to match the CLI's
             # locked dependency tree the way `cargo install` would.
             - name: Install Stellar CLI
-              uses: stellar/stellar-cli@v27.1.0
+              uses: stellar/stellar-cli@v30.0.1
             - name: Check committed ABI against contract interfaces
               run: make check-abi
             - name: Test ABI generator and checker

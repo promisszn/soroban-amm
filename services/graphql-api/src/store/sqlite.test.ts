@@ -57,7 +57,9 @@ describe("SqliteStore", () => {
     });
     await store.upsertPosition({ id: "position-1", poolId: "pool-1", owner: "owner", shares: 5, valueUsd: 25 });
     await store.recordPrice({ poolId: "pool-1", timestamp: asSeconds(100), price: 2, feeBps: 30, feeBpsSource: "configured" });
-    await store.setAlertConfig({ poolId: "pool-1", metric: "tvl", thresholdValue: 10 });
+    await store.setAlertConfig({
+      poolId: "pool-1", metric: "tvl", comparison: "below", thresholdValue: 10,
+    });
     await store.recordAlert({ poolId: "pool-1", metric: "tvl", threshold: 10, currentValue: 50, firedAt: asSeconds(100) });
     await store.close();
 
@@ -67,6 +69,7 @@ describe("SqliteStore", () => {
     assert.equal((await store.getPositions("owner"))[0].valueUsd, 25);
     assert.equal((await store.getPriceHistory("pool-1", asSeconds(0), asSeconds(200)))[0].price, 2);
     assert.equal((await store.getAlertConfigs("pool-1"))[0].thresholdValue, 10);
+    assert.equal((await store.getAlertConfigs("pool-1"))[0].comparison, "below");
     assert.equal((await store.getFiredAlerts("pool-1"))[0].currentValue, 50);
     await store.close();
   });

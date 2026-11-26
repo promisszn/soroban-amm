@@ -1359,18 +1359,17 @@ mod tests {
     }
 
     /// Bootstrap a full fixture around the REAL V2 AMM:
-    ///   - `admin` seeds the pool with 6_000_000/6_000_000 (the first deposit
-    ///     locks MINIMUM_LIQUIDITY = 1_000; admin receives 5_999_000 LP);
-    ///   - `lp` mints exactly `lp_deposit_a`/`lp_deposit_b` and deposits
-    ///     them, ending with reserves 7_000_000/7_000_000 (+lp_deposit_b)
-    ///     and total shares 7_000_000 (+lp_deposit_b);
+    ///   - `admin` seeds the pool with the given reserve ratio, locking the
+    ///     first 1,000 shares;
+    ///   - `lp` supplies the deposit amounts at that ratio; later deposits
+    ///     refund unused tokens rather than changing the reserve ratio;
     ///   - the registered `TestV3Pool` harness is wired to the pair in the
     ///     `reversed` order when requested;
     ///   - the migration contract is initialized against both pools.
     fn build_fixture(
         env: &Env,
-        lp_deposit_a: i128,
-        lp_deposit_b: i128,
+        seed: (i128, i128),
+        deposit: (i128, i128),
         reversed: bool,
         initial_tick: i32,
     ) -> Fixture<'_> {
@@ -1406,16 +1405,24 @@ mod tests {
 
         ta_sac.mint(&admin, &10_000_000_i128);
         tb_sac.mint(&admin, &10_000_000_i128);
-        v2.add_liquidity(&admin, &6_000_000_i128, &6_000_000_i128, &0_i128, &DEADLINE);
+        v2.add_liquidity(&admin, &seed.0, &seed.1, &0, &DEADLINE);
+        let initial = v2.get_info();
+        assert_eq!((initial.reserve_a, initial.reserve_b), seed);
         assert_eq!(
-            LpTokenClient::new(env, &v2_lp_addr).balance(&admin),
-            5_999_000_i128,
-            "6M initial shares minus the 1_000 locked MINIMUM_LIQUIDITY"
+            LpTokenClient::new(env, &v2_lp_addr).balance(&admin) + 1_000,
+            initial.total_shares,
+            "the first deposit locks 1,000 LP shares"
         );
 
-        ta_sac.mint(&lp, &lp_deposit_a);
-        tb_sac.mint(&lp, &lp_deposit_b);
-        let lp_shares = v2.add_liquidity(&lp, &lp_deposit_a, &lp_deposit_b, &0_i128, &DEADLINE);
+        ta_sac.mint(&lp, &deposit.0);
+        tb_sac.mint(&lp, &deposit.1);
+        let lp_shares = v2.add_liquidity(&lp, &deposit.0, &deposit.1, &0, &DEADLINE);
+        let seeded = v2.get_info();
+        assert_eq!(
+            (seeded.reserve_a, seeded.reserve_b),
+            (seed.0 + deposit.0, seed.1 + deposit.1),
+            "the fixture must deposit at the seeded ratio"
+        );
 
         // ── V3 harness ──
         let v3_addr = env.register_contract(None, TestV3Pool);
@@ -1460,7 +1467,19 @@ mod tests {
     /// reserves 7_000_000/7_000_000, total shares 7_000_000, `lp` holds
     /// 1_000_000 shares (a full exit withdraws exactly 1_000_000/1_000_000).
     fn fixture(env: &Env) -> Fixture<'_> {
-        build_fixture(env, 1_000_000, 1_000_000, false, 0)
+        build_fixture(
+            env,
+            (6_000_000, 6_000_000),
+            (1_000_000, 1_000_000),
+            false,
+            0,
+        )
+    }
+
+    /// A 1:4 reserve ratio makes swapped token amounts visible in every
+    /// assertion. The LP owns 2M of 6M shares and redeems exactly 1M A / 4M B.
+    fn reversed_fixture(env: &Env) -> Fixture<'_> {
+        build_fixture(env, (2_000_000, 8_000_000), (1_000_000, 4_000_000), true, 0)
     }
 
     // ── initialize ─────────────────────────────────────────────────────────────
@@ -2126,13 +2145,7 @@ mod tests {
     #[test]
     fn test_migrate_reversed_v3_token_order_maps_amounts_correctly() {
         let env = Env::default();
-        // Asymmetric deposit so amount_a != amount_b, making any swap bug
-        // observable instead of silently self-cancelling:
-        //   admin: 6M/6M → reserves 6M/6M, total 6M shares (5_999_000 + 1_000);
-        //   lp:    1M/2M → shares = min(1M*6M/6M, 2M*6M/6M) = 1M;
-        //   reserves 7M/8M, total shares 7M.
-        // Full exit: out_a = 1M*7M/7M = 1_000_000, out_b = 1M*8M/7M = 1_142_857.
-        let f = build_fixture(&env, 1_000_000, 2_000_000, true, 0);
+        let f = reversed_fixture(&env);
 
         let result = f.migration.migrate_default(
             &f.lp,
@@ -2149,17 +2162,17 @@ mod tests {
 
         // The reversed V3 pool (token_a == V2's token_b) must receive the tb
         // side as its amount_a and the ta side as its amount_b.
-        assert_eq!(result.deposited_a, 1_142_857_i128);
+        assert_eq!(result.deposited_a, 4_000_000_i128);
         assert_eq!(result.deposited_b, 1_000_000_i128);
 
         let pos = f.v3.position(&result.position_token_id.unwrap());
-        assert_eq!(pos.deposited_a, 1_142_857_i128);
+        assert_eq!(pos.deposited_a, 4_000_000_i128);
         assert_eq!(pos.deposited_b, 1_000_000_i128);
 
         // The underlying tokens landed on the correct sides: V3's token_a (==
-        // V2's token_b) is ahead by 1_142_857; V3's token_b (== V2's token_a)
+        // V2's token_b) is ahead by 4_000_000; V3's token_b (== V2's token_a)
         // by 1_000_000.
-        assert_eq!(f.tb.balance(&f.v3_pool), 1_142_857_i128);
+        assert_eq!(f.tb.balance(&f.v3_pool), 4_000_000_i128);
         assert_eq!(f.ta.balance(&f.v3_pool), 1_000_000_i128);
     }
 
@@ -2167,7 +2180,13 @@ mod tests {
     fn test_migrated_event_emits_versioned_schema() {
         let env = Env::default();
         env.mock_all_auths();
-        let f = build_fixture(&env, 1_000_000_i128, 1_000_000_i128, false, 1000);
+        let f = build_fixture(
+            &env,
+            (6_000_000, 6_000_000),
+            (1_000_000, 1_000_000),
+            false,
+            1000,
+        );
 
         let _result = f.migration.migrate_default(
             &f.lp,
@@ -2366,7 +2385,7 @@ mod tests {
     #[test]
     fn test_migrate_respects_reversed_cl_token_order() {
         let env = Env::default();
-        let f = build_fixture(&env, 1_000_000, 2_000_000, true, 0);
+        let f = reversed_fixture(&env);
 
         let result = f
             .migration
@@ -2375,9 +2394,9 @@ mod tests {
         // CL token_a is the V2 pool's token_b.
         assert_eq!(
             (result.deposited_a, result.deposited_b),
-            (1_142_857, 1_000_000)
+            (4_000_000, 1_000_000)
         );
-        assert_eq!(f.tb.balance(&f.v3_pool), 1_142_857);
+        assert_eq!(f.tb.balance(&f.v3_pool), 4_000_000);
         assert_eq!(f.ta.balance(&f.v3_pool), 1_000_000);
     }
 
@@ -2923,7 +2942,7 @@ mod tests {
     #[test]
     fn test_preview_migration_reports_amounts_in_cl_token_order() {
         let env = Env::default();
-        let f = build_fixture(&env, 1_000_000, 2_000_000, true, 0);
+        let f = reversed_fixture(&env);
 
         let preview =
             f.migration
@@ -2932,7 +2951,7 @@ mod tests {
         // CL token_a is the V2 pool's token_b.
         assert_eq!(
             (preview.withdraw_a, preview.withdraw_b),
-            (1_142_857, 1_000_000)
+            (4_000_000, 1_000_000)
         );
     }
 

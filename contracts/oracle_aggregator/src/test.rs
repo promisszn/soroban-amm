@@ -984,6 +984,92 @@ fn get_price_detailed_accounts_all_sources() {
     assert_eq!(deviant_count, 1);
 }
 
+#[test]
+fn get_price_persists_last_successful_source_timestamp() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let source = deploy_fixed_source(&env, 100, 900);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &source,
+        &OracleSourceType::External,
+        &10_000,
+    );
+    // The production policy needs two agreeing sources for a successful quote.
+    let supporting_source = deploy_fixed_source(&env, 100, 900);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &supporting_source,
+        &OracleSourceType::External,
+        &10_000,
+    );
+    set_now(&env, 1_000);
+
+    assert_eq!(
+        h.aggregator
+            .list_sources(&pair(&h), &0, &MAX_PAGE_SIZE)
+            .get_unchecked(0)
+            .last_updated_at,
+        0
+    );
+
+    h.aggregator.get_price(&h.token_a, &h.token_b);
+
+    assert_eq!(
+        h.aggregator
+            .list_sources(&pair(&h), &0, &MAX_PAGE_SIZE)
+            .get_unchecked(0)
+            .last_updated_at,
+        900
+    );
+}
+
+#[test]
+fn preview_price_reads_do_not_persist_source_timestamps() {
+    let env = Env::default();
+    let h = deploy(&env, 600);
+    let source = deploy_fixed_source(&env, 100, 900);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &source,
+        &OracleSourceType::External,
+        &10_000,
+    );
+    // The production policy needs two agreeing sources for a successful quote.
+    let supporting_source = deploy_fixed_source(&env, 100, 900);
+    h.aggregator.register_source(
+        &h.admin,
+        &pair(&h),
+        &supporting_source,
+        &OracleSourceType::External,
+        &10_000,
+    );
+    set_now(&env, 1_000);
+    h.aggregator.get_price(&h.token_a, &h.token_b);
+
+    FixedTimestampAdapterClient::new(&env, &source).set_quote(&100, &950);
+    h.aggregator.get_price_safe(&h.token_a, &h.token_b);
+    assert_eq!(
+        h.aggregator
+            .list_sources(&pair(&h), &0, &MAX_PAGE_SIZE)
+            .get_unchecked(0)
+            .last_updated_at,
+        900
+    );
+
+    h.aggregator.get_price_detailed(&h.token_a, &h.token_b);
+    assert_eq!(
+        h.aggregator
+            .list_sources(&pair(&h), &0, &MAX_PAGE_SIZE)
+            .get_unchecked(0)
+            .last_updated_at,
+        900
+    );
+}
+
 /// The Agreed subset of get_price_detailed reproduces get_price_safe.
 #[test]
 fn get_price_detailed_agreed_matches_get_price_safe() {

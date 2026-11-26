@@ -112,6 +112,17 @@ export class DeadLetterQueue {
     return true;
   }
 
+  /** Remove every retained delivery for an unregistered subscription. */
+  removeBySubscription(subscriptionId: string): number {
+    const remaining = this.entries.filter((entry) => entry.subscription.id !== subscriptionId);
+    const removed = this.entries.length - remaining.length;
+    if (removed > 0) {
+      this.entries = remaining;
+      this.persist();
+    }
+    return removed;
+  }
+
   /** Drop every entry. */
   clear(): void {
     this.entries = [];

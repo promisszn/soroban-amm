@@ -182,14 +182,49 @@ func (e *ContractError) Unwrap() error { return e.sentinel }
 // report a contract-returned error.
 var contractErrPattern = regexp.MustCompile(`Error\s*\(\s*Contract\s*,\s*#(\d+)\s*\)`)
 
-var diagnosticErrors = []struct {
-	patterns []string
+// diagnosticPatterns holds compiled word-boundary regexps for the free-text
+// host diagnostic classifier. Each pattern uses \b so that short tokens like
+// "ttl" or "budget" cannot match mid-word (e.g. "bottleneck", "rebudget").
+// Patterns that already span multiple words (e.g. "wasm trap") do not need
+// boundary anchors on the space, only on the outer edges.
+var diagnosticPatterns = []struct {
+	patterns []*regexp.Regexp
 	err      error
 }{
-	{[]string{"error(auth", "auth,", "unauthorized"}, ErrAuthFailed},
-	{[]string{"wasmvm", "wasm trap", "unreachable"}, ErrWasmTrap},
-	{[]string{"budget", "exceededlimit", "resource limit", "txinsufficientfee"}, ErrResourceLimit},
-	{[]string{"archived", "restorefootprint", "entryarchived", "ttl"}, ErrArchivedState},
+	{
+		[]*regexp.Regexp{
+			regexp.MustCompile(`\berror\(auth`),
+			regexp.MustCompile(`\bauth,`),
+			regexp.MustCompile(`\bunauthorized\b`),
+		},
+		ErrAuthFailed,
+	},
+	{
+		[]*regexp.Regexp{
+			regexp.MustCompile(`\bwasmvm\b`),
+			regexp.MustCompile(`\bwasm trap\b`),
+			regexp.MustCompile(`\bunreachable\b`),
+		},
+		ErrWasmTrap,
+	},
+	{
+		[]*regexp.Regexp{
+			regexp.MustCompile(`\bbudget\b`),
+			regexp.MustCompile(`\bexceededlimit\b`),
+			regexp.MustCompile(`\bresource limit\b`),
+			regexp.MustCompile(`\btxinsufficientfee\b`),
+		},
+		ErrResourceLimit,
+	},
+	{
+		[]*regexp.Regexp{
+			regexp.MustCompile(`\barchived\b`),
+			regexp.MustCompile(`\brestorefootprint\b`),
+			regexp.MustCompile(`\bentryarchived\b`),
+			regexp.MustCompile(`\bttl\b`),
+		},
+		ErrArchivedState,
+	},
 }
 
 // DecodeContractError converts an RPC error string into a typed *ContractError.
@@ -208,9 +243,9 @@ func DecodeContractErrorFor(kind ContractKind, raw string) *ContractError {
 	m := contractErrPattern.FindStringSubmatch(raw)
 	if m == nil {
 		lower := strings.ToLower(raw)
-		for _, diagnostic := range diagnosticErrors {
+		for _, diagnostic := range diagnosticPatterns {
 			for _, pattern := range diagnostic.patterns {
-				if strings.Contains(lower, pattern) {
+				if pattern.MatchString(lower) {
 					ce.sentinel = diagnostic.err
 					return ce
 				}

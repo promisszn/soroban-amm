@@ -43,7 +43,11 @@ async function main(): Promise<void> {
   // Build a signer from SIGNING_SECRET_KEY. Set DRY_RUN=1 to skip writes and
   // only print the reviewed parameters — useful when no funded key is available.
   const dryRun = process.env.DRY_RUN === "1";
-  const signer = dryRun ? null : makeKeypairSigner(networkPassphrase);
+  const signer = dryRun ? null : makeKeypairSigner();
+
+  if (signer && await signer.publicKey() !== sourceAddress) {
+    throw new Error("SIGNING_SECRET_KEY does not match SOURCE_ADDRESS");
+  }
 
   // 1. Read pool info to confirm the pair and current reserves.
   const info = await pool.getInfo();
@@ -63,14 +67,14 @@ async function main(): Promise<void> {
   });
 
   // 3. Submit the swap via AmmPool.swap. The SDK simulates the transaction,
-  //    assembles the Soroban auth entries, signs it via the signer callback,
+  //    assembles the Soroban auth entries, signs it via the supplied signer,
   //    and polls until the transaction is confirmed.
   if (signer) {
-    const amountOut = await pool.swap(
+    const { returnValue: amountOut, hash } = await pool.swap(
       { trader: sourceAddress, tokenIn: tokenInId, amountIn, minAmountOut, deadline },
       signer
     );
-    console.log("Swap confirmed", { amountOut });
+    console.log("Swap confirmed", { amountOut, hash });
   } else {
     console.log("DRY_RUN: swap would submit", { trader: sourceAddress, tokenIn: tokenInId, amountIn, minAmountOut, deadline });
   }
@@ -87,8 +91,8 @@ async function main(): Promise<void> {
       deadline: addDeadline,
     };
     if (signer) {
-      const result = await pool.addLiquidity(addParams, signer);
-      console.log("Add-liquidity confirmed", { ...result, token: tokenSymbol });
+      const { returnValue: shares, hash } = await pool.addLiquidity(addParams, signer);
+      console.log("Add-liquidity confirmed", { shares, hash, token: tokenSymbol });
     } else {
       console.log("DRY_RUN: add-liquidity would submit", { ...addParams, token: tokenSymbol });
     }
@@ -114,8 +118,8 @@ async function main(): Promise<void> {
         deadline: removeDeadline,
       };
       if (signer) {
-        const result = await pool.removeLiquidity(removeParams, signer);
-        console.log("Remove-liquidity confirmed", result);
+        const { returnValue: [amountA, amountB], hash } = await pool.removeLiquidity(removeParams, signer);
+        console.log("Remove-liquidity confirmed", { amountA, amountB, shares, hash });
       } else {
         console.log("DRY_RUN: remove-liquidity would submit", removeParams);
       }

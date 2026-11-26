@@ -360,12 +360,31 @@ test("renderAlertConfigs labels bps and native-unit metrics differently", () => 
   const doc = installFakeDocument(["alert-list"]);
   renderAlertConfigs([
     { poolId: "p", metric: "price_deviation", thresholdBps: 50 },
-    { poolId: "p", metric: "tvl", thresholdValue: 1000 },
+    { poolId: "p", metric: "tvl", comparison: "below", thresholdValue: 1000 },
   ], () => {});
   const list = doc.getElementById("alert-list");
   assert.ok(list.children[0].textContent.includes("50 bps"));
-  assert.ok(list.children[1].textContent.includes("> 1000"));
+  assert.ok(list.children[1].textContent.includes("< 1000"));
   assert.ok(!list.children[1].textContent.includes("bps"));
+});
+
+test("addAlert submits TVL floor comparison and configured comparison is rendered", async () => {
+  const doc = setupRefreshTestDom();
+  let mutation;
+  globalThis.fetch = async (_url, options) => {
+    mutation = JSON.parse(options.body);
+    return { ok: true, json: async () => ({ data: {} }) };
+  };
+  doc.registerElement("alert-metric", { value: "tvl" });
+  doc.registerElement("alert-threshold", { value: "500" });
+
+  const controller = createDashboardController({ apiUrl: "http://api.test", poolId: "pool-a" });
+  await controller.addAlert();
+
+  assert.equal(mutation.variables.comparison, "below");
+  assert.match(mutation.query, /setAlertConfig\([^)]*comparison: \$comparison/);
+  assert.match(mutation.query, /\{ poolId metric comparison /);
+  assert.ok(doc.getElementById("alert-list").children[0].textContent.includes("< 500"));
 });
 
 test("gql throws on a non-OK HTTP status", async () => {

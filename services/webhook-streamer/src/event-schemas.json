@@ -314,6 +314,36 @@
     },
     "batch_auction": {
       "events": {
+        "pause": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "admin"
+            ]
+          }
+        ],
+        "unpause": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "admin"
+            ]
+          }
+        ],
+        "upgraded": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "new_wasm_hash"
+            ]
+          }
+        ],
         "order_submitted": [
           {
             "version": 1,
@@ -579,6 +609,27 @@
     },
     "cl_position_nft": {
       "events": {
+        "accept_transfers_set": [
+          {
+            "version": 1,
+            "topics": 2,
+            "shape": "tuple",
+            "fields": [
+              "accepts"
+            ]
+          }
+        ],
+        "ttl_params_set": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "min_ttl_threshold",
+              "bump_to"
+            ]
+          }
+        ],
         "initialized": [
           {
             "version": 1,
@@ -975,6 +1026,37 @@
             "shape": "tuple",
             "fields": [
               "admin"
+            ]
+          }
+        ],
+        "admin_nominated": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "current_admin",
+              "new_admin"
+            ]
+          }
+        ],
+        "admin_changed": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "new_admin"
+            ]
+          }
+        ],
+        "upgraded": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "new_wasm_hash"
             ]
           }
         ],
@@ -1553,7 +1635,7 @@
             "fields": [
               "campaign_id",
               "provider",
-              "pending",
+              "amount",
               "dist_id"
             ]
           }
@@ -2146,6 +2228,16 @@
               "unhealthy"
             ]
           }
+        ],
+        "upgraded": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "new_wasm_hash"
+            ]
+          }
         ]
       }
     },
@@ -2433,6 +2525,28 @@
             "shape": "tuple",
             "fields": [
               "registered"
+            ]
+          }
+        ],
+        "staker_index_backfilled": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "added"
+            ]
+          }
+        ],
+        "staker_index_migration_progress": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "offset",
+              "processed",
+              "remaining"
             ]
           }
         ]

@@ -71,17 +71,21 @@ export const typeDefs = `#graphql
   Configured alert threshold for a pool metric. metric must be one of
   "price_deviation", "tvl", "volume24h". "price_deviation" uses thresholdBps
   (basis points); "tvl" and "volume24h" use thresholdValue (a raw value in
-  the metric's native units, not basis points).
+  the metric's native units, not basis points). comparison defaults to
+  "above"; "below" fires only when the metric is strictly below the threshold.
+  TVL alerts do not fire while TVL is null because token prices are unavailable.
   """
   type AlertConfig {
     poolId: ID!
     metric: String!
+    comparison: String!
     thresholdBps: Int
     thresholdValue: Float
   }
 
   type Query {
     poolStats(poolId: ID): [PoolStats!]!
+    "Maximum 1000 events. limit must be between 1 and 1000."
     poolEvents(poolId: ID, limit: Int = 100): [PoolEvent!]!
     positions(owner: String): [Position!]!
     "from and to are inclusive bounds in seconds since the Unix epoch."
@@ -95,9 +99,9 @@ export const typeDefs = `#graphql
     """
     metric must be one of "price_deviation", "tvl", "volume24h". Pass
     thresholdBps for "price_deviation"; pass thresholdValue for "tvl" and
-    "volume24h". Both fields must be >= 0.
+    "volume24h". Both fields must be >= 0. comparison defaults to "above".
     """
-    setAlertConfig(poolId: ID!, metric: String!, thresholdBps: Int, thresholdValue: Float): AlertConfig!
+    setAlertConfig(poolId: ID!, metric: String!, comparison: String = "above", thresholdBps: Int, thresholdValue: Float): AlertConfig!
     removeAlertConfig(poolId: ID!, metric: String!): Boolean!
   }
 

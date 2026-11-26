@@ -92,13 +92,11 @@ against for the compiler, so `.stellar-version` is the single source of truth
 that `Dockerfile` reads directly, while `scripts/check_stellar_version.mjs`
 enforces that `ci.yml`, `release.yml`, and `smoke-test.yml` pin the matching tag.
 
-The version is chosen deliberately rather than by taking the newest release.
-`27.1.0` is what this image can build: `--locked` compiles the CLI's own
-`Cargo.lock` with the toolchain above, and `25.1.0` locks `ethnum 1.5.2`,
-which Rust 1.98.1 rejects with E0512 (`cannot transmute between types of
-different sizes`). `27.1.0` locks `ethnum 1.5.3`, the version this workspace
-already builds with, so the container, the release optimizer and the smoke
-test all agree on a CLI that compiles here.
+Check a new version against the pinned Rust toolchain before upgrading:
+`--locked` builds the CLI's own dependency tree. Older releases such as
+`25.1.0` pin `ethnum 1.5.2`, which Rust 1.98.1 rejects with E0512
+(`cannot transmute between types of different sizes`). Also regenerate and
+check the ABI, and verify that the new CLI can optimize the release WASM.
 
 ---
 
@@ -133,8 +131,9 @@ Common tasks are wrapped in the `Makefile`:
 make help       # list every target with a one-line description (default goal)
 make build      # cargo build --release --target wasm32v1-none
 make optimize   # optimize every WASM artifact from `make build` via the Stellar CLI
-make test       # build, then run the workspace test suite
-make test-all   # run tests for the whole workspace
+make test       # build, then run the workspace test suite (excludes amm_fuzz, matches CI)
+make test-all   # run workspace tests excluding amm_fuzz (matches CI)
+make mutation-check CRATE=amm # check curated authorization and guard mutations
 make fmt        # cargo fmt --all
 make lint       # cargo clippy --all -- -D warnings
 make check-docs # verify docs/error-codes.md matches #[contracterror] enums
@@ -145,7 +144,7 @@ make size       # print a WASM size report for all built contracts
 make size-check # fail if any contract WASM exceeds the size limit
 make doc        # build workspace docs with warnings denied
 make audit      # run a security audit of dependencies (cargo-audit)
-make check      # fmt + lint + test + check-docs + check-deploy-scripts + size-check + doc (run before pushing)
+make check      # run the local equivalents of CI gates, including the dependency audit
 make bench      # hot-path benchmarks
 make deploy     # deploy contracts via scripts/deploy.sh
 make e2e        # run the end-to-end test suite
@@ -172,8 +171,13 @@ Before opening a PR, run:
 make check
 ```
 
-This is intended to track the same set of checks CI enforces in
-`.github/workflows/ci.yml`, so passing it locally means your PR should pass CI.
+`make check` mirrors the gates in `.github/workflows/ci.yml` that have local
+Make targets. When adding a CI gate that already has a Make target, add that
+target to `check` in the same PR.
+
+The dependency audit runs by default and requires `cargo-audit`. If it is not
+installed locally, `make check SKIP_AUDIT=1` runs the remaining checks and prints
+that the audit was skipped. This does not skip the separate CI audit.
 
 ---
 
@@ -209,6 +213,52 @@ This is intended to track the same set of checks CI enforces in
 
 Every behavioral change **must** come with tests.
 
+### Authorization and guard mutations
+
+When adding or changing an authorization check, deadline, slippage bound, or
+similar guard in a contract, run the curated mutation check for that crate:
+
+```bash
+make mutation-check CRATE=amm
+```
+
+This builds the WASM fixtures (`make build`), then runs the crate's unmutated
+library tests as a baseline: if they do not build or do not pass, the check
+stops with an error rather than reporting a meaningless result. It then removes
+or flips one selected guard at a time in the crate's production sources (every
+module reachable from `src/lib.rs`, skipping `#[cfg(test)]` items and test-only
+modules), reruns `cargo test -p <crate> --lib`, and restores the file after
+each mutation, including on timeout and Ctrl-C. A survivor means the tests
+still pass with the guard changed; unaccepted survivors fail the command and
+include the file, line, function and before/after text. Mutations that do not
+compile are counted separately, and a run where no mutation compiles fails.
+The nightly `Curated Mutation Check` workflow runs the selected contracts (in
+parallel shards) and uploads the reports. The local script requires Python
+3.11 or newer.
+
+Pass extra flags with `ARGS`: `ARGS="--list"` prints every mutation and its id
+without running cargo, and `ARGS="--limit 3"` runs only the first three.
+
+An intentional survivor can be exempted in `mutations.toml` under the crate's
+`[crates.<name>]` table. Add its exact reported mutation `id` and a specific
+reason explaining why the survivor is not a coverage gap:
+
+```toml
+[[crates.amm.accepted_survivors]]
+id = "auth:deposit_for:0123abcd45"
+justification = "Removing this user-level auth fails nested token authorization."
+```
+
+Ids have the form `<operator>:<function>:<hash>`. The hash covers the crate,
+file, enclosing function, the mutated line's text (whitespace-normalized) and
+the mutation itself, so edits elsewhere in the file do not change an id, but
+editing the guarded line, renaming its function or moving it to another file
+does. The report lists accepted ids that no longer match any mutation as
+`STALE`; update or remove them.
+
+Do not use an exemption to avoid adding a test for a guard the contract relies
+on. Remove accepted entries when the corresponding tests land.
+
 ### Local artifacts and repository hygiene
 
 Soroban `test_snapshots/` directories are generated local artifacts, not test
@@ -240,7 +290,7 @@ these artifacts.
 Run the full suite:
 
 ```bash
-make test          # or: cargo test --workspace
+make test          # or: cargo test --workspace --exclude amm_fuzz
 ```
 
 Run a single crate's tests:
@@ -264,9 +314,14 @@ The release workflow uses only that version's section as the GitHub release
 body; it does not modify or upload a temporary changelog.
 
 After the PR is merged, create and push a `v*` tag on the merged commit. The
-workflow confirms that commit is reachable from `main`, builds with the pinned
-Rust toolchain and locked Cargo dependencies, runs the Rust and ABI/documentation
-gates, and checks the exact deployable WASM set. It then creates a draft release,
+workflow confirms that commit is reachable from `main`, checks Stellar CLI and
+Node version pins, event schemas, and JS/TS module reachability, builds with the
+pinned Rust toolchain and locked Cargo dependencies, runs the Rust gates
+(workspace tests, upgrade tests, benchmarks, clippy, rustfmt, rustdoc),
+documentation/contract checks (error docs, storage keys, deploy scripts,
+test-module compilation, ABI check and fixture tests, documented contract
+commands and fixture tests, WASM size limits, and release manifest tests), and
+verifies the exact deployable WASM set. It then creates a draft release,
 downloads and verifies the draft assets, and runs the testnet e2e smoke suite
 against those downloaded WASM files. The release is published only if the smoke
 test passes. The published assets include the contract WASM files,

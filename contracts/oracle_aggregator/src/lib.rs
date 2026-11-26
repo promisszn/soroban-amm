@@ -54,7 +54,7 @@ pub enum OracleSourceType {
 pub struct OracleSource {
     pub source_contract: Address,
     pub source_type: OracleSourceType,
-    /// Last timestamp reported by the source itself
+    /// Timestamp of the last successfully returned quote, persisted by `get_price`.
     pub last_updated_at: u64,
     /// Weight in basis points (10_000 = 1.0×).
     pub weight: u32,
@@ -632,7 +632,8 @@ impl OracleAggregator {
     ) -> PriceBreakdown {
         let (pair, reverse) = canonical_pair(env, token_a, token_b);
         let mut sources = read_pair_sources(env, &pair);
-        if sources.is_empty() {
+        let using_legacy_sources = sources.is_empty();
+        if using_legacy_sources {
             sources = read_legacy_sources(env);
         }
 
@@ -658,17 +659,21 @@ impl OracleAggregator {
         let mut source_quotes: Vec<SourceQuote> = Vec::new(env);
 
         for i in 0..sources.len() {
-            let source = sources.get_unchecked(i);
+            let mut source = sources.get_unchecked(i);
             let src_addr = source.source_contract.clone();
             let w = source.weight;
 
             let client = OracleSourceAdapterClient::new(env, &source.source_contract);
 
-            let (mut price, source_timestamp) = match client.try_quote(&pair.token_a, &pair.token_b)
-            {
-                Ok(Ok(res)) => res,
-                _ => (0, 0),
-            };
+            let (mut price, source_timestamp, quote_succeeded) =
+                match client.try_quote(&pair.token_a, &pair.token_b) {
+                    Ok(Ok((price, timestamp))) => (price, timestamp, true),
+                    _ => (0, 0, false),
+                };
+            if emit_alerts && quote_succeeded {
+                source.last_updated_at = source_timestamp;
+                sources.set(i, source);
+            }
             if reverse && price > 0 {
                 price = PRICE_SCALE.saturating_mul(PRICE_SCALE) / price;
             }
@@ -697,6 +702,14 @@ impl OracleAggregator {
                 weight: w,
                 status,
             });
+        }
+
+        if emit_alerts {
+            if using_legacy_sources {
+                env.storage().instance().set(&DataKey::Sources, &sources);
+            } else {
+                write_pair_sources(env, &pair, &sources);
+            }
         }
 
         if emit_alerts && !stale_sources.is_empty() {

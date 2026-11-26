@@ -67,6 +67,6 @@ The example prints a readable contract error and links to `docs/error-codes.md` 
 1. `pool.getInfo()` — confirm the pair and read reserves.
 2. `pool.simulateSwap(tokenIn, amountIn)` — quote the swap off-chain using the constant-product formula. No transaction is submitted.
 3. Apply slippage: `minAmountOut = quote.amountOut * (10_000 - slippageBps) / 10_000`.
-4. `pool.swap(params, signer)` — the SDK simulates the transaction (gets the Soroban footprint and auth entries), assembles the envelope, calls `signer` with the unsigned XDR, and submits the signed result. It polls until the transaction is confirmed or rejected, then returns the amount of output token received.
+4. `pool.swap(params, signer)` — the SDK simulates the transaction (gets the Soroban footprint and auth entries), assembles the envelope, calls `signer.signTransaction` with the unsigned XDR, and submits the signed result. It polls until the transaction is confirmed or rejected, then returns the hash, ledger, and amount received in `returnValue`.
 5. `pool.addLiquidity(params, signer)` — same signed lifecycle (opt-in via `ADD_LIQUIDITY=1`).
 6. `pool.removeLiquidity(params, signer)` — same signed lifecycle (opt-in via `REMOVE_LIQUIDITY=1`).

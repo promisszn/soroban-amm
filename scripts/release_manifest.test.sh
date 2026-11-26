@@ -15,7 +15,7 @@ fi
 wasms=(
   amm.wasm batch_auction.wasm batch_router.wasm cl_position_nft.wasm
   concentrated_liquidity.wasm dex_aggregator.wasm factory.wasm governance.wasm
-  incentive_campaigns.wasm oracle_aggregator.wasm pol_vesting.wasm
+  incentive_campaigns.wasm oracle_adapters.wasm oracle_aggregator.wasm pol_vesting.wasm
   reserve_manager.wasm router.wasm staking.wasm token.wasm twal_consumer.wasm
   twap_consumer.wasm v2_to_v3_migration.wasm
 )
@@ -85,7 +85,8 @@ assert manifest["commit"] == "abc123"
 assert manifest["tag"] == "v1.2.3"
 assert manifest["rust_toolchain"] == "1.98.1"
 assert manifest["stellar_cli_version"] == "27.1.0"
-assert len(manifest["artifacts"]) == 18
+assert len(manifest["artifacts"]) == 19
+assert "oracle_adapters.wasm" in {item["name"] for item in manifest["artifacts"]}
 assert all(len(item["sha256"]) == 64 and item["size_bytes"] > 0 for item in manifest["artifacts"])
 assert not {"flash_loan_receiver.wasm", "soroban_amm_sdk.wasm"} & {item["name"] for item in manifest["artifacts"]}
 PY

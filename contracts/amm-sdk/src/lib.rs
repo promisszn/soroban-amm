@@ -6,9 +6,10 @@
 //!
 //! * **`types`** – shared Soroban-compatible types that mirror on-chain data
 //!   structures (errors, pool state, swap results, events).
-//! * **`client`** – a high-level [`client::AmmPoolSdk`] client that wraps every
-//!   contract entry point with Rust-native ergonomics and validated quote
-//!   helpers.
+//! * **`client`** – a high-level [`client::AmmPoolSdk`] client and
+//!   [`client::AmmPoolInterface`] typed contract trait covering all public AMM
+//!   entry points, including emergency withdrawal, multisig, circuit-breaker,
+//!   FOT, oracle, and view operations.
 //! * **`events`** – strongly-typed event decoders for every event emitted by
 //!   the AMM contracts.
 //!

@@ -18,7 +18,7 @@
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
-    Bytes, BytesN, Env, Symbol,
+    Bytes, BytesN, Env, Symbol, U256,
 };
 // Export compiled WASM for tests/dev usage when the `testutils` feature is enabled.
 #[cfg(feature = "testutils")]
@@ -865,14 +865,14 @@ impl AmmPool {
                 .instance()
                 .get(&DataKey::MultisigSigners)
                 .unwrap_or_else(|| soroban_sdk::Vec::new(&env));
-            let mut approved: u32 = 0;
+            let mut approved_signers = soroban_sdk::Vec::new(&env);
             for caller in callers.iter() {
-                if signers.contains(&caller) {
+                if signers.contains(&caller) && !approved_signers.contains(&caller) {
                     caller.require_auth();
-                    approved += 1;
+                    approved_signers.push_back(caller);
                 }
             }
-            if approved < quorum {
+            if approved_signers.len() < quorum {
                 return Err(AmmError::Unauthorized);
             }
         }
@@ -1987,10 +1987,9 @@ impl AmmPool {
     /// Deposit tokens into the pool and receive LP shares in return.
     ///
     /// On the first deposit any ratio is accepted and the initial share supply is
-    /// set to the geometric mean of the two amounts. Subsequent deposits must
-    /// match the current pool ratio (within integer rounding); excess tokens are
-    /// **not** refunded automatically — callers should compute amounts off-chain
-    /// before calling.
+    /// set to the geometric mean of the two amounts. For subsequent deposits,
+    /// only the amounts backing the minted shares are retained; any excess is
+    /// refunded to the provider.
     ///
     /// Requires `provider` to have authorized this call.
     ///
@@ -2052,20 +2051,38 @@ impl AmmPool {
             min_shares,
         )?;
 
+        let (used_a, used_b) = Self::compute_liquidity_amounts_used(
+            &env,
+            amount_a,
+            amount_b,
+            reserve_a,
+            reserve_b,
+            total_shares,
+            shares_to_provider,
+        );
+
         // Pull tokens from provider into the pool contract.
         let client_a = SepTokenClient::new(&env, &token_a);
         let client_b = SepTokenClient::new(&env, &token_b);
-        client_a.transfer(&provider, &env.current_contract_address(), &amount_a);
-        client_b.transfer(&provider, &env.current_contract_address(), &amount_b);
+        let pool = env.current_contract_address();
+        client_a.transfer(&provider, &pool, &amount_a);
+        client_b.transfer(&provider, &pool, &amount_b);
+
+        if amount_a > used_a {
+            client_a.transfer(&pool, &provider, &(amount_a - used_a));
+        }
+        if amount_b > used_b {
+            client_b.transfer(&pool, &provider, &(amount_b - used_b));
+        }
 
         // Update reserves.
         let total_minted = shares_to_provider + shares_locked;
         env.storage()
             .instance()
-            .set(&DataKey::ReserveA, &(reserve_a + amount_a));
+            .set(&DataKey::ReserveA, &(reserve_a + used_a));
         env.storage()
             .instance()
-            .set(&DataKey::ReserveB, &(reserve_b + amount_b));
+            .set(&DataKey::ReserveB, &(reserve_b + used_b));
         env.storage()
             .instance()
             .set(&DataKey::TotalShares, &(total_shares + total_minted));
@@ -2084,7 +2101,7 @@ impl AmmPool {
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "add_liquidity"), provider),
-            (amount_a, amount_b, shares_to_provider)
+            (used_a, used_b, shares_to_provider)
         );
 
         Ok(shares_to_provider)
@@ -3448,7 +3465,8 @@ impl AmmPool {
     /// Like `add_liquidity` but measures the actual token amounts received
     /// by the pool via pre/post balance snapshots rather than trusting the
     /// nominal `amount_a`/`amount_b` values. LP shares are minted proportional
-    /// to what the pool actually received.
+    /// to what the pool actually received, and unused received amounts are
+    /// refunded to the provider.
     ///
     /// # Parameters
     /// - `min_received_a` – Minimum actual `token_a` the pool must receive.
@@ -3524,12 +3542,29 @@ impl AmmPool {
             min_shares,
         )?;
 
+        let (used_a, used_b) = Self::compute_liquidity_amounts_used(
+            &env,
+            actual_a,
+            actual_b,
+            reserve_a,
+            reserve_b,
+            total_shares,
+            shares,
+        );
+
+        if actual_a > used_a {
+            client_a.transfer(&pool, &provider, &(actual_a - used_a));
+        }
+        if actual_b > used_b {
+            client_b.transfer(&pool, &provider, &(actual_b - used_b));
+        }
+
         env.storage()
             .instance()
-            .set(&DataKey::ReserveA, &(reserve_a + actual_a));
+            .set(&DataKey::ReserveA, &(reserve_a + used_a));
         env.storage()
             .instance()
-            .set(&DataKey::ReserveB, &(reserve_b + actual_b));
+            .set(&DataKey::ReserveB, &(reserve_b + used_b));
         env.storage().instance().set(
             &DataKey::TotalShares,
             &(total_shares + shares + shares_locked),
@@ -3547,13 +3582,53 @@ impl AmmPool {
         soroban_amm_sdk::emit_versioned_event!(
             env,
             (Symbol::new(&env, "add_liquidity"), provider),
-            (actual_a, actual_b, shares)
+            (used_a, used_b, shares)
         );
 
         Ok(shares)
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────
+
+    /// Return the amounts retained by the pool for the minted provider shares.
+    /// The first deposit uses both amounts in full because no reserve ratio
+    /// exists yet. For later deposits, round the backing amounts up: rounding
+    /// down twice can mint shares without their full pro-rata backing, or
+    /// charge zero for one side of a highly skewed pool.
+    fn compute_liquidity_amounts_used(
+        env: &Env,
+        amount_a: i128,
+        amount_b: i128,
+        reserve_a: i128,
+        reserve_b: i128,
+        total_shares: i128,
+        shares: i128,
+    ) -> (i128, i128) {
+        if total_shares == 0 {
+            (amount_a, amount_b)
+        } else {
+            (
+                Self::ceil_share_backing(env, shares, reserve_a, total_shares),
+                Self::ceil_share_backing(env, shares, reserve_b, total_shares),
+            )
+        }
+    }
+
+    fn ceil_share_backing(env: &Env, shares: i128, reserve: i128, total_shares: i128) -> i128 {
+        if let Some(product) = shares.checked_mul(reserve) {
+            return product / total_shares + i128::from(product % total_shares != 0);
+        }
+        let product =
+            U256::from_u128(env, shares as u128).mul(&U256::from_u128(env, reserve as u128));
+        let denominator = U256::from_u128(env, total_shares as u128);
+        // Each share amount is bounded by floor(deposited * total / reserve),
+        // so the rounded result cannot exceed the original i128 deposit.
+        product
+            .add(&U256::from_u128(env, (total_shares - 1) as u128))
+            .div(&denominator)
+            .to_u128()
+            .expect("share backing is bounded by input amount") as i128
+    }
 
     /// Shared first-deposit / proportional share computation used by both
     /// dd_liquidity and dd_liquidity_fot.
@@ -3696,6 +3771,9 @@ impl AmmPool {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+mod guard_tests;
 
 // ── Authorization regression tests for admin entrypoints ─────────────────────
 

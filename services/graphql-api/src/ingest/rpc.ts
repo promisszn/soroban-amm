@@ -92,6 +92,8 @@ const TOPIC_MAP: Record<string, PoolEventType> = {
   price_upd: "price_upd",
   mint_pos: "mint_pos",
   burn_pos: "burn_pos",
+  mod_pos: "mod_pos",
+  mint_1t: "mint_1t",
   coll_fees: "coll_fees",
   proposed: "governance",
   voted: "governance",
@@ -426,10 +428,11 @@ export class RpcIngester {
         return null;
       }
 
-      // Maps rawPayload onto PoolEvent fields per contracts/amm-sdk/src/events.rs:
+      // Maps rawPayload onto PoolEvent fields per the contract event schemas:
       // - swap: topics `("swap", trader)`, data `(1, (token_in, amount_in, token_out, amount_out, referrer))`
       // - add_liquidity: topics `("add_liquidity", provider)`, data `(1, (amount_a, amount_b, shares_minted))`
       // - remove_liquidity (`rm_liq`/`rm_liq_1s`): topics `("rm_liq",)`, data `(1, (provider, shares_burned, amount_a, amount_b))`
+      // - CL position events use the provider/owner topic and a named tick/liquidity tuple.
       const payload = this._mapPayload(eventName, topics, rawPayload, contractId);
 
       const [txHashPart, indexStr] = (raw.pagingToken || "").split("-");
@@ -511,6 +514,29 @@ export class RpcIngester {
         payload["liquidity"] = Number(rawPayload[2] ?? 0);
         payload["amountA"] = Number(rawPayload[3] ?? 0);
         payload["amountB"] = Number(rawPayload[4] ?? 0);
+      }
+    } else if (eventName === "mod_pos") {
+      if (topics.length > 1) payload["owner"] = asStr(topics[1]);
+      if (Array.isArray(rawPayload)) {
+        payload["lowerTick"] = Number(rawPayload[0] ?? 0);
+        payload["upperTick"] = Number(rawPayload[1] ?? 0);
+        payload["liquidityDelta"] = Number(rawPayload[2] ?? 0);
+        payload["amountA"] = Number(rawPayload[3] ?? 0);
+        payload["amountB"] = Number(rawPayload[4] ?? 0);
+      }
+    } else if (eventName === "mint_1t") {
+      // `(lower_tick, upper_tick, liquidity, amount_used, dust)` does not say
+      // which token was deposited: below/above-range mints take A/B by the
+      // pool's tick at mint time, and an in-range mint takes whichever token
+      // the caller chose. amountA/amountB are therefore left unset rather than
+      // guessed, so reserves are not moved by this event (README-INGESTION.md).
+      if (topics.length > 1) payload["owner"] = asStr(topics[1]);
+      if (Array.isArray(rawPayload)) {
+        payload["lowerTick"] = Number(rawPayload[0] ?? 0);
+        payload["upperTick"] = Number(rawPayload[1] ?? 0);
+        payload["liquidity"] = Number(rawPayload[2] ?? 0);
+        payload["amountUsed"] = Number(rawPayload[3] ?? 0);
+        payload["dust"] = Number(rawPayload[4] ?? 0);
       }
     } else if (eventName === "swap_out") {
       this.mapClSwap(payload, rawPayload, contractId);

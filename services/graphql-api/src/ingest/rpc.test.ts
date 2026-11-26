@@ -377,3 +377,48 @@ test("9. Event persistence and cursor advancement are atomic before indexing", a
     global.fetch = originalFetch;
   }
 });
+
+test("mod_pos and mint_1t decode to typed events with named payload fields", () => {
+  const ingester = new RpcIngester(
+    { rpcUrl: "https://rpc.test", contractIds: ["C_POOL"] },
+    async () => {},
+    async () => {},
+  );
+  const owner = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF";
+  const decode = (name: string, payload: unknown, id: string): PoolEvent | null => {
+    const fixture = encodeFixture(name, 1, payload, owner);
+    return internals(ingester)._decodeEvent({
+      type: "contract",
+      ledger: 105,
+      ledgerClosedAt: new Date().toISOString(),
+      contractId: "C_POOL",
+      id,
+      pagingToken: "105-0",
+      topic: fixture.topic,
+      value: fixture.value,
+      inSuccessfulContractInvocation: true,
+    }, "C_POOL");
+  };
+
+  const modified = decode("mod_pos", [-10, 10, -5, 2, 3], "mod-pos");
+  assert.equal(modified?.type, "mod_pos");
+  assert.deepEqual(modified?.payload, {
+    owner,
+    lowerTick: -10,
+    upperTick: 10,
+    liquidityDelta: -5,
+    amountA: 2,
+    amountB: 3,
+  });
+
+  const singleTokenMint = decode("mint_1t", [-10, 10, 15, 20, 2], "mint-1t");
+  assert.equal(singleTokenMint?.type, "mint_1t");
+  assert.deepEqual(singleTokenMint?.payload, {
+    owner,
+    lowerTick: -10,
+    upperTick: 10,
+    liquidity: 15,
+    amountUsed: 20,
+    dust: 2,
+  });
+});

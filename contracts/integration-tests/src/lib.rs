@@ -13,6 +13,12 @@ pub mod fixture;
 mod factory_test;
 
 #[cfg(test)]
+mod factory_treasury_test;
+
+#[cfg(test)]
+mod factory_cl_pool_test;
+
+#[cfg(test)]
 mod upgrade_integration_test;
 
 #[cfg(test)]

@@ -46,7 +46,7 @@
 use soroban_amm_sdk::emit_versioned_event;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
-    Env, Symbol, Vec,
+    BytesN, Env, Symbol, Vec,
 };
 
 // ── Storage TTL ──────────────────────────────────────────────────────────────
@@ -381,6 +381,17 @@ impl ReserveManager {
         Ok(())
     }
 
+    /// Replace the contract WASM. Governance-only; stored state is preserved.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), ReserveManagerError> {
+        Self::extend_instance_ttl(&env);
+        let governance: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
+        governance.require_auth();
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        emit_versioned_event!(env, (Symbol::new(&env, "upgraded"),), (new_wasm_hash,));
+        Ok(())
+    }
+
     pub fn is_paused(env: Env) -> bool {
         Self::extend_instance_ttl(&env);
         env.storage()
@@ -555,13 +566,7 @@ impl ReserveManager {
     pub fn get_min_reserve(env: Env, token_a: Address, token_b: Address) -> ReserveRequirement {
         Self::extend_instance_ttl(&env);
         let (ta, tb) = Self::normalize(token_a, token_b);
-        env.storage()
-            .persistent()
-            .get(&DataKey::MinReserve(ta, tb))
-            .unwrap_or(ReserveRequirement {
-                min_reserve_a: 0,
-                min_reserve_b: 0,
-            })
+        Self::read_min_reserve(&env, &ta, &tb)
     }
 
     // ── Compliance checks ─────────────────────────────────────────────────────
@@ -598,14 +603,7 @@ impl ReserveManager {
         };
 
         let (ta, tb) = Self::normalize(token_a.clone(), token_b.clone());
-        let req: ReserveRequirement = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MinReserve(ta.clone(), tb))
-            .unwrap_or(ReserveRequirement {
-                min_reserve_a: 0,
-                min_reserve_b: 0,
-            });
+        let req = Self::read_min_reserve(&env, &ta, &tb);
 
         // The requirement is stored against the normalized pair, so align the
         // observed reserves with that same ordering before comparing.
@@ -813,6 +811,24 @@ impl ReserveManager {
         }
     }
 
+    /// Read a per-pair minimum reserve requirement and, when present, extend its
+    /// persistent TTL so a configured floor stays alive on read.
+    fn read_min_reserve(env: &Env, ta: &Address, tb: &Address) -> ReserveRequirement {
+        let key = DataKey::MinReserve(ta.clone(), tb.clone());
+        let req = env.storage().persistent().get(&key);
+        if let Some(req) = req {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, MIN_PERSISTENT_TTL, PERSISTENT_TTL_BUMP_TO);
+            req
+        } else {
+            ReserveRequirement {
+                min_reserve_a: 0,
+                min_reserve_b: 0,
+            }
+        }
+    }
+
     /// Build a report from a resolved `(token_a, token_b, reserve_a, reserve_b)`
     /// tuple, expressed in the pool's own token order.
     fn build_report(
@@ -828,14 +844,7 @@ impl ReserveManager {
             (token_b.clone(), token_a.clone())
         };
 
-        let req: ReserveRequirement = env
-            .storage()
-            .persistent()
-            .get(&DataKey::MinReserve(ta, tb))
-            .unwrap_or(ReserveRequirement {
-                min_reserve_a: 0,
-                min_reserve_b: 0,
-            });
+        let req = Self::read_min_reserve(env, &ta, &tb);
 
         // Requirements are stored under the normalised pair; map them back onto
         // the pool's own token order so `min_a` always describes `token_a`.
@@ -948,11 +957,17 @@ impl ReserveManager {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use amm::AmmPool;
     use soroban_sdk::{
-        testutils::{storage::Instance as _, Address as _, Events as _, Ledger as _},
+        testutils::{
+            storage::{Instance as _, Persistent as _},
+            Address as _, Events as _, Ledger as _, MockAuth, MockAuthInvoke,
+        },
         token::StellarAssetClient,
-        Env, IntoVal, String,
+        xdr::{ScErrorCode, ScErrorType},
+        Env, IntoVal, String, Symbol, Val,
     };
     use token::{LpToken, LpTokenClient};
 
@@ -1020,6 +1035,193 @@ mod tests {
         }
     }
 
+    fn assert_requires_auth<A: IntoVal<Env, soroban_sdk::Vec<Val>>>(
+        env: &Env,
+        contract_id: &Address,
+        signer_expected: &Address,
+        fn_name: &str,
+        args: A,
+    ) {
+        let args = args.into_val(env);
+        let invoke = MockAuthInvoke {
+            contract: contract_id,
+            fn_name,
+            args: args.clone(),
+            sub_invokes: &[],
+        };
+        let auth_error = soroban_sdk::Error::from_type_and_code(
+            ScErrorType::Context,
+            ScErrorCode::InvalidAction,
+        );
+
+        env.set_auths(&[]);
+        assert_eq!(
+            env.try_invoke_contract::<(), soroban_sdk::Error>(
+                contract_id,
+                &Symbol::new(env, fn_name),
+                args.clone(),
+            ),
+            Err(Ok(auth_error)),
+            "{fn_name}: call without authorization must fail with Auth/InvalidAction"
+        );
+
+        let stranger = Address::generate(env);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &invoke,
+        }]);
+        assert_eq!(
+            env.try_invoke_contract::<(), soroban_sdk::Error>(
+                contract_id,
+                &Symbol::new(env, fn_name),
+                args.clone(),
+            ),
+            Err(Ok(auth_error)),
+            "{fn_name}: stranger authorization must fail with Auth/InvalidAction"
+        );
+
+        env.mock_auths(&[MockAuth {
+            address: signer_expected,
+            invoke: &invoke,
+        }]);
+        assert!(
+            env.try_invoke_contract::<(), soroban_sdk::Error>(
+                contract_id,
+                &Symbol::new(env, fn_name),
+                args,
+            )
+            .is_ok(),
+            "{fn_name}: expected authorization from signer"
+        );
+    }
+
+    #[test]
+    fn propose_governance_requires_governance_auth() {
+        let s = setup();
+        let nominee = Address::generate(&s.env);
+        assert_requires_auth(
+            &s.env,
+            &s.rm_addr,
+            &s.governance,
+            "propose_governance",
+            (s.governance.clone(), nominee),
+        );
+
+        let stranger = Address::generate(&s.env);
+        s.env.mock_all_auths();
+        assert_eq!(
+            ReserveManagerClient::new(&s.env, &s.rm_addr)
+                .try_propose_governance(&stranger, &Address::generate(&s.env))
+                .unwrap_err()
+                .unwrap(),
+            ReserveManagerError::Unauthorized,
+            "propose_governance"
+        );
+    }
+
+    #[test]
+    fn propose_admin_requires_governance_auth() {
+        let s = setup();
+        let nominee = Address::generate(&s.env);
+        assert_requires_auth(
+            &s.env,
+            &s.rm_addr,
+            &s.governance,
+            "propose_admin",
+            (s.governance.clone(), nominee),
+        );
+
+        let stranger = Address::generate(&s.env);
+        s.env.mock_all_auths();
+        assert_eq!(
+            ReserveManagerClient::new(&s.env, &s.rm_addr)
+                .try_propose_admin(&stranger, &Address::generate(&s.env))
+                .unwrap_err()
+                .unwrap(),
+            ReserveManagerError::Unauthorized,
+            "propose_admin"
+        );
+    }
+
+    #[test]
+    fn accept_governance_requires_nominee_auth() {
+        let s = setup();
+        let nominee = Address::generate(&s.env);
+        ReserveManagerClient::new(&s.env, &s.rm_addr).propose_governance(&s.governance, &nominee);
+        assert_requires_auth(
+            &s.env,
+            &s.rm_addr,
+            &nominee,
+            "accept_governance",
+            (nominee.clone(),),
+        );
+    }
+
+    #[test]
+    fn accept_admin_requires_nominee_auth() {
+        let s = setup();
+        let nominee = Address::generate(&s.env);
+        ReserveManagerClient::new(&s.env, &s.rm_addr).propose_admin(&s.governance, &nominee);
+        assert_requires_auth(
+            &s.env,
+            &s.rm_addr,
+            &nominee,
+            "accept_admin",
+            (nominee.clone(),),
+        );
+    }
+
+    #[test]
+    fn pause_requires_governance_auth() {
+        let s = setup();
+        assert_requires_auth(
+            &s.env,
+            &s.rm_addr,
+            &s.governance,
+            "pause",
+            soroban_sdk::Vec::<Val>::new(&s.env),
+        );
+        assert!(ReserveManagerClient::new(&s.env, &s.rm_addr).is_paused());
+    }
+
+    #[test]
+    fn unpause_requires_governance_auth() {
+        let s = setup();
+        ReserveManagerClient::new(&s.env, &s.rm_addr).pause();
+        assert_requires_auth(
+            &s.env,
+            &s.rm_addr,
+            &s.governance,
+            "unpause",
+            soroban_sdk::Vec::<Val>::new(&s.env),
+        );
+        assert!(!ReserveManagerClient::new(&s.env, &s.rm_addr).is_paused());
+    }
+
+    #[test]
+    fn set_min_reserve_requires_governance_auth() {
+        let s = setup();
+        assert_requires_auth(
+            &s.env,
+            &s.rm_addr,
+            &s.governance,
+            "set_min_reserve",
+            (s.ta.clone(), s.tb.clone(), 500_000_i128, 300_000_i128),
+        );
+    }
+
+    #[test]
+    fn set_pool_kind_requires_governance_auth() {
+        let s = setup();
+        assert_requires_auth(
+            &s.env,
+            &s.rm_addr,
+            &s.governance,
+            "set_pool_kind",
+            (s.pool.clone(), PoolKind::Amm),
+        );
+    }
+
     #[test]
     fn test_initialize_stores_governance_and_factory() {
         let env = Env::default();
@@ -1032,6 +1234,94 @@ mod tests {
         assert_eq!(rm.get_governance(), gov);
         assert_eq!(rm.get_factory(), factory);
         assert_eq!(rm.get_admin(), Some(gov.clone()));
+    }
+
+    fn own_wasm(env: &Env) -> BytesN<32> {
+        env.budget().reset_unlimited();
+        let wasm = soroban_sdk::Bytes::from_slice(
+            env,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../target/wasm32v1-none/release/reserve_manager.wasm"
+            )),
+        );
+        env.deployer().upload_contract_wasm(wasm)
+    }
+
+    /// Runs `f` and returns the host error message it panics with. The
+    /// `try_` client cannot be used to inspect an auth failure: the host
+    /// reports any non-contract error from a sub-call as
+    /// `Error(Context, InvalidAction)`, so the specific `Error(Auth, ...)`
+    /// is only visible in the panic message of the plain client call.
+    fn panic_message(f: impl FnOnce()) -> std::string::String {
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(std::boxed::Box::new(|_| {}));
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        std::panic::set_hook(prev_hook);
+        let err = res.expect_err("call should have been rejected");
+        if let Some(s) = err.downcast_ref::<&str>() {
+            std::string::String::from(*s)
+        } else if let Some(s) = err.downcast_ref::<std::string::String>() {
+            s.clone()
+        } else {
+            std::string::String::new()
+        }
+    }
+
+    #[test]
+    fn test_upgrade_rejects_non_governance_caller() {
+        let env = Env::default();
+        let gov = Address::generate(&env);
+        let stranger = Address::generate(&env);
+        let factory = Address::generate(&env);
+        let rm_addr = env.register_contract(None, ReserveManager);
+        let rm = ReserveManagerClient::new(&env, &rm_addr);
+        rm.initialize(&gov, &factory);
+        let hash = own_wasm(&env);
+
+        // No authorization at all.
+        let msg = panic_message(|| rm.upgrade(&hash));
+        assert!(
+            msg.contains("Error(Auth, InvalidAction)"),
+            "expected Error(Auth, InvalidAction), got: {msg}"
+        );
+
+        // A non-governance address authorizing the exact call is still rejected.
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &rm_addr,
+                fn_name: "upgrade",
+                args: (hash.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let msg = panic_message(|| rm.upgrade(&hash));
+        assert!(
+            msg.contains("Error(Auth, InvalidAction)"),
+            "expected Error(Auth, InvalidAction), got: {msg}"
+        );
+        assert_eq!(rm.get_governance(), gov);
+    }
+
+    #[test]
+    fn test_governance_upgrade_preserves_state_and_emits_event() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+        rm.set_min_reserve(&s.ta, &s.tb, &500_000_i128, &300_000_i128);
+        rm.set_pool_kind(&s.pool, &PoolKind::Amm);
+        let hash = own_wasm(&s.env);
+
+        rm.upgrade(&hash);
+
+        let req = rm.get_min_reserve(&s.ta, &s.tb);
+        assert_eq!(req.min_reserve_a, 500_000);
+        assert_eq!(req.min_reserve_b, 300_000);
+        assert_eq!(rm.get_pool_kind(&s.pool), Some(PoolKind::Amm));
+        assert_eq!(rm.get_governance(), s.governance);
+        let (version, data): (u32, (BytesN<32>,)) = last_versioned_event(&s, "upgraded");
+        assert_eq!(version, 1);
+        assert_eq!(data.0, hash);
     }
 
     #[test]
@@ -1702,20 +1992,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pause_and_unpause_requires_auth() {
-        let s = setup();
-        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
-
-        // This will panic internally in the mock auth test environment because we didn't mock the auth for a random user,
-        // or it will fail authorization. Wait, if we use `try_pause`, we can't catch the require_auth() easily without a specific setup,
-        // but since `s.governance` has mock auth, calling it directly works. We can check that the admin can pause.
-        rm.pause();
-        assert!(rm.is_paused());
-        rm.unpause();
-        assert!(!rm.is_paused());
-    }
-
-    #[test]
     fn test_mutating_functions_paused() {
         let s = setup();
         let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
@@ -2220,5 +2496,69 @@ mod tests {
         assert_eq!(report.min_b, 500_000);
         assert_eq!(report.shortfall_a, 400_000);
         assert_eq!(report.shortfall_b, 400_000);
+    }
+
+    fn floor_ttl(s: &Setup) -> u32 {
+        let (ta, tb) = ReserveManager::normalize(s.ta.clone(), s.tb.clone());
+        s.env.as_contract(&s.rm_addr, || {
+            s.env
+                .storage()
+                .persistent()
+                .get_ttl(&DataKey::MinReserve(ta, tb))
+        })
+    }
+
+    fn age_floor_below_threshold(s: &Setup) {
+        let remaining = MIN_PERSISTENT_TTL - 1;
+        let advance = floor_ttl(s) - remaining;
+        s.env.ledger().with_mut(|l| l.sequence_number += advance);
+        assert_eq!(floor_ttl(s), remaining);
+    }
+
+    #[test]
+    fn test_get_min_reserve_and_check_reserves_extend_ttl() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+
+        rm.set_min_reserve(&s.ta, &s.tb, &2_000_000_i128, &2_000_000_i128);
+        age_floor_below_threshold(&s);
+        assert!(!rm.check_reserves(&s.pool));
+        assert_eq!(floor_ttl(&s), PERSISTENT_TTL_BUMP_TO);
+        age_floor_below_threshold(&s);
+        let req = rm.get_min_reserve(&s.ta, &s.tb);
+        assert_eq!(floor_ttl(&s), PERSISTENT_TTL_BUMP_TO);
+        assert_eq!(req.min_reserve_a, 2_000_000);
+        assert_eq!(req.min_reserve_b, 2_000_000);
+        assert!(!rm.check_reserves(&s.pool));
+    }
+
+    #[test]
+    fn test_check_reserves_detailed_and_batch_extend_ttl() {
+        let s = setup();
+        let rm = ReserveManagerClient::new(&s.env, &s.rm_addr);
+
+        rm.set_min_reserve(&s.ta, &s.tb, &2_000_000_i128, &2_000_000_i128);
+
+        age_floor_below_threshold(&s);
+
+        let detailed = rm.check_reserves_detailed(&s.pool);
+        assert_eq!(floor_ttl(&s), PERSISTENT_TTL_BUMP_TO);
+        assert!(!detailed.healthy);
+        assert_eq!(detailed.min_a, 2_000_000);
+        assert_eq!(detailed.min_b, 2_000_000);
+        assert_eq!(detailed.shortfall_a, 1_000_000);
+        assert_eq!(detailed.shortfall_b, 1_000_000);
+
+        age_floor_below_threshold(&s);
+
+        let pools = soroban_sdk::vec![&s.env, s.pool.clone()];
+        let reports = rm.check_reserves_batch(&pools);
+        assert_eq!(floor_ttl(&s), PERSISTENT_TTL_BUMP_TO);
+        let report = reports.get(0).unwrap();
+        assert!(!report.healthy);
+        assert_eq!(report.min_a, 2_000_000);
+        assert_eq!(report.min_b, 2_000_000);
+        assert_eq!(report.shortfall_a, 1_000_000);
+        assert_eq!(report.shortfall_b, 1_000_000);
     }
 }

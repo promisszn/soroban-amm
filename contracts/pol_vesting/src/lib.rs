@@ -948,10 +948,71 @@ impl PolVestingContract {
 mod tests {
     use super::*;
     use soroban_sdk::{
-        testutils::{storage::Instance as _, Address as _, Ledger},
+        testutils::{storage::Instance as _, Address as _, Ledger, MockAuth, MockAuthInvoke},
         token::{StellarAssetClient, TokenClient},
-        Env,
+        xdr::{ScErrorCode, ScErrorType},
+        Env, IntoVal, Symbol, Val,
     };
+
+    fn assert_requires_auth<A: IntoVal<Env, Vec<Val>>>(
+        env: &Env,
+        contract_id: &Address,
+        signer_expected: &Address,
+        fn_name: &str,
+        args: A,
+    ) {
+        let args = args.into_val(env);
+        let invoke = MockAuthInvoke {
+            contract: contract_id,
+            fn_name,
+            args: args.clone(),
+            sub_invokes: &[],
+        };
+        let auth_error = soroban_sdk::Error::from_type_and_code(
+            ScErrorType::Context,
+            ScErrorCode::InvalidAction,
+        );
+
+        env.set_auths(&[]);
+        assert_eq!(
+            env.try_invoke_contract::<(), soroban_sdk::Error>(
+                contract_id,
+                &Symbol::new(env, fn_name),
+                args.clone(),
+            ),
+            Err(Ok(auth_error)),
+            "{fn_name}: call without authorization must fail with Auth/InvalidAction"
+        );
+
+        let stranger = Address::generate(env);
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &invoke,
+        }]);
+        assert_eq!(
+            env.try_invoke_contract::<(), soroban_sdk::Error>(
+                contract_id,
+                &Symbol::new(env, fn_name),
+                args.clone(),
+            ),
+            Err(Ok(auth_error)),
+            "{fn_name}: stranger authorization must fail with Auth/InvalidAction"
+        );
+
+        env.mock_auths(&[MockAuth {
+            address: signer_expected,
+            invoke: &invoke,
+        }]);
+        assert!(
+            env.try_invoke_contract::<(), soroban_sdk::Error>(
+                contract_id,
+                &Symbol::new(env, fn_name),
+                args,
+            )
+            .is_ok(),
+            "{fn_name}: expected authorization from signer"
+        );
+    }
 
     struct Setup {
         env: Env,
@@ -1019,6 +1080,167 @@ mod tests {
             &cliff,
             &end,
         )
+    }
+
+    #[test]
+    fn propose_governance_requires_governance_auth() {
+        let s = setup();
+        let new_governance = Address::generate(&s.env);
+        assert_requires_auth(
+            &s.env,
+            &s.contract_id,
+            &s.governance,
+            "propose_governance",
+            (s.governance.clone(), new_governance),
+        );
+
+        let stranger = Address::generate(&s.env);
+        s.env.mock_all_auths();
+        let err = PolVestingContractClient::new(&s.env, &s.contract_id)
+            .try_propose_governance(&stranger, &Address::generate(&s.env))
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, VestingError::NotGovernance, "propose_governance");
+    }
+
+    #[test]
+    fn accept_governance_requires_nominee_auth() {
+        let s = setup();
+        let nominee = Address::generate(&s.env);
+        PolVestingContractClient::new(&s.env, &s.contract_id)
+            .propose_governance(&s.governance, &nominee);
+
+        assert_requires_auth(
+            &s.env,
+            &s.contract_id,
+            &nominee,
+            "accept_governance",
+            (nominee.clone(),),
+        );
+    }
+
+    #[test]
+    fn propose_treasury_requires_governance_auth() {
+        let s = setup();
+        let new_treasury = Address::generate(&s.env);
+        assert_requires_auth(
+            &s.env,
+            &s.contract_id,
+            &s.governance,
+            "propose_treasury",
+            (s.governance.clone(), new_treasury),
+        );
+
+        let stranger = Address::generate(&s.env);
+        s.env.mock_all_auths();
+        let err = PolVestingContractClient::new(&s.env, &s.contract_id)
+            .try_propose_treasury(&stranger, &Address::generate(&s.env))
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, VestingError::NotGovernance, "propose_treasury");
+    }
+
+    #[test]
+    fn accept_treasury_requires_nominee_auth() {
+        let s = setup();
+        let nominee = Address::generate(&s.env);
+        PolVestingContractClient::new(&s.env, &s.contract_id)
+            .propose_treasury(&s.governance, &nominee);
+
+        assert_requires_auth(
+            &s.env,
+            &s.contract_id,
+            &nominee,
+            "accept_treasury",
+            (nominee.clone(),),
+        );
+    }
+
+    #[test]
+    fn create_vesting_requires_governance_auth() {
+        let s = setup();
+        let args = (
+            s.governance.clone(),
+            s.beneficiary.clone(),
+            s.lp_token.clone(),
+            s.pool.clone(),
+            1_000_000_i128,
+            0_u32,
+            0_u32,
+            1_000_u32,
+        );
+        assert_requires_auth(
+            &s.env,
+            &s.contract_id,
+            &s.governance,
+            "create_vesting",
+            args,
+        );
+
+        let stranger = Address::generate(&s.env);
+        s.env.mock_all_auths();
+        let err = PolVestingContractClient::new(&s.env, &s.contract_id)
+            .try_create_vesting(
+                &stranger,
+                &s.beneficiary,
+                &s.lp_token,
+                &s.pool,
+                &1_000_000,
+                &0,
+                &0,
+                &1_000,
+            )
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, VestingError::NotGovernance, "create_vesting");
+    }
+
+    #[test]
+    fn change_beneficiary_requires_governance_auth() {
+        let s = setup();
+        let schedule_id = create_schedule(&s, 0, 0, 1_000);
+        let new_beneficiary = Address::generate(&s.env);
+        assert_requires_auth(
+            &s.env,
+            &s.contract_id,
+            &s.governance,
+            "change_beneficiary",
+            (
+                s.governance.clone(),
+                s.beneficiary.clone(),
+                schedule_id,
+                new_beneficiary.clone(),
+            ),
+        );
+
+        let stranger = Address::generate(&s.env);
+        s.env.mock_all_auths();
+        let err = PolVestingContractClient::new(&s.env, &s.contract_id)
+            .try_change_beneficiary(&stranger, &s.beneficiary, &schedule_id, &new_beneficiary)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, VestingError::NotGovernance, "change_beneficiary");
+    }
+
+    #[test]
+    fn revoke_vesting_requires_governance_auth() {
+        let s = setup();
+        let schedule_id = create_schedule(&s, 0, 0, 1_000);
+        assert_requires_auth(
+            &s.env,
+            &s.contract_id,
+            &s.governance,
+            "revoke_vesting",
+            (s.governance.clone(), s.beneficiary.clone(), schedule_id),
+        );
+
+        let stranger = Address::generate(&s.env);
+        s.env.mock_all_auths();
+        let err = PolVestingContractClient::new(&s.env, &s.contract_id)
+            .try_revoke_vesting(&stranger, &s.beneficiary, &schedule_id)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, VestingError::NotGovernance, "revoke_vesting");
     }
 
     #[test]

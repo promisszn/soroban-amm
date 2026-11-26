@@ -7,7 +7,7 @@ import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { extractEmitSites, extractFromSource } from "./event_emit_sites.mjs";
-import { findProblems, renderCatalogue } from "./check_event_schemas.mjs";
+import { findProblems, LOCAL_NAME_ALIASES, renderCatalogue } from "./check_event_schemas.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const schema = () => JSON.parse(readFileSync(join(ROOT, "services/webhook-streamer/src/event-schemas.json"), "utf8"));
@@ -31,6 +31,15 @@ test("reads Symbol::new names and a one-element tuple", () => {
 test("treats a parenthesised single value as a bare value, not a tuple", () => {
   const [s] = site(`emit_versioned_event!(env, (symbol_short!("ev"),), (value));`);
   assert.deepEqual([s.arity, s.shape], [1, "scalar"]);
+});
+
+test("captures plain payload identifiers and falls back per element for anything else", () => {
+  const [plain, mixed] = site(`
+    emit_versioned_event!(env, (symbol_short!("plain"),), (campaign_id, amount));
+    emit_versioned_event!(env, (symbol_short!("mixed"),), (provider.clone(), price as i128, true, MAX_BPS, fee));
+  `);
+  assert.deepEqual(plain.payload_fields, ["campaign_id", "amount"]);
+  assert.deepEqual(mixed.payload_fields, [null, null, null, null, "fee"]);
 });
 
 test("counts commas only at the top level", () => {
@@ -89,7 +98,56 @@ test("fails when an emit site gains a payload field the schema lacks", () => {
   assert.ok(flash);
   const drifted = sites.map((s) => (s === flash ? { ...s, arity: flash.arity + 1 } : s));
   const problems = findProblems(schema(), drifted, docs());
-  assert.ok(problems.some((p) => /amm\.flash_loan is emitted with 5 payload field/.test(p)), problems.join("\n"));
+  const hit = problems.find((p) => /amm\.flash_loan is emitted with 5 payload field/.test(p));
+  assert.ok(hit, problems.join("\n"));
+  assert.match(hit, /only describes: 4 field\(s\)\/2 topic\(s\) versioned$/);
+});
+
+test("fails when a plain payload field name differs from the schema", () => {
+  // #1323: the schema called reward_distributed's amount field `pending`.
+  const s = schema();
+  const reward = s.kinds.incentive_campaigns.events.reward_distributed[0];
+  assert.equal(reward.fields[2], "amount");
+  reward.fields[2] = "pending";
+  const problems = findProblems(s, extractEmitSites(), docs());
+  const hit = problems.filter((p) => /incentive_campaigns\.reward_distributed payload names disagree/.test(p));
+  assert.equal(hit.length, 1, problems.join("\n"));
+  assert.match(hit[0], /field 2 is built from `amount` but the schema names it `pending`/);
+  // A name mismatch is reported once, not again as an unemitted schema entry.
+  assert.ok(!problems.some((p) => /reward_distributed .* is not emitted/.test(p)), problems.join("\n"));
+});
+
+test("fails when an emit site renames a plain payload identifier", () => {
+  const sites = extractEmitSites();
+  const pruned = sites.find((s) => s.contract === "twap_consumer" && s.event === "pruned");
+  assert.deepEqual(pruned.payload_fields, ["removed_count", "oldest_remaining_ts"]);
+  const drifted = sites.map((s) => (s === pruned ? { ...s, payload_fields: ["remove_count", "oldest_remaining_ts"] } : s));
+  const problems = findProblems(schema(), drifted, docs());
+  assert.ok(problems.some((p) => /twap_consumer\.pruned payload names disagree.*`remove_count`.*`removed_count`/.test(p)), problems.join("\n"));
+});
+
+test("fails when two plain payload fields swap places", () => {
+  const sites = extractEmitSites();
+  const reward = sites.find((s) => s.contract === "incentive_campaigns" && s.event === "reward_distributed");
+  const [a, b, ...rest] = reward.payload_fields;
+  const drifted = sites.map((s) => (s === reward ? { ...s, payload_fields: [b, a, ...rest] } : s));
+  const problems = findProblems(schema(), drifted, docs());
+  assert.ok(problems.some((p) => /incentive_campaigns\.reward_distributed payload names disagree/.test(p)), problems.join("\n"));
+});
+
+test("a recorded local-name alias is accepted, but only for its own field", () => {
+  const sites = extractEmitSites();
+  const recovered = sites.find((s) => s.contract === "amm" && s.event === "cb_recovered");
+  assert.deepEqual(recovered.payload_fields, ["now"]);
+  assert.deepEqual(findProblems(schema(), sites, docs()), []);
+  const problems = findProblems(schema(), sites, docs(), { ...LOCAL_NAME_ALIASES, "amm.cb_recovered": { now: "other" } });
+  assert.ok(problems.some((p) => /amm\.cb_recovered payload names disagree/.test(p)), problems.join("\n"));
+});
+
+test("fails when a local-name alias is no longer used by any emit site", () => {
+  const aliases = { ...LOCAL_NAME_ALIASES, "amm.swap": { gone: "amount_in" } };
+  const problems = findProblems(schema(), extractEmitSites(), docs(), aliases);
+  assert.ok(problems.some((p) => /LOCAL_NAME_ALIASES maps amm\.swap `gone` -> `amount_in` but no emit site uses it/.test(p)), problems.join("\n"));
 });
 
 test("fails when a contract starts emitting an event the schema does not know", () => {

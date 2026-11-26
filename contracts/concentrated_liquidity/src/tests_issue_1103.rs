@@ -219,7 +219,11 @@ fn test_admin_set_oracle_emits_event() {
 #[test]
 fn test_admin_set_position_nft_emits_event() {
     let te = setup_test();
-    let nft_addr = Address::generate(&te.env);
+    let nft_addr = te
+        .env
+        .register_contract(None, cl_position_nft::ClPositionNft);
+    cl_position_nft::ClPositionNftClient::new(&te.env, &nft_addr)
+        .initialize(&te.admin, &te.pool_addr);
 
     te.client
         .set_position_nft(&te.admin, &Some(nft_addr.clone()));

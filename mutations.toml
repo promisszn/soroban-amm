@@ -1,0 +1,14 @@
+# Only add a survivor after confirming it is an intentional non-coverage gap.
+# Every accepted entry needs the mutation id from the report (or from
+# `python3 scripts/mutation_check.py --crate <name> --list`) and a specific
+# justification. Ids are content based; see CONTRIBUTING.md.
+
+[crates.amm]
+
+[crates.batch_auction]
+
+[crates.concentrated_liquidity]
+
+[crates.governance]
+
+[crates.token]

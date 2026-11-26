@@ -92,6 +92,10 @@ const MIGRATIONS = [
       updated_at INTEGER NOT NULL
     );
   `,
+  `
+    ALTER TABLE alert_configs
+    ADD COLUMN comparison TEXT NOT NULL DEFAULT 'above';
+  `,
 ] as const;
 
 export class SqliteStore implements AnalyticsStore {
@@ -248,19 +252,21 @@ export class SqliteStore implements AnalyticsStore {
   }
 
   async setAlertConfig(config: AlertConfig): Promise<AlertConfig> {
+    const normalized = { ...config, comparison: config.comparison ?? "above" };
     this.db.prepare(`
       INSERT INTO alert_configs
-        (pool_id, metric, threshold_bps, threshold_value)
-      VALUES (@poolId, @metric, @thresholdBps, @thresholdValue)
+        (pool_id, metric, comparison, threshold_bps, threshold_value)
+      VALUES (@poolId, @metric, @comparison, @thresholdBps, @thresholdValue)
       ON CONFLICT(pool_id, metric) DO UPDATE SET
+        comparison=excluded.comparison,
         threshold_bps=excluded.threshold_bps,
         threshold_value=excluded.threshold_value
     `).run({
-      ...config,
-      thresholdBps: config.thresholdBps ?? null,
-      thresholdValue: config.thresholdValue ?? null,
+      ...normalized,
+      thresholdBps: normalized.thresholdBps ?? null,
+      thresholdValue: normalized.thresholdValue ?? null,
     });
-    return config;
+    return normalized;
   }
 
   async removeAlertConfig(poolId: string, metric: string): Promise<boolean> {
@@ -385,6 +391,7 @@ function toPricePoint(row: SqlRow): PricePoint {
 function toAlertConfig(row: SqlRow): AlertConfig {
   return {
     poolId: String(row["pool_id"]), metric: String(row["metric"]),
+    comparison: row["comparison"] === "below" ? "below" : "above",
     thresholdBps: nullableNumber(row, "threshold_bps") ?? undefined,
     thresholdValue: nullableNumber(row, "threshold_value") ?? undefined,
   };

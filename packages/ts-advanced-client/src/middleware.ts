@@ -139,7 +139,7 @@ export interface RetryOptions {
   retryOn: (error: unknown) => boolean
 }
 
-/** Wraps the downstream chain, submission included, in a retry loop. The chain
+/** Wraps the downstream chain, submission and beforeSend hooks included, in a retry loop. The chain
  *  is re-run from the point of this middleware on each attempt, waiting
  *  `backoffMs * 2^(attempt - 1)` between attempts. Gives up with the last
  *  error after `attempts` tries or as soon as `retryOn` returns `false`. */

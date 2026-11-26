@@ -235,11 +235,11 @@ a representative call sequence and asserts every pool event carries the leading
 |---|---|
 | `admin_nominated` | `(current_admin: Address, new_admin: Address)` |
 | `admin_changed` | `(new_admin: Address)` |
-| `proposed` | `(id: u64, proposer: Address, kind: ProposalKind, vote_end: u64, snapshot_ledger: u32)` |
-| `voted` | `(proposal_id: u64, voter: Address, choice: VoteChoice, voting_power: i128)` |
-| `executed` | `(proposal_id: u64, kind: ProposalKind)` |
-| `vote_unlocked` | `(proposal_id: u64, locked: i128)` |
-| `vetoed` | `(proposal_id: u64, multisig: Address, now: u64, discussion_end: u64)` |
+| `proposed` | `(id: u32, proposer: Address, kind: ProposalKind, vote_end: u64, snapshot_ledger: u32)` |
+| `voted` | `(proposal_id: u32, voter: Address, choice: VoteChoice, voting_power: i128)` |
+| `executed` | `(proposal_id: u32, kind: ProposalKind)` |
+| `vote_unlocked` | `(proposal_id: u32, locked: i128)` |
+| `vetoed` | `(proposal_id: u32, multisig: Address, now: u64, discussion_end: u64)` |
 
 ### Token (SEP-41 LP token) — `contracts/token/src/lib.rs`
 
@@ -259,6 +259,7 @@ a representative call sequence and asserts every pool event carries the leading
 | `min_reserve_set` | — | `(token_a: Address, token_b: Address, min_reserve_a: i128, min_reserve_b: i128, removed: bool)` |
 | `pool_kind_set` | — | `(pool: Address, kind: PoolKind)` |
 | `res_warn` | — | `(unhealthy: Vec<Address>)` |
+| `upgraded` | — | `(new_wasm_hash: BytesN<32>)` |
 
 ### POL Vesting — `contracts/pol_vesting/src/lib.rs`
 
@@ -269,7 +270,7 @@ a representative call sequence and asserts every pool event carries the leading
 | `treasury_proposed` | — | `(governance: Address, new_treasury: Address)` |
 | `treasury_transferred` | — | `(old_treasury: Address, new_treasury: Address)` |
 | `vesting_created` | — | `(beneficiary: Address, schedule_id: u32, total: i128, start_ledger: u32, cliff_ledger: u32, end_ledger: u32)` |
-| `released` | — | `(beneficiary: Address, schedule_id: u32, amount: i128)` |
+| `released` | — | `(beneficiary: Address, schedule_id: u32, releasable: i128)` |
 | `beneficiary_changed` | — | `(old_beneficiary: Address, old_schedule_id: u32, new_beneficiary: Address, new_schedule_id: u32)` |
 | `vesting_revoked` | — | `(beneficiary: Address, schedule_id: u32, to_beneficiary: i128, to_treasury: i128)` |
 
@@ -425,6 +426,8 @@ on-wire data shape `(schema_version, payload)`.
 | `rewards_reconciled` | — | `(admin: Address, old_undistributed: i128, old_owed: i128, new_undistributed: i128, new_owed: i128)` |
 | `initialized` | — | `(lp_token: Address, reward_token: Address, admin: Address, min_boost: i128, max_boost: i128, min_lock_duration: u64, max_lock_duration: u64)` |
 | `staker_index_migrated` | — | `(registered: u32)` |
+| `staker_index_backfilled` | — | `(added: u32)` |
+| `staker_index_migration_progress` | — | `(offset: u32, processed: u32, remaining: u32)` |
 | `admin_nominated` | — | `(admin: Address, new_admin: Address)` |
 | `admin_changed` | — | `(new_admin: Address)` |
 | `upgraded` | — | `(new_wasm_hash: BytesN<32>)` |
@@ -447,6 +450,11 @@ front-run initialization is detected.
 
 `staker_index_migrated` (issue #1113) is emitted once, by the last page of
 `migrate_staker_index`, with the number of stakers in the registry.
+
+`staker_index_backfilled` reports the number of newly indexed stakers for each
+`register_existing_stakers` call. `staker_index_migration_progress` reports
+`(offset, processed, remaining)` for each successful migration call. When no
+legacy vector exists, all three progress values are zero.
 
 `admin_nominated`, `admin_changed` and `upgraded` were the last staking events
 published without the leading `schema_version`; as of issue #1114 they go
@@ -663,6 +671,9 @@ count. Events marked unversioned carry their payload without the
 
 | Event | Topics | Payload fields | Envelope |
 |---|---|---|---|
+| `pause` | 1 | `admin` | v1 |
+| `unpause` | 1 | `admin` | v1 |
+| `upgraded` | 1 | `new_wasm_hash` | v1 |
 | `order_submitted` | 2 | `id`, `amount_in` | v1 |
 | `order_cancelled` | 2 | `order_id` | v1 |
 | `order_expired` | 2 | `order_id` | v1 |
@@ -680,9 +691,6 @@ count. Events marked unversioned carry their payload without the
 | `admin_nominated` | 1 | `current_admin`, `new_admin` | v1 |
 | `admin_changed` | 1 | `new_admin` | v1 |
 | `window_bounds_updated` | 1 | `min_secs`, `max_secs` | v1 |
-| `pause` | 1 | `admin` | v1 |
-| `unpause` | 1 | `admin` | v1 |
-| `upgraded` | 1 | `new_wasm_hash` | v1 |
 
 ### `batch_router`
 
@@ -701,6 +709,8 @@ count. Events marked unversioned carry their payload without the
 
 | Event | Topics | Payload fields | Envelope |
 |---|---|---|---|
+| `accept_transfers_set` | 2 | `accepts` | v1 |
+| `ttl_params_set` | 1 | `min_ttl_threshold`, `bump_to` | v1 |
 | `initialized` | 1 | `admin`, `cl_pool` | v1 |
 | `admin_nominated` | 1 | `current_admin`, `new_admin` | v1 |
 | `admin_transferred` | 1 | `new_admin` | v1 |
@@ -745,6 +755,9 @@ count. Events marked unversioned carry their payload without the
 |---|---|---|---|
 | `pause` | 1 | `admin` | v1 |
 | `unpause` | 1 | `admin` | v1 |
+| `admin_nominated` | 1 | `current_admin`, `new_admin` | v1 |
+| `admin_changed` | 1 | `new_admin` | v1 |
+| `upgraded` | 1 | `new_wasm_hash` | v1 |
 | `cl_reg` | 1 | `token_a`, `token_b`, `fee_bps`, `pool` | v1 |
 | `route_sel` | 1 | `venue`, `venue_kind`, `amount_in`, `amount_out` | v1 |
 | `route_alt` | 1 | `venue`, `amount_out`, `alt_venue`, `alt_venue_kind`, `alt_amount_out` | v1 |
@@ -807,7 +820,7 @@ count. Events marked unversioned carry their payload without the
 | `campaign_created` | 1 | `id`, `pool`, `reward_token`, `start_time`, `end_time`, `reward_rate` | v1 |
 | `rate_updated` | 1 | `campaign_id`, `new_rate` | v1 |
 | `leftover_recovered` | 1 | `campaign_id`, `recipient`, `leftover` | v1 |
-| `reward_distributed` | 1 | `campaign_id`, `provider`, `pending`, `dist_id` | v1 |
+| `reward_distributed` | 1 | `campaign_id`, `provider`, `amount`, `dist_id` | v1 |
 | `staked` | 1 | `campaign_id`, `provider`, `amount`, `total_staked` | v1 |
 | `unstaked` | 1 | `campaign_id`, `provider`, `amount`, `total_staked` | v1 |
 | `paused` | 1 | `caller` | v1 |
@@ -881,6 +894,7 @@ count. Events marked unversioned carry their payload without the
 | `min_reserve_set` | 1 | `token_a`, `token_b`, `min_reserve_a`, `min_reserve_b`, `removed` | v1 |
 | `pool_kind_set` | 1 | `pool`, `kind` | v1 |
 | `res_warn` | 1 | `unhealthy` | v1 |
+| `upgraded` | 1 | `new_wasm_hash` | v1 |
 
 ### `router`
 
@@ -916,6 +930,8 @@ count. Events marked unversioned carry their payload without the
 | `claimed` | 1 | `staker`, `pending` | v1 |
 | `initialized` | 1 | `lp_token`, `reward_token`, `admin`, `min_boost`, `max_boost`, `min_lock_duration`, `max_lock_duration` | v1 |
 | `staker_index_migrated` | 1 | `registered` | v1 |
+| `staker_index_backfilled` | 1 | `added` | v1 |
+| `staker_index_migration_progress` | 1 | `offset`, `processed`, `remaining` | v1 |
 
 ### `token`
 

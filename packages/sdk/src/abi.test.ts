@@ -25,6 +25,7 @@ import { FactoryClient } from "./factory.js";
 import { RouterClient } from "./router.js";
 import { TokenClient } from "./token.js";
 import { GovernanceClient } from "./governance.js";
+import { OracleAggregatorClient } from "./oracle-aggregator.js";
 import { ContractDecodeError } from "./internal/decode.js";
 
 
@@ -99,6 +100,7 @@ const STRUCT_DECODERS = [
   { file: "./cl.ts", method: "estimatePriceImpact", contract: "concentrated_liquidity", struct: "PriceImpactEstimate" },
   { file: "./governance.ts", method: "proposalFromNative", contract: "governance", struct: "Proposal" },
   { file: "./governance.ts", method: "paramsFromNative", contract: "governance", struct: "GovernanceParams" },
+  { file: "./oracle-aggregator.ts", method: "decodeAggregatedPrice", contract: "oracle_aggregator", struct: "AggregatedPrice" },
 ];
 
 describe("struct decoders match the generated contract ABI fixture", () => {
@@ -116,7 +118,7 @@ describe("struct decoders match the generated contract ABI fixture", () => {
   });
 
   it("does not decode named struct fields with toBigInt", () => {
-    for (const file of ["./AmmPool.ts", "./cl.ts", "./governance.ts"]) {
+    for (const file of ["./AmmPool.ts", "./cl.ts", "./governance.ts", "./oracle-aggregator.ts"]) {
       const source = readFileSync(fileURLToPath(new URL(file, import.meta.url)), "utf8");
       expect(source).not.toMatch(/toBigInt\(native\.[A-Za-z_][A-Za-z0-9_]*\)/);
     }
@@ -142,6 +144,8 @@ const SCV_FOR_TYPE: Record<string, string[]> = {
   // Option<T> is scvVoid for None and scvVec([value]) for Some.
   "Option<Address>": ["scvVoid", "scvVec"],
   "Option<BytesN<32>>": ["scvVoid", "scvVec"],
+  // PairKey is a #[contracttype] struct, encoded as an scvMap.
+  PairKey: ["scvMap"],
 };
 
 // ── Test harness ──────────────────────────────────────────────────────────────
@@ -162,6 +166,7 @@ const cl = new ConcentratedLiquidityClient(config);
 const router = new RouterClient(config);
 const token = new TokenClient(config);
 const factory = new FactoryClient(config);
+const oracle = new OracleAggregatorClient(config);
 
 /** The XDR type discriminant name of an ScVal, e.g. "scvI128". */
 function typeOf(v: xdr.ScVal): string {
@@ -331,6 +336,12 @@ describe("parameter builders match the generated contract ABI fixture", () => {
       entrypoint: "create_pool_with_fee_bps",
       args: factory.createPoolWithFeeBpsParams(ALICE, TOKEN_A, TOKEN_B, 30n),
     },
+    {
+      label: "oracle.listSourcesParams",
+      contract: "oracle_aggregator",
+      entrypoint: "list_sources",
+      args: oracle.listSourcesParams(TOKEN_A, TOKEN_B, 0, 10),
+    },
   ];
 
   for (const { label, contract, entrypoint: name, args } of cases) {
@@ -357,6 +368,7 @@ describe("read wrappers send only names the contracts export", () => {
     { contract: "factory", file: "factory.ts" },
     { contract: "router", file: "router.ts" },
     { contract: "concentrated_liquidity", file: "cl.ts" },
+    { contract: "oracle_aggregator", file: "oracle-aggregator.ts" },
   ];
 
   for (const { contract, file } of clients) {
@@ -591,6 +603,21 @@ describe("struct decoders reject missing required fields", () => {
     mockServer(client, () => xdr.ScVal.scvMap([]));
     await expect(client.getParams()).rejects.toThrow(/GovernanceParams.voting_period_secs/);
   });
+
+  it("rejects an AggregatedPrice payload without confidence", async () => {
+    const client = new OracleAggregatorClient(config);
+    // Return a map with only `price`, omitting the required `confidence` field.
+    mockServer(client, () =>
+      xdr.ScVal.scvMap([
+        new xdr.ScMapEntry({
+          key: xdr.ScVal.scvSymbol("price"),
+          val: nativeToScVal(1_000_000n, { type: "i128" }),
+        }),
+      ])
+    );
+    await expect(client.getPrice(TOKEN_A, TOKEN_B)).rejects.toBeInstanceOf(ContractDecodeError);
+    await expect(client.getPrice(TOKEN_A, TOKEN_B)).rejects.toThrow(/AggregatedPrice\.confidence/);
+  });
 });
 
 describe("FactoryClient.poolCount", () => {
@@ -627,6 +654,63 @@ describe("cl.observe", () => {
 });
 
 // ── 5. Already-correct builders, kept under the fixture sweep ──────────────────
+
+describe("OracleAggregatorClient", () => {
+  // contracts/oracle_aggregator/src/lib.rs list_sources(pair: PairKey, cursor: u32, limit: u32)
+  it("listSources sends (scvMap, scvU32, scvU32) matching list_sources arity and types", async () => {
+    const client = new OracleAggregatorClient(config);
+    const calls = mockServer(client, () => nativeToScVal([]));
+    await client.listSources(TOKEN_A, TOKEN_B, 0, 10);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].method).toBe("list_sources");
+    expectTypes(calls[0].args, ["scvMap", "scvU32", "scvU32"]);
+  });
+
+  it("listSources encodes PairKey as a two-entry map with token_a and token_b", async () => {
+    const client = new OracleAggregatorClient(config);
+    const calls = mockServer(client, () => nativeToScVal([]));
+    await client.listSources(TOKEN_A, TOKEN_B, 0, 10);
+    const pairKeyNative = scValToNative(calls[0].args[0]) as Record<string, unknown>;
+    expect(Object.keys(pairKeyNative).sort()).toEqual(["token_a", "token_b"]);
+    expect(pairKeyNative.token_a).toBe(TOKEN_A);
+    expect(pairKeyNative.token_b).toBe(TOKEN_B);
+  });
+
+  it("listSources encodes cursor and limit as u32", async () => {
+    const client = new OracleAggregatorClient(config);
+    const calls = mockServer(client, () => nativeToScVal([]));
+    await client.listSources(TOKEN_A, TOKEN_B, 5, 20);
+    expect(scValToNative(calls[0].args[1])).toBe(5);
+    expect(scValToNative(calls[0].args[2])).toBe(20);
+  });
+
+  it("listSources matches the fixture's list_sources input order and types", () => {
+    const ep = entrypoint("oracle_aggregator", "list_sources");
+    expect(ep.inputs.map((i) => i.name)).toEqual(["pair", "cursor", "limit"]);
+    expect(ep.inputs.map((i) => i.type)).toEqual(["PairKey", "u32", "u32"]);
+  });
+
+  it("getPrice decodes price and confidence from the contract struct", async () => {
+    const client = new OracleAggregatorClient(config);
+    mockServer(client, () =>
+      xdr.ScVal.scvMap([
+        new xdr.ScMapEntry({
+          key: xdr.ScVal.scvSymbol("price"),
+          val: nativeToScVal(500_000n, { type: "i128" }),
+        }),
+        new xdr.ScMapEntry({
+          key: xdr.ScVal.scvSymbol("confidence"),
+          val: nativeToScVal(50, { type: "u32" }),
+        }),
+      ])
+    );
+    const result = await client.getPrice(TOKEN_A, TOKEN_B);
+    expect(result.price).toBe(500_000n);
+    expect(result.confidence).toBe(50);
+    expect(result.confidenceBps).toBe(50);
+  });
+});
+
 
 describe("cl.swapParams", () => {
   const args = cl.swapParams(ALICE, true, 1_000n, 79_228_162_514_264_337_593_543_950_336n, 950n, 1_700_000_000n);

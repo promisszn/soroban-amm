@@ -86,6 +86,8 @@ const staking = new StakingClient({
 
 // Read pool information and encode write arguments for a transaction builder.
 const poolInfo = await staking.getPoolInfo();
+// currentBoost returns the raw multiplier scaled by BOOST_SCALE = 10_000
+// (10_000n = 1x); boostMultiplierHuman converts it to a human multiplier.
 const multiplier = staking.boostMultiplierHuman(await staking.currentBoost("G..."));
 const args = staking.stakeLockedParams("G...", 500n, 1200n);
 ```

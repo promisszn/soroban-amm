@@ -17,6 +17,19 @@
 //! | `protocol_fee_set` | `("protocol_fee_set",)`    | `(1, (protocol_fee_bps, recipient))`   |
 //! | `circuit_break` | `("circuit_break",)`          | `(1, (price_before, price_after, deviation_bps, threshold_bps))` |
 //! | `cb_recovered`  | `("cb_recovered",)`           | `(1, (timestamp,))`                    |
+//! | `lp_locker_set` | `("lp_locker_set",)`           | `(1, (lp_token, locker))`              |
+//! | `emergency_announce` | `("emergency_announce",)` | `(1, (admin, to, announced_at, delay_secs))` |
+//! | `emergency_cancel` | `("emergency_cancel",)`     | `(1, (admin, to))`                     |
+//! | `emergency_wd` | `("emergency_wd",)`             | `(1, (admin, to, drain_a, drain_b))`   |
+//! | `force_unlock` | `("force_unlock",)`             | `(1, (timestamp,))`                    |
+//! | `cb_config` | `("cb_config",)`                 | `(1, (threshold_bps, cooldown_secs))`  |
+//! | `lp_rebate_set` | `("lp_rebate_set", admin)`      | `(1, (lp_rebate_bps,))`                |
+//! | `multisig_set` | `("multisig_set", admin_or_signer)` | `(1, (quorum,))`                    |
+//! | `ms_proposed` | `("ms_proposed", signer)`        | `(1, (proposal_id, recipient))`        |
+//! | `ms_set_proposed` | `("ms_set_proposed", signer)`| `(1, (proposal_id, new_quorum))`       |
+//! | `ms_approved` | `("ms_approved", signer)`        | `(1, (proposal_id, approval_count))`   |
+//! | `ms_ew` | `("ms_ew", signer)`                 | `(1, (to, drain_a, drain_b))`          |
+//! | `fot_detected` | `("fot_detected", token_in)`     | `(1, (amount_in, actual_received))`    |
 //!
 //! The DEX aggregator (`contracts/dex_aggregator`) adds:
 //!
@@ -155,6 +168,119 @@ pub struct CircuitBreakerEvent {
     pub threshold_bps: i128,
 }
 
+/// Emitted when the LP token's locker is changed.
+#[contracttype(export = false)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct LpLockerSetEvent {
+    pub lp_token: Address,
+    pub locker: Address,
+}
+
+/// Emitted when an emergency withdrawal is announced.
+#[contracttype(export = false)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmergencyAnnounceEvent {
+    pub admin: Address,
+    pub to: Address,
+    pub announced_at: u64,
+    pub delay_secs: u64,
+}
+
+/// Emitted when a pending emergency withdrawal is cancelled.
+#[contracttype(export = false)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmergencyCancelEvent {
+    pub admin: Address,
+    pub to: Address,
+}
+
+/// Emitted when an emergency withdrawal transfers the pool reserves.
+#[contracttype(export = false)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmergencyWithdrawEvent {
+    pub admin: Address,
+    pub to: Address,
+    pub drain_a: i128,
+    pub drain_b: i128,
+}
+
+/// Emitted when an admin or multisig signer clears the pool lock.
+#[contracttype(export = false)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForceUnlockEvent {
+    pub timestamp: u64,
+}
+
+/// Emitted when the circuit-breaker configuration changes.
+#[contracttype(export = false)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CircuitBreakerConfigEvent {
+    pub threshold_bps: i128,
+    pub cooldown_secs: u64,
+}
+
+/// Emitted when the LP rebate rate changes. The admin is indexed in the topic.
+#[contracttype(export = false)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct LpRebateSetEvent {
+    pub admin: Address,
+    pub lp_rebate_bps: i128,
+}
+
+/// Emitted when the multisig signer set is installed or updated.
+#[contracttype(export = false)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultisigSetEvent {
+    pub actor: Address,
+    pub quorum: u32,
+}
+
+/// Emitted when a multisig emergency-withdraw proposal is created.
+#[contracttype(export = false)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultisigProposedEvent {
+    pub signer: Address,
+    pub proposal_id: u64,
+    pub recipient: Address,
+}
+
+/// Emitted when a multisig signer-set proposal is created.
+#[contracttype(export = false)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultisigSetProposedEvent {
+    pub signer: Address,
+    pub proposal_id: u64,
+    pub new_quorum: u32,
+}
+
+/// Emitted when a multisig signer approves a proposal.
+#[contracttype(export = false)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultisigApprovedEvent {
+    pub signer: Address,
+    pub proposal_id: u64,
+    pub approval_count: u32,
+}
+
+/// Emitted when a multisig emergency-withdraw proposal executes.
+#[contracttype(export = false)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultisigEmergencyWithdrawEvent {
+    pub signer: Address,
+    pub to: Address,
+    pub drain_a: i128,
+    pub drain_b: i128,
+}
+
+/// Emitted when a swap detects a fee-on-transfer token.
+#[contracttype(export = false)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct FotDetectedEvent {
+    pub token_in: Address,
+    pub amount_in: i128,
+    pub actual_received: i128,
+}
+
 /// Venue family behind a route hop. Mirrors `dex_aggregator::PoolKind`.
 #[contracttype]
 #[derive(Debug, Clone, PartialEq)]
@@ -239,6 +365,19 @@ pub mod symbols {
     pub const CIRCUIT_BREAKER: &str = "circuit_break";
     pub const PROTOCOL_FEE_SET: &str = "protocol_fee_set";
     pub const CB_RECOVERED: &str = "cb_recovered";
+    pub const LP_LOCKER_SET: &str = "lp_locker_set";
+    pub const EMERGENCY_ANNOUNCE: &str = "emergency_announce";
+    pub const EMERGENCY_CANCEL: &str = "emergency_cancel";
+    pub const EMERGENCY_WITHDRAW: &str = "emergency_wd";
+    pub const FORCE_UNLOCK: &str = "force_unlock";
+    pub const CB_CONFIG: &str = "cb_config";
+    pub const LP_REBATE_SET: &str = "lp_rebate_set";
+    pub const MULTISIG_SET: &str = "multisig_set";
+    pub const MULTISIG_PROPOSED: &str = "ms_proposed";
+    pub const MULTISIG_SET_PROPOSED: &str = "ms_set_proposed";
+    pub const MULTISIG_APPROVED: &str = "ms_approved";
+    pub const MULTISIG_EMERGENCY_WITHDRAW: &str = "ms_ew";
+    pub const FOT_DETECTED: &str = "fot_detected";
 
     // ── DEX aggregator (#685) ────────────────────────────────────────────────
     pub const CL_POOL_REGISTERED: &str = "cl_reg";
@@ -385,6 +524,94 @@ pub const EVENT_SCHEMAS: &[EventSchema] = &[
         fields: &[("timestamp", "u64")],
     },
     EventSchema {
+        contract: "amm",
+        topic: symbols::LP_LOCKER_SET,
+        version: crate::EVENT_SCHEMA_VERSION,
+        fields: &[("lp_token", "Address"), ("locker", "Address")],
+    },
+    EventSchema {
+        contract: "amm",
+        topic: symbols::EMERGENCY_ANNOUNCE,
+        version: crate::EVENT_SCHEMA_VERSION,
+        fields: &[
+            ("admin", "Address"),
+            ("to", "Address"),
+            ("announced_at", "u64"),
+            ("delay_secs", "u64"),
+        ],
+    },
+    EventSchema {
+        contract: "amm",
+        topic: symbols::EMERGENCY_CANCEL,
+        version: crate::EVENT_SCHEMA_VERSION,
+        fields: &[("admin", "Address"), ("to", "Address")],
+    },
+    EventSchema {
+        contract: "amm",
+        topic: symbols::EMERGENCY_WITHDRAW,
+        version: crate::EVENT_SCHEMA_VERSION,
+        fields: &[
+            ("admin", "Address"),
+            ("to", "Address"),
+            ("drain_a", "i128"),
+            ("drain_b", "i128"),
+        ],
+    },
+    EventSchema {
+        contract: "amm",
+        topic: symbols::FORCE_UNLOCK,
+        version: crate::EVENT_SCHEMA_VERSION,
+        fields: &[("timestamp", "u64")],
+    },
+    EventSchema {
+        contract: "amm",
+        topic: symbols::CB_CONFIG,
+        version: crate::EVENT_SCHEMA_VERSION,
+        fields: &[("threshold_bps", "i128"), ("cooldown_secs", "u64")],
+    },
+    EventSchema {
+        contract: "amm",
+        topic: symbols::LP_REBATE_SET,
+        version: crate::EVENT_SCHEMA_VERSION,
+        fields: &[("lp_rebate_bps", "i128")],
+    },
+    EventSchema {
+        contract: "amm",
+        topic: symbols::MULTISIG_SET,
+        version: crate::EVENT_SCHEMA_VERSION,
+        fields: &[("quorum", "u32")],
+    },
+    EventSchema {
+        contract: "amm",
+        topic: symbols::MULTISIG_PROPOSED,
+        version: crate::EVENT_SCHEMA_VERSION,
+        fields: &[("proposal_id", "u64"), ("recipient", "Address")],
+    },
+    EventSchema {
+        contract: "amm",
+        topic: symbols::MULTISIG_SET_PROPOSED,
+        version: crate::EVENT_SCHEMA_VERSION,
+        fields: &[("proposal_id", "u64"), ("new_quorum", "u32")],
+    },
+    EventSchema {
+        contract: "amm",
+        topic: symbols::MULTISIG_APPROVED,
+        version: crate::EVENT_SCHEMA_VERSION,
+        fields: &[("proposal_id", "u64"), ("approval_count", "u32")],
+    },
+    EventSchema {
+        contract: "amm",
+        topic: symbols::MULTISIG_EMERGENCY_WITHDRAW,
+        version: crate::EVENT_SCHEMA_VERSION,
+        fields: &[("to", "Address"), ("drain_a", "i128"), ("drain_b", "i128")],
+    },
+    EventSchema {
+        contract: "amm",
+        topic: symbols::FOT_DETECTED,
+        version: crate::EVENT_SCHEMA_VERSION,
+        fields: &[("amount_in", "i128"), ("actual_received", "i128")],
+    },
+    EventSchema {
         contract: "dex_aggregator",
         topic: symbols::CL_POOL_REGISTERED,
         version: crate::EVENT_SCHEMA_VERSION,
@@ -461,6 +688,19 @@ pub enum AmmEvent {
     ProtocolFeeSet(ProtocolFeeSetEvent),
     CircuitBreaker(CircuitBreakerEvent),
     CbRecovered(CbRecoveredEvent),
+    LpLockerSet(LpLockerSetEvent),
+    EmergencyAnnounce(EmergencyAnnounceEvent),
+    EmergencyCancel(EmergencyCancelEvent),
+    EmergencyWithdraw(EmergencyWithdrawEvent),
+    ForceUnlock(ForceUnlockEvent),
+    CircuitBreakerConfig(CircuitBreakerConfigEvent),
+    LpRebateSet(LpRebateSetEvent),
+    MultisigSet(MultisigSetEvent),
+    MultisigProposed(MultisigProposedEvent),
+    MultisigSetProposed(MultisigSetProposedEvent),
+    MultisigApproved(MultisigApprovedEvent),
+    MultisigEmergencyWithdraw(MultisigEmergencyWithdrawEvent),
+    FotDetected(FotDetectedEvent),
     ClPoolRegistered(ClPoolRegisteredEvent),
     RouteSelected(RouteSelectedEvent),
     RouteAlternative(RouteAlternativeEvent),
@@ -708,6 +948,96 @@ pub fn decode_amm_event(
     } else if symbol == Symbol::new(env, symbols::CB_RECOVERED) {
         let (timestamp,): (u64,) = decode_payload(env, payload_val, 1)?;
         Some(AmmEvent::CbRecovered(CbRecoveredEvent { timestamp }))
+    } else if symbol == Symbol::new(env, symbols::LP_LOCKER_SET) {
+        let (lp_token, locker): (Address, Address) = decode_payload(env, payload_val, 2)?;
+        Some(AmmEvent::LpLockerSet(LpLockerSetEvent { lp_token, locker }))
+    } else if symbol == Symbol::new(env, symbols::EMERGENCY_ANNOUNCE) {
+        let (admin, to, announced_at, delay_secs): (Address, Address, u64, u64) =
+            decode_payload(env, payload_val, 4)?;
+        Some(AmmEvent::EmergencyAnnounce(EmergencyAnnounceEvent {
+            admin,
+            to,
+            announced_at,
+            delay_secs,
+        }))
+    } else if symbol == Symbol::new(env, symbols::EMERGENCY_CANCEL) {
+        let (admin, to): (Address, Address) = decode_payload(env, payload_val, 2)?;
+        Some(AmmEvent::EmergencyCancel(EmergencyCancelEvent {
+            admin,
+            to,
+        }))
+    } else if symbol == Symbol::new(env, symbols::EMERGENCY_WITHDRAW) {
+        let (admin, to, drain_a, drain_b): (Address, Address, i128, i128) =
+            decode_payload(env, payload_val, 4)?;
+        Some(AmmEvent::EmergencyWithdraw(EmergencyWithdrawEvent {
+            admin,
+            to,
+            drain_a,
+            drain_b,
+        }))
+    } else if symbol == Symbol::new(env, symbols::FORCE_UNLOCK) {
+        let (timestamp,): (u64,) = decode_payload(env, payload_val, 1)?;
+        Some(AmmEvent::ForceUnlock(ForceUnlockEvent { timestamp }))
+    } else if symbol == Symbol::new(env, symbols::CB_CONFIG) {
+        let (threshold_bps, cooldown_secs): (i128, u64) = decode_payload(env, payload_val, 2)?;
+        Some(AmmEvent::CircuitBreakerConfig(CircuitBreakerConfigEvent {
+            threshold_bps,
+            cooldown_secs,
+        }))
+    } else if symbol == Symbol::new(env, symbols::LP_REBATE_SET) {
+        let admin: Address = topics.get(1)?.try_into_val(env).ok()?;
+        let (lp_rebate_bps,): (i128,) = decode_payload(env, payload_val, 1)?;
+        Some(AmmEvent::LpRebateSet(LpRebateSetEvent {
+            admin,
+            lp_rebate_bps,
+        }))
+    } else if symbol == Symbol::new(env, symbols::MULTISIG_SET) {
+        let actor: Address = topics.get(1)?.try_into_val(env).ok()?;
+        let (quorum,): (u32,) = decode_payload(env, payload_val, 1)?;
+        Some(AmmEvent::MultisigSet(MultisigSetEvent { actor, quorum }))
+    } else if symbol == Symbol::new(env, symbols::MULTISIG_PROPOSED) {
+        let signer: Address = topics.get(1)?.try_into_val(env).ok()?;
+        let (proposal_id, recipient): (u64, Address) = decode_payload(env, payload_val, 2)?;
+        Some(AmmEvent::MultisigProposed(MultisigProposedEvent {
+            signer,
+            proposal_id,
+            recipient,
+        }))
+    } else if symbol == Symbol::new(env, symbols::MULTISIG_SET_PROPOSED) {
+        let signer: Address = topics.get(1)?.try_into_val(env).ok()?;
+        let (proposal_id, new_quorum): (u64, u32) = decode_payload(env, payload_val, 2)?;
+        Some(AmmEvent::MultisigSetProposed(MultisigSetProposedEvent {
+            signer,
+            proposal_id,
+            new_quorum,
+        }))
+    } else if symbol == Symbol::new(env, symbols::MULTISIG_APPROVED) {
+        let signer: Address = topics.get(1)?.try_into_val(env).ok()?;
+        let (proposal_id, approval_count): (u64, u32) = decode_payload(env, payload_val, 2)?;
+        Some(AmmEvent::MultisigApproved(MultisigApprovedEvent {
+            signer,
+            proposal_id,
+            approval_count,
+        }))
+    } else if symbol == Symbol::new(env, symbols::MULTISIG_EMERGENCY_WITHDRAW) {
+        let signer: Address = topics.get(1)?.try_into_val(env).ok()?;
+        let (to, drain_a, drain_b): (Address, i128, i128) = decode_payload(env, payload_val, 3)?;
+        Some(AmmEvent::MultisigEmergencyWithdraw(
+            MultisigEmergencyWithdrawEvent {
+                signer,
+                to,
+                drain_a,
+                drain_b,
+            },
+        ))
+    } else if symbol == Symbol::new(env, symbols::FOT_DETECTED) {
+        let token_in: Address = topics.get(1)?.try_into_val(env).ok()?;
+        let (amount_in, actual_received): (i128, i128) = decode_payload(env, payload_val, 2)?;
+        Some(AmmEvent::FotDetected(FotDetectedEvent {
+            token_in,
+            amount_in,
+            actual_received,
+        }))
     } else {
         None
     }

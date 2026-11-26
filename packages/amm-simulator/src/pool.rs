@@ -360,6 +360,24 @@ impl PoolState {
             raw_shares
         };
 
+        if shares == 0 {
+            return Err(SimulationError::ZeroAmount);
+        }
+
+        // Later deposits retain only the backing for minted shares, rounded
+        // up on each side; the remainder of the requested amounts is refunded.
+        let (amount_a, amount_b) = if self.total_shares == 0 {
+            (amount_a, amount_b)
+        } else {
+            let backing = |reserve: i128| -> Result<i128> {
+                let product = shares
+                    .checked_mul(reserve)
+                    .ok_or(SimulationError::Overflow)?;
+                Ok(product / self.total_shares + i128::from(product % self.total_shares != 0))
+            };
+            (backing(self.reserve_a)?, backing(self.reserve_b)?)
+        };
+
         Ok(LiquidityQuote {
             amount_a,
             amount_b,
@@ -560,12 +578,12 @@ impl PoolState {
 
         self.reserve_a = self
             .reserve_a
-            .checked_add(amount_a)
+            .checked_add(quote.amount_a)
             .ok_or(SimulationError::Overflow)?;
 
         self.reserve_b = self
             .reserve_b
-            .checked_add(amount_b)
+            .checked_add(quote.amount_b)
             .ok_or(SimulationError::Overflow)?;
 
         if first_deposit {
@@ -913,6 +931,26 @@ mod tests {
         assert_eq!(pool.total_shares, 3_000);
         assert_eq!(pool.locked_liquidity, MINIMUM_LIQUIDITY);
         assert!(pool.min_liquidity_locked);
+    }
+
+    #[test]
+    fn asymmetric_deposit_retains_only_rounded_share_backing() {
+        let mut pool = pool_with_liquidity();
+        pool.reserve_a = 10_000;
+        pool.reserve_b = 3_333;
+        pool.total_shares = 9_000;
+
+        let quote = pool.quote_add_liquidity(100, 100).unwrap();
+        assert_eq!(
+            (quote.shares, quote.amount_a, quote.amount_b),
+            (90, 100, 34)
+        );
+        let executed = pool.execute_add_liquidity(100, 100, 90).unwrap();
+        assert_eq!((executed.amount_a, executed.amount_b), (100, 34));
+        assert_eq!(
+            (pool.reserve_a, pool.reserve_b, pool.total_shares),
+            (10_100, 3_367, 9_090)
+        );
     }
 
     #[test]

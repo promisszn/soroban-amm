@@ -112,6 +112,11 @@ impl ClPoolState {
         };
 
         while amount_remaining > 0 {
+            if limit != 0
+                && ((zero_for_one && sqrt_price <= limit) || (!zero_for_one && sqrt_price >= limit))
+            {
+                break;
+            }
             let next_tick_opt = self.next_initialized_tick(current_tick, zero_for_one);
             if next_tick_opt.is_none() && active_liquidity == 0 {
                 break;
@@ -136,6 +141,22 @@ impl ClPoolState {
                     target_price = limit;
                     hit_limit = true;
                 }
+            }
+
+            // Mirror the contract: only an adjacent initialized tick at
+            // a real price boundary can be crossed without price movement.
+            if target_price == sqrt_price
+                && (hit_limit
+                    || sqrt_price <= swap_math::tick_to_sqrt_price_x96(MIN_TICK)
+                    || sqrt_price >= swap_math::tick_to_sqrt_price_x96(MAX_TICK)
+                    || next_tick_opt
+                        != Some(if zero_for_one {
+                            current_tick
+                        } else {
+                            current_tick + 1
+                        }))
+            {
+                break;
             }
 
             let amount_in_after_fee =
@@ -188,12 +209,9 @@ impl ClPoolState {
                     current_tick = next_tick;
                 }
 
-                // Pinned at MIN_TICK/MAX_TICK with liquidity left, the contract
-                // repeats this exact step until it exhausts its budget.
                 if (current_tick, sqrt_price, amount_remaining) == before {
                     return Err(SimulationError::InvalidInput(format!(
-                        "swap cannot progress past tick {current_tick}; the contract would \
-                         exhaust its budget here"
+                        "swap cannot progress past tick {current_tick}"
                     )));
                 }
             } else {

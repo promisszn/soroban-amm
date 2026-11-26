@@ -6,9 +6,12 @@
 
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, request, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { after, before, describe, it } from "node:test";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { CircuitBreaker } from "./circuit-breaker.js";
 import { DeadLetterQueue } from "./dead-letter.js";
@@ -27,7 +30,16 @@ import {
 } from "./management-security.js";
 import { WebhookRegistry } from "./registry.js";
 import { signPayload, verifySignature } from "./signing.js";
-import { toPublic, toPublicDeadLetter, type PoolEvent } from "./types.js";
+import { FileStateStore } from "./storage.js";
+import {
+  toPublic,
+  toPublicDeadLetter,
+  type DeadLetter,
+  type DeliveryResult,
+  type PoolEvent,
+  type PublicDeadLetter,
+  type WebhookSubscription,
+} from "./types.js";
 
 process.env["WEBHOOK_ALLOW_PRIVATE_TARGETS"] = "true";
 
@@ -590,5 +602,85 @@ describe("management API over HTTP", () => {
   it("checks the token before reading an oversized body", async () => {
     const huge = JSON.stringify({ url: "x", secret: "x".repeat(10_000) });
     assert.equal((await call(service, "POST", "/webhooks", { body: huge })).status, 401);
+  });
+});
+
+// ── Dead letters of a deleted subscription (issue #1375) ─────────────────
+
+describe("dead letters of a deleted subscription over HTTP", () => {
+  const TOKEN = "management-token-for-tests";
+  let dataDir: string;
+  let receiver: Receiver;
+  let service: Service | undefined;
+
+  function deadLetterFor(id: string, subscription: WebhookSubscription): DeadLetter {
+    return { id, event: { ...EVENT, id: `evt-${id}` }, subscription, attempts: [], failedAt: 0, reason: "HTTP 500" };
+  }
+
+  /** Writes the state a previous run left behind, then boots the service on it. */
+  async function boot(subscriptions: WebhookSubscription[], deadLetters: DeadLetter[]): Promise<Service> {
+    const store = new FileStateStore(dataDir);
+    store.saveSubscriptions({ subscriptions, nextId: 10 });
+    store.saveDeadLetters({ entries: deadLetters, nextId: 10 });
+    service = await startService({ MANAGEMENT_API_TOKEN: TOKEN, DATA_DIR: dataDir });
+    return service;
+  }
+
+  before(async () => {
+    receiver = await startReceiver();
+  });
+  after(async () => {
+    await receiver.close();
+  });
+
+  beforeEach(() => {
+    dataDir = mkdtempSync(join(tmpdir(), "streamer-dead-letters-"));
+    receiver.requests.length = 0;
+  });
+  afterEach(async () => {
+    await service?.stop();
+    service = undefined;
+    rmSync(dataDir, { recursive: true, force: true });
+  });
+
+  it("answers 410 to a replay whose subscription no longer exists and sends nothing", async () => {
+    // A dead letter left behind by a release that did not purge on DELETE: its
+    // subscription snapshot still names a live URL and secret.
+    const gone: WebhookSubscription = { id: "1", url: receiver.url, secret: SECRET, createdAt: 0 };
+    const svc = await boot([], [deadLetterFor("1", gone)]);
+
+    const replay = await call(svc, "POST", "/dead-letters/1/replay", { token: TOKEN });
+
+    assert.equal(replay.status, 410);
+    const body = JSON.parse(replay.text) as { error: string; result: DeliveryResult };
+    assert.equal(body.result.failureKind, "subscription_gone");
+    assert.equal(body.result.success, false);
+    assert.equal(body.result.subscriptionId, "1");
+    assert.equal(receiver.requests.length, 0, "no request reached the deleted subscription's URL");
+    assert.equal(replay.text.includes(SECRET), false);
+  });
+
+  it("DELETE /webhooks/:id purges that subscription's dead letters, durably", async () => {
+    const deleted: WebhookSubscription = { id: "1", url: receiver.url, secret: SECRET, createdAt: 0 };
+    const kept: WebhookSubscription = { id: "2", url: "http://127.0.0.1:9/hook", createdAt: 0 };
+    const svc = await boot([deleted, kept], [deadLetterFor("1", deleted), deadLetterFor("2", kept), deadLetterFor("3", deleted)]);
+
+    const listed = async () =>
+      (JSON.parse((await call(svc, "GET", "/dead-letters", { token: TOKEN })).text) as PublicDeadLetter[]).map((d) => d.id);
+    assert.deepEqual(await listed(), ["1", "2", "3"]);
+
+    const removed = await call(svc, "DELETE", "/webhooks/1", { token: TOKEN });
+    assert.equal(removed.status, 200);
+    assert.deepEqual(JSON.parse(removed.text), { removed: true });
+
+    assert.deepEqual(await listed(), ["2"], "only the other subscription's dead letter remains");
+    for (const id of ["1", "3"]) {
+      assert.equal((await call(svc, "POST", `/dead-letters/${id}/replay`, { token: TOKEN })).status, 404);
+    }
+    assert.equal(receiver.requests.length, 0);
+
+    // The purge reached the state file, so a restart cannot resurrect them.
+    const onDisk = new FileStateStore(dataDir).loadDeadLetters().entries.map((d) => d.id);
+    assert.deepEqual(onDisk, ["2"]);
   });
 });

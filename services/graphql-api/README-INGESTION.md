@@ -69,8 +69,12 @@ the fallback as an on-chain value.
 - `valueUsd` is `null` until the pool has a usable TVL price source.
 
 The ingester recognizes AMM swap/add/remove events and CL `mint_pos`,
-`burn_pos`, `swap_out`, and `coll_fees` events. Governance and staking events
-are retained and queryable even though they do not change pool reserves.
+`burn_pos`, `mod_pos`, `mint_1t`, `swap_out`, and `coll_fees` events. CL
+`mod_pos` applies its signed liquidity delta and token amounts to the indexed
+position and reserves. `mint_1t` updates position liquidity; its event does not
+identify which token was deposited, so its `amount_used` cannot be assigned to
+either reserve. Governance and staking events are retained and queryable even
+though they do not change pool reserves.
 
 ## API Endpoints
 

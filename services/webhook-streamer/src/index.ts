@@ -272,6 +272,9 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
     if (!result) {
       return json(res, 404, { error: "dead letter not found" });
     }
+    if (result.failureKind === "subscription_gone") {
+      return json(res, 410, { error: result.error, result });
+    }
     return json(res, result.success ? 200 : 502, { replayed: result.success, result });
   }
 
@@ -322,7 +325,10 @@ async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise
   if (method === "DELETE" && deleteMatch) {
     const id = deleteMatch[1];
     const removed = defaultRegistry.unregister(id);
-    if (removed) dispatcher.circuitBreaker.forget(id);
+    if (removed) {
+      dispatcher.circuitBreaker.forget(id);
+      dispatcher.deadLetters.removeBySubscription(id);
+    }
     return json(res, removed ? 200 : 404, { removed });
   }
 

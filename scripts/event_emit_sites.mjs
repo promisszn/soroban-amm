@@ -3,8 +3,10 @@
 // An emit site is a call to `emit_versioned_event!(env, <topics>, <payload>)`
 // or a raw `env.events().publish(<topics>, <payload>)`. For each one this
 // records the contract (directory under contracts/), the event name (the first
-// topic), the number of topics and the payload arity, so the webhook-streamer
-// schema file can be checked against what the contracts actually emit.
+// topic), the number of topics, the payload arity and, per payload element, the
+// local identifier it is built from when it is a plain identifier (null
+// otherwise), so the webhook-streamer schema file can be checked against what
+// the contracts actually emit.
 //
 // Usage as a module: import { extractEmitSites } from "./event_emit_sites.mjs"
 // Usage as a CLI:    node scripts/event_emit_sites.mjs   (prints JSON)
@@ -129,6 +131,21 @@ function removeTestModules(src) {
   }
 }
 
+/** Rust keywords and literals that look like identifiers but name no binding. */
+const NOT_BINDINGS = new Set(["true", "false", "self"]);
+
+/**
+ * The binding name of a payload element that is a plain local identifier
+ * (`amount`), or null for anything else: an expression (`provider.clone()`,
+ * `price as i128`), a literal (`true`) or a SCREAMING_CASE constant. Only
+ * plain identifiers are compared with the schema's field names; other elements
+ * are checked for arity only.
+ */
+function plainIdentifier(element) {
+  const e = element.trim();
+  return /^[a-z_][a-z0-9_]*$/.test(e) && !NOT_BINDINGS.has(e) ? e : null;
+}
+
 function lineOf(src, index) {
   let line = 1;
   for (let i = 0; i < index; i++) if (src[i] === "\n") line++;
@@ -185,6 +202,7 @@ export function extractFromSource(source, file, contract) {
       shape,
       versioned: shape !== "unversioned",
       args: args_.map((a) => a.replace(/\s+/g, " ")),
+      payload_fields: args_.length === payloadArity ? args_.map(plainIdentifier) : null,
       source: `${file}:${lineOf(src, m.index)}`,
     });
   }

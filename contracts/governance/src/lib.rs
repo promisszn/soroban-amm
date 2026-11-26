@@ -377,7 +377,7 @@ pub struct Proposal {
 #[soroban_sdk::contractclient(name = "LpTokenClient")]
 pub trait LpTokenInterface {
     fn balance(env: Env, id: Address) -> i128;
-    fn balance_at(env: Env, id: Address, ledger: u32) -> i128;
+    fn balance_at(env: Env, id: Address, ledger: u32) -> Result<i128, TokenError>;
     fn total_supply(env: Env) -> i128;
     fn total_supply_at(env: Env, ledger: u32) -> Result<i128, TokenError>;
     fn locked_balance(env: Env, id: Address) -> i128;
@@ -1284,6 +1284,9 @@ impl Governance {
         if proposal.cancelled {
             return Err(GovernanceError::ProposalCancelled);
         }
+        if proposal.vetoed {
+            return Err(GovernanceError::ProposalVetoed);
+        }
         if env.ledger().timestamp() > proposal.vote_end {
             return Err(GovernanceError::VotingPeriodEnded);
         }
@@ -1558,7 +1561,15 @@ impl Governance {
             .ok_or(GovernanceError::ProposalNotFound)?;
         let lp_token = Self::read_lp_token(&env)?;
         let lp_client = LpTokenClient::new(&env, &lp_token);
-        Ok(lp_client.balance_at(&holder, &proposal.snapshot_ledger))
+        // `balance_at` returns a typed `TokenError` once the holder's
+        // checkpoint is no longer in the token's retained window. Map both the
+        // host-level `Result` and the inner token error to the same governance
+        // error so the caller sees `InsufficientSnapshotBal` instead of a trap.
+        let balance = lp_client
+            .try_balance_at(&holder, &proposal.snapshot_ledger)
+            .map_err(|_| GovernanceError::InsufficientSnapshotBal)?
+            .map_err(|_| GovernanceError::InsufficientSnapshotBal)?;
+        Ok(balance)
     }
 
     /// The voting power `vote(voter, proposal_id, ..)` would count right now,
@@ -1778,7 +1789,13 @@ impl Governance {
         proposal: &Proposal,
         is_voter: bool,
     ) -> Result<i128, GovernanceError> {
-        let snapshot = lp_client.balance_at(holder, &proposal.snapshot_ledger);
+        // A holder whose snapshot checkpoint has been evicted gets a typed
+        // `InsufficientSnapshotBal` here rather than a host trap. The `current`
+        // balance read cannot fail: it is a fresh read, not a snapshot.
+        let snapshot = lp_client
+            .try_balance_at(holder, &proposal.snapshot_ledger)
+            .map_err(|_| GovernanceError::InsufficientSnapshotBal)?
+            .map_err(|_| GovernanceError::InsufficientSnapshotBal)?;
         let current = lp_client.balance(holder);
         if is_voter {
             if current < snapshot {
@@ -2071,6 +2088,9 @@ impl Governance {
 // Authorization regression tests for the admin entrypoints.
 #[cfg(test)]
 mod auth_tests;
+
+#[cfg(test)]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2864,6 +2884,11 @@ mod tests {
             300 + 300,
             "B's power must not be counted twice"
         );
+        assert_eq!(
+            LpTokenClient::new(&s.env, &s.lp_addr).locked_balance(&b),
+            300,
+            "B's balance must stay locked exactly once"
+        );
     }
 
     #[test]
@@ -3028,6 +3053,50 @@ mod tests {
         assert_eq!(__ver_11.0, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
         let data: (u32, Address, u64, u64) = __ver_11.1;
         assert_eq!(data.0, pid);
+    }
+
+    fn vetoed_proposal_for_cancellation() -> (Suite, Address, u32) {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        gov.set_veto_multisig(&Address::generate(&s.env));
+        let proposer = Address::generate(&s.env);
+        mint_lp(&s, &proposer, 1_000);
+
+        let pid = gov.propose(&proposer, &ProposalKind::UpdateFee(99));
+        gov.vote(&proposer, &pid, &Vote::For);
+        let vote_end = gov.get_proposal(&pid).vote_end;
+        s.env.ledger().set_timestamp(vote_end + 1);
+        gov.veto(&pid);
+        (s, proposer, pid)
+    }
+
+    #[test]
+    fn test_cancel_vetoed_proposal_returns_veto_error() {
+        let (s, proposer, pid) = vetoed_proposal_for_cancellation();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+
+        assert_eq!(
+            gov.try_cancel_proposal(&pid, &proposer),
+            Err(Ok(GovernanceError::ProposalVetoed))
+        );
+        assert!(!gov.get_proposal(&pid).cancelled);
+    }
+
+    #[test]
+    fn test_cancel_vetoed_proposal_preserves_discussion_and_veto_status() {
+        let (s, proposer, pid) = vetoed_proposal_for_cancellation();
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::InDiscussion);
+        assert_eq!(
+            gov.try_cancel_proposal(&pid, &proposer),
+            Err(Ok(GovernanceError::ProposalVetoed))
+        );
+
+        let discussion_end = gov.get_veto_audit(&pid).unwrap().discussion_end;
+        s.env.ledger().set_timestamp(discussion_end);
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::InDiscussion);
+        s.env.ledger().set_timestamp(discussion_end + 1);
+        assert_eq!(gov.proposal_status(&pid), ProposalStatus::Vetoed);
     }
 
     #[test]
@@ -3332,7 +3401,8 @@ mod tests {
         let lp1 = Address::generate(&env);
         token::LpTokenClient::new(&env, &lp_addr).mint(&lp1, &1000);
 
-        let nft_addr = Address::generate(&env);
+        let nft_addr = env.register_contract(None, cl_position_nft::ClPositionNft);
+        cl_position_nft::ClPositionNftClient::new(&env, &nft_addr).initialize(&gov_addr, &cl_addr);
         let pid = gov.propose(
             &lp1,
             &ProposalKind::SetClPositionNft(SetClPositionNftParams {
@@ -4854,6 +4924,92 @@ mod tests {
         assert!(
             cpu < 2_000_000_000,
             "vote exceeded the instruction budget: {cpu}"
+        );
+    }
+    /// A voter whose snapshot checkpoint has been evicted must get a typed
+    /// `GovernanceError::InsufficientSnapshotBal` from `vote`, not a host trap.
+    #[test]
+    fn test_vote_returns_typed_error_when_snapshot_evicted() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let voter = Address::generate(&s.env);
+        let proposer = Address::generate(&s.env);
+        let sink = Address::generate(&s.env);
+        mint_lp(&s, &voter, 100);
+        mint_lp(&s, &proposer, 300);
+        s.env.budget().reset_unlimited();
+        let pid = propose_at_ledger(&s, &gov, &proposer);
+        let snapshot_ledger = gov.get_proposal(&pid).snapshot_ledger;
+
+        // Write > MAX_CHECKPOINTS distinct-ledger checkpoints on `voter` so
+        // the proposal's snapshot is evicted from the token's retained window.
+        let lp = lp_of(&s);
+        let target = snapshot_ledger + LpToken::MAX_CHECKPOINTS + 2;
+        while s.env.ledger().sequence() < target {
+            s.env.ledger().with_mut(|l| l.sequence_number += 1);
+            lp.transfer(&voter, &sink, &1);
+            lp.transfer(&sink, &voter, &1);
+        }
+
+        assert_eq!(
+            gov.try_vote(&voter, &pid, &Vote::For),
+            Err(Ok(GovernanceError::InsufficientSnapshotBal))
+        );
+    }
+
+    /// Same as above, for the read-only view.
+    #[test]
+    fn test_get_voting_power_returns_typed_error_when_snapshot_evicted() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let voter = Address::generate(&s.env);
+        let proposer = Address::generate(&s.env);
+        let sink = Address::generate(&s.env);
+        mint_lp(&s, &voter, 100);
+        mint_lp(&s, &proposer, 300);
+        s.env.budget().reset_unlimited();
+        let pid = propose_at_ledger(&s, &gov, &proposer);
+        let snapshot_ledger = gov.get_proposal(&pid).snapshot_ledger;
+
+        let lp = lp_of(&s);
+        let target = snapshot_ledger + LpToken::MAX_CHECKPOINTS + 2;
+        while s.env.ledger().sequence() < target {
+            s.env.ledger().with_mut(|l| l.sequence_number += 1);
+            lp.transfer(&voter, &sink, &1);
+            lp.transfer(&sink, &voter, &1);
+        }
+
+        assert_eq!(
+            gov.try_get_voting_power(&pid, &voter),
+            Err(Ok(GovernanceError::InsufficientSnapshotBal))
+        );
+    }
+
+    /// Same as above, for the raw snapshot-balance read.
+    #[test]
+    fn test_get_snapshot_balance_returns_typed_error_when_evicted() {
+        let s = setup_suite(30);
+        let gov = GovernanceClient::new(&s.env, &s.gov_addr);
+        let voter = Address::generate(&s.env);
+        let proposer = Address::generate(&s.env);
+        let sink = Address::generate(&s.env);
+        mint_lp(&s, &voter, 100);
+        mint_lp(&s, &proposer, 300);
+        s.env.budget().reset_unlimited();
+        let pid = propose_at_ledger(&s, &gov, &proposer);
+        let snapshot_ledger = gov.get_proposal(&pid).snapshot_ledger;
+
+        let lp = lp_of(&s);
+        let target = snapshot_ledger + LpToken::MAX_CHECKPOINTS + 2;
+        while s.env.ledger().sequence() < target {
+            s.env.ledger().with_mut(|l| l.sequence_number += 1);
+            lp.transfer(&voter, &sink, &1);
+            lp.transfer(&sink, &voter, &1);
+        }
+
+        assert_eq!(
+            gov.try_get_snapshot_balance(&pid, &voter),
+            Err(Ok(GovernanceError::InsufficientSnapshotBal))
         );
     }
 }

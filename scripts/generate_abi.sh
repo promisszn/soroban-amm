@@ -46,13 +46,24 @@ import json
 import os
 import sys
 
+def canonical_spec_entry(entry):
+    # Stellar CLI 30 serializes the XDR type field as "type" rather than
+    # "type_" on named spec entries (function inputs, struct fields, and
+    # union tuple cases). Keep the published JSON shape stable.
+    if "type" in entry and "name" in entry and "doc" in entry:
+        if "type_" in entry:
+            raise ValueError("spec entry supplies both type and type_")
+        entry["type_"] = entry.pop("type")
+    return entry
+
+
 temp_dir, output_path, *contracts = sys.argv[1:]
 interfaces = {}
 for name in contracts:
     try:
         with open(os.path.join(temp_dir, f"{name}.json"), encoding="utf-8") as stream:
-            interfaces[name] = json.load(stream)
-    except (OSError, json.JSONDecodeError) as error:
+            interfaces[name] = json.load(stream, object_hook=canonical_spec_entry)
+    except (OSError, ValueError) as error:
         print(f"ERROR: Invalid interface JSON for '{name}': {error}", file=sys.stderr)
         sys.exit(1)
 

@@ -12,6 +12,7 @@ EXPECTED_WASMS=(
   factory.wasm
   governance.wasm
   incentive_campaigns.wasm
+  oracle_adapters.wasm
   oracle_aggregator.wasm
   pol_vesting.wasm
   reserve_manager.wasm

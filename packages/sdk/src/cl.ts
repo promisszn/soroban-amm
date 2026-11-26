@@ -175,6 +175,13 @@ export class ConcentratedLiquidityClient {
     };
   }
 
+  /** Encode the arguments for the contract's quote_position entrypoint. */
+  quotePositionParams(
+    lowerTick: number, upperTick: number, liquidity: bigint,
+  ): xdr.ScVal[] {
+    return [i32(lowerTick), i32(upperTick), i128(liquidity)];
+  }
+
   /**
    * Quotes the token A and token B amounts required for `liquidity` in a
    * position between `lowerTick` and `upperTick`.
@@ -189,9 +196,7 @@ export class ConcentratedLiquidityClient {
   ): Promise<PositionQuote> {
     const raw = await this.simulate(
       "quote_position",
-      i32(lowerTick),
-      i32(upperTick),
-      i128(liquidity)
+      ...this.quotePositionParams(lowerTick, upperTick, liquidity)
     );
     const native = scValToNative(raw) as [unknown, unknown];
     return {

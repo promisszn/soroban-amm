@@ -38,7 +38,7 @@ ABI_TO_XDR: dict[str, set[SCValType]] = {
     "bool": {SCValType.SCV_BOOL},
     "Symbol": {SCValType.SCV_SYMBOL},
     "String": {SCValType.SCV_STRING},
-    "Option": {SCValType.SCV_VOID, SCValType.SCV_BYTES, SCValType.SCV_ADDRESS},
+    "Option": {SCValType.SCV_VOID, SCValType.SCV_VEC},
     "Vec": {SCValType.SCV_VEC},
     "Void": {SCValType.SCV_VOID},
     # Unit-variant enums are encoded as a one-element vector holding the variant symbol.
@@ -150,6 +150,37 @@ def test_factory_create_pool_has_five_parameters_in_abi_order(recorder: _Recorde
         "caller", "token_a", "token_b", "fee_tier", "governance_wasm_hash"
     ]
     assert_matches_abi(abi, method, args)
+
+
+def test_factory_create_pool_governance_wasm_hash_some_is_vec(recorder: _Recorder) -> None:
+    """Some(governance_wasm_hash) must encode as SCV_VEC([SCV_BYTES]), not bare SCV_BYTES."""
+    hash_bytes = b"\xaa" * 32
+    _, args = capture(
+        recorder, factory_client.create_pool, stub(), SOURCE, ADDR, ADDR, ADDR, 2, hash_bytes
+    )
+    gov_arg = args[4]
+    assert gov_arg.type == SCValType.SCV_VEC, (
+        f"governance_wasm_hash Some branch: expected SCV_VEC, got {gov_arg.type.name}"
+    )
+    elements = gov_arg.vec.sc_vec
+    assert len(elements) == 1, f"expected one-element vec, got {len(elements)} elements"
+    inner = elements[0]
+    assert inner.type == SCValType.SCV_BYTES, (
+        f"inner element: expected SCV_BYTES, got {inner.type.name}"
+    )
+    assert len(inner.bytes.sc_bytes) == 32, (
+        f"inner bytes length: expected 32, got {len(inner.bytes.sc_bytes)}"
+    )
+
+
+def test_factory_create_pool_governance_wasm_hash_none_is_void(recorder: _Recorder) -> None:
+    """None governance_wasm_hash must still encode as SCV_VOID."""
+    _, args = capture(
+        recorder, factory_client.create_pool, stub(), SOURCE, ADDR, ADDR, ADDR, 2
+    )
+    assert args[4].type == SCValType.SCV_VOID, (
+        f"governance_wasm_hash None branch: expected SCV_VOID, got {args[4].type.name}"
+    )
 
 
 def test_factory_create_pool_fee_tier_is_i128(recorder: _Recorder) -> None:

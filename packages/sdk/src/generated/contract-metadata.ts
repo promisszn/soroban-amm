@@ -445,7 +445,8 @@ export const CONTRACT_METADATA = {
       "18": "NotTracked",
       "19": "TooManyPools",
       "20": "NoPendingKeeper",
-      "21": "WrongPendingKeeper"
+      "21": "WrongPendingKeeper",
+      "22": "CannotDeleteRequiredSnapshot"
     },
     "structs": {
       "AmmPoolInfo": [
@@ -887,7 +888,8 @@ export const CONTRACT_METADATA = {
       "19": "TooManyVenues",
       "20": "NotInitialized",
       "21": "InvalidBatchWindow",
-      "22": "InvalidWindowBounds"
+      "22": "InvalidWindowBounds",
+      "23": "Paused"
     },
     "structs": {
       "Order": [

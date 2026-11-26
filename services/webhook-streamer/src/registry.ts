@@ -71,6 +71,11 @@ export class WebhookRegistry {
     return true;
   }
 
+  /** Look up a registered subscription by ID. */
+  get(id: string): WebhookSubscription | undefined {
+    return this.subscriptions.get(id);
+  }
+
   /** List all registered webhooks, optionally filtered by contractId. */
   list(contractId?: string): WebhookSubscription[] {
     const all = [...this.subscriptions.values()];

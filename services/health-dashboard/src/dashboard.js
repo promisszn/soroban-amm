@@ -152,7 +152,7 @@ export async function gql(
 const QUERY = {
   stats: `query Stats($poolId: ID) { poolStats(poolId: $poolId) { poolId tokenA tokenB tvl volume24h fees24h swapCount priceDeviationBps } }`,
   health: `query Health($poolId: ID!) { poolHealth(poolId: $poolId) { poolId healthScore tvlScore volumeScore feeEfficiencyScore priceDeviationBps status alertsFired { poolId metric threshold currentValue firedAt } } }`,
-  alerts: `query Alerts($poolId: ID) { alertConfigs(poolId: $poolId) { poolId metric thresholdBps thresholdValue } }`,
+  alerts: `query Alerts($poolId: ID) { alertConfigs(poolId: $poolId) { poolId metric comparison thresholdBps thresholdValue } }`,
   history: `query History($poolId: ID!) { priceHistory(poolId: $poolId, from: 0) { poolId timestamp price feeBps } }`,
   events: `query Events($poolId: ID) { poolEvents(poolId: $poolId, limit: 200) { id poolId type timestamp payload } }`,
 };
@@ -374,7 +374,7 @@ export function renderAlertConfigs(configs, onRemove) {
   if (!list) return;
   list.replaceChildren();
   if (!configs.length) { list.innerHTML = '<div class="empty-state">No alerts configured for this pool</div>'; return; }
-  configs.forEach((alert) => { const item = document.createElement("div"); item.className = "alert-item"; const label = alert.metric === "price_deviation" ? `${alert.metric} > ${alert.thresholdBps} bps` : `${alert.metric} > ${alert.thresholdValue}`; item.textContent = `${label} `; const button = document.createElement("button"); button.className = "remove"; button.type = "button"; button.textContent = "×"; button.setAttribute("aria-label", `Remove ${alert.metric} alert`); button.addEventListener("click", () => onRemove(alert)); item.appendChild(button); list.appendChild(item); });
+  configs.forEach((alert) => { const item = document.createElement("div"); item.className = "alert-item"; const operator = (alert.comparison ?? "above") === "below" ? "<" : ">"; const label = alert.metric === "price_deviation" ? `${alert.metric} ${operator} ${alert.thresholdBps} bps` : `${alert.metric} ${operator} ${alert.thresholdValue}`; item.textContent = `${label} `; const button = document.createElement("button"); button.className = "remove"; button.type = "button"; button.textContent = "×"; button.setAttribute("aria-label", `Remove ${alert.metric} alert`); button.addEventListener("click", () => onRemove(alert)); item.appendChild(button); list.appendChild(item); });
 }
 
 function addDashboardMessages() {
@@ -427,14 +427,15 @@ export function createDashboardController({ apiUrl, poolId, pollIntervalMs = DEF
   async function addAlert() {
     const metric = field("alert-metric")?.value; const thresholdInput = field("alert-threshold"); const threshold = Number(thresholdInput?.value); if (!metric || !Number.isFinite(threshold) || threshold < 0) return;
     // "price_deviation" is basis points; "tvl" and "volume24h" are raw values in the metric's native units.
+    const comparison = metric === "tvl" ? "below" : "above";
     const thresholdBps = metric === "price_deviation" ? threshold : undefined;
     const thresholdValue = metric === "price_deviation" ? undefined : threshold;
     const currentPool = field("pool-id")?.value.trim() || pool;
     // Dedup by metric AND poolId — filtering by metric alone would drop other pools' alerts
     // for the same metric when the Pool ID field is blank (alertConfigs(poolId: undefined) spans all pools).
-    const previous = configs; const next = [...configs.filter((item) => !(item.metric === metric && item.poolId === currentPool)), { poolId: currentPool, metric, thresholdBps, thresholdValue }]; configs = next; renderAlertConfigs(configs, removeAlert); if (thresholdInput) thresholdInput.value = "";
+    const previous = configs; const next = [...configs.filter((item) => !(item.metric === metric && item.poolId === currentPool)), { poolId: currentPool, metric, comparison, thresholdBps, thresholdValue }]; configs = next; renderAlertConfigs(configs, removeAlert); if (thresholdInput) thresholdInput.value = "";
     const currentUrl = field("api-url")?.value.trim() || url;
-    try { await gql(currentUrl, `mutation SetAlert($poolId: ID!, $metric: String!, $thresholdBps: Int, $thresholdValue: Float) { setAlertConfig(poolId: $poolId, metric: $metric, thresholdBps: $thresholdBps, thresholdValue: $thresholdValue) { poolId metric thresholdBps thresholdValue } }`, { poolId: currentPool, metric, thresholdBps, thresholdValue }, { timeoutMs }); } catch (error) { configs = previous; renderAlertConfigs(configs, removeAlert); setSectionState(`Alert was not saved: ${formatError(error)}`); }
+    try { await gql(currentUrl, `mutation SetAlert($poolId: ID!, $metric: String!, $comparison: String, $thresholdBps: Int, $thresholdValue: Float) { setAlertConfig(poolId: $poolId, metric: $metric, comparison: $comparison, thresholdBps: $thresholdBps, thresholdValue: $thresholdValue) { poolId metric comparison thresholdBps thresholdValue } }`, { poolId: currentPool, metric, comparison, thresholdBps, thresholdValue }, { timeoutMs }); } catch (error) { configs = previous; renderAlertConfigs(configs, removeAlert); setSectionState(`Alert was not saved: ${formatError(error)}`); }
   }
   async function removeAlert(alert) {
     const previous = configs; configs = configs.filter((item) => !(item.metric === alert.metric && item.poolId === alert.poolId)); renderAlertConfigs(configs, removeAlert);

@@ -1,0 +1,138 @@
+name: Curated Mutation Check
+
+# Nightly (and on demand) only: every mutation recompiles the crate and reruns
+# its whole library test suite, which is far too slow for pull requests.
+# Each crate runs in its own matrix job, and the larger mutation sets are split
+# into round-robin shards (`--shard K/N`), so no single job approaches the
+# runner's time limit. Unaccepted survivors open or update a tracking issue,
+# and the next fully passing run closes it — see the `report` job.
+
+on:
+  schedule:
+    - cron: "11 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutation-check:
+    if: github.repository == 'promisszn/soroban-amm'
+    name: mutation-check (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    # Generous ceiling per job: the largest shard is ~40 mutations at roughly
+    # one to two minutes each, plus the workspace WASM build and the baseline.
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: amm-1, crate: amm, shard: "1/2", timeout: 300 }
+          - { name: amm-2, crate: amm, shard: "2/2", timeout: 300 }
+          - { name: batch_auction, crate: batch_auction, shard: "1/1", timeout: 300 }
+          - { name: concentrated_liquidity-1, crate: concentrated_liquidity, shard: "1/2", timeout: 300 }
+          - { name: concentrated_liquidity-2, crate: concentrated_liquidity, shard: "2/2", timeout: 300 }
+          # The governance suite alone takes about three minutes per run.
+          - { name: governance, crate: governance, shard: "1/1", timeout: 900 }
+          - { name: token, crate: token, shard: "1/1", timeout: 300 }
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      # Channel, components and targets come from rust-toolchain.toml.
+      - name: Set up Rust
+        run: rustup show
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mutation-check
+
+      # The contract test suites load token/amm/... WASM via include_bytes!,
+      # so the artifacts must exist before the baseline run (same as ci.yml).
+      - name: Build WASM artifacts
+        run: bash scripts/build_workspace.sh
+
+      # The script runs the unmutated suite first and exits 2 if it does not
+      # pass, so a broken suite can never report "no survivors".
+      - name: Run curated mutations
+        run: >-
+          python3 scripts/mutation_check.py
+          --crate "${{ matrix.crate }}"
+          --shard "${{ matrix.shard }}"
+          --timeout "${{ matrix.timeout }}"
+          --report "mutation-reports/${{ matrix.name }}.txt"
+
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mutation-report-${{ matrix.name }}
+          path: mutation-reports/
+          if-no-files-found: warn
+          retention-days: 30
+
+  report:
+    needs: mutation-check
+    if: >-
+      always()
+      && github.repository == 'promisszn/soroban-amm'
+      && needs.mutation-check.result != 'cancelled'
+      && needs.mutation-check.result != 'skipped'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      CHECK_RESULT: ${{ needs.mutation-check.result }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      SHA: ${{ github.sha }}
+      LABEL: mutation-survivors
+    steps:
+      - name: Download mutation reports
+        uses: actions/download-artifact@v7
+        with:
+          pattern: mutation-report-*
+          path: mutation-reports
+          merge-multiple: true
+
+      - name: Open, update or close the tracking issue
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Survivors in any shard -> open/update the issue. Every shard green
+          # -> close it. Anything else (baseline failure, build error) is left
+          # to the failed run itself and does not touch the issue.
+          if grep -Eqs '^Unaccepted survivors: [1-9][0-9]*$' mutation-reports/*.txt; then
+            result=survivors
+          elif [ "$CHECK_RESULT" = success ]; then
+            result=pass
+          else
+            echo "Mutation check did not complete cleanly ($CHECK_RESULT); not touching the tracking issue."
+            exit 0
+          fi
+
+          open_issue="$(gh issue list --label "$LABEL" --state open --limit 1 --json number --jq '.[0].number // empty')"
+          if [ "$result" = pass ]; then
+            if [ -n "$open_issue" ]; then
+              gh issue close "$open_issue" --comment "Curated mutation check passed on \`$SHA\`: $RUN_URL"
+            fi
+            exit 0
+          fi
+
+          body="$(printf '%s\n\nMutation survivors are available in the \`mutation-report-*\` workflow artifacts.\n\n| | |\n|---|---|\n| Commit | \`%s\` |\n| Run | %s |\n' \
+            '**Curated mutation check found unaccepted survivors.**' "$SHA" "$RUN_URL")"
+          if [ -n "$open_issue" ]; then
+            gh issue comment "$open_issue" --body "$body"
+          else
+            gh label create "$LABEL" --color B60205 \
+              --description "Opened and closed automatically by the Curated Mutation Check workflow" --force
+            gh issue create --label "$LABEL" \
+              --title "Curated mutation check has unaccepted survivors" \
+              --body "$body"
+          fi

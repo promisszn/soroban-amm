@@ -123,6 +123,22 @@ const FIXTURES: &[Fixture] = &[
         ],
     },
     Fixture {
+        name: "start on an initialized low-price tick",
+        fee_bps: 30,
+        protocol_fee_bps: 0,
+        tick_spacing: 1,
+        initial_tick: -69_050,
+        positions: &[
+            (-69_060, -69_050, 0, 1_000_000_000),
+            (-69_050, -69_040, 1_000_000_000_000, 0),
+        ],
+        swaps: &[
+            (true, 100_000_000, Some(-69_050)),
+            (true, 100_000_000, None),
+            (false, 1_000_000, None),
+        ],
+    },
+    Fixture {
         name: "low-price ticks around -69_100",
         fee_bps: 30,
         protocol_fee_bps: 0,
@@ -398,7 +414,10 @@ fn assert_same_position(
 ) {
     let on_chain = chain.client.get_position(provider, &lower, &upper);
     let sim_pos = &sim.positions[&ClPoolState::position_key(owner, lower, upper)];
-    assert_eq!(on_chain.liquidity, sim_pos.liquidity, "{ctx}: position liquidity");
+    assert_eq!(
+        on_chain.liquidity, sim_pos.liquidity,
+        "{ctx}: position liquidity"
+    );
     assert_eq!(
         on_chain.tokens_owed,
         (sim_pos.tokens_owed_a, sim_pos.tokens_owed_b),
@@ -460,14 +479,9 @@ fn mint_both(
 }
 
 fn swap_both(chain: &Chain, sim: &mut ClPoolState, zero_for_one: bool, amount_in: i128) {
-    let amount_out = chain.client.swap(
-        &chain.trader,
-        &zero_for_one,
-        &amount_in,
-        &0,
-        &0,
-        &DEADLINE,
-    );
+    let amount_out = chain
+        .client
+        .swap(&chain.trader, &zero_for_one, &amount_in, &0, &0, &DEADLINE);
     let res = sim.swap(zero_for_one, amount_in, 0, 0).unwrap();
     assert_eq!(res.amount_out, amount_out);
 }
@@ -476,7 +490,15 @@ fn swap_both(chain: &Chain, sim: &mut ClPoolState, zero_for_one: bool, amount_in
 fn burn_partial_matches_contract() {
     let env = Env::default();
     let (chain, mut sim) = setup_lifecycle_pool(&env, 30, 10, 0);
-    let (lp, liq) = mint_both(&chain, &mut sim, "lp0", -600, 600, 1_000_000_000_000, 1_000_000_000_000);
+    let (lp, liq) = mint_both(
+        &chain,
+        &mut sim,
+        "lp0",
+        -600,
+        600,
+        1_000_000_000_000,
+        1_000_000_000_000,
+    );
 
     swap_both(&chain, &mut sim, true, 50_000_000_000);
     swap_both(&chain, &mut sim, false, 40_000_000_000);
@@ -503,7 +525,15 @@ fn burn_partial_matches_contract() {
 fn burn_full_matches_contract() {
     let env = Env::default();
     let (chain, mut sim) = setup_lifecycle_pool(&env, 30, 10, 0);
-    let (lp, liq) = mint_both(&chain, &mut sim, "lp0", -600, 600, 1_000_000_000_000, 1_000_000_000_000);
+    let (lp, liq) = mint_both(
+        &chain,
+        &mut sim,
+        "lp0",
+        -600,
+        600,
+        1_000_000_000_000,
+        1_000_000_000_000,
+    );
 
     swap_both(&chain, &mut sim, true, 80_000_000_000);
     swap_both(&chain, &mut sim, false, 60_000_000_000);
@@ -528,14 +558,37 @@ fn burn_full_matches_contract() {
 fn collect_fees_after_tick_crossing_matches_contract() {
     let env = Env::default();
     let (chain, mut sim) = setup_lifecycle_pool(&env, 30, 10, 0);
-    let (lp_wide, _) = mint_both(&chain, &mut sim, "wide", -1_000, 1_000, 500_000_000_000, 500_000_000_000);
-    let (lp_narrow, _) = mint_both(&chain, &mut sim, "narrow", -200, 200, 300_000_000_000, 300_000_000_000);
+    let (lp_wide, _) = mint_both(
+        &chain,
+        &mut sim,
+        "wide",
+        -1_000,
+        1_000,
+        500_000_000_000,
+        500_000_000_000,
+    );
+    let (lp_narrow, _) = mint_both(
+        &chain,
+        &mut sim,
+        "narrow",
+        -200,
+        200,
+        300_000_000_000,
+        300_000_000_000,
+    );
 
-    // Cross out of [-200, 200) upward, then cross back down through it.
-    swap_both(&chain, &mut sim, false, 400_000_000_000);
-    assert!(sim.current_tick() >= 200, "expected tick to cross above 200");
-    swap_both(&chain, &mut sim, true, 600_000_000_000);
-    assert!(sim.current_tick() < -200, "expected tick to cross below -200");
+    // Use enough input, after fees, to cross both edges of the narrow
+    // range: the wide position also contributes liquidity on this path.
+    swap_both(&chain, &mut sim, false, 500_000_000_000);
+    assert!(
+        sim.current_tick() >= 200,
+        "expected tick to cross above 200"
+    );
+    swap_both(&chain, &mut sim, true, 1_200_000_000_000);
+    assert!(
+        sim.current_tick() < -200,
+        "expected tick to cross below -200"
+    );
 
     let ranges = [(-1_000, 1_000), (-200, 200)];
     assert_same_state(&chain, &sim, &ranges, "after crossing swaps");
@@ -546,8 +599,14 @@ fn collect_fees_after_tick_crossing_matches_contract() {
     ] {
         let on_chain_fees = chain.client.collect_fees(provider, &lower, &upper);
         let sim_fees = sim.collect_fees(owner, lower, upper).unwrap();
-        assert_eq!(on_chain_fees, sim_fees, "{owner}: collect_fees after crossing");
-        assert!(sim_fees.0 > 0 && sim_fees.1 > 0, "{owner}: expected non-zero fees");
+        assert_eq!(
+            on_chain_fees, sim_fees,
+            "{owner}: collect_fees after crossing"
+        );
+        assert!(
+            sim_fees.0 > 0 && sim_fees.1 > 0,
+            "{owner}: expected non-zero fees"
+        );
         assert_same_position(&chain, &sim, provider, owner, lower, upper, owner);
         assert_eq!(sim.collect_fees(owner, lower, upper).unwrap(), (0, 0));
         assert_eq!(chain.client.collect_fees(provider, &lower, &upper), (0, 0));
@@ -558,8 +617,24 @@ fn collect_fees_after_tick_crossing_matches_contract() {
 fn burn_to_zero_deletes_tick_matches_contract() {
     let env = Env::default();
     let (chain, mut sim) = setup_lifecycle_pool(&env, 30, 10, 0);
-    let (lp1, liq1) = mint_both(&chain, &mut sim, "lp1", -600, 600, 500_000_000_000, 500_000_000_000);
-    let (lp2, liq2) = mint_both(&chain, &mut sim, "lp2", -300, 600, 300_000_000_000, 300_000_000_000);
+    let (lp1, liq1) = mint_both(
+        &chain,
+        &mut sim,
+        "lp1",
+        -600,
+        600,
+        500_000_000_000,
+        500_000_000_000,
+    );
+    let (lp2, liq2) = mint_both(
+        &chain,
+        &mut sim,
+        "lp2",
+        -300,
+        600,
+        300_000_000_000,
+        300_000_000_000,
+    );
 
     swap_both(&chain, &mut sim, true, 20_000_000_000);
 
@@ -567,8 +642,14 @@ fn burn_to_zero_deletes_tick_matches_contract() {
     chain.client.burn_position(&lp2, &-300, &600, &liq2);
     sim.remove_liquidity("lp2", -300, 600, liq2).unwrap();
 
-    assert!(!sim.ticks.contains_key(&-300), "tick -300 should be deleted");
-    assert!(sim.ticks.contains_key(&600), "shared tick 600 should remain");
+    assert!(
+        !sim.ticks.contains_key(&-300),
+        "tick -300 should be deleted"
+    );
+    assert!(
+        sim.ticks.contains_key(&600),
+        "shared tick 600 should remain"
+    );
     assert_same_state(&chain, &sim, &[(-600, 600)], "after burning lp2");
     assert_same_position(&chain, &sim, &lp2, "lp2", -300, 600, "after burning lp2");
 

@@ -57,7 +57,7 @@ export interface RunResult {
 export interface PluginHooks<TTransaction extends Transaction = Transaction, TResult = unknown> {
   /** Runs after the whole middleware chain succeeded, right before submission. */
   beforeSend?: (tx: TTransaction) => Promise<void> | void
-  /** Runs after the submitter returned. */
+  /** Runs after the submitter returned and the middleware chain unwound successfully. */
   afterSend?: (result: TResult) => Promise<void> | void
 }
 
@@ -161,8 +161,9 @@ export class AdvancedClient<
 
   /**
    * Runs the middleware chain and submits the processed transaction. Submission
-   * is the last step of the chain, so a middleware that wraps `next()` (retry,
-   * logging) also covers it.
+   * is the last step of the chain, so middleware that wraps `next()` (retry,
+   * logging) covers beforeSend hooks and submission. afterSend hooks run after
+   * the chain unwinds so they cannot re-enter or trigger submission retries.
    *
    * Rejects with `MiddlewareAborted`, without submitting, when a middleware
    * returns without calling `next()`.
@@ -174,9 +175,9 @@ export class AdvancedClient<
       for (const hooks of this.hooks) await hooks.beforeSend?.(ctx.tx)
       const value = await this.submitter.sendTransaction(ctx.tx)
       result = { value }
-      for (const hooks of this.hooks) await hooks.afterSend?.(value)
     })
     if (!completed || !result) throw new MiddlewareAborted()
+    for (const hooks of this.hooks) await hooks.afterSend?.(result.value)
     return result.value
   }
 }

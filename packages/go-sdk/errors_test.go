@@ -173,6 +173,11 @@ func TestDecodeContractErrorParsesRPCShapes(t *testing.T) {
 		{"lowercase contract", "Error(contract, #5)", 0, nil},
 		{"overflowing number", "Error(Contract, #99999999999999999999999)", 0, nil},
 		{"empty", "", 0, nil},
+		// Negative cases: words containing a pattern token must not match.
+		{"bottleneck does not match ttl", "host error: bottleneck exceeded", 0, nil},
+		{"little does not match ttl", "connection closed: little progress made", 0, nil},
+		{"subtitle does not match ttl", "subtitle field is missing", 0, nil},
+		{"rebudget does not match budget", "host error: rebudget insufficient", 0, nil},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -261,6 +266,32 @@ func TestClientErrorsAreNotContractErrors(t *testing.T) {
 		if errors.As(err, &ce) {
 			t.Fatalf("%v must not be classified as a contract error", err)
 		}
+	}
+}
+
+func TestDecodeContractErrorNegativeDiagnostics(t *testing.T) {
+	// These messages contain substrings of pattern tokens but must not be
+	// classified because the tokens do not appear as whole words.
+	cases := []struct {
+		name        string
+		raw         string
+		badSentinel error
+	}{
+		{"bottleneck contains ttl letters", "host error: bottleneck exceeded", ErrArchivedState},
+		{"little contains ttl letters", "connection closed: little progress made", ErrArchivedState},
+		{"subtitle contains ttl letters", "subtitle field is missing", ErrArchivedState},
+		{"rebudget contains budget", "host error: rebudget insufficient", ErrResourceLimit},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ce := DecodeContractError(tc.raw)
+			if errors.Is(ce, tc.badSentinel) {
+				t.Fatalf("DecodeContractError(%q) must not match %v, but it did", tc.raw, tc.badSentinel)
+			}
+			if ce.Code != 0 {
+				t.Fatalf("code = %d, want 0", ce.Code)
+			}
+		})
 	}
 }
 

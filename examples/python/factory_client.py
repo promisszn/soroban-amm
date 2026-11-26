@@ -138,7 +138,7 @@ def create_pool(
         scval.to_address(token_a),
         scval.to_address(token_b),
         scval.to_int128(fee_tier),
-        scval.to_bytes(governance_wasm_hash) if governance_wasm_hash is not None else scval.to_void(),
+        scval.to_vec([scval.to_bytes(governance_wasm_hash)]) if governance_wasm_hash is not None else scval.to_void(),
     )
 
     pool_result, governance_result = result

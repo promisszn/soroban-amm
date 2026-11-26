@@ -12,7 +12,13 @@ export class StakingClient extends ReadContractClient {
   isPaused(): Promise<boolean> { return this.read("is_paused"); }
   isEmergencyMode(): Promise<boolean> { return this.read("is_emergency_mode"); }
   getOwedRewards(): Promise<bigint> { return this.read("get_owed_rewards"); }
-  boostMultiplierHuman(raw: bigint): number { return Number(raw) / 1_000_000; }
+
+  /**
+   * Converts a raw contract boost to a human multiplier.
+   * The staking contract's BOOST_SCALE is 10_000 (1x = 10_000n).
+   */
+  boostMultiplierHuman(raw: bigint): number { return Number(raw) / 10_000; }
+
   stakeParams(staker: string, amount: bigint): xdr.ScVal[] { return this.params(address(staker), i128(amount)); }
   stakeLockedParams(staker: string, amount: bigint, seconds: bigint): xdr.ScVal[] { return this.params(address(staker), i128(amount), u64(seconds)); }
   unstakeParams(staker: string, amount: bigint): xdr.ScVal[] { return this.params(address(staker), i128(amount)); }

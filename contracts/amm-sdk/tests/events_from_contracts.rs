@@ -10,14 +10,17 @@
 use amm::{AmmPool, AmmPoolClient};
 use soroban_amm_sdk::events::{
     decode_amm_event, AddLiquidityEvent, AdminChangedEvent, AdminNominatedEvent, AmmEvent,
-    FeeUpdatedEvent, FlashFeeUpdatedEvent, FlashLoanEvent, ProtocolFeeSetEvent,
-    RemoveLiquidityEvent, RemoveLiquidityOneSidedEvent, SwapEvent,
+    CircuitBreakerConfigEvent, EmergencyAnnounceEvent, EmergencyCancelEvent, FeeUpdatedEvent,
+    FlashFeeUpdatedEvent, FlashLoanEvent, ForceUnlockEvent, FotDetectedEvent, LpLockerSetEvent,
+    LpRebateSetEvent, MultisigApprovedEvent, MultisigProposedEvent, MultisigSetEvent,
+    MultisigSetProposedEvent, ProtocolFeeSetEvent, RemoveLiquidityEvent,
+    RemoveLiquidityOneSidedEvent, SwapEvent,
 };
 use soroban_sdk::{
-    contract, contractimpl, symbol_short,
+    contract, contractimpl, contracttype, symbol_short,
     testutils::{Address as _, Events, Ledger},
     token::{StellarAssetClient, TokenClient},
-    Address, Bytes, Env, String,
+    Address, Bytes, Env, String, Symbol, TryFromVal,
 };
 use token::{LpToken, LpTokenClient};
 
@@ -62,12 +65,17 @@ impl RepayingReceiver {
 struct Setup {
     env: Env,
     pool: Address,
+    lp_token: Address,
     admin: Address,
     token_a: Address,
     token_b: Address,
 }
 
 fn setup() -> Setup {
+    setup_with_emergency_delay(None)
+}
+
+fn setup_with_emergency_delay(delay_secs: Option<u64>) -> Setup {
     let env = Env::default();
     env.mock_all_auths();
     env.ledger().set_timestamp(12_345);
@@ -89,16 +97,73 @@ fn setup() -> Setup {
         .register_stellar_asset_contract_v2(admin.clone())
         .address();
 
-    AmmPoolClient::new(&env, &pool).initialize(
-        &admin, &token_a, &token_b, &lp_token, &30_i128, &admin, &0_i128,
-    );
+    let amm = AmmPoolClient::new(&env, &pool);
+    if let Some(delay_secs) = delay_secs {
+        amm.initialize_with_emergency_delay(
+            &admin,
+            &token_a,
+            &token_b,
+            &lp_token,
+            &30_i128,
+            &admin,
+            &0_i128,
+            &delay_secs,
+        );
+    } else {
+        amm.initialize(
+            &admin, &token_a, &token_b, &lp_token, &30_i128, &admin, &0_i128,
+        );
+    }
 
     Setup {
         env,
         pool,
+        lp_token,
         admin,
         token_a,
         token_b,
+    }
+}
+
+#[contract]
+struct FeeOnTransferToken;
+
+#[contracttype]
+enum FotKey {
+    Balance(Address),
+}
+
+#[contractimpl]
+impl FeeOnTransferToken {
+    pub fn mint(env: Env, to: Address, amount: i128) {
+        let balance: i128 = env
+            .storage()
+            .instance()
+            .get(&FotKey::Balance(to.clone()))
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&FotKey::Balance(to), &(balance + amount));
+    }
+
+    pub fn balance(env: Env, id: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&FotKey::Balance(id))
+            .unwrap_or(0)
+    }
+
+    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+        from.require_auth();
+        let from_balance = Self::balance(env.clone(), from.clone());
+        let to_balance = Self::balance(env.clone(), to.clone());
+        let received = amount - amount * 2 / 100;
+        env.storage()
+            .instance()
+            .set(&FotKey::Balance(from), &(from_balance - amount));
+        env.storage()
+            .instance()
+            .set(&FotKey::Balance(to), &(to_balance + received));
     }
 }
 
@@ -117,6 +182,23 @@ impl Setup {
             .rev()
             .find(|(contract, _, _)| *contract == self.pool)
             .expect("pool published no event");
+        decode_amm_event(&self.env, topics, data).expect("pool event did not decode")
+    }
+
+    fn pool_event(&self, event_type: &str) -> AmmEvent {
+        let expected = Symbol::new(&self.env, event_type);
+        let events = self.env.events().all();
+        let (_, topics, data) = events
+            .iter()
+            .rev()
+            .find(|(contract, topics, _)| {
+                *contract == self.pool
+                    && topics
+                        .get(0)
+                        .and_then(|topic| Symbol::try_from_val(&self.env, &topic).ok())
+                        == Some(expected.clone())
+            })
+            .expect("pool did not publish the requested event");
         decode_amm_event(&self.env, topics, data).expect("pool event did not decode")
     }
 
@@ -366,5 +448,291 @@ fn decodes_admin_rotation() {
     assert_eq!(
         s.last_pool_event(),
         AmmEvent::AdminChanged(AdminChangedEvent { new_admin })
+    );
+}
+
+#[test]
+fn decodes_lp_locker_set() {
+    let s = setup();
+    let locker = Address::generate(&s.env);
+    AmmPoolClient::new(&s.env, &s.pool).set_lp_locker(&locker);
+
+    assert_eq!(
+        s.last_pool_event(),
+        AmmEvent::LpLockerSet(LpLockerSetEvent {
+            lp_token: s.lp_token,
+            locker,
+        })
+    );
+}
+
+#[test]
+fn decodes_emergency_announce() {
+    let s = setup();
+    let to = Address::generate(&s.env);
+    AmmPoolClient::new(&s.env, &s.pool).announce_emergency_withdraw(&s.admin, &to);
+
+    assert_eq!(
+        s.last_pool_event(),
+        AmmEvent::EmergencyAnnounce(EmergencyAnnounceEvent {
+            admin: s.admin,
+            to,
+            announced_at: 12_345,
+            delay_secs: AmmPoolClient::new(&s.env, &s.pool).get_emergency_delay(),
+        })
+    );
+}
+
+#[test]
+fn decodes_emergency_cancel() {
+    let s = setup();
+    let to = Address::generate(&s.env);
+    let amm = AmmPoolClient::new(&s.env, &s.pool);
+    amm.announce_emergency_withdraw(&s.admin, &to);
+    amm.cancel_emergency_withdraw(&s.admin);
+
+    assert_eq!(
+        s.last_pool_event(),
+        AmmEvent::EmergencyCancel(EmergencyCancelEvent { admin: s.admin, to })
+    );
+}
+
+#[test]
+fn decodes_emergency_withdraw() {
+    let s = setup_with_emergency_delay(Some(0));
+    let to = Address::generate(&s.env);
+    let amm = AmmPoolClient::new(&s.env, &s.pool);
+    amm.pause();
+    amm.announce_emergency_withdraw(&s.admin, &to);
+    amm.emergency_withdraw(&s.admin, &to);
+
+    match s.last_pool_event() {
+        AmmEvent::EmergencyWithdraw(event) => {
+            assert_eq!(event.admin, s.admin);
+            assert_eq!(event.to, to);
+            assert_eq!(event.drain_a, 0);
+            assert_eq!(event.drain_b, 0);
+        }
+        event => panic!("expected emergency withdrawal event, got {event:?}"),
+    }
+}
+
+#[test]
+fn decodes_force_unlock() {
+    let s = setup();
+    AmmPoolClient::new(&s.env, &s.pool).force_unlock(&soroban_sdk::Vec::new(&s.env));
+
+    assert_eq!(
+        s.last_pool_event(),
+        AmmEvent::ForceUnlock(ForceUnlockEvent { timestamp: 12_345 })
+    );
+}
+
+#[test]
+fn decodes_circuit_breaker_config() {
+    let s = setup();
+    AmmPoolClient::new(&s.env, &s.pool).set_circuit_breaker_config(&750_i128, &600_u64);
+
+    assert_eq!(
+        s.last_pool_event(),
+        AmmEvent::CircuitBreakerConfig(CircuitBreakerConfigEvent {
+            threshold_bps: 750,
+            cooldown_secs: 600,
+        })
+    );
+}
+
+#[test]
+fn decodes_lp_rebate_set() {
+    let s = setup();
+    AmmPoolClient::new(&s.env, &s.pool).set_lp_rebate(&s.admin, &5_000_i128);
+
+    assert_eq!(
+        s.last_pool_event(),
+        AmmEvent::LpRebateSet(LpRebateSetEvent {
+            admin: s.admin,
+            lp_rebate_bps: 5_000,
+        })
+    );
+}
+
+#[test]
+fn decodes_initial_multisig_set() {
+    let s = setup();
+    AmmPoolClient::new(&s.env, &s.pool).set_multisig(
+        &s.admin,
+        &soroban_sdk::vec![&s.env, s.admin.clone()],
+        &1,
+    );
+
+    assert_eq!(
+        s.last_pool_event(),
+        AmmEvent::MultisigSet(MultisigSetEvent {
+            actor: s.admin,
+            quorum: 1,
+        })
+    );
+}
+
+#[test]
+fn decodes_multisig_emergency_proposal() {
+    let s = setup();
+    let signer = Address::generate(&s.env);
+    let to = Address::generate(&s.env);
+    let amm = AmmPoolClient::new(&s.env, &s.pool);
+    amm.set_multisig(&s.admin, &soroban_sdk::vec![&s.env, signer.clone()], &1);
+    let proposal_id = amm.propose_emergency_withdraw(&signer, &to);
+
+    assert_eq!(
+        s.last_pool_event(),
+        AmmEvent::MultisigProposed(MultisigProposedEvent {
+            signer,
+            proposal_id,
+            recipient: to,
+        })
+    );
+}
+
+#[test]
+fn decodes_multisig_set_proposal() {
+    let s = setup();
+    let signer = Address::generate(&s.env);
+    let amm = AmmPoolClient::new(&s.env, &s.pool);
+    amm.set_multisig(&s.admin, &soroban_sdk::vec![&s.env, signer.clone()], &1);
+    let proposal_id = amm.propose_set_multisig(&signer, &soroban_sdk::Vec::new(&s.env), &0);
+
+    assert_eq!(
+        s.last_pool_event(),
+        AmmEvent::MultisigSetProposed(MultisigSetProposedEvent {
+            signer,
+            proposal_id,
+            new_quorum: 0,
+        })
+    );
+}
+
+#[test]
+fn decodes_multisig_approval() {
+    let s = setup();
+    let signer_a = Address::generate(&s.env);
+    let signer_b = Address::generate(&s.env);
+    let amm = AmmPoolClient::new(&s.env, &s.pool);
+    amm.set_multisig(
+        &s.admin,
+        &soroban_sdk::vec![&s.env, signer_a.clone(), signer_b.clone()],
+        &2,
+    );
+    let proposal_id = amm.propose_emergency_withdraw(&signer_a, &Address::generate(&s.env));
+    amm.approve_multisig_proposal(&signer_b, &proposal_id);
+
+    assert_eq!(
+        s.last_pool_event(),
+        AmmEvent::MultisigApproved(MultisigApprovedEvent {
+            signer: signer_b,
+            proposal_id,
+            approval_count: 2,
+        })
+    );
+}
+
+#[test]
+fn decodes_multisig_emergency_withdraw() {
+    let s = setup_with_emergency_delay(Some(0));
+    let signer = Address::generate(&s.env);
+    let to = Address::generate(&s.env);
+    let amm = AmmPoolClient::new(&s.env, &s.pool);
+    amm.set_multisig(&s.admin, &soroban_sdk::vec![&s.env, signer.clone()], &1);
+    let proposal_id = amm.propose_emergency_withdraw(&signer, &to);
+    amm.pause();
+    amm.exec_multisig_emergency_wd(&signer, &proposal_id);
+
+    match s.last_pool_event() {
+        AmmEvent::MultisigEmergencyWithdraw(event) => {
+            assert_eq!(event.signer, signer);
+            assert_eq!(event.to, to);
+            assert_eq!(event.drain_a, 0);
+            assert_eq!(event.drain_b, 0);
+        }
+        event => panic!("expected multisig emergency withdrawal event, got {event:?}"),
+    }
+}
+
+#[test]
+fn decodes_multisig_set_after_proposal() {
+    let s = setup();
+    let signer_a = Address::generate(&s.env);
+    let signer_b = Address::generate(&s.env);
+    let amm = AmmPoolClient::new(&s.env, &s.pool);
+    amm.set_multisig(
+        &s.admin,
+        &soroban_sdk::vec![&s.env, signer_a.clone(), signer_b.clone()],
+        &2,
+    );
+    let proposal_id = amm.propose_set_multisig(&signer_a, &soroban_sdk::Vec::new(&s.env), &0);
+    amm.approve_multisig_proposal(&signer_b, &proposal_id);
+    amm.exec_multisig_set_multisig(&signer_a, &proposal_id);
+
+    assert_eq!(
+        s.last_pool_event(),
+        AmmEvent::MultisigSet(MultisigSetEvent {
+            actor: signer_a,
+            quorum: 0,
+        })
+    );
+}
+
+#[test]
+fn decodes_fee_on_transfer_detection() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let pool = env.register_contract(None, AmmPool);
+    let lp_token = env.register_contract(None, LpToken);
+    LpTokenClient::new(&env, &lp_token).initialize(
+        &pool,
+        &String::from_str(&env, "AMM LP Token"),
+        &String::from_str(&env, "ALP"),
+        &7_u32,
+    );
+    let token_a = env.register_contract(None, FeeOnTransferToken);
+    let token_b = env
+        .register_stellar_asset_contract_v2(admin.clone())
+        .address();
+    AmmPoolClient::new(&env, &pool).initialize(
+        &admin, &token_a, &token_b, &lp_token, &30_i128, &admin, &0_i128,
+    );
+
+    let provider = Address::generate(&env);
+    FeeOnTransferTokenClient::new(&env, &token_a).mint(&provider, &SEED);
+    StellarAssetClient::new(&env, &token_b).mint(&provider, &SEED);
+    let amm = AmmPoolClient::new(&env, &pool);
+    amm.add_liquidity_fot(
+        &provider, &SEED, &SEED, &0_i128, &0_i128, &0_i128, &DEADLINE,
+    );
+    amm.swap_fot(
+        &provider,
+        &token_a,
+        &10_000_i128,
+        &0_i128,
+        &0_i128,
+        &DEADLINE,
+        &None,
+    );
+    let s = Setup {
+        env,
+        pool,
+        lp_token,
+        admin,
+        token_a,
+        token_b,
+    };
+
+    assert_eq!(
+        s.pool_event("fot_detected"),
+        AmmEvent::FotDetected(FotDetectedEvent {
+            token_in: s.token_a.clone(),
+            amount_in: 10_000,
+            actual_received: 9_800,
+        })
     );
 }

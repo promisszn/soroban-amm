@@ -28,6 +28,7 @@ function fixture() {
     "while (($#)); do",
     "  if [[ \"$1\" == '--wasm' ]]; then wasm=\"$2\"; shift 2; else shift; fi",
     "done",
+    "if [[ -n \"${ABI_TEST_SPEC:-}\" ]]; then printf '%s\\n' \"$ABI_TEST_SPEC\"; exit 0; fi",
     "name=\"$(basename \"$wasm\" .wasm)\"",
     "printf '{\"functions\":[{\"name\":\"%s\"}],\"events\":[]}\\n' \"$name\"",
     "",
@@ -66,6 +67,31 @@ test("check_abi accepts an up-to-date ABI", (t) => {
   const checked = run("scripts/check_abi.sh", ["--reference", f.relative(reference)], f.env);
   assert.equal(checked.status, 0, checked.stderr);
   assert.match(checked.stdout, /matches the interface generated/);
+});
+
+test("both Stellar CLI type spellings preserve the published ABI, but a changed type fails", (t) => {
+  const f = fixture();
+  t.after(() => fs.rmSync(f.tempRoot, { recursive: true, force: true }));
+  const reference = path.join(f.tempRoot, "reference.json");
+  const spec = (key, value) => JSON.stringify([
+    { function_v0: { name: "swap", inputs: [{ name: "amount", doc: "", [key]: value }] } },
+    { udt_struct_v0: { fields: [{ name: "balance", doc: "", [key]: "i128" }] } },
+    { udt_union_v0: { cases: [{ tuple_v0: { name: "Pool", doc: "", [key]: ["address"] } }] } },
+  ]);
+  const legacy = run("scripts/generate_abi.sh", [f.relative(reference)], {
+    ...f.env,
+    ABI_TEST_SPEC: spec("type_", "i128"),
+  });
+  assert.equal(legacy.status, 0, legacy.stderr);
+  const check = (value) => run("scripts/check_abi.sh", ["--reference", f.relative(reference)], {
+    ...f.env,
+    ABI_TEST_SPEC: spec("type", value),
+  });
+  const compatible = check("i128");
+  assert.equal(compatible.status, 0, compatible.stderr);
+  const drift = check("u128");
+  assert.notEqual(drift.status, 0);
+  assert.match(drift.stderr, /function signatures\/specs changed \[swap\]/);
 });
 
 test("check_abi summarizes a stale ABI and never mutates docs/abi.json", (t) => {

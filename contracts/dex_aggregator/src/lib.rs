@@ -4,7 +4,7 @@
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, vec,
-    Address, Env, Vec,
+    Address, BytesN, Env, Symbol, Vec,
 };
 
 use pool_interfaces::{AmmPoolClient, FactoryClient};
@@ -58,14 +58,15 @@ pub enum AggregatorError {
     UnregisteredPool = 3,
     InvalidMaxHops = 4,
     TooManyRoutingTokens = 5,
-    /// A function that reads the admin or factory was called before
-    /// `initialize`.
+    /// A function that reads the admin or factory (or `accept_admin` without a
+    /// pending nomination) was called before `initialize` / nomination.
     NotInitialized = 6,
     /// A state-mutating entrypoint was called while the aggregator is paused
     /// by its admin.
     Paused = 7,
-    /// `pause` / `unpause` was called with an address that is not the stored
-    /// admin.
+    /// An admin- or nominee-gated entrypoint (`pause`, `unpause`,
+    /// `propose_admin`, `accept_admin`, `upgrade`) was called with an
+    /// address that does not match the stored admin or pending nominee.
     Unauthorized = 8,
 }
 
@@ -105,6 +106,7 @@ pub struct RouteQuote {
 #[contracttype]
 pub enum DataKey {
     Admin,
+    PendingAdmin,
     Factory,
     MaxHops,
     RoutingTokens,
@@ -116,6 +118,12 @@ pub enum DataKey {
 
 #[contract]
 pub struct DexAggregator;
+
+// exceeds_price_tolerance relies on 0 <= PRICE_TOLERANCE_BPS <= BPS.
+const _: () = assert!(
+    DexAggregator::PRICE_TOLERANCE_BPS >= 0
+        && DexAggregator::PRICE_TOLERANCE_BPS <= DexAggregator::BPS
+);
 
 #[contractimpl]
 impl DexAggregator {
@@ -171,6 +179,89 @@ impl DexAggregator {
             .instance()
             .get(&DataKey::Paused)
             .unwrap_or(false)
+    }
+
+    /// Return the stored admin address, or `NotInitialized` before `initialize`.
+    pub fn get_admin(env: Env) -> Result<Address, AggregatorError> {
+        Self::extend_ttl(&env);
+        Self::read_admin(&env)
+    }
+
+    /// Return the pending admin nominee, if any.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        Self::extend_ttl(&env);
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None)
+    }
+
+    /// Return the stored factory address, or `NotInitialized` before `initialize`.
+    pub fn get_factory(env: Env) -> Result<Address, AggregatorError> {
+        Self::extend_ttl(&env);
+        Self::read_factory(&env)
+    }
+
+    /// Nominate `new_admin` as the pending admin (step 1 of 2). Admin-only.
+    pub fn propose_admin(
+        env: Env,
+        current_admin: Address,
+        new_admin: Address,
+    ) -> Result<(), AggregatorError> {
+        Self::extend_ttl(&env);
+        Self::require_admin(&env, &current_admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &Some(new_admin.clone()));
+        soroban_amm_sdk::emit_versioned_event!(
+            &env,
+            (Symbol::new(&env, "admin_nominated"),),
+            (current_admin, new_admin)
+        );
+        Ok(())
+    }
+
+    /// Accept a pending admin nomination (step 2 of 2). Nominee-only.
+    pub fn accept_admin(env: Env, new_admin: Address) -> Result<(), AggregatorError> {
+        Self::extend_ttl(&env);
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .unwrap_or(None);
+        let nominee = pending.ok_or(AggregatorError::NotInitialized)?;
+        if new_admin != nominee {
+            return Err(AggregatorError::Unauthorized);
+        }
+        new_admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &Option::<Address>::None);
+        soroban_amm_sdk::emit_versioned_event!(
+            &env,
+            (Symbol::new(&env, "admin_changed"),),
+            (new_admin,)
+        );
+        Ok(())
+    }
+
+    /// Upgrade the contract WASM in place. Admin-only.
+    pub fn upgrade(
+        env: Env,
+        admin: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), AggregatorError> {
+        Self::extend_ttl(&env);
+        Self::require_admin(&env, &admin)?;
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        soroban_amm_sdk::emit_versioned_event!(
+            &env,
+            (symbol_short!("upgraded"),),
+            (new_wasm_hash,)
+        );
+        Ok(())
     }
 
     pub fn set_max_hops(env: Env, max_hops: u32) -> Result<(), AggregatorError> {
@@ -448,6 +539,9 @@ impl DexAggregator {
         quoted_out: i128,
     ) -> bool {
         Self::extend_ttl(&env);
+        if quoted_out < 0 {
+            return false;
+        }
         let max_hops: u32 = env
             .storage()
             .instance()
@@ -457,7 +551,7 @@ impl DexAggregator {
         else {
             return quoted_out == 0;
         };
-        if best.amount_out == 0 {
+        if best.amount_out <= 0 {
             return quoted_out == 0;
         }
         let diff = if best.amount_out >= quoted_out {
@@ -465,8 +559,13 @@ impl DexAggregator {
         } else {
             quoted_out - best.amount_out
         };
-        let observed_bps = diff * Self::BPS / best.amount_out;
-        if observed_bps > Self::PRICE_TOLERANCE_BPS {
+        if Self::exceeds_price_tolerance(diff, best.amount_out) {
+            let observed_bps = diff
+                .checked_mul(Self::BPS)
+                .map(|scaled_diff| {
+                    (scaled_diff / best.amount_out).max(Self::PRICE_TOLERANCE_BPS + 1)
+                })
+                .unwrap_or(i128::MAX);
             soroban_amm_sdk::emit_versioned_event!(
                 &env,
                 (symbol_short!("tol_fail"),),
@@ -907,6 +1006,30 @@ impl DexAggregator {
         vec.push_back(addr);
     }
 
+    /// Whether `diff` deviates from `amount_out` by more than
+    /// `PRICE_TOLERANCE_BPS`, i.e. `diff * BPS > PRICE_TOLERANCE_BPS * amount_out`,
+    /// evaluated without overflowing `i128`. Expects `diff >= 0` and
+    /// `amount_out > 0`.
+    fn exceeds_price_tolerance(diff: i128, amount_out: i128) -> bool {
+        match (
+            diff.checked_mul(Self::BPS),
+            Self::PRICE_TOLERANCE_BPS.checked_mul(amount_out),
+        ) {
+            (Some(scaled_diff), Some(allowed)) => scaled_diff > allowed,
+            // Exactly one product overflowed, so it is the larger side.
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            // Both overflowed. Split amount_out = q * BPS + r so the allowed
+            // deviation TOL * q + TOL * r / BPS fits in i128 (TOL <= BPS). Its
+            // floor is exact for the comparison because diff is an integer.
+            (None, None) => {
+                let allowed = Self::PRICE_TOLERANCE_BPS * (amount_out / Self::BPS)
+                    + Self::PRICE_TOLERANCE_BPS * (amount_out % Self::BPS) / Self::BPS;
+                diff > allowed
+            }
+        }
+    }
+
     fn extend_ttl(env: &Env) {
         env.storage().instance().extend_ttl(MIN_TTL, BUMP_TO);
     }
@@ -925,8 +1048,9 @@ impl DexAggregator {
             .ok_or(AggregatorError::NotInitialized)
     }
 
-    /// Stored-admin check shared by `pause` / `unpause`: the caller-supplied
-    /// address must equal the stored admin and must authorize the call.
+    /// Stored-admin check shared by `pause`, `unpause`, `propose_admin`, and
+    /// `upgrade`: the caller-supplied address must equal the stored admin and
+    /// must authorize the call.
     fn require_admin(env: &Env, admin: &Address) -> Result<(), AggregatorError> {
         let stored_admin = Self::read_admin(env)?;
         if *admin != stored_admin {
@@ -1021,6 +1145,7 @@ mod tests {
 
         // A bool-returning query must degrade gracefully rather than trap.
         assert!(!agg.is_price_within_tolerance(&a, &b, &100_i128, &1_i128));
+        assert!(agg.is_price_within_tolerance(&a, &b, &100_i128, &0_i128));
     }
 
     #[test]
@@ -1458,6 +1583,56 @@ mod tests {
         ));
 
         assert_eq!(count_events(&v.env, &v.agg, symbol_short!("tol_fail")), 0);
+    }
+
+    #[test]
+    fn test_tolerance_rejects_zero_and_i128_max_without_trapping() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+        assert!(!agg.is_price_within_tolerance(&v.token_a, &v.token_b, &10_000_i128, &0_i128));
+        assert!(!agg.is_price_within_tolerance(&v.token_a, &v.token_b, &10_000_i128, &i128::MAX));
+    }
+
+    #[test]
+    fn test_tolerance_includes_exact_boundary_and_rejects_one_unit_beyond() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+        let best = agg.find_best_route(&v.token_a, &v.token_b, &10_000_i128, &2u32);
+        let max_diff = best.amount_out * DexAggregator::PRICE_TOLERANCE_BPS / DexAggregator::BPS;
+        let at_boundary = best.amount_out - max_diff;
+        assert!(agg.is_price_within_tolerance(&v.token_a, &v.token_b, &10_000_i128, &at_boundary));
+        assert!(!agg.is_price_within_tolerance(
+            &v.token_a,
+            &v.token_b,
+            &10_000_i128,
+            &(at_boundary - 1)
+        ));
+    }
+
+    #[test]
+    fn test_exceeds_price_tolerance_matches_cross_multiplied_bound() {
+        let tol = DexAggregator::PRICE_TOLERANCE_BPS;
+        let bps = DexAggregator::BPS;
+        // Small values: the exact boundary passes and one unit beyond fails;
+        // a fractional bound (9_999 * 10 / 10_000 = 9.999) admits 9 but not 10.
+        assert!(!DexAggregator::exceeds_price_tolerance(10, 10_000));
+        assert!(DexAggregator::exceeds_price_tolerance(11, 10_000));
+        assert!(!DexAggregator::exceeds_price_tolerance(9, 9_999));
+        assert!(DexAggregator::exceeds_price_tolerance(10, 9_999));
+        assert!(!DexAggregator::exceeds_price_tolerance(0, 1));
+        assert!(DexAggregator::exceeds_price_tolerance(1, 1));
+
+        // Only diff * BPS overflows: far outside tolerance.
+        assert!(DexAggregator::exceeds_price_tolerance(i128::MAX - 1, 1));
+
+        // Only PRICE_TOLERANCE_BPS * amount_out overflows: well within.
+        assert!(!DexAggregator::exceeds_price_tolerance(1, i128::MAX));
+
+        // Both products overflow: the bound is still exact at i128::MAX.
+        let out = i128::MAX;
+        let allowed = tol * (out / bps) + tol * (out % bps) / bps;
+        assert!(!DexAggregator::exceeds_price_tolerance(allowed, out));
+        assert!(DexAggregator::exceeds_price_tolerance(allowed + 1, out));
     }
 
     #[test]
@@ -2192,5 +2367,278 @@ mod tests {
             &10_000_i128,
             &quote.amount_out
         ));
+    }
+
+    // -------------------------------------------------------------------------
+    // #1361: admin rotation, upgrade, and get_admin / get_factory views
+    // -------------------------------------------------------------------------
+
+    fn setup_aggregator(env: &Env) -> (DexAggregatorClient<'_>, Address, Address, Address) {
+        env.mock_all_auths();
+        let agg_addr = env.register_contract(None, DexAggregator);
+        let agg = DexAggregatorClient::new(env, &agg_addr);
+        let admin = Address::generate(env);
+        let factory = Address::generate(env);
+        agg.initialize(&admin, &factory);
+        (agg, agg_addr, admin, factory)
+    }
+
+    fn aggregator_wasm(env: &Env) -> soroban_sdk::Bytes {
+        env.budget().reset_unlimited();
+        soroban_sdk::Bytes::from_slice(
+            env,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../target/wasm32v1-none/release/dex_aggregator.wasm"
+            )),
+        )
+    }
+
+    #[test]
+    fn test_get_admin_and_get_factory_before_init_return_not_initialized() {
+        let env = Env::default();
+        let agg_addr = env.register_contract(None, DexAggregator);
+        let agg = DexAggregatorClient::new(&env, &agg_addr);
+        assert_eq!(
+            agg.try_get_admin(),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+        assert_eq!(
+            agg.try_get_factory(),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+        assert_eq!(agg.get_pending_admin(), None);
+    }
+
+    #[test]
+    fn test_get_admin_and_get_factory_return_stored_values() {
+        let env = Env::default();
+        let (agg, _, admin, factory) = setup_aggregator(&env);
+        assert_eq!(agg.get_admin(), admin);
+        assert_eq!(agg.get_factory(), factory);
+        assert_eq!(agg.get_pending_admin(), None);
+    }
+
+    #[test]
+    fn test_propose_admin_rejects_non_admin_and_before_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let uninit_addr = env.register_contract(None, DexAggregator);
+        let uninit = DexAggregatorClient::new(&env, &uninit_addr);
+        let outsider = Address::generate(&env);
+        let nominee = Address::generate(&env);
+        assert_eq!(
+            uninit.try_propose_admin(&outsider, &nominee),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+
+        let (agg, _, admin, _) = setup_aggregator(&env);
+        assert_eq!(
+            agg.try_propose_admin(&outsider, &nominee),
+            Err(Ok(AggregatorError::Unauthorized))
+        );
+        assert_eq!(agg.get_admin(), admin);
+        assert_eq!(agg.get_pending_admin(), None);
+    }
+
+    #[test]
+    fn test_accept_admin_without_nomination_returns_not_initialized() {
+        let env = Env::default();
+        let (agg, _, admin, _) = setup_aggregator(&env);
+        let someone = Address::generate(&env);
+        assert_eq!(
+            agg.try_accept_admin(&someone),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+        assert_eq!(agg.get_admin(), admin);
+    }
+
+    #[test]
+    fn test_accept_admin_by_non_nominee_returns_unauthorized() {
+        let env = Env::default();
+        let (agg, _, admin, _) = setup_aggregator(&env);
+        let nominee = Address::generate(&env);
+        let outsider = Address::generate(&env);
+
+        agg.propose_admin(&admin, &nominee);
+        assert_eq!(
+            agg.try_accept_admin(&outsider),
+            Err(Ok(AggregatorError::Unauthorized))
+        );
+        assert_eq!(agg.get_admin(), admin);
+        assert_eq!(agg.get_pending_admin(), Some(nominee));
+    }
+
+    #[test]
+    fn test_admin_rotation_transfers_rights_and_emits_events() {
+        let env = Env::default();
+        let (agg, agg_addr, old_admin, _) = setup_aggregator(&env);
+        let new_admin = Address::generate(&env);
+
+        agg.propose_admin(&old_admin, &new_admin);
+        assert_eq!(agg.get_pending_admin(), Some(new_admin.clone()));
+        let nominated_event = env
+            .events()
+            .all()
+            .iter()
+            .rfind(|e| {
+                e.0 == agg_addr && e.1 == (Symbol::new(&env, "admin_nominated"),).into_val(&env)
+            })
+            .expect("admin_nominated event emitted");
+        let nominated_payload: (u32, (Address, Address)) =
+            soroban_sdk::FromVal::from_val(&env, &nominated_event.2);
+        assert_eq!(
+            nominated_payload,
+            (1u32, (old_admin.clone(), new_admin.clone()))
+        );
+
+        agg.accept_admin(&new_admin);
+        assert_eq!(agg.get_admin(), new_admin);
+        assert_eq!(agg.get_pending_admin(), None);
+        let changed_event = env
+            .events()
+            .all()
+            .iter()
+            .rfind(|e| {
+                e.0 == agg_addr && e.1 == (Symbol::new(&env, "admin_changed"),).into_val(&env)
+            })
+            .expect("admin_changed event emitted");
+        let changed_payload: (u32, (Address,)) =
+            soroban_sdk::FromVal::from_val(&env, &changed_event.2);
+        assert_eq!(changed_payload, (1u32, (new_admin.clone(),)));
+
+        // Old admin loses pause, unpause, propose_admin, and upgrade rights.
+        assert_eq!(
+            agg.try_pause(&old_admin),
+            Err(Ok(AggregatorError::Unauthorized))
+        );
+        assert_eq!(
+            agg.try_unpause(&old_admin),
+            Err(Ok(AggregatorError::Unauthorized))
+        );
+        assert_eq!(
+            agg.try_propose_admin(&old_admin, &old_admin),
+            Err(Ok(AggregatorError::Unauthorized))
+        );
+        let dummy_hash = BytesN::from_array(&env, &[0u8; 32]);
+        assert_eq!(
+            agg.try_upgrade(&old_admin, &dummy_hash),
+            Err(Ok(AggregatorError::Unauthorized))
+        );
+
+        // New admin can pause, unpause, set_max_hops, and register_cl_pool.
+        agg.pause(&new_admin);
+        assert!(agg.is_paused());
+        agg.unpause(&new_admin);
+        assert!(!agg.is_paused());
+
+        agg.set_max_hops(&2u32);
+        assert_eq!(env.auths().last().unwrap().0, new_admin);
+
+        let cl_pool = Address::generate(&env);
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+        agg.register_cl_pool(&cl_pool, &token_a, &token_b, &30_i128);
+        assert_eq!(env.auths().last().unwrap().0, new_admin);
+    }
+
+    #[test]
+    fn test_admin_rotation_requires_signatures() {
+        let env = Env::default();
+        let (agg, _, admin, _) = setup_aggregator(&env);
+        let nominee = Address::generate(&env);
+
+        env.set_auths(&[]);
+        assert!(agg.try_propose_admin(&admin, &nominee).is_err());
+
+        env.mock_all_auths();
+        agg.propose_admin(&admin, &nominee);
+
+        env.set_auths(&[]);
+        assert!(agg.try_accept_admin(&nominee).is_err());
+    }
+
+    #[test]
+    fn test_upgrade_rejects_non_admin_and_before_init() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let uninit_addr = env.register_contract(None, DexAggregator);
+        let uninit = DexAggregatorClient::new(&env, &uninit_addr);
+        let outsider = Address::generate(&env);
+        let dummy_hash = BytesN::from_array(&env, &[1u8; 32]);
+        assert_eq!(
+            uninit.try_upgrade(&outsider, &dummy_hash),
+            Err(Ok(AggregatorError::NotInitialized))
+        );
+
+        let (agg, _, _, _) = setup_aggregator(&env);
+        assert_eq!(
+            agg.try_upgrade(&outsider, &dummy_hash),
+            Err(Ok(AggregatorError::Unauthorized))
+        );
+    }
+
+    #[test]
+    fn test_upgrade_preserves_state_and_emits_upgraded() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let wasm = aggregator_wasm(&env);
+        let agg_addr = env.register_contract_wasm(None, wasm.clone());
+        let agg = DexAggregatorClient::new(&env, &agg_addr);
+        let admin = Address::generate(&env);
+        let factory = Address::generate(&env);
+        agg.initialize(&admin, &factory);
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+        let cl_pool = Address::generate(&env);
+
+        agg.set_max_hops(&2u32);
+        agg.set_routing_tokens(&vec![&env, token_a.clone(), token_b.clone()]);
+        agg.register_cl_pool(&cl_pool, &token_a, &token_b, &30_i128);
+
+        let wasm_hash = env.deployer().upload_contract_wasm(wasm);
+        agg.upgrade(&admin, &wasm_hash);
+
+        let upgraded_event = env
+            .events()
+            .all()
+            .iter()
+            .rfind(|e| e.0 == agg_addr && e.1 == (symbol_short!("upgraded"),).into_val(&env))
+            .expect("upgraded event emitted");
+        let upgraded_payload: (u32, (BytesN<32>,)) =
+            soroban_sdk::FromVal::from_val(&env, &upgraded_event.2);
+        assert_eq!(upgraded_payload, (1u32, (wasm_hash,)));
+
+        assert_eq!(agg.get_admin(), admin);
+        assert_eq!(agg.get_factory(), factory);
+        env.as_contract(&agg_addr, || {
+            assert_eq!(
+                env.storage().instance().get::<_, u32>(&DataKey::MaxHops),
+                Some(2u32)
+            );
+            assert_eq!(
+                env.storage()
+                    .instance()
+                    .get::<_, Vec<Address>>(&DataKey::RoutingTokens),
+                Some(vec![&env, token_a.clone(), token_b.clone()])
+            );
+            assert_eq!(
+                env.storage()
+                    .instance()
+                    .get::<_, u32>(&DataKey::ClPoolCount),
+                Some(1u32)
+            );
+            assert_eq!(
+                env.storage()
+                    .instance()
+                    .get::<_, ClPoolInfo>(&DataKey::ClPool(0)),
+                Some(ClPoolInfo {
+                    pool: cl_pool,
+                    token_a,
+                    token_b,
+                    fee_bps: 30_i128,
+                })
+            );
+        });
     }
 }

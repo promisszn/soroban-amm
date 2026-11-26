@@ -8,9 +8,12 @@ import { describe, it } from "node:test";
 import {
   PoolIndexer,
   RETENTION_SECONDS,
+  InvalidComparisonError,
+  MAX_POOL_EVENTS_LIMIT,
   InvalidMetricError,
   InvalidThresholdError,
   seedDemoData,
+  type AlertConfig,
   type PoolEvent,
 } from "./indexer.js";
 import { asSeconds, type Seconds } from "./time.js";
@@ -187,6 +190,104 @@ describe("health alerts", () => {
     const health = idx.getPoolHealth("p1");
     assert.equal(health!.alertsFired.length, 0);
   });
+
+  it("normalizes a missing or null comparison to \"above\"", () => {
+    const idx = makeIndexer();
+    const stored = idx.setAlertConfig({ poolId: "p1", metric: "tvl", thresholdValue: 500 });
+    assert.equal(stored.comparison, "above");
+    idx.setAlertConfig({
+      poolId: "p1", metric: "volume24h", comparison: null, thresholdValue: 10,
+    } as unknown as AlertConfig);
+    const comparisons = idx.getAlertConfigs("p1").map((config) => config.comparison);
+    assert.deepEqual(comparisons, ["above", "above"]);
+  });
+
+  it("rejects a comparison other than \"above\" or \"below\"", () => {
+    const idx = makeIndexer();
+    assert.throws(
+      () => idx.setAlertConfig({
+        poolId: "p1", metric: "tvl", comparison: "sideways", thresholdValue: 500,
+      } as unknown as AlertConfig),
+      InvalidComparisonError,
+    );
+    assert.deepEqual(idx.getAlertConfigs(), []);
+  });
+
+  it("fires TVL alerts only in their configured comparison direction", () => {
+    const below = makeIndexer();
+    below.setAlertConfig({ poolId: "p1", metric: "tvl", comparison: "below", thresholdValue: 500 });
+    below.indexEvent(addLiquidityEvent({
+      id: "below-tvl", poolId: "p1", payload: { amountA: 1000, amountB: 1000 },
+    }));
+    assert.equal(below.getPoolHealth("p1")!.alertsFired.length, 0);
+
+    const belowThreshold = makeIndexer();
+    belowThreshold.setAlertConfig({
+      poolId: "p1", metric: "tvl", comparison: "below", thresholdValue: 500,
+    });
+    belowThreshold.indexEvent(addLiquidityEvent({
+      id: "below-tvl-trigger", poolId: "p1", payload: { amountA: 100, amountB: 100 },
+    }));
+    assert.equal(belowThreshold.getPoolHealth("p1")!.alertsFired.length, 1);
+
+    const above = makeIndexer();
+    above.setAlertConfig({ poolId: "p1", metric: "tvl", comparison: "above", thresholdValue: 500 });
+    above.indexEvent(addLiquidityEvent({
+      id: "above-tvl", poolId: "p1", payload: { amountA: 1000, amountB: 1000 },
+    }));
+    assert.equal(above.getPoolHealth("p1")!.alertsFired.length, 1);
+  });
+
+  it("fires volume alerts only in their configured comparison direction", () => {
+    const above = makeIndexer();
+    above.setAlertConfig({ poolId: "p1", metric: "volume24h", comparison: "above", thresholdValue: 500 });
+    above.indexEvent(swapEvent({ id: "above-volume", poolId: "p1" }));
+    assert.equal(above.getPoolHealth("p1")!.alertsFired.length, 1);
+
+    const below = makeIndexer();
+    below.setAlertConfig({ poolId: "p1", metric: "volume24h", comparison: "below", thresholdValue: 1000 });
+    below.indexEvent(swapEvent({ id: "below-volume", poolId: "p1" }));
+    assert.equal(below.getPoolHealth("p1")!.alertsFired.length, 1);
+  });
+
+  it("fires price-deviation alerts only in their configured comparison direction", () => {
+    const above = makeIndexer();
+    above.setAlertConfig({
+      poolId: "p1", metric: "price_deviation", comparison: "above", thresholdBps: 1000,
+    });
+    above.indexEvent(swapEvent({ id: "above-dev-1", poolId: "p1" }));
+    above.indexEvent(swapEvent({
+      id: "above-dev-2", poolId: "p1",
+      payload: { amountIn: 500, amountOut: 1000, fee: 5, token_in: "XLM", token_out: "USDC" },
+    }));
+    assert.equal(above.getPoolHealth("p1")!.alertsFired.length, 1);
+
+    // The first swap has no price history, so its deviation is 0 and any
+    // "below" config fires on it; only the second swap (2500 bps) is compared.
+    const secondSwapAlerts = (thresholdBps: number) => {
+      const below = makeIndexer();
+      below.setAlertConfig({ poolId: "p1", metric: "price_deviation", comparison: "below", thresholdBps });
+      below.indexEvent(swapEvent({ id: "below-dev-1", poolId: "p1" }));
+      const before = below.getPoolHealth("p1")!.alertsFired.length;
+      below.indexEvent(swapEvent({
+        id: "below-dev-2", poolId: "p1",
+        payload: { amountIn: 500, amountOut: 1000, fee: 5, token_in: "XLM", token_out: "USDC" },
+      }));
+      return below.getPoolHealth("p1")!.alertsFired.slice(before);
+    };
+    const fired = secondSwapAlerts(3000);
+    assert.equal(fired.length, 1);
+    assert.equal(fired[0].currentValue, 2500);
+    assert.deepEqual(secondSwapAlerts(2000), []);
+  });
+
+  it("does not fire a TVL alert while TVL is null", () => {
+    const idx = new PoolIndexer(() => NOW);
+    idx.setAlertConfig({ poolId: "p1", metric: "tvl", comparison: "below", thresholdValue: 500 });
+    idx.indexEvent(addLiquidityEvent({ id: "null-tvl-alert", poolId: "p1" }));
+    assert.equal(idx.getPoolStats("p1")[0].tvl, null);
+    assert.equal(idx.getPoolHealth("p1")!.alertsFired.length, 0);
+  });
 });
 
 describe("analytics correctness", () => {
@@ -240,6 +341,62 @@ describe("analytics correctness", () => {
     const positions = idx.getPositions();
     assert.equal(positions.find((position) => position.owner === "alice")?.shares, 5);
     assert.equal(positions.find((position) => position.owner === "bob")?.lowerTick, -10);
+  });
+
+  it("indexes mint_1t liquidity for the owner's tick range", () => {
+    const idx = makeIndexer();
+    idx.indexEvent({
+      id: "single-token-mint", poolId: "p1", type: "mint_1t", timestamp: NOW,
+      payload: {
+        owner: "alice", lowerTick: -10, upperTick: 10, liquidity: 15, amountUsed: 20, dust: 2,
+      },
+    });
+
+    const position = idx.getPositions("alice")[0];
+    assert.equal(position.shares, 15);
+    assert.equal(position.lowerTick, -10);
+    assert.equal(position.upperTick, 10);
+    // The event does not identify the deposited token, so amountUsed must not
+    // be credited to either reserve.
+    const stats = idx.getPoolStats("p1")[0];
+    assert.equal(stats.reserveA, 0);
+    assert.equal(stats.reserveB, 0);
+  });
+
+  it("applies positive mod_pos liquidity and reserve deltas", () => {
+    const idx = makeIndexer();
+    idx.indexEvent({
+      id: "modify-increase", poolId: "p1", type: "mod_pos", timestamp: NOW,
+      payload: {
+        owner: "alice", lowerTick: -10, upperTick: 10,
+        liquidityDelta: 25, amountA: 4, amountB: 8,
+      },
+    });
+
+    assert.equal(idx.getPositions("alice")[0].shares, 25);
+    assert.equal(idx.getPoolStats("p1")[0].reserveA, 4);
+    assert.equal(idx.getPoolStats("p1")[0].reserveB, 8);
+  });
+
+  it("applies negative mod_pos liquidity and reserve deltas", () => {
+    const idx = makeIndexer();
+    idx.indexEvent({
+      id: "position-mint", poolId: "p1", type: "mint_pos", timestamp: NOW,
+      payload: {
+        owner: "alice", lowerTick: -10, upperTick: 10, liquidity: 100, amountA: 10, amountB: 20,
+      },
+    });
+    idx.indexEvent({
+      id: "modify-decrease", poolId: "p1", type: "mod_pos", timestamp: NOW,
+      payload: {
+        owner: "alice", lowerTick: -10, upperTick: 10,
+        liquidityDelta: -30, amountA: 3, amountB: 6,
+      },
+    });
+
+    assert.equal(idx.getPositions("alice")[0].shares, 70);
+    assert.equal(idx.getPoolStats("p1")[0].reserveA, 7);
+    assert.equal(idx.getPoolStats("p1")[0].reserveB, 14);
   });
 
   it("surfaces when the pool fee came from the explicit default", () => {
@@ -359,6 +516,13 @@ describe("getEvents", () => {
     assert.equal(last2.length, 2);
     assert.equal(last2[0].id, "e3");
     assert.equal(last2[1].id, "e2");
+  });
+
+  it("rejects zero, negative, and oversized limits", () => {
+    const idx = makeIndexer();
+    for (const limit of [0, -1, MAX_POOL_EVENTS_LIMIT + 1]) {
+      assert.throws(() => idx.getEvents("p1", limit), /limit must be an integer between 1 and 1000/);
+    }
   });
 });
 

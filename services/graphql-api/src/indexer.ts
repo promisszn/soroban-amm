@@ -11,6 +11,7 @@ import type {
 } from "./store/interface.js";
 
 export const RETENTION_SECONDS = 30 * 24 * 60 * 60;
+export const MAX_POOL_EVENTS_LIMIT = 1000;
 const ROLLING_WINDOW_SECONDS = 24 * 60 * 60;
 const PRICE_DEVIATION_WINDOW_SECONDS = 60 * 60;
 const DEFAULT_FEE_BPS = 30;
@@ -18,6 +19,15 @@ const DEFAULT_FEE_BPS = 30;
 export type PoolEvent = Omit<StoredPoolEvent, "ledger" | "txHash" | "eventIndex"> &
   Partial<Pick<StoredPoolEvent, "ledger" | "txHash" | "eventIndex">>;
 export type { PoolEventType, PoolStats, Position, PricePoint, HealthAlert };
+
+export function validatePoolEventsLimit(limit: number): number {
+  if (!Number.isInteger(limit) || limit <= 0 || limit > MAX_POOL_EVENTS_LIMIT) {
+    throw new RangeError(
+      `limit must be an integer between 1 and ${MAX_POOL_EVENTS_LIMIT}`,
+    );
+  }
+  return limit;
+}
 
 export interface PoolConfig {
   tokenA: string;
@@ -32,6 +42,7 @@ export type AlertMetric = (typeof VALID_ALERT_METRICS)[number];
 export interface AlertConfig {
   poolId: string;
   metric: AlertMetric;
+  comparison?: "above" | "below";
   thresholdBps?: number;
   thresholdValue?: number;
 }
@@ -75,8 +86,19 @@ export class InvalidThresholdError extends Error {
   }
 }
 
+export class InvalidComparisonError extends Error {
+  constructor(comparison: string) {
+    super(`Invalid alert comparison "${comparison}". Must be "above" or "below"`);
+    this.name = "InvalidComparisonError";
+  }
+}
+
 function isValidMetric(metric: string): metric is AlertMetric {
   return (VALID_ALERT_METRICS as readonly string[]).includes(metric);
+}
+
+function isValidComparison(comparison: string): comparison is "above" | "below" {
+  return comparison === "above" || comparison === "below";
 }
 
 function toStr(value: unknown): string {
@@ -171,16 +193,32 @@ export class PoolIndexer {
       }
     }
 
-    if (event.type === "add_liquidity" || event.type === "mint_pos") {
+    if (event.type === "add_liquidity" || event.type === "mint_pos" || event.type === "mint_1t") {
       stats.reserveA += toNumber(event.payload["amountA"] ?? event.payload["amount_a"]);
       stats.reserveB += toNumber(event.payload["amountB"] ?? event.payload["amount_b"]);
-      const position = this.updatePosition(event, 1);
+      const position = this.updatePosition(
+        event,
+        toNumber(event.payload["shares"] ?? event.payload["liquidity"]),
+      );
       if (position) changedPositions.push(position);
     }
     if (event.type === "remove_liquidity" || event.type === "burn_pos") {
       stats.reserveA = Math.max(0, stats.reserveA - toNumber(event.payload["amountA"] ?? event.payload["amount_a"]));
       stats.reserveB = Math.max(0, stats.reserveB - toNumber(event.payload["amountB"] ?? event.payload["amount_b"]));
-      const position = this.updatePosition(event, -1);
+      const position = this.updatePosition(
+        event,
+        -toNumber(event.payload["shares"] ?? event.payload["liquidity"]),
+      );
+      if (position) changedPositions.push(position);
+    }
+    if (event.type === "mod_pos") {
+      const liquidityDelta = toNumber(event.payload["liquidityDelta"] ?? event.payload["liquidity_delta"]);
+      const reserveDirection = liquidityDelta < 0 ? -1 : 1;
+      const amountA = Math.abs(toNumber(event.payload["amountA"] ?? event.payload["amount_a"]));
+      const amountB = Math.abs(toNumber(event.payload["amountB"] ?? event.payload["amount_b"]));
+      stats.reserveA = Math.max(0, stats.reserveA + reserveDirection * amountA);
+      stats.reserveB = Math.max(0, stats.reserveB + reserveDirection * amountB);
+      const position = this.updatePosition(event, liquidityDelta);
       if (position) changedPositions.push(position);
     }
 
@@ -201,8 +239,9 @@ export class PoolIndexer {
   }
 
   getEvents(poolId?: string, limit = 100): PoolEvent[] {
+    const validatedLimit = validatePoolEventsLimit(limit);
     const filtered = poolId ? this.events.filter((event) => event.poolId === poolId) : this.events;
-    return filtered.slice(-limit).reverse();
+    return filtered.slice(-validatedLimit).reverse();
   }
 
   getPositions(owner?: string): Position[] {
@@ -259,6 +298,8 @@ export class PoolIndexer {
   /** Validate an alert config without mutating the in-memory map. */
   validateAlertConfig(config: AlertConfig): AlertConfig {
     if (!isValidMetric(config.metric)) throw new InvalidMetricError(config.metric);
+    const comparison = config.comparison ?? "above";
+    if (!isValidComparison(comparison)) throw new InvalidComparisonError(comparison);
     const threshold = config.metric === "price_deviation" ? config.thresholdBps : config.thresholdValue;
     if (threshold === undefined || !Number.isFinite(threshold)) {
       throw new InvalidThresholdError(config.metric === "price_deviation"
@@ -266,7 +307,9 @@ export class PoolIndexer {
         : `thresholdValue is required for metric "${config.metric}"`);
     }
     if (threshold < 0) throw new InvalidThresholdError("Threshold must be >= 0");
-    return config;
+    // AlertConfig.comparison is non-null in the GraphQL schema, so a config set
+    // without one (or with an explicit null) is normalized to the default here.
+    return { ...config, comparison };
   }
 
   /** Apply an already-validated config to the in-memory map. */
@@ -294,7 +337,9 @@ export class PoolIndexer {
   }
 
   private isAnalyticsEvent(type: PoolEventType): boolean {
-    return ["swap", "swap_out", "add_liquidity", "remove_liquidity", "mint_pos", "burn_pos"].includes(type);
+    return [
+      "swap", "swap_out", "add_liquidity", "remove_liquidity", "mint_pos", "burn_pos", "mod_pos", "mint_1t",
+    ].includes(type);
   }
 
   private rollingEntry(poolId: string, entry: RollingAmount): void {
@@ -317,7 +362,7 @@ export class PoolIndexer {
     return priceA === undefined || priceB === undefined ? null : stats.reserveA * priceA + stats.reserveB * priceB;
   }
 
-  private updatePosition(event: PoolEvent, direction: 1 | -1): Position | null {
+  private updatePosition(event: PoolEvent, liquidityDelta: number): Position | null {
     const owner = toStr(event.payload["provider"] ?? event.payload["owner"]);
     if (!owner) return null;
     const lowerTick = event.payload["lowerTick"] ?? event.payload["tick_lower"];
@@ -325,7 +370,7 @@ export class PoolIndexer {
     const suffix = lowerTick === undefined ? "lp" : `${toNumber(lowerTick)}:${toNumber(upperTick)}`;
     const id = `${event.poolId}:${owner}:${suffix}`;
     const current = this.positions.get(id);
-    const shares = Math.max(0, (current?.shares ?? 0) + direction * toNumber(event.payload["shares"] ?? event.payload["liquidity"]));
+    const shares = Math.max(0, (current?.shares ?? 0) + liquidityDelta);
     const position: Position = {
       id, poolId: event.poolId, owner, shares, valueUsd: current?.valueUsd ?? null,
       lowerTick: lowerTick === undefined ? undefined : toNumber(lowerTick),
@@ -356,7 +401,10 @@ export class PoolIndexer {
       const currentValue = config.metric === "price_deviation" ? stats.priceDeviationBps
         : config.metric === "tvl" ? stats.tvl : stats.volume24h;
       const threshold = config.metric === "price_deviation" ? config.thresholdBps! : config.thresholdValue!;
-      if (currentValue !== null && currentValue > threshold) {
+      // A null metric (e.g. TVL without token prices) never fires.
+      if (currentValue === null) continue;
+      const crossed = config.comparison === "below" ? currentValue < threshold : currentValue > threshold;
+      if (crossed) {
         const alert = { poolId, metric: config.metric, threshold, currentValue, firedAt: this.clock() };
         fired.push(alert);
         this.firedAlerts.push(alert);

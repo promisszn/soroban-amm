@@ -38,8 +38,10 @@ pub enum NftError {
     NoPendingAdmin = 9,
     WrongAdmin = 10,
     InvalidAddress = 11,
+    /// `mint` supplied a pool address other than the registered `cl_pool`.
+    PoolMismatch = 12,
     /// `set_cl_pool` was called while position NFTs are still live.
-    PositionsExist = 12,
+    PositionsExist = 13,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -113,6 +115,16 @@ pub struct ClPositionNft;
 
 #[contractimpl]
 impl ClPositionNft {
+    /// Whether `address` is the all-zero Stellar account
+    /// (`GAAAA…WHF`), which no one can sign for.
+    fn is_zero_address(env: &Env, address: &Address) -> bool {
+        let zero_address = Address::from_string(&soroban_sdk::String::from_str(
+            env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        address == &zero_address
+    }
+
     // ── TTL configuration ─────────────────────────────────────────────────────
     //
     // Persistent entries are evicted by the network once their TTL lapses
@@ -182,17 +194,28 @@ impl ClPositionNft {
     pub const MAX_POSITIONS_PER_OWNER: u64 = 10_000;
 
     /// Number of positions `owner` holds in the O(1) index. `O(1)`.
+    ///
+    /// Renews `OwnerTokenCount` on every read so it cannot expire while
+    /// `OwnerTokenByIndex` slots are still live (index slots are renewed by
+    /// `tokens_of_paginated`/`token_of_owner_by_index`; without this bump
+    /// the counter could lapse independently, causing the next mint to treat
+    /// a stale `0` as the free-slot index and overwrite slot 0).
     fn owner_token_count(env: &Env, owner: &Address) -> u64 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::OwnerTokenCount(owner.clone()))
-            .unwrap_or(0)
+        let key = DataKey::OwnerTokenCount(owner.clone());
+        let count: u64 = env.storage().persistent().get(&key).unwrap_or(0);
+        if count > 0 {
+            Self::bump_persistent(env, &key);
+        }
+        count
     }
 
     fn has_index_slot(env: &Env, token_id: u64) -> bool {
-        env.storage()
-            .persistent()
-            .has(&DataKey::TokenIndexOfOwner(token_id))
+        let key = DataKey::TokenIndexOfOwner(token_id);
+        let exists = env.storage().persistent().has(&key);
+        if exists {
+            Self::bump_persistent(env, &key);
+        }
+        exists
     }
 
     /// Adds `token_id` to `owner`'s O(1) index at the next free slot. `O(1)`:
@@ -343,7 +366,13 @@ impl ClPositionNft {
         lower_tick: i32,
         upper_tick: i32,
     ) -> Result<u64, NftError> {
-        Self::require_pool(&env)?;
+        let registered_pool = Self::require_pool(&env)?;
+        if pool != registered_pool {
+            return Err(NftError::PoolMismatch);
+        }
+        if Self::is_zero_address(&env, &to) {
+            return Err(NftError::InvalidReceiver);
+        }
 
         // #697: cap growth of the O(1) index itself (defence in depth on top
         // of the O(1) cost fix — see MAX_POSITIONS_PER_OWNER's doc comment).
@@ -453,6 +482,7 @@ impl ClPositionNft {
 
     /// Returns the owner of `token_id`, or [`NftError::TokenNotFound`].
     pub fn owner_of(env: Env, token_id: u64) -> Result<Address, NftError> {
+        Self::bump_instance(&env);
         let key = DataKey::Owner(token_id);
         let owner: Address = env
             .storage()
@@ -465,6 +495,7 @@ impl ClPositionNft {
 
     /// Returns the [`PositionMeta`] for `token_id`, or [`NftError::TokenNotFound`].
     pub fn position_meta(env: Env, token_id: u64) -> Result<PositionMeta, NftError> {
+        Self::bump_instance(&env);
         let key = DataKey::TokenPosition(token_id);
         let meta: PositionMeta = env
             .storage()
@@ -482,6 +513,7 @@ impl ClPositionNft {
     /// index; a not-yet-migrated owner's legacy holdings are not included
     /// (see the "#697: ownership index" section above).
     pub fn tokens_of_paginated(env: Env, owner: Address, offset: u64, limit: u32) -> Vec<u64> {
+        Self::bump_instance(&env);
         let count = Self::owner_token_count(&env, &owner);
         let limit = limit.min(Self::MAX_PAGE) as u64;
         let mut out = Vec::new(&env);
@@ -505,6 +537,10 @@ impl ClPositionNft {
     /// `index >= balance_of(owner)`. `O(1)`. Slot order is unspecified after
     /// any removal (swap-and-pop) — do not rely on it matching mint order.
     pub fn token_of_owner_by_index(env: Env, owner: Address, index: u64) -> Option<u64> {
+        Self::bump_instance(&env);
+        if index >= Self::owner_token_count(&env, &owner) {
+            return None;
+        }
         let key = DataKey::OwnerTokenByIndex(owner, index);
         let token_id: Option<u64> = env.storage().persistent().get(&key);
         if token_id.is_some() {
@@ -520,6 +556,7 @@ impl ClPositionNft {
     /// an unbounded `tokens_of` would reintroduce the exact DoS this issue
     /// closes.
     pub fn tokens_of(env: Env, owner: Address) -> Vec<u64> {
+        Self::bump_instance(&env);
         Self::tokens_of_paginated(env, owner, 0, Self::MAX_PAGE)
     }
 
@@ -530,6 +567,7 @@ impl ClPositionNft {
     /// not include a not-yet-migrated owner's legacy holdings; see
     /// `is_migrated`.
     pub fn balance_of(env: Env, owner: Address) -> u64 {
+        Self::bump_instance(&env);
         Self::owner_token_count(&env, &owner)
     }
 
@@ -538,6 +576,7 @@ impl ClPositionNft {
     /// the O(1) index by `migrate_ownership_index`,
     /// or they never had any. `true` for every owner on a fresh deployment.
     pub fn is_migrated(env: Env, owner: Address) -> bool {
+        Self::bump_instance(&env);
         match env
             .storage()
             .persistent()
@@ -607,11 +646,13 @@ impl ClPositionNft {
 
     /// Returns the number of tokens ever minted, including tokens later burned.
     pub fn total_minted(env: Env) -> u64 {
+        Self::bump_instance(&env);
         Self::next_token_id(env)
     }
 
     /// Returns the number of currently-live position NFTs.
     pub fn total_supply(env: Env) -> u64 {
+        Self::bump_instance(&env);
         let minted = Self::next_token_id(env.clone());
         let burned: u64 = env
             .storage()
@@ -643,11 +684,7 @@ impl ClPositionNft {
             return Err(NftError::Unauthorized);
         }
 
-        let zero_account = Address::from_string(&soroban_sdk::String::from_str(
-            &env,
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
-        ));
-        if approved == zero_account || approved == owner {
+        if Self::is_zero_address(&env, &approved) || approved == owner {
             return Err(NftError::InvalidAddress);
         }
 
@@ -685,6 +722,7 @@ impl ClPositionNft {
 
     /// Check if `operator` is approved for all tokens of `owner`.
     pub fn is_approved_for_all(env: Env, owner: Address, operator: Address) -> bool {
+        Self::bump_instance(&env);
         let key = DataKey::OperatorApproval(owner, operator);
         match env.storage().persistent().get::<_, bool>(&key) {
             Some(approved) => {
@@ -705,6 +743,9 @@ impl ClPositionNft {
         token_id: u64,
     ) -> Result<(), NftError> {
         caller.require_auth();
+        if Self::is_zero_address(&env, &to) {
+            return Err(NftError::InvalidReceiver);
+        }
 
         let owner_key = DataKey::Owner(token_id);
         let owner: Address = env
@@ -791,6 +832,7 @@ impl ClPositionNft {
 
     /// Returns the currently-approved address for `token_id`, if any.
     pub fn get_approved(env: Env, token_id: u64) -> Option<Address> {
+        Self::bump_instance(&env);
         let key = DataKey::Approved(token_id);
         let approved: Option<Address> = env.storage().persistent().get(&key);
         if approved.is_some() {
@@ -801,16 +843,19 @@ impl ClPositionNft {
 
     /// Returns the registered admin address.
     pub fn admin(env: Env) -> Address {
+        Self::bump_instance(&env);
         env.storage().instance().get(&DataKey::Admin).unwrap()
     }
 
     /// Returns the registered `cl_pool` address.
     pub fn cl_pool(env: Env) -> Address {
+        Self::bump_instance(&env);
         env.storage().instance().get(&DataKey::ClPool).unwrap()
     }
 
     /// Returns the nominated successor admin, if a handover is pending.
     pub fn pending_admin(env: Env) -> Option<Address> {
+        Self::bump_instance(&env);
         env.storage()
             .instance()
             .get(&DataKey::PendingAdmin)
@@ -825,6 +870,7 @@ impl ClPositionNft {
     /// owner refused. Absent entries stay absent — the default is `true` and
     /// there is nothing to keep alive.
     pub fn accepts_transfers(env: Env, owner: Address) -> bool {
+        Self::bump_instance(&env);
         let key = DataKey::AcceptTransfers(owner);
         match env.storage().persistent().get::<_, bool>(&key) {
             Some(accepts) => {
@@ -838,10 +884,18 @@ impl ClPositionNft {
     /// Set whether this address accepts incoming NFT transfers.
     pub fn set_accept_transfers(env: Env, owner: Address, accepts: bool) {
         owner.require_auth();
-        let key = DataKey::AcceptTransfers(owner);
+        let key = DataKey::AcceptTransfers(owner.clone());
         env.storage().persistent().set(&key, &accepts);
         Self::bump_persistent(&env, &key);
         Self::bump_instance(&env);
+        emit_versioned_event!(
+            env,
+            (
+                soroban_sdk::Symbol::new(&env, "accept_transfers_set"),
+                owner
+            ),
+            (accepts,)
+        );
     }
 
     /// Nominate a successor admin. The nominee completes the transfer by calling `accept_admin`.
@@ -942,11 +996,7 @@ impl ClPositionNft {
             .instance()
             .get(&DataKey::ClPool)
             .ok_or(NftError::Unauthorized)?;
-        let zero_account = Address::from_string(&soroban_sdk::String::from_str(
-            &env,
-            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
-        ));
-        if new_pool == current_pool || new_pool == zero_account {
+        if new_pool == current_pool || Self::is_zero_address(&env, &new_pool) {
             return Err(NftError::InvalidAddress);
         }
         if Self::total_supply(env.clone()) > 0 {
@@ -963,6 +1013,7 @@ impl ClPositionNft {
 
     /// Returns the next token id that will be assigned.
     pub fn next_token_id(env: Env) -> u64 {
+        Self::bump_instance(&env);
         env.storage()
             .instance()
             .get(&DataKey::NextTokenId)
@@ -972,6 +1023,7 @@ impl ClPositionNft {
     /// Returns the active persistent-entry TTL parameters
     /// `(min_ttl_threshold, bump_to)`, in ledgers.
     pub fn ttl_params(env: Env) -> (u32, u32) {
+        Self::bump_instance(&env);
         Self::ttl_config(&env)
     }
 
@@ -993,6 +1045,11 @@ impl ClPositionNft {
             .set(&DataKey::TtlMinThreshold, &min_ttl_threshold);
         env.storage().instance().set(&DataKey::TtlBumpTo, &bump_to);
         Self::bump_instance(&env);
+        emit_versioned_event!(
+            env,
+            (soroban_sdk::Symbol::new(&env, "ttl_params_set"),),
+            (min_ttl_threshold, bump_to)
+        );
         Ok(())
     }
 }
@@ -1025,6 +1082,45 @@ mod tests {
         let user = Address::generate(&env);
         client.initialize(&admin, &pool);
         (env, client, admin, pool, user)
+    }
+
+    fn assert_view_restores_instance_ttl(
+        view: impl FnOnce(
+            &Env,
+            &ClPositionNftClient<'static>,
+            &Address,
+            &Address,
+            &Address,
+            &Address,
+            u64,
+        ),
+    ) {
+        use soroban_sdk::testutils::{storage::Instance as _, Ledger as _};
+
+        let (env, client, admin, pool, user) = setup();
+        let operator = Address::generate(&env);
+        let token_id = client.mint(&user, &pool, &-100, &100);
+        client.approve(&user, &operator, &token_id);
+        client.set_approval_for_all(&user, &operator, &true);
+        client.set_accept_transfers(&user, &false);
+
+        env.ledger().with_mut(|ledger| {
+            ledger.sequence_number +=
+                ClPositionNft::DEFAULT_BUMP_TO - ClPositionNft::DEFAULT_MIN_TTL + 1
+        });
+        let ttl = env.as_contract(&client.address, || env.storage().instance().get_ttl());
+        assert!(
+            ttl < ClPositionNft::DEFAULT_MIN_TTL,
+            "test setup should lower instance TTL below the threshold, got {ttl}"
+        );
+
+        view(&env, &client, &admin, &pool, &user, &operator, token_id);
+
+        let ttl = env.as_contract(&client.address, || env.storage().instance().get_ttl());
+        assert!(
+            ttl >= ClPositionNft::DEFAULT_BUMP_TO - 1,
+            "instance TTL {ttl} should be bumped toward DEFAULT_BUMP_TO"
+        );
     }
 
     // ── initialize ─────────────────────────────────────────────────────────────
@@ -1101,6 +1197,23 @@ mod tests {
     }
 
     #[test]
+    fn mint_to_zero_address_is_rejected() {
+        let (env, client, _admin, pool, _user) = setup();
+        let zero = Address::from_string(&soroban_sdk::String::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+
+        assert_eq!(
+            client
+                .try_mint(&zero, &pool, &-100, &100)
+                .unwrap_err()
+                .unwrap(),
+            NftError::InvalidReceiver
+        );
+    }
+
+    #[test]
     fn mint_stores_correct_position_meta() {
         let (_, client, _admin, pool, user) = setup();
         let id = client.mint(&user, &pool, &-500, &500);
@@ -1108,6 +1221,27 @@ mod tests {
         assert_eq!(meta.pool, pool);
         assert_eq!(meta.lower_tick, -500);
         assert_eq!(meta.upper_tick, 500);
+    }
+
+    #[test]
+    fn mint_rejects_pool_other_than_registered_pool() {
+        let (env, client, _admin, _pool, user) = setup();
+        let other_pool = Address::generate(&env);
+
+        assert_eq!(
+            client.try_mint(&user, &other_pool, &-100, &100),
+            Err(Ok(NftError::PoolMismatch))
+        );
+        assert_eq!(client.total_supply(), 0);
+    }
+
+    #[test]
+    fn mint_metadata_pool_matches_registered_pool() {
+        let (_, client, _admin, pool, user) = setup();
+        let id = client.mint(&user, &pool, &-100, &100);
+
+        assert_eq!(client.position_meta(&id).pool, client.cl_pool());
+        assert_eq!(client.position_meta(&id).pool, pool);
     }
 
     // ── burn ─────────────────────────────────────────────────────────────────
@@ -1300,6 +1434,25 @@ mod tests {
         let b_tokens = client.tokens_of(&user_b);
         assert_eq!(b_tokens.len(), 1);
         assert_eq!(b_tokens.get(0).unwrap(), id);
+    }
+
+    #[test]
+    fn transfer_to_zero_address_is_rejected() {
+        let (env, client, _admin, pool, owner) = setup();
+        let zero = Address::from_string(&soroban_sdk::String::from_str(
+            &env,
+            "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF",
+        ));
+        let id = client.mint(&owner, &pool, &-100, &100);
+
+        assert_eq!(
+            client
+                .try_transfer(&owner, &owner, &zero, &id)
+                .unwrap_err()
+                .unwrap(),
+            NftError::InvalidReceiver
+        );
+        assert_eq!(client.owner_of(&id), owner);
     }
 
     #[test]
@@ -1704,6 +1857,73 @@ mod tests {
         let (min_ttl, bump_to) = client.ttl_params();
         assert_eq!(min_ttl, ClPositionNft::DEFAULT_MIN_TTL);
         assert_eq!(bump_to, ClPositionNft::DEFAULT_BUMP_TO);
+    }
+
+    #[test]
+    fn every_read_view_restores_lapsed_instance_ttl() {
+        assert_view_restores_instance_ttl(|_, client, _, _, user, _, token_id| {
+            assert_eq!(client.owner_of(&token_id), user.clone());
+        });
+        assert_view_restores_instance_ttl(|_, client, _, pool, _, _, token_id| {
+            let meta = client.position_meta(&token_id);
+            assert_eq!(meta.pool, pool.clone());
+            assert_eq!((meta.lower_tick, meta.upper_tick), (-100, 100));
+        });
+        assert_view_restores_instance_ttl(|_, client, _, _, user, _, token_id| {
+            let tokens = client.tokens_of_paginated(user, &0, &10);
+            assert_eq!(tokens.len(), 1);
+            assert_eq!(tokens.get(0), Some(token_id));
+        });
+        assert_view_restores_instance_ttl(|_, client, _, _, user, _, token_id| {
+            assert_eq!(client.token_of_owner_by_index(user, &0), Some(token_id));
+        });
+        assert_view_restores_instance_ttl(|_, client, _, _, user, _, token_id| {
+            let tokens = client.tokens_of(user);
+            assert_eq!(tokens.len(), 1);
+            assert_eq!(tokens.get(0), Some(token_id));
+        });
+        assert_view_restores_instance_ttl(|_, client, _, _, user, _, _| {
+            assert_eq!(client.balance_of(user), 1);
+        });
+        assert_view_restores_instance_ttl(|_, client, _, _, user, _, _| {
+            assert!(client.is_migrated(user));
+        });
+        assert_view_restores_instance_ttl(|_, client, _, _, _, _, _| {
+            assert_eq!(client.total_minted(), 1);
+        });
+        assert_view_restores_instance_ttl(|_, client, _, _, _, _, _| {
+            assert_eq!(client.total_supply(), 1);
+        });
+        assert_view_restores_instance_ttl(|_, client, _, _, user, operator, _| {
+            assert!(client.is_approved_for_all(user, operator));
+        });
+        assert_view_restores_instance_ttl(|_, client, _, _, _, operator, token_id| {
+            assert_eq!(client.get_approved(&token_id), Some(operator.clone()));
+        });
+        assert_view_restores_instance_ttl(|_, client, admin, _, _, _, _| {
+            assert_eq!(client.admin(), admin.clone());
+        });
+        assert_view_restores_instance_ttl(|_, client, _, pool, _, _, _| {
+            assert_eq!(client.cl_pool(), pool.clone());
+        });
+        assert_view_restores_instance_ttl(|_, client, _, _, _, _, _| {
+            assert_eq!(client.pending_admin(), None);
+        });
+        assert_view_restores_instance_ttl(|_, client, _, _, user, _, _| {
+            assert!(!client.accepts_transfers(user));
+        });
+        assert_view_restores_instance_ttl(|_, client, _, _, _, _, _| {
+            assert_eq!(client.next_token_id(), 1);
+        });
+        assert_view_restores_instance_ttl(|_, client, _, _, _, _, _| {
+            assert_eq!(
+                client.ttl_params(),
+                (
+                    ClPositionNft::DEFAULT_MIN_TTL,
+                    ClPositionNft::DEFAULT_BUMP_TO
+                )
+            );
+        });
     }
 
     #[test]
@@ -2357,6 +2577,141 @@ mod tests {
         }
     }
 
+    // ── TTL divergence regression (#ownership-index-ttl) ─────────────────────
+    //
+    // `OwnerTokenCount` and the `OwnerTokenByIndex` slots were bumped at
+    // different times: `tokens_of_paginated` renewed individual slots but
+    // did not renew the counter. If the counter expired (read back as `0`)
+    // while slot 0 was still live, the next mint would call `index_add` with
+    // `count = 0`, write `OwnerTokenByIndex(owner, 0) = new_id`, and silently
+    // overwrite the token that was already in slot 0.
+    //
+    // The fix renews `OwnerTokenCount` inside `owner_token_count` (which every
+    // read and write path already calls) and renews `TokenIndexOfOwner` inside
+    // `has_index_slot` (called by `burn` / `transfer` to choose the O(1) vs.
+    // legacy path).
+    #[test]
+    fn ownership_index_counter_ttl_divergence_does_not_overwrite_slot_0() {
+        use soroban_sdk::testutils::Ledger as _;
+
+        // Use small TTL windows so the test can drive counter expiry without
+        // advancing billions of ledgers.
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|li| {
+            li.sequence_number = 1_000;
+            // A generous max_entry_ttl; the test drives expiry via bump
+            // parameters, not this cap.
+            li.min_persistent_entry_ttl = 10;
+            li.max_entry_ttl = 10_000_000;
+        });
+
+        let contract_id = env.register_contract(None, ClPositionNft);
+        let client = ClPositionNftClient::new(&env, &contract_id);
+        let admin = Address::generate(&env);
+        let pool = Address::generate(&env);
+        let owner = Address::generate(&env);
+        client.initialize(&admin, &pool);
+
+        // Use a very small bump window so we can drive expiry cheaply.
+        // bump_to = 200, min_ttl_threshold = 100.
+        client.set_ttl_params(&100, &200);
+
+        // Mint two positions → slots 0 and 1.
+        let id0 = client.mint(&owner, &pool, &-1, &1);
+        let id1 = client.mint(&owner, &pool, &-2, &2);
+        assert_eq!(client.balance_of(&owner), 2);
+
+        // Advance ledger by bump_to - min_ttl_threshold + 1 so entries that
+        // were bumped at mint time are now below the renewal threshold but
+        // still live (TTL > 0).  tokens_of will renew the two
+        // OwnerTokenByIndex slots; without the fix it does NOT renew the
+        // OwnerTokenCount key.
+        env.ledger()
+            .with_mut(|li| li.sequence_number += 200 - 100 + 1);
+
+        // This call renews the two index slots but (on main, pre-fix) leaves
+        // OwnerTokenCount un-renewed.
+        let page = client.tokens_of(&owner);
+        assert_eq!(page.len(), 2);
+
+        // Now advance far enough that OwnerTokenCount would expire if it had
+        // not been renewed by the fix, while the two OwnerTokenByIndex slots
+        // — which tokens_of just renewed — remain live.
+        //
+        // State after first advance + tokens_of call:
+        //   - On main (no fix): counter's last bump was at mint time
+        //     (TTL ~99 remaining); slots were just bumped to TTL 200 by tokens_of.
+        //   - With fix: counter was also bumped to TTL 200 by tokens_of.
+        //
+        // Advancing 150 more:
+        //   - Counter on main: TTL 99 - 150 < 0 → evicted (reads as 0).
+        //   - Counter with fix: TTL 200 - 150 = 50 → still live.
+        //   - Slots (both paths): TTL 200 - 150 = 50 → still live.
+        env.ledger().with_mut(|li| li.sequence_number += 150);
+
+        // Mint a third position.  If OwnerTokenCount was not renewed it reads
+        // as 0 and index_add writes to slot 0, overwriting id0.
+        let id2 = client.mint(&owner, &pool, &-3, &3);
+
+        // The balance must reflect all three live positions.
+        assert_eq!(
+            client.balance_of(&owner),
+            3,
+            "balance_of must be 3 after minting a third position"
+        );
+
+        // Every slot below balance_of must resolve to a unique id — slot 0
+        // must NOT have been overwritten with id2.
+        let count = client.balance_of(&owner);
+        let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for i in 0..count {
+            let id = client
+                .token_of_owner_by_index(&owner, &i)
+                .unwrap_or_else(|| panic!("slot {i} below balance_of must resolve"));
+            assert!(
+                seen.insert(id),
+                "token {id} appears in more than one index slot (slot {i} overwritten)"
+            );
+        }
+
+        // All three minted ids must be reachable.
+        assert!(
+            seen.contains(&id0),
+            "id0={id0} not found in index after third mint"
+        );
+        assert!(
+            seen.contains(&id1),
+            "id1={id1} not found in index after third mint"
+        );
+        assert!(
+            seen.contains(&id2),
+            "id2={id2} not found in index after third mint"
+        );
+    }
+
+    #[test]
+    fn reading_a_single_owner_slot_renews_the_counter() {
+        use soroban_sdk::testutils::Ledger as _;
+        let (env, client, _admin, pool, owner) = setup();
+        client.set_ttl_params(&100, &200);
+        let id = client.mint(&owner, &pool, &-1, &1);
+        let count_key = DataKey::OwnerTokenCount(owner.clone());
+
+        let ttl = || {
+            use soroban_sdk::testutils::storage::Persistent as _;
+            env.as_contract(&client.address, || {
+                env.storage().persistent().get_ttl(&count_key)
+            })
+        };
+        let advance = ttl() - 99;
+        env.ledger()
+            .with_mut(|ledger| ledger.sequence_number += advance);
+        assert_eq!(ttl(), 99);
+        assert_eq!(client.token_of_owner_by_index(&owner, &0), Some(id));
+        assert_eq!(ttl(), 200);
+    }
+
     // ── Issue #915: every event carries EVENT_SCHEMA_VERSION ────────────────
     //
     // `mint`, `burn`, `approve`, `set_approval_for_all`, and `transfer` used
@@ -2446,6 +2801,28 @@ mod tests {
             last_versioned_event(&env, &client.address, "transfer");
         assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
         assert_eq!(token_id, id);
+    }
+
+    #[test]
+    fn set_accept_transfers_emits_versioned_event() {
+        let (env, client, _admin, _pool, user) = setup();
+        client.set_accept_transfers(&user, &false);
+
+        let (version, (accepts,)): (u32, (bool,)) =
+            last_versioned_event(&env, &client.address, "accept_transfers_set");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert!(!accepts);
+    }
+
+    #[test]
+    fn set_ttl_params_emits_versioned_event() {
+        let (env, client, _admin, _pool, _user) = setup();
+        client.set_ttl_params(&1_000, &10_000);
+
+        let (version, (min_ttl, bump_to)): (u32, (u32, u32)) =
+            last_versioned_event(&env, &client.address, "ttl_params_set");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!((min_ttl, bump_to), (1_000, 10_000));
     }
 
     #[test]

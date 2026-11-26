@@ -8,6 +8,9 @@
 // The check fails when
 //   - a contract emits an event (or an arity of one) that
 //     services/webhook-streamer/src/event-schemas.json does not describe,
+//   - a payload element that is a plain local identifier is named differently
+//     from the schema field at that position (and LOCAL_NAME_ALIASES does not
+//     record the difference),
 //   - the schema file describes an event no contract emits any more, or
 //   - the generated catalogue in docs/event-schema-versioning.md is stale.
 // So changing a Rust emit site without updating the schema (or the other way
@@ -57,6 +60,51 @@ export function renderCatalogue(schema) {
   return lines.join("\n");
 }
 
+// Emit sites whose payload is built from a local variable whose name is not
+// the payload field name the schema (and so the webhook-streamer) uses, keyed
+// by `contract.event`, mapping the Rust identifier to the schema field it is
+// emitted as. A local name is often terser or scoped differently (`ta` for
+// `token_a`, `now` for `timestamp`), and renaming a schema field changes the
+// webhook payload for every consumer, so the schema stays the source of truth
+// for field names and each known divergence is recorded here explicitly. Any
+// other plain identifier must match its schema field exactly, so a renamed or
+// reordered field fails the check; an entry that no emit site uses any more
+// fails too, so this table cannot rot.
+export const LOCAL_NAME_ALIASES = {
+  "amm.add_liquidity": { used_a: "amount_a", used_b: "amount_b", shares_to_provider: "shares_minted", shares: "shares_minted" },
+  "amm.cb_recovered": { now: "timestamp" },
+  "amm.emergency_wd": { drain_a: "reserve_a", drain_b: "reserve_b" },
+  "amm.ms_ew": { drain_a: "reserve_a", drain_b: "reserve_b" },
+  "amm.multisig_set": { new_quorum: "quorum" },
+  "amm.rm_liq": { shares: "shares_burned", out_a: "amount_a", out_b: "amount_b" },
+  "amm.rm_liq_1s": { shares: "shares_burned" },
+  "batch_router.batch_op": { i: "index" },
+  "cl_position_nft.pool_changed": { current_pool: "old_pool" },
+  "concentrated_liquidity.burn_pos": { pay_a: "amount_a", pay_b: "amount_b" },
+  "concentrated_liquidity.coll_fees": { pay_a: "amount_a", pay_b: "amount_b" },
+  "concentrated_liquidity.max_oracle_deviation_set": { max_deviation_bps: "new_deviation_bps" },
+  "concentrated_liquidity.oracle_set": { oracle: "new_oracle" },
+  "concentrated_liquidity.position_nft_set": { existing_nft: "old_position_nft", nft: "new_position_nft" },
+  "concentrated_liquidity.price_upd": { amount_in_actual: "amount_in", amount_out_total: "amount_out", current_tick: "tick" },
+  "concentrated_liquidity.swap": { amount_in_actual: "amount_in", amount_out_total: "amount_out", current_tick: "tick" },
+  "dex_aggregator.route_alt": { alt_pool: "alt_venue", alt_kind: "alt_venue_kind", alt_out: "alt_amount_out" },
+  "factory.cl_wasm_updated": { cl_wasm_hash: "new_wasm_hash" },
+  "factory.fee_window_set": { old_min: "old_min_fee_bps", old_max: "old_max_fee_bps" },
+  "factory.pool_deprecated": { ta: "token_a", tb: "token_b" },
+  "factory.rate_limit_set": { min_ledgers: "new_limit" },
+  "governance.min_stake_set": { old_bps: "old_min_proposer_stake_bps", new_bps: "new_min_proposer_stake_bps" },
+  "governance.quorum_decay_set": { old_rate: "old_rate_bps_per_day", new_rate: "new_rate_bps_per_day" },
+  "governance.timelock_set": { old_delay: "old_timelock_secs", new_delay: "new_timelock_secs" },
+  "governance.veto_multisig_set": { multisig: "new_multisig" },
+  "incentive_campaigns.staked": { new_total: "total_staked" },
+  "incentive_campaigns.unstaked": { new_total: "total_staked" },
+  "reserve_manager.min_reserve_set": { ta: "token_a", tb: "token_b", normalized_min_a: "min_reserve_a", normalized_min_b: "min_reserve_b" },
+  "router.route": { current_amount: "amount_out", total_in: "amount_in" },
+  "token.approve": { remaining: "amount" },
+  "token.unlock": { rem_entry: "new_entry", rem_locked: "new_locked" },
+};
+
+/** Same topic count, arity, envelope and tuple/bare-value shape. Names are checked separately. */
 function sameShape(variant, site) {
   return (
     variant.fields.length === site.arity &&
@@ -66,9 +114,37 @@ function sameShape(variant, site) {
   );
 }
 
-export function findProblems(schema, sites, docs) {
+/**
+ * The payload positions where a plain-identifier element of `site` does not
+ * match the field name `variant` gives that position, after applying
+ * `aliases`. Elements that are not plain identifiers (null) are not compared.
+ * Each mismatch is `{ index, local, field }`; alias entries that matched are
+ * added to `usedAliases` as `contract.event:local`.
+ */
+function nameMismatches(variant, site, aliases, usedAliases) {
+  const known = aliases[`${site.contract}.${site.event}`] ?? {};
+  const mismatches = [];
+  (site.payload_fields ?? []).forEach((local, index) => {
+    const field = variant.fields[index];
+    if (local === null || local === field) return;
+    if (Object.hasOwn(known, local) && known[local] === field) {
+      usedAliases?.add(`${site.contract}.${site.event}:${local}`);
+      return;
+    }
+    mismatches.push({ index, local, field });
+  });
+  return mismatches;
+}
+
+function describeShape(v) {
+  const envelope = v.versioned === false ? "unversioned" : "versioned";
+  return `${v.fields.length} field(s)/${v.topics} topic(s) ${envelope}${v.shape === "scalar" ? " bare value" : ""}`;
+}
+
+export function findProblems(schema, sites, docs, aliases = LOCAL_NAME_ALIASES) {
   const problems = [];
   const covered = new Set();
+  const usedAliases = new Set();
 
   for (const site of sites) {
     const where = site.source;
@@ -81,17 +157,43 @@ export function findProblems(schema, sites, docs) {
       problems.push(`${where}: ${site.contract} emits "${site.event}" but event-schemas.json has no entry for it`);
       continue;
     }
-    const index = variants.findIndex((v) => sameShape(v, site));
-    if (index === -1) {
-      const known = variants.map((v) => `${v.fields.length}`).join(", ");
+    const shaped = variants.flatMap((v, i) => (sameShape(v, site) ? [i] : []));
+    if (shaped.length === 0) {
+      const known = variants.map(describeShape).join("; ");
       problems.push(
         `${where}: ${site.contract}.${site.event} is emitted with ${site.arity} payload field(s) and ${site.topics} topic(s) ` +
           `(${site.versioned ? "versioned" : "unversioned"}${site.shape === "scalar" ? ", bare value" : ""}), ` +
-          `but event-schemas.json describes arity ${known}`,
+          `but event-schemas.json only describes: ${known}`,
       );
       continue;
     }
+    const index = shaped.find((i) => nameMismatches(variants[i], site, aliases).length === 0);
+    if (index === undefined) {
+      // The shape matches, so the variant is emitted; only names disagree.
+      const first = shaped[0];
+      covered.add(`${site.contract}.${site.event}#${first}`);
+      const detail = nameMismatches(variants[first], site, aliases)
+        .map(({ index: i, local, field }) => `field ${i} is built from \`${local}\` but the schema names it \`${field}\``)
+        .join("; ");
+      problems.push(
+        `${where}: ${site.contract}.${site.event} payload names disagree with event-schemas.json: ${detail}. ` +
+          `Fix the schema field (it is the webhook payload name), or if the local name legitimately differs, ` +
+          `record it in LOCAL_NAME_ALIASES in scripts/check_event_schemas.mjs`,
+      );
+      continue;
+    }
+    nameMismatches(variants[index], site, aliases, usedAliases);
     covered.add(`${site.contract}.${site.event}#${index}`);
+  }
+
+  for (const [key, map] of Object.entries(aliases)) {
+    for (const [local, field] of Object.entries(map)) {
+      if (!usedAliases.has(`${key}:${local}`)) {
+        problems.push(
+          `scripts/check_event_schemas.mjs: LOCAL_NAME_ALIASES maps ${key} \`${local}\` -> \`${field}\` but no emit site uses it; remove the entry`,
+        );
+      }
+    }
   }
 
   for (const [kind, { events }] of Object.entries(schema.kinds)) {

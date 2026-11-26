@@ -114,8 +114,9 @@ export class MemoryStore implements AnalyticsStore {
 
   async setAlertConfig(config: AlertConfig): Promise<AlertConfig> {
     const key = `${config.poolId}:${config.metric}`;
-    this.alertConfigs.set(key, config);
-    return config;
+    const normalized = { ...config, comparison: config.comparison ?? "above" };
+    this.alertConfigs.set(key, normalized);
+    return normalized;
   }
 
   async removeAlertConfig(poolId: string, metric: string): Promise<boolean> {

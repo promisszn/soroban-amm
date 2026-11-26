@@ -236,6 +236,7 @@ This returns the contract address.
 
 Call the `initialize` entry point with the pool address and owner address:
 
+<!-- contract: flash_loan_receiver -->
 ```bash
 stellar contract invoke \
   --id <receiver-address> \

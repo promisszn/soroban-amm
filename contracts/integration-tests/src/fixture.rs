@@ -132,7 +132,8 @@ impl Protocol {
         // ── Deploy CL pool ──────────────────────────────────────────────────
 
         let cl_pool = env.register_contract(None, concentrated_liquidity::ConcentratedLiquidity);
-        // Note: full CL initialization would happen here
+        let cl_client = concentrated_liquidity::ConcentratedLiquidityClient::new(&env, &cl_pool);
+        cl_client.initialize(&admin, &token_a, &token_b, &30i128, &0i32, &10i32);
 
         // ── Deploy CL NFT wrapper ────────────────────────────────────────────
 

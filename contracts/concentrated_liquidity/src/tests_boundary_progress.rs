@@ -2,7 +2,10 @@
 
 use crate::{ClError, ConcentratedLiquidity, ConcentratedLiquidityClient, MIN_TICK};
 use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
-use soroban_sdk::{testutils::{Address as _, Ledger}, Address, Env};
+use soroban_sdk::{
+    testutils::{Address as _, Ledger},
+    Address, Env,
+};
 
 struct BoundaryPool {
     env: Env,
@@ -178,14 +181,7 @@ fn exact_out_swap_reports_unfilled_at_saturated_tick_without_looping() {
     let client = ConcentratedLiquidityClient::new(&pool.env, &pool.pool);
     let token_a = TokenClient::new(&pool.env, &pool.token_a);
     let balance_before = token_a.balance(&trader);
-    let result = client.try_swap_exact_out(
-        &trader,
-        &true,
-        &1,
-        &0,
-        &1_000_000,
-        &u64::MAX,
-    );
+    let result = client.try_swap_exact_out(&trader, &true, &1, &0, &1_000_000, &u64::MAX);
     assert_eq!(result, Err(Ok(ClError::ExactOutNotFullyFilled)));
     assert_eq!(token_a.balance(&trader), balance_before);
 }

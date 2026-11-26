@@ -13,6 +13,8 @@ export interface SorobanSimulation {
   error?: string
   /** Resource fee the simulation asks for, in stroops. */
   minResourceFee?: bigint
+  /** Set when RPC reports that the footprint must be restored before invocation. */
+  restoreRequired?: boolean
 }
 
 export type SorobanSendStatus = 'PENDING' | 'DUPLICATE' | 'TRY_AGAIN_LATER' | 'ERROR'
@@ -33,7 +35,14 @@ export interface SorobanTransactionResponse<TReturn = unknown> {
 export interface SorobanRpc<TTransaction extends Transaction, TReturn = unknown> {
   simulateTransaction(tx: TTransaction): Promise<SorobanSimulation>
   /** Applies the simulation's footprint and resource fee to the transaction. */
-  assembleTransaction(tx: TTransaction, simulation: SorobanSimulation): TTransaction
+  assembleTransaction(
+    tx: TTransaction,
+    simulation: SorobanSimulation,
+  ): TTransaction | Promise<TTransaction>
+  /** Builds a restoreFootprint transaction for a restore simulation. */
+  createRestoreTransaction?(tx: TTransaction, simulation: SorobanSimulation): Promise<TTransaction>
+  /** Refreshes the source sequence after the restore transaction is confirmed. */
+  refreshTransaction?(tx: TTransaction): Promise<TTransaction>
   sendTransaction(tx: TTransaction): Promise<SorobanSendResponse>
   getTransaction(hash: string): Promise<SorobanTransactionResponse<TReturn>>
 }
@@ -119,14 +128,45 @@ export class SorobanSubmitter<TTransaction extends Transaction, TReturn = unknow
   }
 
   async sendTransaction(tx: TTransaction): Promise<SorobanSubmissionResult<TReturn>> {
-    const simulation = await this.rpc.simulateTransaction(tx)
+    let simulation = await this.rpc.simulateTransaction(tx)
     if (simulation.error !== undefined) {
       throw new SorobanSubmissionError(
         'SIMULATION_FAILED',
         `simulation failed: ${simulation.error}`,
       )
     }
-    const signed = await this.signer.sign(this.rpc.assembleTransaction(tx, simulation))
+
+    if (simulation.restoreRequired) {
+      if (!this.rpc.createRestoreTransaction || !this.rpc.refreshTransaction) {
+        throw new SorobanSubmissionError(
+          'SIMULATION_FAILED',
+          'simulation requires footprint restoration, but the RPC adapter does not support it',
+        )
+      }
+
+      const restore = await this.rpc.createRestoreTransaction(tx, simulation)
+      const signedRestore = await this.signer.sign(restore)
+      const restoreHash = await this.submit(signedRestore)
+      await this.poll(restoreHash)
+
+      tx = await this.rpc.refreshTransaction(tx)
+      simulation = await this.rpc.simulateTransaction(tx)
+      if (simulation.error !== undefined) {
+        throw new SorobanSubmissionError(
+          'SIMULATION_FAILED',
+          `simulation failed after footprint restoration: ${simulation.error}`,
+        )
+      }
+      if (simulation.restoreRequired) {
+        throw new SorobanSubmissionError(
+          'SIMULATION_FAILED',
+          'simulation still requires footprint restoration after the restore transaction',
+        )
+      }
+    }
+
+    const assembled = await this.rpc.assembleTransaction(tx, simulation)
+    const signed = await this.signer.sign(assembled)
     const hash = await this.submit(signed)
     return this.poll(hash)
   }

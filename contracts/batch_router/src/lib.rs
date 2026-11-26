@@ -80,6 +80,10 @@ pub enum BatchRouterError {
     /// The AMM pool has been permanently drained via emergency withdrawal.
     /// Surfaced by simulation so pre-flight does not quote untradeable pools.
     PoolDrained = 16,
+    /// The address passed to `initialize` as `factory` does not implement the
+    /// factory interface. Rejected at deploy time so a mistyped address cannot
+    /// turn every later batch into an untyped host trap.
+    InvalidFactory = 17,
 }
 
 #[contracttype]
@@ -215,10 +219,26 @@ impl BatchRouter {
     /// admin is a contract that cannot sign for itself. Deployers must read
     /// back `get_admin` and `get_factory` right after deployment (the deploy
     /// script does) and redeploy if either differs from the intended value.
+    ///
+    /// # Factory validation
+    ///
+    /// The candidate `factory` is probed with `try_get_pool_count` before
+    /// anything is written, mirroring `router::initialize`. Every op resolves
+    /// its pool through `FactoryClient::get_pool_tokens`, a hard cross-contract
+    /// call, so a wrong address would make `execute_batch`, `simulate_batch`
+    /// and `validate_batch` trap with an untyped host error for every batch.
+    /// Instead the probe returns [`BatchRouterError::InvalidFactory`] and
+    /// leaves storage empty, so the router stays initializable.
     pub fn initialize(env: Env, admin: Address, factory: Address) -> Result<(), BatchRouterError> {
         Self::extend_ttl(&env);
         if env.storage().instance().has(&DataKey::Factory) {
             return Err(BatchRouterError::AlreadyInitialized);
+        }
+        if !matches!(
+            FactoryClient::new(&env, &factory).try_get_pool_count(),
+            Ok(Ok(_))
+        ) {
+            return Err(BatchRouterError::InvalidFactory);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Factory, &factory);
@@ -676,11 +696,11 @@ impl BatchRouter {
     ) -> Result<BatchOpResult, BatchRouterError> {
         let mut state = Self::load_pool(env, pools, &o.pool);
         let amm = AmmPoolClient::new(env, &o.pool);
-        if amm.is_paused() {
-            return Err(BatchRouterError::PoolPaused);
-        }
         if amm.is_drained() {
             return Err(BatchRouterError::PoolDrained);
+        }
+        if amm.is_paused() {
+            return Err(BatchRouterError::PoolPaused);
         }
         let (reserve_in, reserve_out, in_is_a) = if o.token_in == state.token_a {
             (state.reserve_a, state.reserve_b, true)
@@ -760,11 +780,11 @@ impl BatchRouter {
     ) -> Result<BatchOpResult, BatchRouterError> {
         let mut state = Self::load_pool(env, pools, &o.pool);
         let amm = AmmPoolClient::new(env, &o.pool);
-        if amm.is_paused() {
-            return Err(BatchRouterError::PoolPaused);
-        }
         if amm.is_drained() {
             return Err(BatchRouterError::PoolDrained);
+        }
+        if amm.is_paused() {
+            return Err(BatchRouterError::PoolPaused);
         }
         // Mirrors amm::add_liquidity share math (contracts/amm/src/lib.rs:1610-1618).
         let shares = if state.total_shares == 0 {
@@ -807,11 +827,11 @@ impl BatchRouter {
     ) -> Result<BatchOpResult, BatchRouterError> {
         let mut state = Self::load_pool(env, pools, &o.pool);
         let amm = AmmPoolClient::new(env, &o.pool);
-        if amm.is_paused() {
-            return Err(BatchRouterError::PoolPaused);
-        }
         if amm.is_drained() {
             return Err(BatchRouterError::PoolDrained);
+        }
+        if amm.is_paused() {
+            return Err(BatchRouterError::PoolPaused);
         }
         if state.total_shares == 0 {
             return Err(BatchRouterError::InvalidAmount);
@@ -2253,13 +2273,93 @@ mod tests {
         // Deliberate (see the doc on `initialize`): an auth check cannot stop a
         // front-run, so the deploy script verifies `get_admin` / `get_factory`.
         let env = Env::default();
+        // The factory's own `initialize` needs the deployer's auth; clear the
+        // mock afterwards so the router call below is genuinely unsigned.
+        env.mock_all_auths();
+        let factory = setup_env_and_factory(&env);
+        env.mock_auths(&[]);
         let addr = env.register_contract(None, BatchRouter);
         let client = BatchRouterClient::new(&env, &addr);
         let admin = Address::generate(&env);
-        let factory = Address::generate(&env);
         client.initialize(&admin, &factory);
         assert_eq!(client.get_admin(), admin);
         assert_eq!(client.get_factory(), factory);
+    }
+
+    #[test]
+    fn test_initialize_rejects_non_factory_without_writing_state() {
+        let env = Env::default();
+        // Needed for the real-factory setup at the end of this test.
+        env.mock_all_auths();
+        let addr = env.register_contract(None, BatchRouter);
+        let client = BatchRouterClient::new(&env, &addr);
+        let admin = Address::generate(&env);
+        let not_a_factory = Address::generate(&env);
+
+        assert_eq!(
+            client.try_initialize(&admin, &not_a_factory),
+            Err(Ok(BatchRouterError::InvalidFactory))
+        );
+        assert_eq!(
+            client.try_get_factory(),
+            Err(Ok(BatchRouterError::NotInitialized))
+        );
+        assert_eq!(
+            client.try_get_admin(),
+            Err(Ok(BatchRouterError::NotInitialized))
+        );
+
+        // A rejected probe does not burn the one-shot initialize: the same
+        // router still initializes against a real factory afterwards.
+        let factory = setup_env_and_factory(&env);
+        client.initialize(&admin, &factory);
+        assert_eq!(client.get_admin(), admin);
+        assert_eq!(client.get_factory(), factory);
+    }
+
+    #[soroban_sdk::contract]
+    struct WrongFactoryReturn;
+
+    #[soroban_sdk::contractimpl]
+    impl WrongFactoryReturn {
+        pub fn get_pool_count(env: Env) -> Address {
+            env.current_contract_address()
+        }
+    }
+
+    #[test]
+    fn test_initialize_rejects_a_factory_probe_with_wrong_return_type() {
+        let env = Env::default();
+        let wrong = env.register_contract(None, WrongFactoryReturn);
+        let router = env.register_contract(None, BatchRouter);
+        let client = BatchRouterClient::new(&env, &router);
+        assert_eq!(
+            client.try_initialize(&Address::generate(&env), &wrong),
+            Err(Ok(BatchRouterError::InvalidFactory))
+        );
+        assert_eq!(
+            client.try_get_factory(),
+            Err(Ok(BatchRouterError::NotInitialized))
+        );
+    }
+
+    #[test]
+    fn test_initialize_accepts_real_factory_and_batch_still_executes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let factory_addr = setup_env_and_factory(&env);
+        let (ta, _tb, pool, _) = setup_pool(&env, &factory_addr);
+        let trader = Address::generate(&env);
+        fund(&env, &ta, &trader, 100_000);
+
+        let addr = env.register_contract(None, BatchRouter);
+        let client = BatchRouterClient::new(&env, &addr);
+        let admin = Address::generate(&env);
+        client.initialize(&admin, &factory_addr);
+        assert_eq!(client.get_factory(), factory_addr);
+
+        let ops = vec![&env, swap_op(&pool, &ta, 10_000, PoolType::Amm, false)];
+        assert_eq!(client.execute_batch(&trader, &ops, &u64::MAX).len(), 1);
     }
 
     #[test]
@@ -2472,11 +2572,12 @@ mod tests {
     #[test]
     fn test_ttl_bump_initialize() {
         let env = Env::default();
+        env.mock_all_auths();
+        let factory = setup_env_and_factory(&env);
         let addr = env.register_contract(None, BatchRouter);
         let before = env.as_contract(&addr, || env.storage().instance().get_ttl());
         assert!(before < MIN_TTL);
-        BatchRouterClient::new(&env, &addr)
-            .initialize(&Address::generate(&env), &Address::generate(&env));
+        BatchRouterClient::new(&env, &addr).initialize(&Address::generate(&env), &factory);
         assert_eq!(
             env.as_contract(&addr, || env.storage().instance().get_ttl()),
             BUMP_TO

@@ -275,8 +275,14 @@ function loadInterfaces(wasmDir, stellar) {
 function main() {
     const wasmDir = resolve(process.argv[2] ?? join(ROOT, 'target/wasm32v1-none/release'));
     let interfaces;
+    const exampleWasm = resolve(process.argv[3] ?? join(ROOT, 'target/doc-example/wasm32v1-none/release/flash_loan_receiver.wasm'));
+    const stellar = process.env.STELLAR_BIN ?? 'stellar';
     try {
-        interfaces = loadInterfaces(wasmDir, process.env.STELLAR_BIN ?? 'stellar');
+        interfaces = loadInterfaces(wasmDir, stellar);
+        // The receiver is an example, not a release artifact. Use its separately
+        // built WASM to check the real interface without changing the release set.
+        const output = execFileSync(stellar, ['-q', 'contract', 'info', 'interface', '--wasm', exampleWasm, '--output', 'json'], { encoding: 'utf8' });
+        interfaces.flash_loan_receiver = JSON.parse(output);
     } catch (error) {
         console.error(`ERROR: Could not load contract interfaces from ${wasmDir}: ${error.message}`);
         process.exitCode = 2;

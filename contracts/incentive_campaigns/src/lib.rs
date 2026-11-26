@@ -873,6 +873,12 @@ impl IncentiveCampaigns {
 
     /// Update the reward rate for an active campaign. Governance only.
     ///
+    /// An inactive campaign — one wound down by `recover_leftover_funds` — is
+    /// rejected with `CampaignInactive` before any state is touched. It can
+    /// never pay out again (`claim_rewards` and `stake` reject it too), so
+    /// re-pricing it would rewrite `reward_rate` and append to the
+    /// `CampaignAccruedRewards` audit trail for a frozen campaign (#1330).
+    ///
     /// The accumulator is flushed to the current timestamp *before* the rate
     /// changes, so rewards already accrued at the old rate are locked in and
     /// only future seconds use the new rate.  This prevents retroactive reward
@@ -898,6 +904,15 @@ impl IncentiveCampaigns {
             .get(&campaign_key)
             .ok_or(IncentiveError::CampaignNotFound)?;
         extend_persistent_ttl(&env, &campaign_key);
+
+        // Recovery is the only path that deactivates a campaign, and an
+        // inactive one can never pay out again (`claim_rewards` and `stake`
+        // both reject it). Re-pricing it would rewrite `reward_rate` and
+        // append to the `CampaignAccruedRewards` audit trail of a wound-down
+        // campaign, breaking the rule that inactive campaigns are frozen.
+        if !campaign.active {
+            return Err(IncentiveError::CampaignInactive);
+        }
 
         // Flush the payout accumulator to now *before* the rate changes, so
         // seconds already elapsed stay priced at the old rate and only future
@@ -2312,6 +2327,48 @@ mod tests {
             "second claim (rate=200) should be ~2× first claim (rate=100): \
              claim1={claim1}, claim2={claim2}"
         );
+    }
+
+    /// A rate change on a still-active campaign keeps working (#1330).
+    #[test]
+    fn test_set_campaign_rate_still_works_while_active() {
+        let (env, incentives, pool, lp, reward, _provider, gov) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+        let id = std_campaign(&client, &gov, &pool, &lp, &reward);
+
+        set_time(&env, 5_000);
+        client.set_campaign_rate(&gov, &id, &250);
+
+        let campaign = client.get_campaign(&id);
+        assert!(campaign.active);
+        assert_eq!(campaign.reward_rate, 250);
+    }
+
+    /// Once `recover_leftover_funds` has wound a campaign down, governance can
+    /// no longer re-price it: the call is rejected and neither the stored rate
+    /// nor the accrual audit trail changes (#1330).
+    #[test]
+    fn test_set_campaign_rate_rejects_inactive_campaign_and_leaves_audit_trail() {
+        let (env, incentives, pool, lp, reward, _provider, gov) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+        let id = std_campaign(&client, &gov, &pool, &lp, &reward);
+        let treasury = Address::generate(&env);
+
+        set_time(&env, 700_000);
+        client.recover_leftover_funds(&gov, &id, &treasury);
+        assert!(!client.get_campaign(&id).active);
+
+        let rate_before = client.get_campaign(&id).reward_rate;
+        let accrual_before = client.get_campaign_accrual(&id);
+
+        // Time moves on, but a rejected call must not checkpoint anything.
+        set_time(&env, 800_000);
+        assert_eq!(
+            client.try_set_campaign_rate(&gov, &id, &250),
+            Err(Ok(IncentiveError::CampaignInactive))
+        );
+        assert_eq!(client.get_campaign(&id).reward_rate, rate_before);
+        assert_eq!(client.get_campaign_accrual(&id), accrual_before);
     }
 
     // -------------------------------------------------------------------------

@@ -279,7 +279,19 @@ export class WebhookDispatcher {
     const entry = this.deadLetters.get(deadLetterId);
     if (!entry) return undefined;
 
-    const result = await this._deliver(entry.subscription, entry.event);
+    const subscription = this.registry.get(entry.subscription.id);
+    if (!subscription) {
+      return {
+        subscriptionId: entry.subscription.id,
+        url: entry.subscription.url,
+        success: false,
+        failureKind: "subscription_gone",
+        error: "subscription no longer exists",
+        attemptedAt: Date.now(),
+      };
+    }
+
+    const result = await this._deliver(subscription, entry.event, false);
     if (result.success) {
       this.deadLetters.remove(deadLetterId);
     }
@@ -316,11 +328,12 @@ export class WebhookDispatcher {
   private async _deliver(
     sub: WebhookSubscription,
     event: PoolEvent,
+    retainCircuitOpenSkip = true,
   ): Promise<DeliveryResult> {
     // Short-circuit a known-dead endpoint before spending a socket on it.
     if (!this.circuitBreaker.canAttempt(sub.id)) {
       this.counters.shortCircuited += 1;
-      return {
+      const result: DeliveryResult = {
         subscriptionId: sub.id,
         url: sub.url,
         success: false,
@@ -329,6 +342,19 @@ export class WebhookDispatcher {
         attemptedAt: Date.now(),
         attempts: [],
       };
+      if (retainCircuitOpenSkip) {
+        this.counters.failed += 1;
+        const entry = this.deadLetters.add(event, sub, [], "circuit open");
+        this.counters.deadLettered += 1;
+        result.deadLettered = true;
+        result.deadLetterId = entry.id;
+        console.warn(
+          `[dead-letter] event=${event.id} type=${event.eventType} ` +
+            `contract=${event.contractId} subscription=${sub.id} url=${sub.url} ` +
+            `reason="circuit open" deadLetterId=${entry.id} circuit=open`,
+        );
+      }
+      return result;
     }
 
     const body = JSON.stringify(event);

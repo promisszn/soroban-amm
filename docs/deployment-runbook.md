@@ -30,7 +30,7 @@
 |------|-----------------|-------|---------|
 | Rust | stable ≥ 1.75 | `rustc --version` | `rustup update` |
 | WASM target | `wasm32v1-none` | `rustup target list --installed \| grep wasm32v1-none` | `rustup target add wasm32v1-none` |
-| Stellar CLI | **25.1.0** (pinned) | `stellar --version` | `cargo install --locked stellar-cli@25.1.0 --features opt` |
+| Stellar CLI | [`.stellar-version`](../.stellar-version) | `stellar --version` | `cargo install --locked stellar-cli --version "$(cat .stellar-version)"` |
 | Docker (optional) | any recent | `docker --version` | For reproducible builds: `docker compose run --rm build` |
 
 > The WASM target **must** be `wasm32v1-none`. The legacy `wasm32-unknown-unknown`

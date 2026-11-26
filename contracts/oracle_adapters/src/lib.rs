@@ -49,6 +49,9 @@ pub enum AdapterError {
     InvalidPrice = 7,
     ArithmeticOverflow = 8,
     CrossContractCallFailed = 9,
+    Paused = 10,
+    NoPendingAdmin = 11,
+    WrongPendingAdmin = 12,
 }
 
 #[contracttype]

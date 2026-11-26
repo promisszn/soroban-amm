@@ -7,7 +7,7 @@ lifecycle against a narrow RPC interface.
 ## Install
 
 ```sh
-npm install @soroban-amm/ts-advanced-client
+npm install @soroban-amm/ts-advanced-client @stellar/stellar-sdk
 ```
 
 ## Quickstart
@@ -92,21 +92,54 @@ slippage checks do not lose precision.
 ## Soroban submitter
 
 `SorobanSubmitter` implements `TransactionSubmitter` on top of a narrow
-`SorobanRpc` interface (the `@soroban-amm/sdk` write path implements it). It
+`SorobanRpc` interface. `SorobanRpcAdapter` adapts `@stellar/stellar-sdk`'s
+`rpc.Server`; the SDK package's write path is separate. The submitter
 simulates, assembles with the simulated resource fee, signs, sends, resubmits
-on `TRY_AGAIN_LATER`, and polls until `SUCCESS`/`FAILED` or a timeout. Every
-failure is a `SorobanSubmissionError` whose `code` is one of
+on `TRY_AGAIN_LATER`, and polls until `SUCCESS`/`FAILED` or a timeout. If
+simulation reports an expired footprint, the adapter builds and submits a
+`restoreFootprint` transaction, then refreshes and simulates the invocation
+again. Every failure is a `SorobanSubmissionError` whose `code` is one of
 `SIMULATION_FAILED`, `SEND_REJECTED`, `RESUBMIT_EXHAUSTED`,
 `TRANSACTION_FAILED` or `POLL_TIMEOUT`.
 
 ```ts
-import { SorobanSubmitter } from '@soroban-amm/ts-advanced-client'
+import {
+  BASE_FEE,
+  Contract,
+  Keypair,
+  Networks,
+  TransactionBuilder,
+  rpc,
+} from '@stellar/stellar-sdk'
+import {
+  SorobanRpcAdapter,
+  SorobanSubmitter,
+} from '@soroban-amm/ts-advanced-client'
+
+const server = new rpc.Server('https://soroban-testnet.stellar.org')
+const keypair = Keypair.fromSecret(process.env.STELLAR_SECRET_KEY!)
+const source = await server.getAccount(keypair.publicKey())
+const contract = new Contract(process.env.CONTRACT_ID!)
+const transaction = new TransactionBuilder(source, {
+  fee: BASE_FEE,
+  networkPassphrase: Networks.TESTNET,
+})
+  .addOperation(contract.call('your_method')) // Add the method's required arguments.
+  .setTimeout(30)
+  .build()
 
 const submitter = new SorobanSubmitter({
-  rpc,
-  signer,
+  rpc: new SorobanRpcAdapter({ server }),
+  signer: {
+    async sign(tx) {
+      tx.sign(keypair)
+      return tx
+    },
+  },
   timeoutMs: 30_000,
   pollIntervalMs: 1_000,
   maxResubmits: 3,
 })
+
+const result = await submitter.sendTransaction(transaction)
 ```

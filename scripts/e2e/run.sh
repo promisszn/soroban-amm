@@ -39,9 +39,11 @@ Usage:
   bash scripts/e2e/run.sh [options]
 
 Options:
-  --only LIST    Run only these flows (comma-separated). Available: ${ALL_FLOWS[*]}
+  --only LIST    Run only these flows (comma-separated).
   --skip LIST    Skip these flows (comma-separated).
   --help, -h     Show this help.
+
+Available flows: ${ALL_FLOWS[*]}
 HELP
 }
 
@@ -53,6 +55,47 @@ while [[ $# -gt 0 ]]; do
     *) echo "unknown argument: $1" >&2; print_help; exit 2 ;;
   esac
 done
+
+# Validate every token in --only / --skip against the registered flow names.
+# An unknown token is almost certainly a typo; silently ignoring it turns the
+# suite into a no-op that exits zero, which is worse than the error.
+_validate_flow_tokens() {
+  local raw="$1" flag="$2"
+  local token
+  IFS=',' read -ra tokens <<< "$raw"
+  for token in "${tokens[@]}"; do
+    local known=0 f
+    for f in "${ALL_FLOWS[@]}"; do
+      if [[ "$f" == "$token" ]]; then known=1; break; fi
+    done
+    if [[ "$known" -eq 0 ]]; then
+      printf 'error: unknown flow %q in --%s\n' "$token" "$flag" >&2
+      printf 'available flows: %s\n' "${ALL_FLOWS[*]}" >&2
+      exit 2
+    fi
+  done
+}
+
+[[ -n "$ONLY_RAW" ]] && _validate_flow_tokens "$ONLY_RAW" "only"
+[[ -n "$SKIP_RAW" ]] && _validate_flow_tokens "$SKIP_RAW" "skip"
+
+# Fail early when the selection resolves to zero runnable flows, so the caller
+# sees a clear error rather than "E2E PASS" with nothing executed.
+_count_runnable() {
+  local n=0 flow
+  for flow in "${ALL_FLOWS[@]}"; do
+    if [[ -n "$ONLY_RAW" ]] && [[ ",${ONLY_RAW}," != *",${flow},"* ]]; then continue; fi
+    if [[ -n "$SKIP_RAW" ]] && [[ ",${SKIP_RAW}," == *",${flow},"* ]]; then continue; fi
+    n=$(( n + 1 ))
+  done
+  printf '%d' "$n"
+}
+
+if [[ $(_count_runnable) -eq 0 ]]; then
+  printf 'error: the --only/--skip combination selects zero flows\n' >&2
+  printf 'available flows: %s\n' "${ALL_FLOWS[*]}" >&2
+  exit 2
+fi
 
 should_run_flow() {
   local flow="$1"

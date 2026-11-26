@@ -312,7 +312,11 @@ impl TwalConsumer {
     pub fn save_snapshot(env: Env, pool: Address) -> Result<(), TwalError> {
         Self::extend_ttl(&env);
         Self::require_keeper(&env)?;
-        let (cum, pool_ts) = AmmPoolLiquidityClient::new(&env, &pool).get_liquidity_cumulative();
+        let (cum, pool_ts) =
+            match AmmPoolLiquidityClient::new(&env, &pool).try_get_liquidity_cumulative() {
+                Ok(Ok(v)) => v,
+                _ => return Err(TwalError::CrossContractCallFailed),
+            };
         Self::register_tracked_pool(&env, &pool, PoolType::Amm)?;
         Self::record_snapshot(&env, &pool, cum, pool_ts);
         Ok(())
@@ -797,7 +801,10 @@ impl TwalConsumer {
     pub fn save_cl_snapshot(env: Env, pool: Address) -> Result<(), TwalError> {
         Self::extend_ttl(&env);
         Self::require_keeper(&env)?;
-        let active = ClPoolLiquidityClient::new(&env, &pool).active_liquidity();
+        let active = match ClPoolLiquidityClient::new(&env, &pool).try_active_liquidity() {
+            Ok(Ok(v)) => v,
+            _ => return Err(TwalError::CrossContractCallFailed),
+        };
         let ledger_ts = env.ledger().timestamp();
 
         let acc_key = DataKey::ClAccumulator(pool.clone());
@@ -2583,6 +2590,33 @@ mod tests {
     }
 
     use backwards_amm_pool::{BackwardsAmmPool, BackwardsAmmPoolClient};
+
+    #[test]
+    fn save_snapshot_on_non_contract_returns_cross_contract_call_failed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_keeper, consumer) = setup_consumer(&env);
+        let not_a_contract = Address::generate(&env);
+
+        let result = consumer.try_save_snapshot(&not_a_contract);
+        assert_eq!(result, Err(Ok(TwalError::CrossContractCallFailed)));
+        assert!(!consumer.is_tracked(&not_a_contract));
+        assert_eq!(consumer.get_snapshot_count(&not_a_contract), 0);
+    }
+
+    #[test]
+    fn save_cl_snapshot_on_non_contract_returns_cross_contract_call_failed() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_keeper, consumer) = setup_consumer(&env);
+        let not_a_contract = Address::generate(&env);
+
+        let result = consumer.try_save_cl_snapshot(&not_a_contract);
+        assert_eq!(result, Err(Ok(TwalError::CrossContractCallFailed)));
+        assert!(!consumer.is_tracked(&not_a_contract));
+        assert_eq!(consumer.get_snapshot_count(&not_a_contract), 0);
+        assert_eq!(consumer.max_servable_window(&not_a_contract), 0);
+    }
 
     #[test]
     fn backwards_amm_cumulative_returns_arithmetic_overflow() {

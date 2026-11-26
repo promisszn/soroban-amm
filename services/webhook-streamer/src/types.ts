@@ -87,7 +87,7 @@ export function toPublic(sub: WebhookSubscription): PublicWebhookSubscription {
  * `timeout` is deliberately distinct from `network` so operators can tell a
  * slow subscriber from a broken one (issue #720).
  */
-export type FailureKind = "timeout" | "network" | "http" | "circuit_open";
+export type FailureKind = "timeout" | "network" | "http" | "circuit_open" | "subscription_gone";
 
 /** Outcome of one individual HTTP attempt within a delivery. */
 export interface AttemptOutcome {

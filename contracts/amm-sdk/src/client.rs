@@ -5,10 +5,11 @@
 //! binding (e.g. stellar-sdk-rs) can use the same types for argument / return
 //! value construction.
 
-use soroban_sdk::{contractclient, Address, Bytes, BytesN, Env};
+use soroban_sdk::{contractclient, Address, Bytes, BytesN, Env, Vec};
 
 use crate::types::{
-    LiquidityQuote, PoolInfo, SdkAmmError, SwapInQuote, SwapOutQuote, SwapSimulation,
+    CircuitBreakerConfig, EmergencyAnnouncement, LiquidityQuote, MultisigConfig, MultisigProposal,
+    PoolInfo, SdkAmmError, SwapInQuote, SwapOutQuote, SwapSimulation,
 };
 
 // ── Re-export the auto-generated contract client ──────────────────────────────
@@ -31,10 +32,47 @@ pub trait AmmPoolInterface {
         protocol_fee_bps: i128,
     ) -> Result<(), SdkAmmError>;
 
+    #[allow(clippy::too_many_arguments)]
+    fn initialize_with_emergency_delay(
+        env: Env,
+        admin: Address,
+        token_a: Address,
+        token_b: Address,
+        lp_token: Address,
+        fee_bps: i128,
+        fee_recipient: Address,
+        protocol_fee_bps: i128,
+        emergency_delay_secs: u64,
+    ) -> Result<(), SdkAmmError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn initialize_with_flash_loan_fee(
+        env: Env,
+        admin: Address,
+        token_a: Address,
+        token_b: Address,
+        lp_token: Address,
+        fee_bps: i128,
+        fee_recipient: Address,
+        protocol_fee_bps: i128,
+        flash_loan_fee_bps: i128,
+    ) -> Result<(), SdkAmmError>;
+
     fn pause(env: Env) -> Result<(), SdkAmmError>;
     fn unpause(env: Env) -> Result<(), SdkAmmError>;
     fn is_paused(env: Env) -> bool;
+    fn is_drained(env: Env) -> bool;
+    fn exits_allowed_when_paused(env: Env) -> bool;
     fn flash_loan_locked(env: Env) -> bool;
+    fn is_locked(env: Env) -> bool;
+
+    fn set_oracle(env: Env, admin: Address, oracle: Option<Address>) -> Result<(), SdkAmmError>;
+    fn set_max_oracle_deviation_bps(
+        env: Env,
+        admin: Address,
+        max_deviation_bps: i128,
+    ) -> Result<(), SdkAmmError>;
+    fn set_lp_locker(env: Env, locker: Address) -> Result<(), SdkAmmError>;
 
     fn add_liquidity(
         env: Env,
@@ -54,6 +92,27 @@ pub trait AmmPoolInterface {
         deadline: u64,
     ) -> Result<(i128, i128), SdkAmmError>;
 
+    fn remove_liquidity_one_sided(
+        env: Env,
+        provider: Address,
+        shares: i128,
+        token_out: Address,
+        min_out: i128,
+        deadline: u64,
+    ) -> Result<i128, SdkAmmError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_liquidity_fot(
+        env: Env,
+        provider: Address,
+        amount_a: i128,
+        amount_b: i128,
+        min_received_a: i128,
+        min_received_b: i128,
+        min_shares: i128,
+        deadline: u64,
+    ) -> Result<i128, SdkAmmError>;
+
     fn swap(
         env: Env,
         trader: Address,
@@ -71,6 +130,18 @@ pub trait AmmPoolInterface {
         max_in: i128,
         deadline: u64,
     ) -> Result<i128, SdkAmmError>;
+
+    #[allow(clippy::too_many_arguments)]
+    fn swap_fot(
+        env: Env,
+        trader: Address,
+        token_in: Address,
+        amount_in: i128,
+        min_out: i128,
+        min_received: i128,
+        deadline: u64,
+        referrer: Option<Address>,
+    ) -> Result<(i128, i128), SdkAmmError>;
 
     fn flash_loan(
         env: Env,
@@ -94,10 +165,12 @@ pub trait AmmPoolInterface {
     fn get_info(env: Env) -> PoolInfo;
 
     fn get_accrued_fees(env: Env) -> (i128, i128);
+    fn get_fee_info(env: Env) -> Result<i128, SdkAmmError>;
 
     fn shares_of(env: Env, provider: Address) -> i128;
 
     fn get_price_cumulative(env: Env) -> (i128, i128, u64);
+    fn get_liquidity_cumulative(env: Env) -> (i128, u64);
 
     fn withdraw_protocol_fees(env: Env) -> Result<(i128, i128), SdkAmmError>;
 
@@ -123,6 +196,66 @@ pub trait AmmPoolInterface {
     fn accept_admin(env: Env, new_admin: Address) -> Result<(), SdkAmmError>;
 
     fn get_pending_admin(env: Env) -> Option<Address>;
+
+    fn announce_emergency_withdraw(
+        env: Env,
+        admin: Address,
+        to: Address,
+    ) -> Result<(), SdkAmmError>;
+    fn cancel_emergency_withdraw(env: Env, admin: Address) -> Result<(), SdkAmmError>;
+    fn get_emergency_announcement(env: Env) -> Option<EmergencyAnnouncement>;
+    fn get_emergency_delay(env: Env) -> u64;
+    fn emergency_withdraw(env: Env, admin: Address, to: Address) -> Result<(), SdkAmmError>;
+
+    fn force_unlock(env: Env, callers: Vec<Address>) -> Result<(), SdkAmmError>;
+
+    fn set_circuit_breaker_config(
+        env: Env,
+        threshold_bps: i128,
+        cooldown_secs: u64,
+    ) -> Result<(), SdkAmmError>;
+    fn get_circuit_breaker_config(env: Env) -> CircuitBreakerConfig;
+    fn try_circuit_breaker_recovery(env: Env) -> Result<bool, SdkAmmError>;
+    fn trip_circuit_breaker(env: Env) -> Result<bool, SdkAmmError>;
+
+    fn set_lp_rebate(env: Env, admin: Address, lp_rebate_bps: i128) -> Result<(), SdkAmmError>;
+    fn get_lp_rebate(env: Env) -> i128;
+
+    fn set_multisig(
+        env: Env,
+        admin: Address,
+        signers: Vec<Address>,
+        quorum: u32,
+    ) -> Result<(), SdkAmmError>;
+    fn get_multisig_config(env: Env) -> MultisigConfig;
+    fn get_multisig(env: Env) -> (Vec<Address>, u32);
+    fn propose_emergency_withdraw(
+        env: Env,
+        signer: Address,
+        recipient: Address,
+    ) -> Result<u64, SdkAmmError>;
+    fn propose_set_multisig(
+        env: Env,
+        signer: Address,
+        new_signers: Vec<Address>,
+        new_quorum: u32,
+    ) -> Result<u64, SdkAmmError>;
+    fn approve_multisig_proposal(
+        env: Env,
+        signer: Address,
+        proposal_id: u64,
+    ) -> Result<(), SdkAmmError>;
+    fn get_multisig_proposal(env: Env, proposal_id: u64) -> Option<MultisigProposal>;
+    fn exec_multisig_emergency_wd(
+        env: Env,
+        signer: Address,
+        proposal_id: u64,
+    ) -> Result<(), SdkAmmError>;
+    fn exec_multisig_set_multisig(
+        env: Env,
+        signer: Address,
+        proposal_id: u64,
+    ) -> Result<(), SdkAmmError>;
 
     fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), SdkAmmError>;
 }
@@ -191,6 +324,46 @@ impl<'a> AmmPoolSdk<'a> {
     /// Accrued protocol fees not yet withdrawn. Returns `(fee_a, fee_b)`.
     pub fn accrued_fees(&self) -> (i128, i128) {
         self.client.get_accrued_fees()
+    }
+
+    /// Return whether the pool is in the terminal drained state.
+    pub fn drained(&self) -> bool {
+        self.client.is_drained()
+    }
+
+    /// Return whether LP exits remain allowed while paused.
+    pub fn exits_allowed_when_paused(&self) -> bool {
+        self.client.exits_allowed_when_paused()
+    }
+
+    /// Return the reentrancy lock diagnostic.
+    pub fn is_locked(&self) -> bool {
+        self.client.is_locked()
+    }
+
+    /// Return the configured emergency-withdrawal delay.
+    pub fn emergency_delay(&self) -> u64 {
+        self.client.get_emergency_delay()
+    }
+
+    /// Return the pending emergency-withdrawal announcement.
+    pub fn emergency_announcement(&self) -> Option<EmergencyAnnouncement> {
+        self.client.get_emergency_announcement()
+    }
+
+    /// Return the circuit-breaker configuration and state.
+    pub fn circuit_breaker_config(&self) -> CircuitBreakerConfig {
+        self.client.get_circuit_breaker_config()
+    }
+
+    /// Return the LP rebate in basis points.
+    pub fn lp_rebate_bps(&self) -> i128 {
+        self.client.get_lp_rebate()
+    }
+
+    /// Return the configured multisig signers and quorum.
+    pub fn multisig(&self) -> (Vec<Address>, u32) {
+        self.client.get_multisig()
     }
 
     // ── Quote helpers ─────────────────────────────────────────────────────────
@@ -456,6 +629,67 @@ impl<'a> AmmPoolSdk<'a> {
             self.client
                 .try_remove_liquidity(provider, &shares, &min_a, &min_b, &deadline),
         )
+    }
+
+    /// Remove liquidity receiving only one pool token.
+    pub fn remove_liquidity_one_sided(
+        &self,
+        provider: &Address,
+        shares: i128,
+        token_out: &Address,
+        min_out: i128,
+        deadline: u64,
+    ) -> Result<i128, SdkAmmError> {
+        unwrap_contract_result(
+            self.client
+                .try_remove_liquidity_one_sided(provider, &shares, token_out, &min_out, &deadline),
+        )
+    }
+
+    /// Execute a fee-on-transfer swap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_swap_fot(
+        &self,
+        trader: &Address,
+        token_in: &Address,
+        amount_in: i128,
+        min_out: i128,
+        min_received: i128,
+        deadline: u64,
+        referrer: Option<Address>,
+    ) -> Result<(i128, i128), SdkAmmError> {
+        unwrap_contract_result(self.client.try_swap_fot(
+            trader,
+            token_in,
+            &amount_in,
+            &min_out,
+            &min_received,
+            &deadline,
+            &referrer,
+        ))
+    }
+
+    /// Add liquidity from fee-on-transfer tokens.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_liquidity_fot(
+        &self,
+        provider: &Address,
+        amount_a: i128,
+        amount_b: i128,
+        min_received_a: i128,
+        min_received_b: i128,
+        min_shares: i128,
+        deadline: u64,
+    ) -> Result<i128, SdkAmmError> {
+        unwrap_contract_result(self.client.try_add_liquidity_fot(
+            provider,
+            &amount_a,
+            &amount_b,
+            &min_received_a,
+            &min_received_b,
+            &min_shares,
+            &deadline,
+        ))
     }
 
     /// Issue a flash loan.
