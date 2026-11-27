@@ -785,6 +785,25 @@ impl ConcentratedLiquidity {
             .extend_ttl(key, POSITION_TTL_THRESHOLD, POSITION_BUMP_TO);
     }
 
+    fn bump_position_nft_keys(env: &Env, provider: &Address, lower_tick: i32, upper_tick: i32) {
+        let fwd_key = DataKey::PositionNftToken(provider.clone(), lower_tick, upper_tick);
+        if env.storage().persistent().has(&fwd_key) {
+            Self::bump_position(env, &fwd_key);
+            if let Some(token_id) = env.storage().persistent().get::<_, u64>(&fwd_key) {
+                let rev_key = DataKey::NftTokenToPosition(token_id);
+                if env.storage().persistent().has(&rev_key) {
+                    Self::bump_position(env, &rev_key);
+                } else {
+                    env.storage()
+                        .persistent()
+                        .set(&rev_key, &(provider.clone(), lower_tick, upper_tick));
+                    Self::bump_position(env, &rev_key);
+                    env.storage().instance().remove(&rev_key);
+                }
+            }
+        }
+    }
+
     fn check_oracle_deviation(
         env: &Env,
         token_in: &Address,
@@ -970,6 +989,7 @@ impl ConcentratedLiquidity {
         }
         env.storage().persistent().set(&pos_key, &pos);
         Self::bump_position(&env, &pos_key);
+        Self::bump_position_nft_keys(&env, &provider, lower_tick, upper_tick);
 
         let fg_a: i128 = env
             .storage()
@@ -1116,6 +1136,7 @@ impl ConcentratedLiquidity {
         }
         env.storage().persistent().set(&pos_key, &pos);
         Self::bump_position(&env, &pos_key);
+        Self::bump_position_nft_keys(&env, &provider, lower_tick, upper_tick);
 
         let fg_a: i128 = env
             .storage()
@@ -1315,6 +1336,7 @@ impl ConcentratedLiquidity {
         }
         env.storage().persistent().set(&pos_key, &pos);
         Self::bump_position(&env, &pos_key);
+        Self::bump_position_nft_keys(&env, &provider, lower_tick, upper_tick);
 
         // ── Update tick state ─────────────────────────────────────────────────
         let fg_a: i128 = env
@@ -1804,6 +1826,7 @@ impl ConcentratedLiquidity {
         );
         env.storage().persistent().set(&pos_key, &pos);
         Self::bump_position(env, &pos_key);
+        Self::bump_position_nft_keys(env, provider, lower_tick, upper_tick);
         // Remove from position list when position is fully closed
         if pos.liquidity == 0 {
             let list_key = DataKey::PositionList(provider.clone());
@@ -1911,6 +1934,7 @@ impl ConcentratedLiquidity {
         pos.tokens_owed = (total_a - pay_a, total_b - pay_b);
         env.storage().persistent().set(&pos_key, &pos);
         Self::bump_position(env, &pos_key);
+        Self::bump_position_nft_keys(env, provider, lower_tick, upper_tick);
         if pay_a > 0 {
             TokenClient::new(env, &token_a).transfer(&contract_addr, recipient, &pay_a);
         }
@@ -1983,6 +2007,10 @@ impl ConcentratedLiquidity {
             } else {
                 return Err(ClError::PositionNotFound);
             };
+        let fwd_key = DataKey::PositionNftToken(position.0.clone(), position.1, position.2);
+        env.storage().persistent().set(&fwd_key, &token_id);
+        Self::bump_position(env, &fwd_key);
+        env.storage().instance().remove(&fwd_key);
         let owner = PositionNftClient::new(env, &nft).owner_of(&token_id);
         if owner != *caller {
             return Err(ClError::NotNftOwner);
@@ -2009,6 +2037,16 @@ impl ConcentratedLiquidity {
         let Some(token_id) = token_id else {
             return Ok(());
         };
+        let rev_key = DataKey::NftTokenToPosition(token_id);
+        if env.storage().persistent().has(&rev_key) {
+            Self::bump_position(env, &rev_key);
+        } else {
+            env.storage()
+                .persistent()
+                .set(&rev_key, &(provider.clone(), lower_tick, upper_tick));
+            Self::bump_position(env, &rev_key);
+            env.storage().instance().remove(&rev_key);
+        }
         let Some(nft) = Self::nft_addr(env) else {
             return Ok(());
         };
@@ -9252,6 +9290,145 @@ mod test_single_token_deposit {
         // Re-attaching the same contract is allowed.
         client.set_position_nft(&admin, &Some(nft_v1.clone()));
         assert_eq!(client.position_nft(), Some(nft_v1));
+    }
+
+    #[test]
+    fn expired_forward_index_cannot_be_burned_by_original_provider() {
+        let env = Env::default();
+        let f = setup_with_nft(&env);
+        let buyer = Address::generate(&env);
+
+        f.nft.transfer(&f.alice, &f.alice, &buyer, &0_u64);
+        assert_eq!(f.nft.owner_of(&0_u64), buyer);
+
+        env.ledger()
+            .with_mut(|l| l.sequence_number += POSITION_BUMP_TO - 100);
+        f.client.collect_fees_by_token_id(&buyer, &0_u64);
+
+        env.ledger().with_mut(|l| l.sequence_number += 200);
+
+        let burn_err = f
+            .client
+            .try_burn_position(&f.alice, &f.lower, &f.upper, &f.liquidity)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(burn_err, ClError::NotNftOwner);
+
+        let collect_err = f
+            .client
+            .try_collect_fees(&f.alice, &f.lower, &f.upper)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(collect_err, ClError::NotNftOwner);
+
+        let (a_out, b_out) = f
+            .client
+            .burn_position_by_token_id(&buyer, &0_u64, &f.liquidity);
+        assert!(a_out > 0 || b_out > 0);
+        assert_eq!(TokenClient::new(&env, &f.token_a).balance(&buyer), a_out);
+        assert_eq!(TokenClient::new(&env, &f.token_b).balance(&buyer), b_out);
+
+        assert!(f.nft.try_owner_of(&0_u64).is_err());
+        assert_eq!(f.client.position_of_token(&0_u64), None);
+        assert_eq!(
+            f.client.position_token_id(&f.alice, &f.lower, &f.upper),
+            None
+        );
+    }
+
+    #[test]
+    fn token_id_call_restores_missing_forward_index() {
+        let env = Env::default();
+        let f = setup_with_nft(&env);
+        let buyer = Address::generate(&env);
+
+        f.nft.transfer(&f.alice, &f.alice, &buyer, &0_u64);
+
+        let fwd_key = DataKey::PositionNftToken(f.alice.clone(), f.lower, f.upper);
+        env.as_contract(&f.client.address, || {
+            env.storage().persistent().remove(&fwd_key);
+        });
+        assert_eq!(
+            f.client.position_token_id(&f.alice, &f.lower, &f.upper),
+            None
+        );
+
+        f.client.collect_fees_by_token_id(&buyer, &0_u64);
+        assert_eq!(
+            f.client.position_token_id(&f.alice, &f.lower, &f.upper),
+            Some(0_u64)
+        );
+
+        let err = f
+            .client
+            .try_burn_position(&f.alice, &f.lower, &f.upper, &f.liquidity)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, ClError::NotNftOwner);
+    }
+
+    #[test]
+    fn legacy_call_restores_missing_reverse_index() {
+        let env = Env::default();
+        let f = setup_with_nft(&env);
+
+        let rev_key = DataKey::NftTokenToPosition(0_u64);
+        env.as_contract(&f.client.address, || {
+            env.storage().persistent().remove(&rev_key);
+        });
+        assert_eq!(f.client.position_of_token(&0_u64), None);
+
+        let _ = f.client.collect_fees(&f.alice, &f.lower, &f.upper);
+        assert_eq!(
+            f.client.position_of_token(&0_u64),
+            Some((f.alice.clone(), f.lower, f.upper))
+        );
+    }
+
+    #[test]
+    fn untokenized_position_works_through_legacy_paths() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        StellarAssetClient::new(&env, &token_a).mint(&alice, &1_000_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&alice, &1_000_000_i128);
+
+        client.mint_position(
+            &alice,
+            &-100,
+            &100,
+            &100_000_i128,
+            &100_000_i128,
+            &0,
+            &0,
+            &u64::MAX,
+        );
+
+        let liq = client.get_position(&alice, &-100, &100).liquidity;
+        assert!(liq > 0);
+        assert_eq!(client.position_token_id(&alice, &-100, &100), None);
+
+        client.collect_fees(&alice, &-100, &100);
+        let (a_out, b_out) = client.burn_position(&alice, &-100, &100, &liq);
+        assert!(a_out > 0 || b_out > 0);
     }
 }
 
