@@ -213,6 +213,8 @@ pub enum ReserveManagerError {
     /// `accept_admin` called by an address other than the nominee.
     WrongAdmin = 7,
     Paused = 8,
+    /// A function that requires initialized governance or factory state was called before `initialize`.
+    NotInitialized = 9,
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -299,7 +301,11 @@ impl ReserveManager {
         if Self::is_paused(env.clone()) {
             return Err(ReserveManagerError::Paused);
         }
-        let stored: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
+        let stored: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Governance)
+            .ok_or(ReserveManagerError::NotInitialized)?;
         if current != stored {
             return Err(ReserveManagerError::Unauthorized);
         }
@@ -365,7 +371,11 @@ impl ReserveManager {
 
     pub fn pause(env: Env) -> Result<(), ReserveManagerError> {
         Self::extend_instance_ttl(&env);
-        let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
+        let gov: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Governance)
+            .ok_or(ReserveManagerError::NotInitialized)?;
         gov.require_auth();
         env.storage().instance().set(&DataKey::Paused, &true);
         emit_versioned_event!(env, (symbol_short!("pause"),), ());
@@ -374,7 +384,11 @@ impl ReserveManager {
 
     pub fn unpause(env: Env) -> Result<(), ReserveManagerError> {
         Self::extend_instance_ttl(&env);
-        let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
+        let gov: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Governance)
+            .ok_or(ReserveManagerError::NotInitialized)?;
         gov.require_auth();
         env.storage().instance().set(&DataKey::Paused, &false);
         emit_versioned_event!(env, (symbol_short!("unpause"),), ());
@@ -384,7 +398,11 @@ impl ReserveManager {
     /// Replace the contract WASM. Governance-only; stored state is preserved.
     pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), ReserveManagerError> {
         Self::extend_instance_ttl(&env);
-        let governance: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
+        let governance: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Governance)
+            .ok_or(ReserveManagerError::NotInitialized)?;
         governance.require_auth();
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
@@ -484,7 +502,11 @@ impl ReserveManager {
         if Self::is_paused(env.clone()) {
             return Err(ReserveManagerError::Paused);
         }
-        let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
+        let gov: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Governance)
+            .ok_or(ReserveManagerError::NotInitialized)?;
         gov.require_auth();
         if min_reserve_a < 0 || min_reserve_b < 0 {
             return Err(ReserveManagerError::NegativeReserveAmount);
@@ -635,7 +657,11 @@ impl ReserveManager {
         if Self::is_paused(env.clone()) {
             return Err(ReserveManagerError::Paused);
         }
-        let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
+        let gov: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Governance)
+            .ok_or(ReserveManagerError::NotInitialized)?;
         gov.require_auth();
         let key = DataKey::PoolKind(pool.clone());
         env.storage().persistent().set(&key, &kind);
@@ -718,16 +744,22 @@ impl ReserveManager {
         Ok(reports)
     }
 
-    /// Return the governance address.
-    pub fn get_governance(env: Env) -> Address {
+    /// Return the governance address, or `NotInitialized` before `initialize`.
+    pub fn get_governance(env: Env) -> Result<Address, ReserveManagerError> {
         Self::extend_instance_ttl(&env);
-        env.storage().instance().get(&DataKey::Governance).unwrap()
+        env.storage()
+            .instance()
+            .get(&DataKey::Governance)
+            .ok_or(ReserveManagerError::NotInitialized)
     }
 
-    /// Return the factory address.
-    pub fn get_factory(env: Env) -> Address {
+    /// Return the factory address, or `NotInitialized` before `initialize`.
+    pub fn get_factory(env: Env) -> Result<Address, ReserveManagerError> {
         Self::extend_instance_ttl(&env);
-        env.storage().instance().get(&DataKey::Factory).unwrap()
+        env.storage()
+            .instance()
+            .get(&DataKey::Factory)
+            .ok_or(ReserveManagerError::NotInitialized)
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────
@@ -1219,6 +1251,53 @@ mod tests {
             &s.governance,
             "set_pool_kind",
             (s.pool.clone(), PoolKind::Amm),
+        );
+    }
+
+    #[test]
+    fn test_pre_init_calls_return_not_initialized() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let rm_addr = env.register_contract(None, ReserveManager);
+        let rm = ReserveManagerClient::new(&env, &rm_addr);
+        let governance = Address::generate(&env);
+        let nominee = Address::generate(&env);
+        let token_a = Address::generate(&env);
+        let token_b = Address::generate(&env);
+        let pool = Address::generate(&env);
+
+        assert_eq!(
+            rm.try_get_governance(),
+            Err(Ok(ReserveManagerError::NotInitialized))
+        );
+        assert_eq!(
+            rm.try_get_factory(),
+            Err(Ok(ReserveManagerError::NotInitialized))
+        );
+        assert_eq!(rm.try_pause(), Err(Ok(ReserveManagerError::NotInitialized)));
+        assert_eq!(
+            rm.try_unpause(),
+            Err(Ok(ReserveManagerError::NotInitialized))
+        );
+        assert_eq!(
+            rm.try_set_min_reserve(&token_a, &token_b, &1_i128, &1_i128),
+            Err(Ok(ReserveManagerError::NotInitialized))
+        );
+        assert_eq!(
+            rm.try_set_pool_kind(&pool, &PoolKind::Amm),
+            Err(Ok(ReserveManagerError::NotInitialized))
+        );
+        assert_eq!(
+            rm.try_propose_governance(&governance, &nominee),
+            Err(Ok(ReserveManagerError::NotInitialized))
+        );
+        assert_eq!(
+            rm.try_propose_admin(&governance, &nominee),
+            Err(Ok(ReserveManagerError::NotInitialized))
+        );
+        assert_eq!(
+            rm.try_upgrade(&BytesN::from_array(&env, &[0; 32])),
+            Err(Ok(ReserveManagerError::NotInitialized))
         );
     }
 
