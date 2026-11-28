@@ -36,11 +36,11 @@ export function riskLevelForScore(score: number): RiskLevel {
 
 export interface RiskParams {
   /** Deviation from TWAP in basis points (non-negative). */
-  priceDeviationBps: number;
+  priceDeviationBps: number | undefined;
   /** Range width around the current price, in percent (non-negative). */
-  rangePct: number;
+  rangePct: number | undefined;
   /** Pool TVL in USD (non-negative). */
-  tvl: number;
+  tvl: number | undefined;
   /** Whether the current price sits inside the selected range. */
   isInRange: boolean;
 }
