@@ -203,3 +203,12 @@ describe("PositionManager", () => {
     expect(screen.queryByText("Low Risk")).not.toBeInTheDocument();
   });
 });
+
+  it("shows unknown risk when optional risk metrics are not supplied", async () => {
+    const user = userEvent.setup();
+    render(<PositionManager {...baseProps} />);
+    await user.click(screen.getByRole("tab", { name: /Risk/ }));
+    expect(screen.getByText("Risk Unknown")).toBeInTheDocument();
+    expect(screen.queryByText("Low Risk")).not.toBeInTheDocument();
+    expect(screen.queryByText("Low TVL")).not.toBeInTheDocument();
+  });

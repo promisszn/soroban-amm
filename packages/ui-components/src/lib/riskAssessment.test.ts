@@ -176,3 +176,20 @@ describe("assessPositionRisk — missing or invalid data", () => {
     expect(r.factors.map((f) => f.name)).toEqual([INVALID_DATA_FACTOR]);
   });
 });
+
+  it("treats undefined optional metrics as unknown", () => {
+    expect(assessPositionRisk({ ...healthy, priceDeviationBps: undefined }).level).toBe("unknown");
+    expect(assessPositionRisk({ ...healthy, rangePct: undefined }).level).toBe("unknown");
+    expect(assessPositionRisk({ ...healthy, tvl: undefined }).level).toBe("unknown");
+  });
+
+  it("still scores explicitly supplied zero metrics", () => {
+    const r = assessPositionRisk({
+      priceDeviationBps: 0,
+      rangePct: 50,
+      tvl: 0,
+      isInRange: true,
+    });
+    expect(r.level).toBe("medium");
+    expect(r.factors.some((f) => f.name === "Low TVL")).toBe(true);
+  });
