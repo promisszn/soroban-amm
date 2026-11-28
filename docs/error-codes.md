@@ -491,6 +491,7 @@ Defined in [contracts/reserve_manager/src/lib.rs](../contracts/reserve_manager/s
 | 6 | `NoPendingAdmin` | `accept_admin` was called when no admin transfer is in progress. | Call `propose_admin` first to nominate a successor. |
 | 7 | `WrongAdmin` | `accept_admin` was called by an address that does not match the pending nominee. | Have the correct address (the one passed to `propose_admin`) call `accept_admin`. |
 | 8 | `Paused` | Contract is administratively paused. | Wait for governance to call `unpause`. |
+| 9 | `NotInitialized` | A function requiring governance or factory state was called before `initialize`. | Call `initialize` first. |
 
 ---
 
