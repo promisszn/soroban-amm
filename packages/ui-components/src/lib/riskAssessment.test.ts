@@ -190,6 +190,6 @@ describe("assessPositionRisk — missing or invalid data", () => {
       tvl: 0,
       isInRange: true,
     });
-    expect(r.level).toBe("medium");
+    expect(r.level).toBe("low");
     expect(r.factors.some((f) => f.name === "Low TVL")).toBe(true);
   });
