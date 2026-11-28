@@ -343,6 +343,7 @@ Defined in [contracts/cl_position_nft/src/lib.rs](../contracts/cl_position_nft/s
 | 10 | `WrongAdmin` | `accept_admin` was called by an address other than the nominated successor. | Call `accept_admin` from the nominated address. |
 | 11 | `InvalidAddress` | `initialize` used the same admin and CL pool, or `set_cl_pool` selected the current or zero address. | Use distinct admin/pool addresses and a nonzero replacement pool address. |
 | 12 | `PoolMismatch` | `mint` supplied a pool address other than the registered `cl_pool`. | Pass the registered pool address to `mint`. |
+| 13 | `PositionsExist` | `set_cl_pool` was called while live position NFTs exist (`total_supply() > 0`). Rotating the pool would strand exits because burns require the new pool's auth. | Burn or migrate every position first so `total_supply() == 0`, then retry `set_cl_pool`. |
 
 `initialize` emits a versioned `initialized` event containing `(admin, cl_pool)`;
 deploy tooling must read both values back and compare them with the intended

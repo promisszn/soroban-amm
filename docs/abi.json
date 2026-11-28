@@ -8780,6 +8780,11 @@
               "doc": "`mint` supplied a pool address other than the registered `cl_pool`.",
               "name": "PoolMismatch",
               "value": 12
+            },
+            {
+              "doc": "`set_cl_pool` was called while position NFTs are still live.",
+              "name": "PositionsExist",
+              "value": 13
             }
           ],
           "doc": "",
@@ -8805,7 +8810,7 @@
       },
       {
         "function_v0": {
-          "doc": "Admin-only migration tool for replacing the pool allowed to mint and burn.",
+          "doc": "Admin-only migration tool for replacing the pool allowed to mint and burn.\\n\\nThis exists to retire a broken pool, but rotation is only safe when no\\nposition NFTs are live. If any positions exist, returns\\n[`NftError::PositionsExist`].\\n\\nSupported migration order:\\n1. Burn or migrate every position so `total_supply() == 0`.\\n2. Call `set_cl_pool` to rotate the authorized pool.",
           "inputs": [
             {
               "doc": "",

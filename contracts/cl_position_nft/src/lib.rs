@@ -40,6 +40,8 @@ pub enum NftError {
     InvalidAddress = 11,
     /// `mint` supplied a pool address other than the registered `cl_pool`.
     PoolMismatch = 12,
+    /// `set_cl_pool` was called while position NFTs are still live.
+    PositionsExist = 13,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
@@ -970,6 +972,14 @@ impl ClPositionNft {
     }
 
     /// Admin-only migration tool for replacing the pool allowed to mint and burn.
+    ///
+    /// This exists to retire a broken pool, but rotation is only safe when no
+    /// position NFTs are live. If any positions exist, returns
+    /// [`NftError::PositionsExist`].
+    ///
+    /// Supported migration order:
+    /// 1. Burn or migrate every position so `total_supply() == 0`.
+    /// 2. Call `set_cl_pool` to rotate the authorized pool.
     pub fn set_cl_pool(env: Env, admin: Address, new_pool: Address) -> Result<(), NftError> {
         Self::bump_instance(&env);
         let current_admin: Address = env
@@ -988,6 +998,9 @@ impl ClPositionNft {
             .ok_or(NftError::Unauthorized)?;
         if new_pool == current_pool || Self::is_zero_address(&env, &new_pool) {
             return Err(NftError::InvalidAddress);
+        }
+        if Self::total_supply(env.clone()) > 0 {
+            return Err(NftError::PositionsExist);
         }
         env.storage().instance().set(&DataKey::ClPool, &new_pool);
         emit_versioned_event!(
@@ -1664,6 +1677,74 @@ mod tests {
         let new_pool = Address::generate(&env);
         client.set_cl_pool(&admin, &new_pool);
         assert_eq!(client.cl_pool(), new_pool);
+    }
+
+    #[test]
+    fn set_cl_pool_succeeds_with_zero_live_positions() {
+        let (env, client, admin, pool, _) = setup();
+        let new_pool = Address::generate(&env);
+        assert_eq!(client.total_supply(), 0);
+        client.set_cl_pool(&admin, &new_pool);
+        assert_eq!(client.cl_pool(), new_pool);
+
+        let (version, (old, new)): (u32, (Address, Address)) =
+            last_versioned_event(&env, &client.address, "pool_changed");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(old, pool);
+        assert_eq!(new, new_pool);
+    }
+
+    #[test]
+    fn set_cl_pool_rejects_when_position_is_live() {
+        let (env, client, admin, pool, user) = setup();
+        let new_pool = Address::generate(&env);
+        client.mint(&user, &pool, &-100, &100);
+        assert_eq!(client.total_supply(), 1);
+
+        let res = client.try_set_cl_pool(&admin, &new_pool);
+        assert_eq!(res.unwrap_err().unwrap(), NftError::PositionsExist);
+        assert_eq!(client.cl_pool(), pool);
+    }
+
+    #[test]
+    fn set_cl_pool_succeeds_after_burning_live_position() {
+        use soroban_sdk::{
+            testutils::{MockAuth, MockAuthInvoke},
+            IntoVal,
+        };
+
+        let (env, client, admin, pool, user) = setup();
+        let new_pool = Address::generate(&env);
+        let token_id = client.mint(&user, &pool, &-100, &100);
+        client.burn(&token_id);
+        assert_eq!(client.total_supply(), 0);
+
+        client.set_cl_pool(&admin, &new_pool);
+        assert_eq!(client.cl_pool(), new_pool);
+
+        env.mock_auths(&[MockAuth {
+            address: &new_pool,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "mint",
+                args: (user.clone(), new_pool.clone(), -10_i32, 10_i32).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let new_id = client.mint(&user, &new_pool, &-10, &10);
+        assert_eq!(client.total_supply(), 1);
+
+        env.mock_auths(&[MockAuth {
+            address: &new_pool,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "burn",
+                args: (new_id,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.burn(&new_id);
+        assert_eq!(client.total_supply(), 0);
     }
 
     #[test]
